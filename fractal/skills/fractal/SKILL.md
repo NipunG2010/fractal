@@ -1,7 +1,404 @@
 ---
 name: fractal
 description: Autonomous agent loops with recursive self-organization.
+argument-hint: <name> [<path>] [--scope=<relpath>] ... [--local] [--detached] [--resume]
 disable-model-invocation: true
 ---
 
 # Fractal
+
+A fractal is a tree of autonomous agent loops, each in its own git
+worktree. A node iterates toward a goal and can spawn child nodes that
+work subtasks in parallel.
+
+This skill configures a node with the user, then launches it in tmux;
+from there it runs autonomously — iterating, committing, and spawning
+children as needed.
+
+Your role does not end at launch. The user (root) node has no loop of
+its own — **you are it.** Once a node is running you are its *operator*:
+you watch the tree, steer it, and relay between it and the user on their
+behalf. See **Operator** below.
+
+## Arguments
+
+Parse the following from `$ARGUMENTS`. The `/fractal` skill routes all
+the configuration to `fractal node init` and passes only `--resume` (if
+present) to `fractal node start`.
+
+**Init** — all configuration. Set by `fractal node init`, written to
+`config.json`, and editable there before launch:
+
+- **`<name>`**: node name (required; letters, digits, and `_` only — no
+  `-`)
+- **`<path>`**: project root, repo root or monorepo sub-project
+  (default: `.`)
+- **`--title`**: human-readable display name (default: de-slugged node
+  name)
+- **`--scope`**: restrict commits to a subdirectory within the worktree
+- **`--base`**: branch to start from (default: current branch)
+- **`--meta`**: target node branch for meta-configuration
+- **`--agent`**: agent command; inherits the user node's default when
+  omitted
+- **`--model`**: model override; when omitted, the agent uses its own
+  default model
+- **`--max-iters`**: per-run iteration cap
+- **`--max-depth`**: maximum child node nesting depth
+- **`--max-children`**: maximum direct child nodes
+- **`--max-descendants`**: maximum total descendant nodes
+- **`--timeout`**: per-run time limit (e.g. `30m`, `1.5h`)
+- **`--iter-timeout`**: per-iteration time limit (e.g. `30m`, `1.5h`)
+- **`--step-timeout`**: per-step time limit (e.g. `30s`, `10m`); caps
+  each step
+- **`--interval`**: fixed iteration schedule (e.g. `1h`)
+- **`--sleep`**: delay between iterations (e.g. `10s`)
+- **`--wait`**: sleep between approval-wait sync invocations (default:
+  `1s`)
+- **`--max-cost`**: per-run cost ceiling in USD
+- **`--max-iter-cost`**: per-iteration cost ceiling in USD
+- **`--max-step-cost`**: per-step cost ceiling in USD (warn-only when
+  unenforceable)
+- **`--reserve-budget`**: budget reserved for cleanup; USD or N% of
+  `--max-cost` (default: 10%)
+- **`--sync`** / **`--no-sync`**: enable (default) or disable radio sync
+  before each step
+- **`--local`**: skip pushing to remote after each commit
+- **`--detached`**: run each step as a separate agent session
+
+**Start** — `fractal node start` just launches; all run parameters come
+from `config.json`. A `max_cost` in `config.json` must be positive if
+set; a missing `max_cost` launches uncapped with a loud warning. Its
+only argument:
+
+- **`--resume`**: resume a stopped/exited node
+
+After parsing, **list the options the user did not specify** (with each
+one's default) so they can see what else is configurable before defining
+the node.
+
+To change a setting after init, edit `<node_dir>/config.json` directly
+(the node reads it at launch), or use
+`fractal node config set <key>=<value>`. Run `fractal node init --help`
+for the full list. (`--reset` also reconfigures, but it wipes the node
+to a stock empty node — see the Reset case below — so it is the heavy
+option, not a setting tweak.)
+
+Cost ceilings are **soft**: a node tracks spend (its own and its
+children's, including sync) but is never *hard*-stopped at `--max-cost`
+— once it drains into the reserve it gets cleanup guidance to wind down
+the remainder of the current iteration cheaply, then the loop ends the
+run at that iteration's boundary (the node does not run `finish`
+itself). A budget-ended run reports `exited` (exit 1) — even if the node
+had already finished and signalled `finish` — so an `exited` status on a
+capped node means "check whether it finished", not necessarily "failed".
+A single iteration or the subtree can still overshoot, so reining in an
+over-spender is the parent's job (monitor with `fractal node cost spent`
+and stop/kill as needed). The exception is in-step spend on claude: each
+step is launched with a hard per-invocation budget — min(run remaining
+minus the reserve, the iteration's headroom, `--max-step-cost`) — and
+stops cleanly mid-step on reaching it, which bounds how far a step can
+overshoot the soft ceilings. codex has no budget flag, so its in-step
+spend is bounded only by the step timeout. Some agents report cost
+directly; others report token usage, which fractal prices via the
+model's published rates — so a cost cap on a token-reporting agent
+requires a (priced) `--model` (the run fails on the first step
+otherwise). Today claude reports cost directly and codex reports tokens.
+
+Nodes run their agent with elevated permissions by design (Claude
+`bypassPermissions`, Codex `danger-full-access`) so they can work
+unattended — only launch nodes whose task you trust to run autonomously.
+
+## Activation
+
+Resolve these before proceeding:
+
+- **path**: the target path argument, resolved to absolute.
+
+### Step 0: Install CLI
+
+Install the fractal CLI from PyPI if `fractal` is not already on your
+`PATH`. fractal shells out to the `wiki` command, so install both:
+
+```bash
+pipx install plasma-fractal
+pipx install plasma-wiki
+```
+
+(`uv tool install plasma-fractal --with-executables-from plasma-wiki`
+does the same in one command.)
+
+### Step 1: Initialize
+
+The node's `<node_dir>/skills/fractal/SKILL.md` documents spawn
+mechanics, child management, configuration, radio, and the full CLI in
+detail — read it for further context as needed.
+
+Determine the node's state and proceed accordingly:
+
+1. **`--resume` was specified** — the node already exists. Resolve its
+   worktree and node directory from `fractal node list --path=<path>`,
+   then skip the rest of this step (the repo and node are already set up
+   — no init or commit).
+
+2. **No `--resume`, but a node already exists** for this path and name
+   (check `fractal node list --path=<path>`) — **ask the user** what to
+   do:
+
+   - **Resume** — treat as case 1 (keep state, continue).
+   - **Reset** — wipe and recreate: do case 3, adding `--reset` to
+     `fractal node init`. `--reset` returns a **stock empty node** —
+     memory, plans, steps, skills, and config are all wiped — so
+     re-author NODE.md, steps, and skills (Step 2 onward) from scratch
+     afterward.
+   - **Cancel** — abort.
+
+3. **Otherwise, create the node.** Commit fractal's own artifacts
+   autonomously, without asking (every command here is idempotent, so
+   re-runs are safe):
+
+   1. `fractal init <path> --agent=<agent>` — writes the root node data
+      (`.fractal/`) and project wiki (`wiki/`); a no-op if the root
+      already exists (re-run to update the stored `--agent`). For a
+      monorepo sub-project `<path>` these nest under it
+      (`<path>/.fractal/`, `<path>/wiki/`), not the repo root. `--agent`
+      sets the default agent that spawned nodes inherit; if the user
+      didn't specify one, default to `--agent=claude` if you are Claude
+      or `--agent=codex` if you are Codex.
+   2. `fractal commit "configure <current_branch>" --init` — commits the
+      project wiki on the user's base branch, so the node worktree
+      branches from a *committed* tree (an uncommitted wiki is invisible
+      to `fractal node init`).
+   3. `fractal node init <name> ...` (add `--reset` for case 2's Reset)
+      — creates the worktree and node directory. `--agent` is optional:
+      when omitted, the node automatically inherits the user node's
+      default (the agent set in step 1). Pass the arguments the user
+      specified; if you intend to pass additional options, confirm with
+      the user first. If it fails, stop and report the error.
+
+The project `wiki/` is **git-tracked** (as are node-branch seeds) —
+never add it to `.gitignore`. The root node's own `.fractal/` is
+**git-ignored on the top-level branch** by default, keeping it out of
+your main history; pass `fractal init --track` to commit it there too
+(chosen once at init). Fractal manages this — its runtime artifacts
+(worktrees, the central database, status, agent logs) plus the top-level
+`.fractal/` — via the repo-local `.git/info/exclude`, which it writes
+automatically; it never touches the committed `.gitignore`.
+
+The output includes the project directory (worktree root) and the node
+data directory. Read these from the output to use in later steps (e.g.
+`<node_dir>/NODE.md`).
+
+If the output includes Obsidian plugin instructions, relay them to the
+user — installing the listed plugin(s) and running
+`wiki config --path=<path>` on the project wiki (`wiki/`) or memory wiki
+(`<node_dir>/memory`) lets them browse in Obsidian (optional).
+
+### Step 2: Define the node
+
+If `--resume` was specified, the node is already defined from its
+previous run. Ask the user whether to keep that definition as-is
+(proceed to next step) or update it — revisit the relevant topics below
+to adjust goals, completion requirements, rules, budget, or steps before
+relaunching.
+
+Have a conversation with the user to define what this node should do.
+Work through each topic below in order. Ask questions naturally — do not
+dump all topics at once. Wait for the user's response to each before
+moving on.
+
+**a) Goals and instructions.** Ask the user what the node should
+accomplish. Draw out specifics: what area of the codebase, what kind of
+work, any constraints or preferences. Node configuration is the
+highest-leverage work — a well-configured node runs autonomously for
+hours; a vague one burns budget. Push for specific, verifiable goals
+rather than transcribing broad statements. Write the result into the
+`## Instructions` section of `<node_dir>/NODE.md`.
+
+**b) Completion requirements.** Ask how the user will know the node is
+done. Help them articulate concrete, verifiable conditions. If the work
+is open-ended with no natural stopping point, suggest leaving this
+section empty and using `--max-iters` to cap the run. Write the result
+into the `## Completion Requirements` section of `<node_dir>/NODE.md`.
+
+**c) Rules and constraints.** Ask if there are any additional rules
+beyond the defaults — files or directories to avoid, patterns to follow,
+tools to use or skip, style preferences. If the user has additions,
+append them to the `## Rules` section. If not, move on.
+
+**d) Budget and scope.** Ask about cost limits (`--max-cost` caps total
+spend, `--max-iter-cost` caps per-iteration). `--max-cost` is optional
+but strongly recommended: without it the node runs **uncapped** — a
+warning at start, bounded only by `--max-iters`/`--timeout` — so settle
+on a cap unless you deliberately want an uncapped run, and also
+recommend `--max-iter-cost`. Note a cost cap on a token-priced agent
+(codex) forces a priced `--model`, which a ChatGPT-subscription codex
+account cannot select — so codex with a cap needs an API-key account,
+while a ChatGPT-subscription codex must run uncapped. If the node should
+only touch certain files or directories, ask about `--scope` (restricts
+what the node can commit). For open-ended work with no completion
+requirements, suggest `--max-iters` to cap iterations.
+
+> [!WARNING]
+> A **low `--max-cost` paired with an expensive `--model`** is the
+> combination most likely to overshoot the budget by a large
+> *percentage*. The run-level ceiling is **soft** and only checked
+> *between* steps, so a single step costing a big fraction of — or more
+> than — the whole budget overshoots before the next check runs.
+> `claude` caps each step with a hard per-step budget (limiting the
+> overshoot, but truncating work when the budget is tiny); `codex` has
+> no per-step cap, so its overshoot is bounded only by `--step-timeout`.
+> For a small budget, prefer a cheaper `--model` and set
+> `--max-iter-cost`; reserve expensive models for budgets large enough
+> that one step is a small slice.
+
+**e) Iteration steps.** Briefly explain how each iteration works: sync
+runs automatically before each numbered step to handle radio
+communication (inbox, feed, parent directives), then the step itself
+executes. The default steps are prepare, plan, execute, review, and
+commit — but steps can be added, removed, or replaced by editing
+`<node_dir>/steps/`. Ask if the user wants to modify them. Most users
+keep the defaults. **Sync is itself a billed step** — it runs once per
+numbered step (its prompt comes from `modes/SYNC.md`, which is *not*
+listed in `steps/`), so an iteration with N step files actually runs ~2N
+agent invocations and a budget sized by counting `steps/` undercounts
+(roughly the per-sync cost × N per iteration). Sync can be disabled with
+`--no-sync` for lightweight leaf nodes. A step may carry YAML
+frontmatter: `agent: <command>` runs that step on a different agent
+(each agent keeps its own woven session across the steps that use it),
+`model: <name>` overrides the model for that step, and `detached: true`
+isolates a single step in its own session within a continuous node.
+
+**f) Environment setup.** Ask if the project needs environment
+preparation (virtual environments, dependencies, containers, build
+steps). If so, edit `<node_dir>/scripts/setup.sh`. It runs automatically
+at the start of every iteration and must be idempotent.
+
+**g) Validation and testing.** Mention that `<node_dir>/scripts/lint.sh`
+runs before each commit, and `<node_dir>/scripts/test.sh` is called by
+the agent during execution. Ask if the user wants to configure either.
+
+**h) Review.** Once all sections are defined, print the final contents
+of `<node_dir>/NODE.md` so the user can review it. Ask if anything needs
+adjustment. Iterate until the user is satisfied.
+
+### Step 3: Launch
+
+Print the exact commands you are about to run, then **ask the user to
+choose**:
+
+- **Launch** — commit the seed and start the node.
+- **Revise** — adjust the node's definition or options first, then
+  re-confirm.
+- **Cancel** — do not launch.
+
+Only proceed if **Launch** is explicitly chosen.
+
+Once launch is approved, commit the configured seed and start the node
+from the worktree — fractal commands act on the node in the current
+directory, so no path is needed:
+
+```bash
+cd <worktree>  # .worktrees/<branch>
+fractal commit "configure <name>" --init
+fractal node start
+```
+
+All run parameters were set at init (in `config.json`); `start` takes no
+config arguments — only `--resume` when continuing a stopped/exited
+node. If the user wants to tweak a setting first, edit
+`<node_dir>/config.json`, then start. The node launches in a detached
+tmux session.
+
+### Step 4: Post-launch briefing
+
+Once the node is running, briefly explain how to interact with it:
+
+- **Steering:** Edit `<node_dir>/NODE.md` directly to adjust goals,
+  rules, or instructions. The node reads it fresh at every step.
+- **Monitoring:** From the node's worktree (`cd <worktree>`), commands
+  act on it directly — `fractal node status`, `fractal node cost spent`,
+  and `fractal node attach` (watch live output — use this, not raw
+  `tmux -t`, whose prefix matching can attach the wrong session).
+  `fractal node list` shows this node's subtree (from a leaf worktree,
+  just its own descendants) — run it from the repo root to see the whole
+  tree. Read `<node_dir>/memory/` (knowledge) or `<node_dir>/plans/`
+  (plans). A run that ends `completed` after `--max-iters` only means
+  the iteration budget was exhausted, not that the goal was met — check
+  `fractal node activity` for the per-iteration outcomes.
+- **TUI:** For a live view of the whole tree — nodes, runs, costs, and
+  output — suggest the user open the dashboard with `fractal open` (run
+  from the repo root). It needs the `tui` extra; if `fractal open`
+  reports it missing, `pipx install 'plasma-fractal[tui]'` adds it.
+- **Stopping:** From the worktree, three escalation levels:
+  - `fractal node finish` — stop after current iteration
+  - `fractal node stop` — stop after current step
+  - `fractal node kill` — kill immediately
+- **Worktree:** The node runs in a git worktree at
+  `<repo>/.worktrees/<branch>/`. The user's repo is untouched. When
+  done, from the repo root, merge with `fractal node merge <branch>`,
+  then delete with `fractal node delete <branch>` (delete must run from
+  outside the worktree). **Delete is destructive:** it is recursive —
+  removing the node's whole subtree — and force-removes each worktree
+  and **force-deletes the branch(es) regardless of merge state**, so any
+  committed-but-unmerged work is lost. Always confirm the `merge`
+  succeeded first (check its output). To keep a node's branch while
+  hiding it, retire it instead. Delete prompts for confirmation `[y/N]`;
+  pass `--force`/`-f` to skip the prompt.
+- **Radio:** nodes communicate via `fractal radio` commands. Run
+  `fractal radio --help` to explore.
+
+Offer to help the user edit `NODE.md`, check progress, or read plan
+files.
+
+## Operator
+
+After launch a node runs autonomously — but the user (root) node never
+does: it is a passive database with no loop, the human's anchor at the
+root of the tree (`"user": true`; never started, merged, or deleted).
+Every other node runs its own loop; the root has none, so **you are the
+operator.** Once the tree is running you are the *operator* — you do for
+the root what the loop does for every node, except your parent is the
+user and your task is their intent. Run like the loop you are: don't
+wait to be asked. Lead with a monitoring pass, keep a standing watch
+where your environment allows recurring checks, and act with full
+autonomy on the user's behalf — steer, `finish`/`stop`/`kill`, merge,
+spawn — reporting what you did rather than asking first. Pause only for
+genuinely ambiguous or irreversible calls, and narrow the moment the
+user scopes you back.
+
+Work the tree through the CLI — run it from the repo root, or name a
+branch positionally. Monitor with
+`fractal node list`/`status`/`activity`/`cost`, and
+`chat <branch> "<q>" --current` to ask a running agent without
+disrupting its loop — `--current` forks the live loop session and is
+claude-only; for codex nodes ask via a fresh chat (omit `--current`) or
+continue one in place with `--session ... --resume`. The root
+auto-subscribes to its children's `outbox` but has no auto-sync, so poll
+its radio yourself — `fractal radio messages` (its inbox) and `feed`
+(children, one hop) — send directives to a child's inbox
+(`radio send <message> --node=<branch> ...`), and post-and-continue (a
+node sees you only on its next sync). Steer by editing `NODE.md` files
+(re-read each step) or by radio; approve gates
+(`node pending`/`approve`), retune limits (`node update`), and merge
+then delete finished subtrees. Relay both ways: surface progress,
+blockers, and cost up to the user, and translate their intent down into
+edits, directives, and spawns. Ask the user for input and feedback
+freely, but never let a question block you unless it is absolutely
+critical — proceed on your best judgment, make reversible calls, and
+note them.
+
+## CLI Reference
+
+Run `fractal --help` and `fractal <command> --help` for all commands and
+options. Commands act on the node in the current directory by default,
+so `cd` into a worktree to operate on it; to act on another node from
+elsewhere in the repo, name its branch positionally (e.g.
+`fractal node status <branch>`). `--path` is an escape hatch for running
+from outside a worktree. `fractal node init` is the exception: `<name>`
+plus the project root via `--path`.
+
+Nodes spawn their own children — the running loop sets the `_NODE`
+environment that makes `fractal node init` nest the child under the
+calling node. Running it by hand from inside a worktree without that env
+nests under the repo-root user node instead, so operators normally don't
+spawn children manually.

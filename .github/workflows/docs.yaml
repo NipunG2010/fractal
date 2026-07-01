@@ -21,6 +21,6 @@ jobs:
       - name: Install package with docs dependencies
         run: ./install.sh --all-extras --groups=docs
       - name: Generate API docs
-        run: uv run --no-sync sphinx-apidoc -f -o docs fractal
+        run: uv run --no-sync sphinx-apidoc -f -o docs fractal fractal/tui
       - name: Build docs
         run: uv run --no-sync sphinx-build -W docs docs/_build

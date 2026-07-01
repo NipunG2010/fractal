@@ -4,6 +4,8 @@ version = "0.0.0"
 description = "Autonomous agent loops with recursive self-organization."
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
+license = "FSL-1.1-ALv2"
+license-files = ["LICENSE"]
 authors = [
     { name = "Andrew Turner", email = "aturner@plasma.ai" },
     { name = "Nicholas Diao", email = "ndiao@plasma.ai" },
@@ -14,6 +16,12 @@ maintainers = [
 ]
 dependencies = [
     "typer>=0.24,<1",
+    "plasma-wiki<1",
+]
+
+[project.optional-dependencies]
+tui = [
+    "textual>=8,<9",
 ]
 
 [project.urls]
@@ -28,6 +36,11 @@ fractal = "fractal.cli.main:cli"
 [tool.poetry]
 packages = [{include = "fractal"}]
 include = [
+    { path = "fractal/_config/git/exclude", format = ["sdist", "wheel"] },
+    { path = "fractal/_node/**/*", format = ["sdist", "wheel"] },
+    { path = "fractal/_scripts/*.sh", format = ["sdist", "wheel"] },
+    { path = "fractal/core/schema.sql", format = ["sdist", "wheel"] },
+    { path = "fractal/tui/app.tcss", format = ["sdist", "wheel"] },
     { path = "fractal/skills/**/*", format = ["sdist", "wheel"] },
 ]
 
@@ -46,6 +59,7 @@ security = [
     "safety",
 ]
 test = [
+    "pytest-asyncio",
     "pytest-cov",
     "pytest-xdist",
 ]
@@ -197,9 +211,23 @@ ignore = [
     "ANN204",
     "F401",
 ]
+"fractal/**" = [
+    "S404",
+    "S603",
+    "S607",
+    "S608",
+]
+"fractal/tui/theme.py" = [
+    "RUF001",
+    "RUF003",
+]
 "tests/**" = [
     "F811",
     "S101",
+    "S404",
+    "S603",
+    "S607",
+    "S608",
 ]
 
 [tool.ruff.lint.isort]
@@ -218,11 +246,13 @@ include = ["fractal"]
 [tool.pytest.ini_options]
 # https://docs.pytest.org/en/stable/customize.html
 addopts = "--doctest-modules -n auto"
+asyncio_mode = "auto"
 
 [tool.coverage.run]
 # https://coverage.readthedocs.io/en/latest/config.html#run
 source = ["fractal"]
 parallel = true
+disable_warnings = ["no-data-collected"]
 
 [tool.coverage.report]
 # https://coverage.readthedocs.io/en/latest/config.html#report

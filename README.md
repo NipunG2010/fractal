@@ -1,5 +1,6 @@
 # fractal
 
+[![license](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](LICENSE)
 [![build](https://github.com/plasma-ai/fractal/actions/workflows/build.yaml/badge.svg)](https://github.com/plasma-ai/fractal/actions/workflows/build.yaml)
 [![docs](https://github.com/plasma-ai/fractal/actions/workflows/docs.yaml/badge.svg)](https://github.com/plasma-ai/fractal/actions/workflows/docs.yaml)
 [![lint](https://github.com/plasma-ai/fractal/actions/workflows/lint.yaml/badge.svg)](https://github.com/plasma-ai/fractal/actions/workflows/lint.yaml)
@@ -9,30 +10,53 @@
 
 Autonomous agent loops with recursive self-organization.
 
----
+In a fractal, autonomous agent loops arrange themselves into a tree: a
+node iterates toward a goal in its own `git worktree` and spawns child
+nodes for separable subtasks, so the tree grows to fit the problem
+rather than a fixed plan. Hard caps (iterations, depth, children, cost,
+time) keep each loop bounded, and an operator can steer or stop it at
+any point. Run metadata (including cost) lands in one local `SQLite`
+database, which can be interacted with live in a terminal UI.
 
-**Source**: [https://github.com/plasma-ai/fractal](https://github.com/plasma-ai/fractal)
+______________________________________________________________________
 
-**Package**: [https://pypi.org/project/plasma-fractal/](https://pypi.org/project/plasma-fractal/)
+**Source**:
+[https://github.com/plasma-ai/fractal](https://github.com/plasma-ai/fractal)
 
-**Documentation**: [https://docs.plasma.ai/fractal](https://docs.plasma.ai/fractal)
+**Package**:
+[https://pypi.org/project/plasma-fractal/](https://pypi.org/project/plasma-fractal/)
 
----
+**Documentation**:
+[https://docs.plasma.ai/fractal](https://docs.plasma.ai/fractal)
+
+______________________________________________________________________
 
 ## Installation
 
-Install the `fractal` CLI from PyPI:
+Install the `fractal` CLI from PyPI. `fractal` shells out to the `wiki`
+command, so install both:
 
 ```bash
 pipx install plasma-fractal
+pipx install plasma-wiki
 ```
 
-(`pip install plasma-fractal` or `uv tool install plasma-fractal` work too.)
+(`uv tool install plasma-fractal --with-executables-from plasma-wiki`
+does the same in one command.)
+
+The terminal UI is optional. To include it, install the `tui` extra:
+
+```bash
+pipx install 'plasma-fractal[tui]'
+```
+
+(the `uv tool install` one-liner above takes `[tui]` too). Open the
+dashboard from your project root with `fractal open`.
 
 ### Skill
 
-Install the `/fractal` skill for your agent via the
-plugin marketplace (Claude Code and Codex):
+Install the `/fractal` skill for your agent via the plugin marketplace
+(Claude Code and Codex):
 
 ```bash
 # Claude Code
@@ -44,8 +68,9 @@ codex plugin marketplace add plasma-ai/plugins
 codex plugin add fractal@plasma
 ```
 
-Or from the CLI, which copies the skill into `~/.claude/skills` and
-`~/.agents/skills` (add `--project` for the current project only):
+Or from the CLI, which copies the fractal and wiki skills into
+`~/.claude/skills` and `~/.agents/skills` (add `--project` for the
+current project only):
 
 ```bash
 fractal install
@@ -53,11 +78,15 @@ fractal install
 
 ## Usage
 
-Basic usage:
+A fractal is a tree of git worktrees, each running an autonomous agent
+loop. The root node branches from your working tree, and child nodes
+branch from their parent. Agents iterate in tmux sessions, and all state
+(runs, iters, steps, costs, signals) is tracked in a local SQLite
+database.
 
-```python
-import fractal
-```
+Use the `/fractal` skill to spawn and manage agent nodes. The `fractal`
+CLI is also available directly — run `fractal --help` and
+`fractal <command> --help` to explore.
 
 ## Development
 
@@ -97,3 +126,10 @@ Run linters and formatters:
 ```bash
 pre-commit run --all-files
 ```
+
+## License
+
+Licensed under the Functional Source License 1.1 (Apache 2.0 Future
+License) — see [LICENSE](LICENSE).
+
+Copyright © 2026 Plasma AI

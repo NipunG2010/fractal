@@ -1,0 +1,36 @@
+# Git worktrees
+.worktrees/
+
+# Virtual environment
+.venv
+
+# Local databases
+.db
+.db-*
+
+# Status file
+.status
+
+# Obsidian config
+.obsidian/
+
+# Agent config
+.agents/
+.claude/
+.codex/
+
+# Agent stderr
+claude.err
+codex.err
+
+# Agent session IDs
+.session
+
+# Failure reason marker
+.fail_reason
+
+# Budget exceeded marker
+.budget_exceeded
+
+# Bytecode
+__pycache__/

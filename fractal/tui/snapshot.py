@@ -1,0 +1,1102 @@
+"""Implements the cockpit's per-tick view-model.
+
+``SnapshotBuilder`` turns the poller's change reports into an immutable
+``Snapshot`` -- the one object every pane renders from. The hard rule this
+module exists for: **renderers never touch the database layer.** Each build
+re-reads only the sections whose branch changed on disk (per-branch caches keyed
+by the poller's tokens), shapes them once into the pane row contracts, and
+returns the previous ``Snapshot`` object untouched when nothing changed -- so a
+steady tick costs zero queries and panes can skip rebuilds by comparison.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import math
+import pathlib
+import sqlite3
+import time
+from collections.abc import Callable
+from typing import Any, Optional
+
+from rich.text import Text
+
+from fractal.tui import fmt, theme
+from fractal.tui.data import TuiData, display_name_of, leaf_of, parse_ts, span, user_tag
+from fractal.tui.poller import NodePoller
+from fractal.util import parse_duration_seconds
+
+__all__ = [
+    'Geometry',
+    'Snapshot',
+    'SnapshotBuilder',
+]
+
+# the sync pre-step persists as step=0 rows (_run.sh); it is excluded from the
+# displayed step numerator/denominator so the card reads step N/N over the real
+# loop steps, and renders as plain `sync` in the explorer and event log
+_SYNC_NAME = 'SYNC'
+
+# the widest node-event verb floors the event-log desc column (see Geometry)
+_EV_LEAD_MAX = max(len(verb) for verb in fmt.NODE_VERB.values())
+
+
+@dataclasses.dataclass(frozen=True)
+class Geometry:
+    """Pane dimensions derived once per focused-section refresh."""
+
+    tree_width: int  # tree pane total width
+    node_width: int  # node pane total width
+    label_w: int  # explorer label cell width
+    desc_w: int  # event-log desc cell width
+    ev_node_w: int  # event-log node column (fits the longest leaf name)
+    ev_run_w: int  # event-log run column (fits the longest value)
+    ev_iter_w: int  # event-log iter column
+    ev_step_w: int  # event-log step column
+    ev_dur_w: int  # event-log duration column
+    ev_cost_w: int  # event-log cost column
+
+
+@dataclasses.dataclass(frozen=True)
+class Snapshot:
+    """The immutable view-model one tick renders from."""
+
+    repo: str  # repository name (header brand)
+    scope: str  # focused branch
+    tree: tuple[dict, ...]  # DFS tree rows (whole tree)
+    counts: tuple[int, int]  # (total, active) for the tree foot
+    card: Optional[dict]  # node-card head/ident state
+    measures: Optional[dict]  # the 3x2 matrix values + caps
+    config: dict  # scope's config.json (chips + tooltip)
+    history: tuple[dict, ...]  # run -> iters -> steps (explorer)
+    log: tuple[dict, ...]  # activity rows, newest first
+    sessions: tuple[str, ...]  # distinct iter sessions, newest first
+    channels: tuple[dict, ...]  # scope's channels (+ read/write flags)
+    messages: tuple[dict, ...]  # scope's own top-level messages
+    feed: tuple[dict, ...]  # subtree public+outbox fan-out (lazy)
+    saved: tuple[dict, ...]  # scope's archive (lazy)
+    geometry: Geometry
+
+
+class SnapshotBuilder:
+    """Builds snapshots from per-branch section caches keyed by poll tokens."""
+
+    def __init__(
+        self: SnapshotBuilder,
+        data: TuiData,
+        poller: NodePoller,
+        *,
+        now: Optional[Callable[[], float]] = None,
+    ) -> None:
+        """Initialize ``SnapshotBuilder``.
+
+        Args:
+            data: The read-only database surface.
+            poller: The change-detection signal consulted on every build.
+            now: Epoch-seconds clock for live-elapsed math; ``time.time``
+                when omitted (injectable for deterministic tests).
+
+        """
+        self._data = data
+        self._poller = poller
+        self._now = now or time.time
+        # per-branch section caches (dropped when the branch's token moves)
+        self._topo: Optional[list[str]] = None
+        self._children: dict[str, list[str]] = {}
+        self._titles: dict[str, str] = {}
+        self._brief: dict[str, dict] = {}
+        self._shaped: dict[str, dict] = {}
+        self._radio: dict[str, tuple] = {}
+        self._archive: dict[str, tuple] = {}
+        self._runcost: dict[str, dict] = {}
+        self._runsteps: dict[str, dict] = {}
+        self._logs: dict[str, tuple] = {}
+        self._tree: Optional[tuple] = None
+        self._tree_scope: Optional[str] = None
+        self._stale: set[str] = set()
+        self._failed: set[str] = set()
+        self._feed_scope: Optional[str] = None
+        self._sublog_scope: Optional[str] = None
+        self._snapshot: Optional[Snapshot] = None
+        # live tmux sessions, refreshed once per build, to display-reconcile a
+        # crashed-but-active node as 'exited' (never persisted -- read-only)
+        self._live_sessions: frozenset[str] = frozenset()
+
+    def build(
+        self: SnapshotBuilder,
+        scope: str,
+        *,
+        want_feed: bool = False,
+        want_archive: bool = False,
+        want_subtree_log: bool = False,
+    ) -> Snapshot:
+        """Return the current snapshot, re-reading only what changed on disk.
+
+        Args:
+            scope: The focused branch.
+            want_feed: Populate the cross-subtree feed section (lazy: the
+                radio pane requests it only while showing Feed).
+            want_archive: Populate the archive section (Archive view).
+            want_subtree_log: Merge every descendant's activity into the log
+                section (lazy: the node pane requests it while toggled on).
+
+        Returns:
+            The snapshot -- the **same object** as the previous build when
+            nothing changed, so callers can skip rendering entirely.
+
+        """
+        # detect change; failed reads from the last build retry as moved
+        moved = set(self._poller.changed(self._watched()))
+        moved |= self._failed
+        self._failed.clear()
+        # refresh topology when the root registry changed (or on first build);
+        # newly registered branches count as moved so their sections build, and
+        # a second poll primes their tokens so the next build sees no movement
+        if self._topo is None or self._data.root_branch in moved:
+            moved |= self._refresh_topo()
+            moved |= self._poller.changed(self._watched())
+        for branch in moved:
+            self._drop(branch)
+        # short-circuit: nothing moved and the previous snapshot still answers
+        previous = self._snapshot
+        root = self._data.root_branch
+        if (
+            previous is not None
+            and not moved
+            and previous.scope == scope
+            and (not want_feed or self._feed_scope == scope)
+            and (not want_archive or root in self._archive)
+            and self._sublog_scope == (scope if want_subtree_log else None)
+        ):
+            return previous
+        # reconcile crashed-but-active nodes for display only: a loop that died
+        # leaves .status 'active' with no tmux session; fetch the live sessions
+        # once and drop any brief whose session is gone so it rebuilds as the
+        # honest 'exited'; (a crash doesn't move the .status mtime, so the poller
+        # can't catch it -- liveness is checked here each build instead)
+        self._live_sessions = self._data.live_sessions()
+        for branch in self._topo or ():
+            brief = self._brief.get(branch)
+            if brief is not None and brief['status'] == 'active':
+                if self._data.tmux_session_name(branch) not in self._live_sessions:
+                    self._drop(branch)
+        # ensure the sections this snapshot needs
+        for branch in self._topo or ():
+            self._ensure_brief(branch)
+        self._ensure_focus(scope)
+        subtree = self._subtree(scope)
+        if want_feed:
+            for branch in subtree:
+                self._ensure_radio(branch)
+            self._feed_scope = scope
+        if want_archive:
+            # saved messages are the cockpit user's: always the root's archive
+            self._ensure_archive(root)
+        # assemble (cached sections keep identity across snapshots)
+        shaped = self._shaped.get(scope) or _EMPTY_SHAPE
+        # the subtree log merges every descendant's shaped rows; its geometry
+        # re-derives so the node column fits the longest descendant leaf
+        if want_subtree_log:
+            log = self._subtree_log(subtree)
+            geometry = self._geometry(shaped['card'], shaped['history'], scope, log)
+        else:
+            log = shaped['log']
+            geometry = shaped['geometry']
+        self._sublog_scope = scope if want_subtree_log else None
+        tree = self._tree_rows(scope)
+        # the count tallies agent nodes -- the user (root) node is not one
+        total = max(0, len(self._topo or ()) - 1)
+        active = sum(
+            1
+            for branch in self._topo or ()
+            if self._brief.get(branch, {}).get('status') == 'active'
+        )
+        feed = self._feed(subtree) if want_feed else ()
+        snapshot = Snapshot(
+            repo=self._data.repo_dir.name,
+            scope=scope,
+            tree=tree,
+            counts=(total, active),
+            card=shaped['card'],
+            measures=shaped['measures'],
+            config=shaped['config'],
+            history=shaped['history'],
+            log=log,
+            sessions=shaped['sessions'],
+            channels=shaped['channels'],
+            messages=self._radio.get(scope, ()),
+            feed=feed,
+            saved=self._archive.get(root, ()) if want_archive else (),
+            geometry=geometry,
+        )
+        self._snapshot = snapshot
+        return snapshot
+
+    def _watched(self: SnapshotBuilder) -> dict[str, pathlib.Path]:
+        """Build the branch -> node-dir map the poller stats.
+
+        Before the first topology refresh only the root is known (its token
+        triggers it).
+        """
+        branches = self._topo or [self._data.root_branch]
+        result = {}
+        for branch in branches:
+            node_dir = self._data.node_dir(branch)
+            if node_dir is not None:
+                result[branch] = node_dir
+        return result
+
+    def _refresh_topo(self: SnapshotBuilder) -> set[str]:
+        """Re-read the worktree map + root registry (creation order).
+
+        Hides branches whose worktree is gone; returns newly seen branches.
+        """
+        self._data.refresh_worktrees()
+        try:
+            registry = self._data.registry_branches()
+            titles = self._data.registry_titles()
+        except sqlite3.Error:
+            self._failed.add(self._data.root_branch)
+            return set()
+        self._titles = titles
+        live = [self._data.root_branch]
+        for branch in registry:
+            if (
+                branch != self._data.root_branch
+                and self._data.node_dir(branch) is not None
+            ):
+                live.append(branch)
+        previous = set(self._topo or ())
+        for branch in previous - set(live):
+            self._data.evict(branch)
+            self._drop(branch)
+        self._topo = live
+        # index direct children in creation order (one dotted segment deeper)
+        self._children = {branch: [] for branch in live}
+        for branch in live:
+            parent, _, _ = branch.rpartition('.')
+            if parent in self._children:
+                self._children[parent].append(branch)
+        self._tree = None
+        return set(live) - previous
+
+    def _drop(self: SnapshotBuilder, branch: str) -> None:
+        """Invalidate every cached section the branch feeds.
+
+        Its own sections, the tree, and any focused shape whose subtree
+        contains it (the run-cost chase); the focused shape is marked stale
+        rather than popped so a contended read (busy timeout) keeps showing
+        last-known data until the retry.
+        """
+        self._brief.pop(branch, None)
+        self._radio.pop(branch, None)
+        self._archive.pop(branch, None)
+        self._runcost.pop(branch, None)
+        self._runsteps.pop(branch, None)
+        self._logs.pop(branch, None)
+        self._tree = None
+        for scope in self._shaped:
+            if branch == scope or branch.startswith(f'{scope}.'):
+                self._stale.add(scope)
+
+    def _subtree(self: SnapshotBuilder, scope: str) -> list[str]:
+        """List the scope and every descendant branch (topology order)."""
+        prefix = f'{scope}.'
+        return [
+            branch
+            for branch in self._topo or ()
+            if branch == scope or branch.startswith(prefix)
+        ]
+
+    def _ensure_brief(self: SnapshotBuilder, branch: str) -> None:
+        """Cache the branch's status + pending signal.
+
+        Status comes from the ``.status`` file, display-reconciled to ``exited``
+        when it reads ``active`` but the node's tmux session is gone (a crashed
+        loop); the signal query runs only for an active node (a settled tree
+        polls with zero queries).
+        """
+        if branch in self._brief:
+            return
+        status = self._data.status(branch)
+        # display-reconcile a crashed-but-active node: active with no live tmux
+        # session means the loop died without ending; show the honest 'exited'
+        # (display only -- never persisted; the cockpit is read-only)
+        if status == 'active':
+            if self._data.tmux_session_name(branch) not in self._live_sessions:
+                status = 'exited'
+        signal = ''
+        if status == 'active':
+            try:
+                connection = self._data.connect()
+                try:
+                    signal = self._data.signal(connection, branch)
+                finally:
+                    connection.close()
+            except sqlite3.Error:
+                self._failed.add(branch)
+        self._brief[branch] = {'status': status, 'signal': signal}
+
+    def _ensure_runcost(self: SnapshotBuilder, branch: str) -> None:
+        """Cache the branch's run-cost and run-step maps (the spend chase)."""
+        if branch in self._runcost:
+            return
+        try:
+            connection = self._data.connect()
+            try:
+                self._runcost[branch] = self._data.run_costs(connection, branch)
+                self._runsteps[branch] = self._data.run_steps(connection, branch)
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            self._failed.add(branch)
+            self._runcost[branch] = {}
+            self._runsteps[branch] = {}
+
+    def _ensure_radio(self: SnapshotBuilder, branch: str) -> None:
+        """Cache the branch's radio rows (with react counts, newest first)."""
+        if branch in self._radio:
+            return
+        try:
+            connection = self._data.connect()
+            try:
+                messages = self._data.message_rows(connection, branch)
+                reacts = self._data.react_counts(connection, branch)
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            self._failed.add(branch)
+            self._radio[branch] = ()
+            return
+        rows = [_message(row, branch, reacts) for row in messages]
+        rows.sort(key=lambda row: row['created_at'], reverse=True)
+        self._radio[branch] = tuple(rows)
+
+    def _ensure_archive(self: SnapshotBuilder, branch: str) -> None:
+        """Cache the branch's archived messages (newest first)."""
+        if branch in self._archive:
+            return
+        try:
+            connection = self._data.connect()
+            try:
+                rows = self._data.archive_rows(connection, branch)
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            self._failed.add(branch)
+            self._archive[branch] = ()
+            return
+        # archived copies are read by definition and carry no react counts;
+        # each row keeps its source node (the `owner` column) for actions
+        shaped = [_message(row, row['owner'], {}) for row in rows]
+        shaped.sort(key=lambda row: row['created_at'], reverse=True)
+        self._archive[branch] = tuple(shaped)
+
+    def _ensure_focus(self: SnapshotBuilder, scope: str) -> None:
+        """Build everything the scoped panes render.
+
+        The run/iter/step tables shaped into card + measures + history +
+        sessions, the event log, the scope's radio section, channels, config,
+        and the geometry -- one connection for the scope plus one per
+        uncached subtree branch (the run-cost chase).
+        """
+        if scope in self._shaped and scope not in self._stale:
+            return
+        self._ensure_brief(scope)
+        brief = self._brief[scope]
+        if self._data.node_dir(scope) is None:
+            self._stale.discard(scope)
+            self._shaped[scope] = dict(
+                _EMPTY_SHAPE,
+                geometry=self._geometry(None, (), scope, ()),
+            )
+            return
+        config = self._data.config(scope)
+        try:
+            connection = self._data.connect()
+            try:
+                runs, iters, steps = self._data.tables(connection, scope)
+                log_raw = self._data.log_rows(connection, (scope,))
+                runcost = self._data.run_costs(connection, scope)
+                runsteps = self._data.run_steps(connection, scope)
+                messages = self._data.message_rows(connection, scope)
+                reacts = self._data.react_counts(connection, scope)
+                channels = self._data.channel_rows(connection, scope)
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            # keep showing the stale shape (if any) until the retry lands
+            self._failed.add(scope)
+            if scope not in self._shaped:
+                self._shaped[scope] = dict(
+                    _EMPTY_SHAPE,
+                    geometry=self._geometry(None, (), scope, ()),
+                )
+            return
+        self._runcost[scope] = runcost
+        self._runsteps[scope] = runsteps
+        radio_rows = [_message(row, scope, reacts) for row in messages]
+        radio_rows.sort(key=lambda row: row['created_at'], reverse=True)
+        self._radio[scope] = tuple(radio_rows)
+        # the run-cost chase spans the subtree; ensure each branch's map
+        for branch in self._subtree(scope):
+            self._ensure_runcost(branch)
+        self._stale.discard(scope)
+        run, it, step, is_live = _context(runs, iters, steps)
+        card = _card(scope, brief, step, config)
+        measures = self._measures(
+            runs=runs,
+            iters=iters,
+            steps=steps,
+            config=config,
+            scope=scope,
+            run=run,
+            it=it,
+            step=step,
+            is_live=is_live,
+        )
+        history = _history(runs, iters, steps, runcost)
+        log = _log(log_raw, [run['run_id'] for run in runs], scope)
+        self._logs[scope] = log
+        # each row carries the run's subtree spend as of its own end -- the
+        # card's run-cost figure when the explorer highlights it (open rows
+        # read all-time: cost only accrues on step ends, which re-shape)
+        for run_row in history:
+            run_row['spend'] = self._run_spend(scope, run_row['run_id'])
+            for iter_row in run_row['iters']:
+                iter_row['run_spend'] = self._run_spend_at(
+                    scope,
+                    run_row['run_id'],
+                    _end_epoch(iter_row),
+                )
+                for step_row in iter_row['steps']:
+                    step_row['run_spend'] = self._run_spend_at(
+                        scope,
+                        run_row['run_id'],
+                        _end_epoch(step_row),
+                    )
+        geometry = self._geometry(card, history, scope, log)
+        self._shaped[scope] = {
+            'card': card,
+            'measures': measures,
+            'config': config,
+            'history': history,
+            'log': log,
+            'sessions': _sessions(iters),
+            'channels': tuple(channels),
+            'geometry': geometry,
+        }
+
+    def _measures(
+        self: SnapshotBuilder,
+        *,
+        runs: list[dict],
+        iters: list[dict],
+        steps: list[dict],
+        config: dict,
+        scope: str,
+        run: Optional[dict],
+        it: Optional[dict],
+        step: Optional[dict],
+        is_live: bool,
+    ) -> Optional[dict]:
+        """Shape the run/iter/step x time/cost matrix with every configured cap.
+
+        All six cap axes exist (``timeout`` is the per-RUN wall clock,
+        ``iter_timeout`` the per-iteration one); ``None`` means uncapped and
+        renders ``-``.
+        """
+        if run is None:
+            return None
+        it_steps = [s for s in steps if it and s['iter_id'] == it['iter_id']]
+        max_iters = config.get('max_iters')
+        iter_max = max_iters if max_iters is not None and max_iters >= 0 else None
+        return {
+            'run': len(runs),
+            'iter': it['iter'] if it else None,
+            'iter_max': iter_max,
+            'step': step['step'] if step else None,
+            'step_total': _step_total(steps),
+            'step_name': step['step_name'] if step else None,
+            'elapsed_step': self._elapsed(step, is_live) if step else None,
+            'elapsed_iter': self._elapsed(it, is_live) if it else None,
+            'elapsed_run': self._elapsed(run, is_live),
+            'cost_step': step['cost'] if step else None,
+            'cost_iter': sum(s['cost'] or 0 for s in it_steps) if it else None,
+            'cost_run': self._run_spend(scope, run['run_id']),
+            'cap_step_s': parse_duration_seconds(config.get('step_timeout') or ''),
+            'cap_step_cost': config.get('max_step_cost'),
+            'cap_iter_s': parse_duration_seconds(config.get('iter_timeout') or ''),
+            'cap_iter_cost': config.get('max_iter_cost'),
+            'cap_run_s': parse_duration_seconds(config.get('timeout') or ''),
+            'cap_run_cost': config.get('max_cost'),
+            'reserve_budget': config.get('reserve_budget'),
+        }
+
+    def _elapsed(
+        self: SnapshotBuilder, row: Optional[dict], is_live: bool
+    ) -> Optional[float]:
+        """Compute a row's elapsed seconds.
+
+        Live rows measure against the injected clock; settled rows report
+        their final wall time (``ended_at`` - ``started_at``).
+        """
+        if row is None:
+            return None
+        if is_live:
+            started = parse_ts(row['started_at'])
+            if started is None:
+                return None
+            return max(0.0, self._now() - started.timestamp())
+        return span(row['started_at'], row['ended_at'])
+
+    def _run_spend(self: SnapshotBuilder, branch: str, run_id: int) -> float:
+        """Compute a run's all-time subtree spend.
+
+        Mirrors ``Node.cost_spent`` without the recursive database walk --
+        the per-branch maps are already cached.
+        """
+        return self._run_spend_at(branch, run_id, math.inf)
+
+    def _run_spend_at(
+        self: SnapshotBuilder,
+        branch: str,
+        run_id: int,
+        t: float,
+    ) -> float:
+        """Compute a run's subtree spend as of instant ``t``.
+
+        Its own steps ended by then, plus every descendant run chained to it
+        via ``parent_run_id``.
+        """
+        own = self._runsteps.get(branch, {}).get(run_id, ())
+        total = sum(cost for end, cost in own if end <= t)
+        for child in self._children.get(branch, ()):
+            child_runs = self._runcost.get(child, {})
+            for child_run_id, (parent_run_id, _) in child_runs.items():
+                if parent_run_id == run_id:
+                    total += self._run_spend_at(child, child_run_id, t)
+        return total
+
+    def _ensure_log(self: SnapshotBuilder, branch: str) -> None:
+        """Cache the branch's shaped activity log (the subtree-log ingredient)."""
+        if branch in self._logs:
+            return
+        try:
+            connection = self._data.connect()
+            try:
+                log_raw = self._data.log_rows(connection, (branch,))
+                run_ids = self._data.run_ids(connection, branch)
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            self._failed.add(branch)
+            self._logs[branch] = ()
+            return
+        self._logs[branch] = _log(log_raw, run_ids, branch)
+
+    def _subtree_log(self: SnapshotBuilder, subtree: list[str]) -> tuple[dict, ...]:
+        """Merge the subtree's activity logs, newest first (capped like one)."""
+        rows: list[dict] = []
+        for branch in subtree:
+            self._ensure_log(branch)
+            rows.extend(self._logs.get(branch, ()))
+        rows.sort(
+            key=lambda row: (
+                row['created_at'],
+                row['run_id'] or 0,
+                row['iter_id'] or 0,
+                row['step_id'] or 0,
+            ),
+            reverse=True,
+        )
+        return tuple(rows[:120])
+
+    def _feed(self: SnapshotBuilder, subtree: list[str]) -> tuple[dict, ...]:
+        """Merge the cross-subtree broadcast view, newest first.
+
+        Every branch's public + outbox posts (read-only -- never
+        ``Radio.feed``).
+        """
+        rows = []
+        for branch in subtree:
+            for row in self._radio.get(branch, ()):
+                if row['channel'] in ('public', 'outbox'):
+                    rows.append(row)
+        rows.sort(key=lambda row: row['created_at'], reverse=True)
+        return tuple(rows[:50])
+
+    def _tree_rows(self: SnapshotBuilder, scope: str) -> tuple[dict, ...]:
+        """Flatten the tree: DFS over the children index in creation order."""
+        if self._tree is not None and self._tree_scope == scope:
+            return self._tree
+        rows: list[dict] = []
+
+        def walk(branch: str, depth: int) -> None:
+            kids = self._children.get(branch, [])
+            brief = self._brief.get(branch, {'status': 'idle', 'signal': ''})
+            name = display_name_of(branch, self._titles.get(branch))
+            rows.append(
+                {
+                    'branch': branch,
+                    'name': name + user_tag(branch, self._data.root_branch),
+                    'depth': depth,
+                    'status': brief['status'],
+                    'signal': brief['signal'],
+                    'is_user': branch == self._data.root_branch,
+                    'is_focused': branch == scope,
+                    'has_kids': bool(kids),
+                }
+            )
+            for kid in kids:
+                walk(kid, depth + 1)
+
+        walk(self._data.root_branch, 0)
+        self._tree = tuple(rows)
+        self._tree_scope = scope
+        return self._tree
+
+    def _geometry(
+        self: SnapshotBuilder,
+        card: Optional[dict],
+        history: tuple[dict, ...],
+        scope: str,
+        log: tuple[dict, ...],
+    ) -> Geometry:
+        """Compute every pane width the renderers consume.
+
+        The node pane sizes to the widest of its ident block and an explorer
+        row (label + the right-anchored session/dur/cost cluster), widened
+        for air, floored by the event log's minimum useful desc column; the
+        tree pane sizes to its widest line; computed once per focused-section
+        refresh -- renderers never re-derive widths.
+        """
+        cluster = theme.SESS_W + theme.GAP + theme.DUR_W + theme.GAP + theme.COST_W
+        if card is not None:
+            agent = card['agent'] or '—'
+            if card['detached']:
+                agent += ' (detached)'
+            values = [agent, card['model'] or '—', card['session'] or '—']
+            ident_w = 13 + max(len(value) for value in values)
+        else:
+            ident_w = 13
+        label_w = 0
+        for run in history:
+            label_w = max(label_w, 2 + len(run['label']))
+            for it in run['iters']:
+                label_w = max(label_w, 4 + len(it['label']))
+                for step in it['steps']:
+                    label_w = max(label_w, 6 + len(step['label']))
+        fit = max(label_w + 2, theme.NODE_FIT_MIN)
+        # the widen air goes to the label area only -- the session/dur/cost
+        # cluster and the ident block are already exact-width content
+        natural = max(ident_w, int(fit * theme.NODE_WIDEN) + theme.GAP + cluster)
+        node_width = natural + theme.NODE_CHROME
+        # floor: the event-log desc column must fit its widest node-event verb
+        # plus META_MIN metadata chars before the ellipsis
+        # every log column sizes to its longest value (desc flexes/truncates)
+        root = self._data.root_branch
+        ev_node_w = max(
+            (
+                len(leaf_of(row['branch']) + user_tag(row['branch'], root))
+                for row in log
+            ),
+            default=0,
+        )
+        ev_run_w = max(
+            (len(f'run {row["run_n"]}') for row in log if row['run_n']),
+            default=0,
+        )
+        ev_iter_w = max(
+            (len(f'iter {row["iter_n"]}') for row in log if row['iter_n']),
+            default=0,
+        )
+        ev_step_w = max(
+            (len(f'step {row["step_n"]}') for row in log if row['step_n']),
+            default=0,
+        )
+        ev_dur_w = max(
+            (len(fmt.dur(row['duration'])) for row in log if row['duration']),
+            default=0,
+        )
+        ev_cost_w = max(
+            (len(fmt.money(row['cost'])) for row in log if row['cost'] is not None),
+            default=0,
+        )
+        event_inner = (
+            theme.TIME_W
+            + theme.GAP
+            + ev_node_w
+            + theme.GAP
+            + ev_run_w
+            + theme.GAP
+            + ev_iter_w
+            + theme.GAP
+            + ev_step_w
+            + theme.GAP
+            + (_EV_LEAD_MAX + 1 + theme.META_MIN + 1)
+            + theme.GAP
+            + ev_dur_w
+            + theme.GAP
+            + ev_cost_w
+        )
+        node_width = max(node_width, event_inner + theme.NODE_CHROME)
+        # floor: the measures matrix row (scope label + both figure/gauge
+        # columns) must fit without clipping its cost figures
+        measures_inner = (
+            theme.MEAS_W
+            + theme.GAP
+            + (theme.EL_FIG_W + 3 + theme.BAR_W)
+            + theme.GAP
+            + (theme.CO_FIG_W + 3 + theme.BAR_W)
+        )
+        node_width = max(node_width, measures_inner + theme.NODE_CHROME)
+        inner = node_width - theme.NODE_CHROME
+        # the tree pane fits its widest (uncollapsed) line and its foot
+        lines = fmt.tree_lines(list(self._tree_rows(scope)), set())
+        widest = max(
+            (len(Text.from_markup(line).plain) for _, line in lines),
+            default=20,
+        )
+        total = max(0, len(self._topo or ()) - 1)
+        active = sum(
+            1
+            for branch in self._topo or ()
+            if self._brief.get(branch, {}).get('status') == 'active'
+        )
+        foot = f'{active}/{total} nodes running'
+        return Geometry(
+            tree_width=max(widest, len(foot)) + theme.TREE_CHROME,
+            node_width=node_width,
+            label_w=inner - theme.GAP - cluster,
+            desc_w=inner
+            - theme.TIME_W
+            - ev_node_w
+            - ev_run_w
+            - ev_iter_w
+            - ev_step_w
+            - ev_dur_w
+            - ev_cost_w
+            - 7 * theme.GAP,
+            ev_node_w=ev_node_w,
+            ev_run_w=ev_run_w,
+            ev_iter_w=ev_iter_w,
+            ev_step_w=ev_step_w,
+            ev_dur_w=ev_dur_w,
+            ev_cost_w=ev_cost_w,
+        )
+
+
+# ------ helper functions (pure shaping)
+
+
+# the focused shape when the scope's worktree is unavailable
+_EMPTY_SHAPE: dict[str, Any] = {
+    'card': None,
+    'measures': None,
+    'config': {},
+    'history': (),
+    'log': (),
+    'sessions': (),
+    'channels': (),
+    'geometry': None,
+}
+
+
+def _context(
+    runs: list[dict],
+    iters: list[dict],
+    steps: list[dict],
+) -> tuple[Optional[dict], Optional[dict], Optional[dict], bool]:
+    """Resolve the displayed (run, iter, step, is_live) from the tables.
+
+    Run and iteration are the active else newest; the step is the iteration's
+    active non-SYNC step (live) else its last numbered step (settled).
+    """
+    run = next((r for r in runs if r['status'] == 'active'), runs[0] if runs else None)
+    if run is None:
+        return None, None, None, False
+    run_iters = [i for i in iters if i['run_id'] == run['run_id']]
+    it = next(
+        (i for i in run_iters if i['status'] == 'active'),
+        run_iters[0] if run_iters else None,
+    )
+    step: Optional[dict] = None
+    is_live = False
+    if it is not None:
+        it_steps = [s for s in steps if s['iter_id'] == it['iter_id']]
+        active = next((s for s in it_steps if s['status'] == 'active'), None)
+        if active is not None and active['step_name'] != _SYNC_NAME:
+            step, is_live = active, True
+        else:
+            numbered = [s for s in it_steps if s['step_name'] != _SYNC_NAME]
+            step = max(
+                numbered,
+                key=lambda s: (s['step'], s['step_id']),
+                default=None,
+            )
+    return run, it, step, is_live
+
+
+def _end_epoch(row: dict) -> float:
+    """Return a history row's end instant (open rows read as "all time")."""
+    if row['started'] is None or row['duration'] is None:
+        return math.inf
+    return row['started'].timestamp() + row['duration']
+
+
+def _step_total(steps: list[dict]) -> Optional[int]:
+    """Return the loop's pipeline length: ``MAX(step)`` excluding SYNC."""
+    total = max(
+        (s['step'] for s in steps if s['step_name'] != _SYNC_NAME),
+        default=0,
+    )
+    return total or None
+
+
+def _card(branch: str, brief: dict, step: Optional[dict], config: dict) -> dict:
+    """Shape the node card's head/ident state."""
+    agent = (step['agent'] if step and step['agent'] else config.get('agent')) or ''
+    model = (step['model'] if step and step['model'] else config.get('model')) or ''
+    return {
+        'branch': branch,
+        'status': brief['status'],
+        'signal': brief['signal'],
+        'agent': agent,
+        'model': model,
+        'detached': bool(config.get('detached')),
+        'session': step['session'] if step else None,
+    }
+
+
+def _history(
+    runs: list[dict],
+    iters: list[dict],
+    steps: list[dict],
+    runcost: dict[int, tuple[Optional[int], float]],
+) -> tuple[dict, ...]:
+    """Shape the explorer tree: runs (newest first) -> iters -> steps.
+
+    Labels are final display strings (``run 2`` / ``iter 3`` / ``step 1:
+    PREPARE`` / ``sync``); every row carries its database ids so the explorer
+    and the event-log reveal address exact entities. A step's preceding sync
+    passes fold into it (time spans both, costs sum) rather than listing
+    separately.
+    """
+    iters_by_run: dict[int, list[dict]] = {}
+    for it in iters:
+        iters_by_run.setdefault(it['run_id'], []).append(it)
+    steps_by_iter: dict[int, list[dict]] = {}
+    for step in steps:
+        steps_by_iter.setdefault(step['iter_id'], []).append(step)
+    total = len(runs)
+    result = []
+    for index, run in enumerate(runs):
+        iter_rows = []
+        for it in iters_by_run.get(run['run_id'], []):
+            it_steps = sorted(
+                steps_by_iter.get(it['iter_id'], []),
+                key=lambda s: (s['step'], s['step_id']),
+            )
+            # the iteration's representative step: its active one, else the last
+            display = next(
+                (s for s in it_steps if s['status'] == 'active'),
+                it_steps[-1] if it_steps else None,
+            )
+            if display is not None:
+                step_disp = (
+                    f'{display["step_name"]} {display["step"]}/{_step_total(steps)}'
+                )
+            else:
+                step_disp = 'done'
+            # each numbered step absorbs the sync passes that precede it: by
+            # recorded number when the loop stamped one, else (legacy step-0
+            # rows, drain-wait passes) the next numbered step to start; the
+            # merged row spans from the earliest sync's start to the step's
+            # own end and carries both costs; a sync with no following step
+            # stays a standalone `sync` row
+            numbered_steps = [s for s in it_steps if s['step_name'] != _SYNC_NAME]
+            numbers = {s['step'] for s in numbered_steps}
+            folded: dict[int, list[dict]] = {}
+            standalone: set[int] = set()
+            for s in it_steps:
+                if s['step_name'] != _SYNC_NAME:
+                    continue
+                if s['step'] in numbers:
+                    folded.setdefault(s['step'], []).append(s)
+                    continue
+                following = [
+                    n for n in numbered_steps if n['started_at'] >= s['started_at']
+                ]
+                if following:
+                    target = min(following, key=lambda n: n['started_at'])
+                    folded.setdefault(target['step'], []).append(s)
+                else:
+                    standalone.add(s['step_id'])
+            step_rows = []
+            for step in it_steps:
+                is_sync = step['step_name'] == _SYNC_NAME
+                if is_sync and step['step_id'] not in standalone:
+                    continue
+                if is_sync:
+                    label = 'sync'
+                    syncs = []
+                else:
+                    label = f'step {step["step"]}: {step["step_name"]}'
+                    syncs = folded.get(step['step'], [])
+                costs = [
+                    cost
+                    for cost in (step['cost'], *(s['cost'] for s in syncs))
+                    if cost is not None
+                ]
+                started_at = min(
+                    (step['started_at'], *(s['started_at'] for s in syncs))
+                )
+                step_rows.append(
+                    {
+                        'label': label,
+                        'status': step['status'],
+                        'step': step['step'],
+                        'name': step['step_name'],
+                        'agent': step['agent'],
+                        'model': step['model'],
+                        'cost': fmt.money(sum(costs) if costs else None),
+                        'cost_raw': sum(costs) if costs else None,
+                        'session': step['session'],
+                        'started': parse_ts(started_at),
+                        'duration': span(started_at, step['ended_at']),
+                        'run_id': step['run_id'],
+                        'iter_id': step['iter_id'],
+                        'step_id': step['step_id'],
+                    }
+                )
+            # chronological listing (a merged step sorts at its sync's start);
+            # the running spend then reads "through this row, syncs included"
+            step_rows.sort(key=lambda row: row['started'])
+            iter_spend = 0.0
+            for row in step_rows:
+                iter_spend += row['cost_raw'] or 0
+                row['iter_spend'] = iter_spend
+            iter_cost = sum(s['cost'] or 0 for s in it_steps)
+            iter_rows.append(
+                {
+                    'label': f'iter {it["iter"]}',
+                    'status': it['status'],
+                    'iter': it['iter'],
+                    'cost': fmt.money(iter_cost),
+                    'cost_raw': iter_cost,
+                    'session': it['session'],
+                    'step': step_disp,
+                    'started': parse_ts(it['started_at']),
+                    'duration': span(it['started_at'], it['ended_at']),
+                    'steps': tuple(step_rows),
+                    'run_id': it['run_id'],
+                    'iter_id': it['iter_id'],
+                }
+            )
+        own_cost = runcost.get(run['run_id'], (None, 0.0))[1]
+        result.append(
+            {
+                'label': f'run {total - index}',
+                'status': run['status'],
+                'number': total - index,
+                'cost': fmt.money(own_cost),
+                'started': parse_ts(run['started_at']),
+                'duration': span(run['started_at'], run['ended_at']),
+                'iters': tuple(iter_rows),
+                'run_id': run['run_id'],
+            }
+        )
+    return tuple(result)
+
+
+def _log(rows: list[dict], run_ids: list[int], branch: str) -> tuple[dict, ...]:
+    """Shape the activity view rows: derive each row's kind from its ids.
+
+    Every row carries the owning ``branch`` and its lineage ordinals
+    ``run_n``/``iter_n``/``step_n`` (the run ordinal is attached here -- the
+    view only knows ids; ``run_ids`` lists the branch's runs newest first);
+    a sync pass keeps ``step_n == 0``, which the log renders as an empty
+    step cell.
+    """
+    total = len(run_ids)
+    run_numbers = {run_id: total - index for index, run_id in enumerate(run_ids)}
+    result = []
+    for row in rows:
+        if row['event_id'] is not None:
+            kind = 'node'
+        elif row['step_id'] is not None:
+            kind = 'step'
+        elif row['iter_id'] is not None:
+            kind = 'iter'
+        else:
+            kind = 'run'
+        number = {
+            'step': row['step_n'],
+            'iter': row['iter_n'],
+            'run': run_numbers.get(row['run_id']),
+        }.get(kind)
+        result.append(
+            {
+                'kind': kind,
+                'n': number,
+                'run_n': run_numbers.get(row['run_id']),
+                'iter_n': row['iter_n'],
+                'step_n': row['step_n'],
+                'branch': branch,
+                'name': row['step_name'] if kind == 'step' else None,
+                'event': row['event'],
+                'status': row['status'],
+                'exit_code': row['exit_code'],
+                'duration': row['duration'],
+                'cost': row['cost'],
+                'metadata': row['metadata'] or '',
+                'created_at': parse_ts(row['timestamp']),
+                'run_id': row['run_id'],
+                'iter_id': row['iter_id'],
+                'step_id': row['step_id'],
+            }
+        )
+    return tuple(result)
+
+
+def _sessions(iters: list[dict]) -> tuple[str, ...]:
+    """Return distinct iteration sessions, newest first (the compose combo)."""
+    seen: list[str] = []
+    for it in iters:
+        session = it['session']
+        if session and session not in seen:
+            seen.append(session)
+    return tuple(seen)
+
+
+def _message(
+    row: dict,
+    owner: str,
+    reacts: dict[int, tuple[int, int]],
+) -> dict:
+    """Shape a raw message/archive row into the radio pane contract.
+
+    ``read`` is the owning node's own state (its receipt in ``reads``,
+    surfaced by the loader as ``is_read``): browsing another node's mailbox
+    observes it without ever changing it, and only the user's own mailbox is
+    interactive. Archive rows (no ``is_read`` key) read as read.
+    """
+    message_id = row['message_id']
+    read = bool(row.get('is_read', True))
+    pos, neg = reacts.get(message_id, (0, 0))
+    return {
+        'message_id': message_id,
+        'message_uuid': row['message_uuid'],
+        'channel': row['channel'],
+        'sender': row['sender'],
+        'session': row.get('session'),
+        'node': owner,
+        'priority': row['priority'],
+        'subject': row['subject'],
+        'data': row['data'],
+        'created_at': parse_ts(row['created_at']),
+        'read': read,
+        'pos_reacts': pos,
+        'neg_reacts': neg,
+    }
