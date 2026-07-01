@@ -49,11 +49,18 @@ def _cli_env(**extra: str) -> dict:
     The site-packages install is a frozen copy, so ``PYTHONPATH`` puts this
     worktree first (the console script and the node scripts that shell out to it
     import the edited package, not stale code) and the script's bin dir goes on
-    ``PATH`` (node lifecycle scripts invoke ``fractal`` by name). ``extra``
-    overlays caller-specific vars (e.g. ``_NODE`` or a stub ``CAPTURE_DIR``);
-    ``_NODE`` is already stripped from the base env by ``_isolate_loop_env``.
+    ``PATH`` (node lifecycle scripts invoke ``fractal`` by name). Color-forcing
+    vars are dropped so typer renders plain output on the captured pipes in CI
+    exactly as it does locally. ``extra`` overlays caller-specific vars (e.g.
+    ``_NODE`` or a stub ``CAPTURE_DIR``); ``_NODE`` is already stripped from the
+    base env by ``_isolate_loop_env``.
     """
     env = dict(os.environ)
+    # drop color-forcing vars: typer force-enables ANSI when any is set (e.g.
+    # GITHUB_ACTIONS in CI), and the escapes it injects inside option names
+    # break plain-substring assertions on captured output
+    for var in ('GITHUB_ACTIONS', 'FORCE_COLOR', 'PY_COLORS'):
+        env.pop(var, None)
     env['PYTHONPATH'] = os.pathsep.join(
         part for part in (str(_worktree_root()), env.get('PYTHONPATH', '')) if part
     )
