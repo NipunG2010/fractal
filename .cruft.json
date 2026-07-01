@@ -1,0 +1,54 @@
+{
+  "template": "https://github.com/plasma-ai/templates.git",
+  "commit": "544793189df39da97960fb4af2ab26867200c9a6",
+  "checkout": null,
+  "context": {
+    "cookiecutter": {
+      "branch": "main",
+      "python": ">=3.11,<3.15",
+      "default_python": "3.14",
+      "project": {
+        "name": "fractal",
+        "package": "plasma-fractal",
+        "title": "Fractal",
+        "description": "Autonomous agent loops with recursive self-organization.",
+        "version": "0.0.0",
+        "authors": [
+          {
+            "name": "Andrew Turner",
+            "email": "aturner@plasma.ai"
+          },
+          {
+            "name": "Nicholas Diao",
+            "email": "ndiao@plasma.ai"
+          }
+        ],
+        "maintainers": [
+          {
+            "name": "Andrew Turner",
+            "email": "aturner@plasma.ai"
+          },
+          {
+            "name": "Nicholas Diao",
+            "email": "ndiao@plasma.ai"
+          }
+        ],
+        "codecov": {
+          "token": "FB0T12O2ZP"
+        }
+      },
+      "github": {
+        "org": "plasma-ai",
+        "user": "",
+        "repo": "fractal"
+      },
+      "urls": {
+        "domain": "plasma.ai",
+        "docs": "docs.plasma.ai/fractal"
+      },
+      "_template": "https://github.com/plasma-ai/templates.git",
+      "_commit": "544793189df39da97960fb4af2ab26867200c9a6"
+    }
+  },
+  "directory": "package"
+}
