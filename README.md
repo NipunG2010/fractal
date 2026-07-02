@@ -33,25 +33,26 @@ ______________________________________________________________________
 
 ## Installation
 
-Install the `fractal` CLI from PyPI. `fractal` shells out to the `wiki`
-command, so install both:
+Install the `fractal` package from PyPI:
 
 ```bash
-pipx install plasma-fractal
-pipx install plasma-wiki
+pip install plasma-fractal
 ```
 
-(`uv tool install plasma-fractal --with-executables-from plasma-wiki`
-does the same in one command.)
+Use `pipx install plasma-fractal` or `uv tool install plasma-fractal` to
+install in an isolated environment (in which case, also install
+`plasma-wiki`, since `fractal` shells out to its `wiki` command).
+
+`uv tool install plasma-fractal --with-executables-from plasma-wiki`
+does the same in one command.
 
 The terminal UI is optional. To include it, install the `tui` extra:
 
 ```bash
-pipx install 'plasma-fractal[tui]'
+pip install 'plasma-fractal[tui]'
 ```
 
-(the `uv tool install` one-liner above takes `[tui]` too). Open the
-dashboard from your project root with `fractal open`.
+Open the dashboard from your project root with `fractal open`.
 
 ### Skill
 
