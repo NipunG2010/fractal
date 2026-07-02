@@ -277,11 +277,13 @@ that make the test's intent clear.
 
 ## Code Style
 
+Key patterns (see `pyproject.toml` for formatter/linter config):
+
 - `from __future__ import annotations` in every module
 - `__all__` in every leaf module; wildcard re-exports in `__init__.py`
 - `self: ClassName` on methods, `cls: type[ClassName]` on classmethods
 - Google-style docstrings with double-backtick RST references
-- Section headers `# ------ section name` (module level only)
+- Section headers: `# ------ section name` (module level only)
 - Single quotes preferred; double quotes for docstrings
 
 ### Comments
