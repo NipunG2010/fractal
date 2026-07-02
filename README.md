@@ -93,23 +93,22 @@ CLI is also available directly — run `fractal --help` and
 ### Install
 
 Run `install.sh` in the package root. With no environment active it
-creates and uses a local `.venv`; with one active (e.g. pyenv) it syncs
-into that:
+creates and uses a local `.venv`; with one active (e.g. pyenv) it
+installs into that environment (editable), without recreating it:
 
 ```bash
 ./install.sh --all-extras --groups=test,lint,type
 ```
 
-Run tools with `uv run <command>`, or activate the environment first
-(`source .venv/bin/activate`). Run `./install.sh --help` for all
-options.
-
-Alternatively, run
+Run `./install.sh --help` for all options. Alternatively, run
 `uv sync --all-extras --group test --group lint --group type` and
 `uv run pre-commit install` to set up the environment manually.
 
 Installing a dependency as editable (e.g. a sibling package) is left to
 the caller: `uv pip install --editable <path>`.
+
+Once installed, run tools with `uv run <command>`, or activate the
+environment first (`source .venv/bin/activate`).
 
 ### Tests
 

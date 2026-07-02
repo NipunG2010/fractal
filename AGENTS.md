@@ -7,8 +7,7 @@ already reads parent directories), also check the parent directory for
 
 ## Overview
 
-`plasma-fractal` is a standalone plugin providing the **fractal** skill
-(autonomous agent iteration in git worktrees).
+`plasma-fractal` is a standalone plugin providing the **fractal** skill.
 
 The `fractal/` package is organized into `cli/` (typer app), `core/`
 (business logic), `tui/` (Textual app), `skills/` (the plugin skill),
