@@ -15,8 +15,8 @@ maintainers = [
     { name = "Nicholas Diao", email = "ndiao@plasma.ai" },
 ]
 dependencies = [
+    "plasma-wiki>=0.2,<1",
     "typer>=0.24,<1",
-    "plasma-wiki<1",
 ]
 
 [project.optional-dependencies]
