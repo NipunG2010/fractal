@@ -11,7 +11,7 @@
         "name": "fractal",
         "package": "plasma-fractal",
         "title": "Fractal",
-        "description": "Autonomous agent loops with recursive self-organization.",
+        "description": "Hierarchical agent loops with recursive self-organization.",
         "version": "0.0.0",
         "authors": [
           {

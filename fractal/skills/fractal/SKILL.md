@@ -1,6 +1,6 @@
 ---
 name: fractal
-description: Autonomous agent loops with recursive self-organization.
+description: Hierarchical agent loops with recursive self-organization.
 argument-hint: <name> [<path>] [--scope=<relpath>] ... [--local] [--detached] [--resume]
 disable-model-invocation: true
 ---

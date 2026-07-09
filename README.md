@@ -8,7 +8,7 @@
 [![codecov](https://codecov.io/gh/plasma-ai/fractal/branch/main/graph/badge.svg?token=FB0T12O2ZP)](https://codecov.io/gh/plasma-ai/fractal)
 [![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://github.com/pre-commit/pre-commit)
 
-Autonomous agent loops with recursive self-organization.
+Hierarchical agent loops with recursive self-organization.
 
 In a fractal, autonomous agent loops arrange themselves into a tree: a
 node iterates toward a goal in its own `git worktree` and spawns child

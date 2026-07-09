@@ -1,6 +1,6 @@
 """The ``fractal`` package.
 
-Autonomous agent loops with recursive self-organization.
+Hierarchical agent loops with recursive self-organization.
 """
 
 from . import cli, core, util

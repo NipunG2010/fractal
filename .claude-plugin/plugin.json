@@ -2,7 +2,7 @@
   "name": "fractal",
   "displayName": "Fractal",
   "version": "0.0.0",
-  "description": "Autonomous agent loops with recursive self-organization.",
+  "description": "Hierarchical agent loops with recursive self-organization.",
   "author": {
     "name": "Andrew Turner",
     "email": "aturner@plasma.ai",

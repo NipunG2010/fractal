@@ -1,7 +1,7 @@
 [project]
 name = "plasma-fractal"
 version = "0.0.0"
-description = "Autonomous agent loops with recursive self-organization."
+description = "Hierarchical agent loops with recursive self-organization."
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 license = "FSL-1.1-ALv2"
