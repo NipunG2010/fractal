@@ -131,11 +131,13 @@ def test_git_exclude_anchors_workspace_dirs(tmp_path: pathlib.Path) -> None:
     """The managed block hides workspace dirs at the repo root only.
 
     Unanchored directory patterns match at every depth, so an unanchored
-    ``.worktrees/`` or ``artifacts/`` exclude also hides committable
-    node-dir trees like ``.fractal/<node>/artifacts/``. Workspace dirs that
-    only ever exist at the repo root are anchored; node-dir runtime markers
-    stay unanchored on purpose, because they live under tracked
-    ``.fractal/<branch>/`` dirs at arbitrary project depth.
+    ``.worktrees/`` exclude would also hide committable node-dir trees like
+    ``.fractal/<node>/artifacts/``. Workspace dirs that only ever exist at
+    the repo root are anchored; node-dir runtime markers -- including the
+    ``tmp/`` scratch dir and ``setup.log`` -- stay unanchored on purpose:
+    they live under tracked ``.fractal/<branch>/`` dirs at arbitrary project
+    depth, and are scratch by convention wherever else they appear (ignore
+    rules never touch already-tracked files, which caps the collateral).
     """
     repo = _committed_repo(tmp_path)
     Node(repo).init(user=True)
@@ -148,11 +150,10 @@ def test_git_exclude_anchors_workspace_dirs(tmp_path: pathlib.Path) -> None:
     # node-dir runtime markers stay ignored at any depth
     assert 'info/exclude' in _check_ignore(repo, '.fractal/main.child/.status')
     assert 'info/exclude' in _check_ignore(repo, '.fractal/main.child/claude.err')
-    # the sanctioned scratch dir is ignored at any depth, while
-    # a same-named tmp/ outside a node dir stays committable
+    # the scratch dir and setup log are ignored at any depth, node dir or not
     assert 'info/exclude' in _check_ignore(repo, '.fractal/main.child/tmp/cache.json')
     assert 'info/exclude' in _check_ignore(repo, 'app/.fractal/main.a/tmp/pages.txt')
-    assert not _check_ignore(repo, 'src/tmp/kept.txt')
+    assert 'info/exclude' in _check_ignore(repo, 'src/tmp/scratch.txt')
 
 
 def test_track_is_fixed_after_init(tmp_path: pathlib.Path) -> None:

@@ -3313,7 +3313,14 @@ class Node:
                 argv += ['--resume', session, '--fork-session']
             else:
                 argv += ['--resume', session]
-            cwd = self._node_dir
+            # match the loop's launch shape: the worktree is the cwd (the
+            # session slug loop forks resolve under) and the node's settings
+            # ride --settings; the root node seeds none, so a root chat runs
+            # on plain user defaults
+            settings = self._node_dir / '.claude' / 'settings.json'
+            if settings.is_file():
+                argv += ['--settings', str(settings)]
+            cwd = self._root
         elif agent == 'codex':
             # codex exec can resume a thread in place but cannot fork it
             if fork:

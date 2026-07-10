@@ -7,8 +7,8 @@ set -euo pipefail
 # Usage: _agent.sh <agent-command> <prompt>
 #
 # Environment:
-#   NODE_DIR             working directory for the agent
-#   WORKTREE_DIR         worktree path (for fractal _stream)
+#   NODE_DIR             node home (agent config dirs, error logs)
+#   WORKTREE_DIR         worktree path (agent working directory; fractal _stream)
 #   STEP_ID              step row ID (for cost recording)
 #   STEP_LIMIT_SECONDS   timeout seconds (0 = no limit)
 #   STEP_MODEL           model override (empty = use config default)
@@ -40,20 +40,21 @@ if [[ "${STEP_DETACHED:-false}" != true ]]; then
 fi
 
 # resolve the agent's own configured default model, for the session record --
-# claude reads the worktree's .claude/settings.json then ~/.claude/settings.json,
-# codex reads ~/.codex/config.toml; empty when neither configures one
+# claude applies the node's --settings over the worktree's .claude/settings.json
+# over ~/.claude/settings.json, codex reads its CODEX_HOME config.toml (the
+# node's .codex); empty when none configures one
 agent_config_model() {
     local AGENT="$1" FILE
     if [[ "$AGENT" == "claude" ]]; then
-        for FILE in "$WORKTREE_DIR/.claude/settings.json" "$HOME/.claude/settings.json"; do
+        for FILE in "$NODE_DIR/.claude/settings.json" "$WORKTREE_DIR/.claude/settings.json" "$HOME/.claude/settings.json"; do
             [[ -f "$FILE" ]] || continue
             python3 -c 'import json, sys
 model = json.load(open(sys.argv[1])).get("model", "")
 print(model if isinstance(model, str) else "")' "$FILE" 2>/dev/null && return
         done
-    elif [[ "$AGENT" == "codex" && -f "$HOME/.codex/config.toml" ]]; then
+    elif [[ "$AGENT" == "codex" && -f "$NODE_DIR/.codex/config.toml" ]]; then
         sed -n 's/^model[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' \
-            "$HOME/.codex/config.toml" | head -1
+            "$NODE_DIR/.codex/config.toml" | head -1
     fi
 }
 
@@ -99,6 +100,10 @@ if [[ "$AGENT_BASE_COMMAND" == "claude" ]]; then
         --include-partial-messages
         --verbose
     )
+    # node settings (permissions, model, env) ride the CLI flag -- they outrank
+    # worktree and user settings, and claude's config home stays the user's own
+    # (auth and session storage untouched)
+    LAUNCH+=(--settings "$NODE_DIR/.claude/settings.json")
     if [[ -n "${STEP_MODEL:-}" ]]; then
         LAUNCH+=(--model "$STEP_MODEL")
     fi
@@ -116,12 +121,13 @@ if [[ "$AGENT_BASE_COMMAND" == "claude" ]]; then
         fi
     fi
     ERR_FILE="$NODE_DIR/claude.err"
-    # capture stderr straight to a log so auth/startup failures are not hidden --
-    # a direct redirect (not an un-awaited `tee` process substitution) can't be
-    # truncated when a fast-failing launch exits before the tee flushes; the script
-    # exits right after, so cd-ing here is harmless; `set +e` lets us read each
-    # pipe stage's status from PIPESTATUS instead of aborting on failure
-    cd "$NODE_DIR"
+    # run in the worktree (the project) so a bare relative write lands in the
+    # deliverable tree, never inside .fractal/; capture stderr straight to a
+    # log so auth/startup failures are not hidden -- a direct redirect (not an
+    # un-awaited `tee` process substitution) can't be truncated when a
+    # fast-failing launch exits before the tee flushes; `set +e` lets us read
+    # each pipe stage's status from PIPESTATUS instead of aborting on failure
+    cd "$WORKTREE_DIR"
     set +e
     "${LAUNCH[@]}" 2>"$ERR_FILE" \
         | fractal _stream ${STREAM_STEP[@]+"${STREAM_STEP[@]}"} \

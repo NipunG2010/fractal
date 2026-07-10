@@ -19,6 +19,7 @@ from fractal.core.node import Node
 
 __all__ = [
     'test_chat_modes_build_expected_command',
+    'test_chat_without_node_settings_omits_the_flag',
     'test_chat_prompt_seeding',
     'test_chat_honors_agent_command_and_model',
     'test_chat_codex_fresh_and_resume',
@@ -89,6 +90,9 @@ def test_chat_modes_build_expected_command(
 ) -> None:
     """``chat`` builds the right claude command per (state, flags) and returns the id."""
     node = node_with_db
+    settings = node._node_dir / '.claude' / 'settings.json'
+    settings.parent.mkdir()
+    settings.write_text('{}\n', encoding='utf-8')
     if active:
         (node._node_dir / '.status').write_text('active\n', encoding='utf-8')
     if stored is not None:
@@ -108,10 +112,27 @@ def test_chat_modes_build_expected_command(
         assert token not in argv
     # the resulting session id is captured from the stream
     assert result == 'sess_new'
-    # claude chats run in the node dir with no extra env, stdin detached
-    assert captured['cwd'] == str(node._node_dir)
+    # claude chats run in the worktree on the user's own config home and env
+    # (matching the loop's launch shape, so loop sessions stay forkable),
+    # with the node's settings riding --settings, stdin detached
+    assert captured['cwd'] == str(node._root)
     assert captured['env'] is None
+    assert argv[argv.index('--settings') + 1] == str(settings)
     assert captured['stdin'] == subprocess.DEVNULL
+
+
+def test_chat_without_node_settings_omits_the_flag(
+    node_with_db: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A node with no seeded ``.claude/settings.json`` chats on user defaults.
+
+    The root (user) node seeds no agent config, so its chats must not point
+    ``--settings`` at a missing file.
+    """
+    captured = _patch_popen(monkeypatch)
+    node_with_db.chat('hello')
+    assert '--settings' not in captured['argv']
 
 
 @pytest.mark.parametrize(

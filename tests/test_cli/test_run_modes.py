@@ -159,10 +159,13 @@ if [[ "$SELF" == "codex" ]]; then
     done
 fi
 
-# bump the shared call counter, record which agent this call used
+# bump the shared call counter, record which agent this call used, its
+# working directory, and the claude config home it was handed (if any)
 N=$(( $(cat "$CAPTURE_DIR/counter" 2>/dev/null || echo 0) + 1 ))
 echo "$N" > "$CAPTURE_DIR/counter"
 echo "$SELF" > "$CAPTURE_DIR/agent_$N.txt"
+pwd > "$CAPTURE_DIR/cwd_$N.txt"
+printf '%s' "${CLAUDE_CONFIG_DIR:-}" > "$CAPTURE_DIR/claude_config_$N.txt"
 
 # record the session flag+id without splitting on the multi-line prompt: scan
 # args and capture the token following --session-id/--resume (empty if neither)
@@ -175,6 +178,15 @@ for ARG in "$@"; do
     PREV="$ARG"
 done
 printf '%s' "$SESSION" > "$CAPTURE_DIR/session_$N.txt"
+
+# record the --settings value the launch carried (empty when none)
+SETTINGS=""
+PREV=""
+for ARG in "$@"; do
+    if [[ "$PREV" == "--settings" ]]; then SETTINGS="$ARG"; break; fi
+    PREV="$ARG"
+done
+printf '%s' "$SETTINGS" > "$CAPTURE_DIR/settings_$N.txt"
 
 if [[ "$SELF" == "claude" ]]; then
     # claude: the prompt is the value after -p, the per-step USD cap the value
@@ -2175,6 +2187,29 @@ def test_setup_runs_from_worktree_root_cwd(repo: dict) -> None:
     assert not (node['node_dir'] / 'cwd_marker').exists(), result.stdout
 
 
+def test_agent_runs_from_worktree_root_cwd(repo: dict) -> None:
+    """Agent invocations run in the worktree; node settings ride --settings.
+
+    The charter tells every node to work in the worktree, so a bare relative
+    write must land in the deliverable tree -- never inside ``.fractal/``,
+    where the merge's seed strip would silently drop it. The node's claude
+    settings arrive via the ``--settings`` flag, and claude's config home is
+    never overridden -- auth and session storage stay the user's own.
+    """
+    node = _make_node(repo, 'agentcwd', detached=False, sync=False)
+    # launch from the node dir -- the ambient CWD must not leak into the agent
+    calls, result = _run_loop(
+        repo, node, capture_name='agent_cwd', cwd=node['node_dir']
+    )
+    assert calls, result.stdout
+    worktree = node['worktree'].resolve()
+    settings = node['node_dir'] / '.claude' / 'settings.json'
+    for call in calls.values():
+        assert pathlib.Path(call['cwd']).resolve() == worktree, result.stdout
+        assert call['claude_config'] == '', result.stdout
+        assert pathlib.Path(call['settings']) == settings, result.stdout
+
+
 def test_run_completes_when_max_iters_reached(repo: dict) -> None:
     """Reaching ``max_iters`` (no timeout, no finish) ends the run ``completed``/0.
 
@@ -2287,21 +2322,33 @@ def _make_node(
 
 
 def _collect_calls(capture: pathlib.Path) -> dict[int, dict[str, str]]:
-    """Reconstruct each call as ``{'agent', 'prompt', 'session', 'budget'}``.
+    """Reconstruct each call as ``{'agent', 'prompt', 'session', ...}``.
 
-    The stub writes an ``agent_N``/``prompt_N``/``session_N`` record per agent
-    invocation (claude also records ``budget_N``, the ``--max-budget-usd`` value),
-    numbered by a shared counter, so the keys are the launch's call order (call 1 =
-    first invocation).
+    The stub writes an ``agent_N``/``cwd_N``/``claude_config_N``/``settings_N``/
+    ``prompt_N``/``session_N`` record per agent invocation (claude also records
+    ``budget_N``, the ``--max-budget-usd`` value), numbered by a shared counter,
+    so the keys are the launch's call order (call 1 = first invocation).
     """
     calls = {}
     for agent_file in capture.glob('agent_*.txt'):
         num = int(agent_file.stem.removeprefix('agent_'))
+        cwd_file = capture / f'cwd_{num}.txt'
+        claude_config_file = capture / f'claude_config_{num}.txt'
+        settings_file = capture / f'settings_{num}.txt'
         prompt_file = capture / f'prompt_{num}.txt'
         session_file = capture / f'session_{num}.txt'
         budget_file = capture / f'budget_{num}.txt'
         calls[num] = {
             'agent': agent_file.read_text(encoding='utf-8').strip(),
+            'cwd': cwd_file.read_text(encoding='utf-8').strip()
+            if cwd_file.exists()
+            else '',
+            'claude_config': claude_config_file.read_text(encoding='utf-8').strip()
+            if claude_config_file.exists()
+            else '',
+            'settings': settings_file.read_text(encoding='utf-8').strip()
+            if settings_file.exists()
+            else '',
             'prompt': prompt_file.read_text(encoding='utf-8')
             if prompt_file.exists()
             else '',
