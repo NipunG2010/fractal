@@ -70,7 +70,7 @@ class Snapshot:
     config: dict  # scope's config.json (chips + tooltip)
     history: tuple[dict, ...]  # run -> iters -> steps (explorer)
     log: tuple[dict, ...]  # activity rows, newest first
-    sessions: tuple[str, ...]  # distinct iter sessions, newest first
+    sessions: tuple[str, ...]  # distinct woven sessions, newest first
     channels: tuple[dict, ...]  # scope's channels (+ read/write flags)
     messages: tuple[dict, ...]  # scope's own top-level messages
     feed: tuple[dict, ...]  # subtree public+outbox fan-out (lazy)
@@ -482,7 +482,7 @@ class SnapshotBuilder:
             'config': config,
             'history': history,
             'log': log,
-            'sessions': _sessions(iters),
+            'sessions': _sessions(steps),
             'channels': tuple(channels),
             'geometry': geometry,
         }
@@ -633,6 +633,7 @@ class SnapshotBuilder:
         rows: list[dict] = []
 
         def walk(branch: str, depth: int) -> None:
+            """Append ``branch``'s row, then recurse into its children."""
             kids = self._children.get(branch, [])
             brief = self._brief.get(branch, {'status': 'idle', 'signal': ''})
             name = display_name_of(branch, self._titles.get(branch))
@@ -910,11 +911,9 @@ def _history(
             else:
                 step_disp = 'done'
             # each numbered step absorbs the sync passes that precede it: by
-            # recorded number when the loop stamped one, else (legacy step-0
-            # rows, drain-wait passes) the next numbered step to start; the
-            # merged row spans from the earliest sync's start to the step's
-            # own end and carries both costs; a sync with no following step
-            # stays a standalone `sync` row
+            # recorded number when it matches a numbered step, else (step-0
+            # rows -- drain-wait passes) the next numbered step to start; a
+            # sync with no following step stays a standalone `sync` row
             numbered_steps = [s for s in it_steps if s['step_name'] != _SYNC_NAME]
             numbers = {s['step'] for s in numbered_steps}
             folded: dict[int, list[dict]] = {}
@@ -1060,11 +1059,16 @@ def _log(rows: list[dict], run_ids: list[int], branch: str) -> tuple[dict, ...]:
     return tuple(result)
 
 
-def _sessions(iters: list[dict]) -> tuple[str, ...]:
-    """Return distinct iteration sessions, newest first (the compose combo)."""
+def _sessions(steps: list[dict]) -> tuple[str, ...]:
+    """Return distinct woven sessions, newest first (the compose combo).
+
+    Sourced from the step rows -- stamped as soon as each invocation's
+    stream opens -- so a live session is offered within seconds of launch,
+    not only after its iteration ends.
+    """
     seen: list[str] = []
-    for it in iters:
-        session = it['session']
+    for step in steps:
+        session = step['session']
         if session and session not in seen:
             seen.append(session)
     return tuple(seen)

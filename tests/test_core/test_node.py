@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import pathlib
 import shutil
 import subprocess
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import patch
 
 import pytest
@@ -46,14 +47,20 @@ __all__ = [
     'test_init_rejects_slash_in_name',
     'test_init_rejects_subsecond_duration',
     'test_init_rejects_invalid_name_chars',
-    'test_init_rejects_over_long_name',
+    'test_init_caps_name_length_at_64',
     'test_init_ignores_cross_repo_ambient_node',
     'test_init_node_default_path_ignores_cross_repo_ambient',
     'test_resolve_node_targets_subproject_user_node',
     'test_resolve_init_target_anchors_subproject_at_git_root',
     'test_full_run_lifecycle',
+    'test_abnormal_end_marks_streamed_step_unpriced',
+    'test_no_unpriced_marker_without_stream_or_flushed_cost',
+    'test_late_flush_replaces_unpriced_marker_with_cost',
+    'test_reconcile_marks_streamed_step_unpriced',
+    'test_cost_unpriced_counts_ended_null_cost_steps',
     'test_run_iteration_record_default_agent_model_session',
     'test_step_records_agent_model_session',
+    'test_iter_end_backfills_model_from_steps',
     'test_run_cost_rollup_spans_iterations_and_sync_steps',
     'test_terminal_end_records_reason',
     'test_terminal_writes_are_first_writer_wins',
@@ -76,6 +83,8 @@ __all__ = [
     'test_start_rejects_non_positive_max_cost',
     'test_start_only_from_idle',
     'test_start_resume_from_terminal',
+    'test_start_resume_re_arms_after_drained_run',
+    'test_start_without_max_cost_warns_and_runs',
     'test_start_resume_reconciles_crashed_active',
     'test_reject_active_op_reconciles_crashed_node',
     'test_reconcile_closes_crashed_runs_open_rows',
@@ -83,7 +92,9 @@ __all__ = [
     'test_kill_unchanged_on_stale_active',
     'test_retire_sets_status',
     'test_retire_rejects_active',
-    'test_unretire_sets_idle',
+    'test_unretire_restores_pre_retire_status',
+    'test_unretire_without_recorded_prior_falls_back_to_idle',
+    'test_unretire_restores_the_latest_prior_when_raced',
     'test_retire_rejects_user',
     'test_delete_rejects_active',
     'test_delete_rejects_from_inside_worktree',
@@ -92,6 +103,8 @@ __all__ = [
     'test_delete_reconciles_crashed_self',
     'test_delete_reconciles_crashed_descendant',
     'test_delete_clears_registry_and_subs_but_keeps_history',
+    'test_run_script_resolves_invoking_installation_cli',
+    'test_commit_resolves_invoking_installation_cli',
     'test_cost_spent_includes_deleted_child',
     'test_root_anchors_central_db',
     'test_delete_keeps_read_receipts',
@@ -104,8 +117,12 @@ __all__ = [
     'test_delete_locked_worktree_aborts_before_remote',
     'test_kill_sets_killed_status',
     'test_signals_recurse_to_active_descendants',
+    'test_recursive_signals_attribute_the_propagating_node',
     'test_recursion_skips_inactive_descendants',
     'test_list_live_trusts_real_state',
+    'test_list_live_relabels_crashed_active',
+    'test_list_renders_config_caps_over_stale_registry',
+    'test_list_flags_orphan_rows',
     'test_kill_recurses_to_descendants',
     'test_signals_reach_deep_through_inactive_intermediate',
     'test_kill_propagates_deep_status_and_keeps_worktrees',
@@ -117,24 +134,39 @@ __all__ = [
     'test_commit_pushes_unless_local',
     'test_commit_event_records_sha_and_emits_once',
     'test_commit_ignore_scope_bypasses_scope_but_not_lint',
+    'test_multi_scope_commit_boundary',
+    'test_scoped_child_baseline_commits_init_gitattributes',
     'test_commit_check_detects_untracked_work',
     'test_commit_surfaces_hook_aborted_commit',
     'test_commit_retries_after_reformat_hook',
     'test_lint_runs_standalone_without_node_dir',
     'test_child_lifecycle',
     'test_child_update_writes_config_before_registry',
+    'test_caps_reconcile_heals_registry_from_config',
+    'test_reconcile_status_heals_caps_on_crashed_node',
+    'test_init_on_existing_node_refuses_loudly',
     'test_cost_remaining',
     'test_cost_remaining_scopes_to_per_level_caps',
+    'test_cost_spent_reads_current_run_after_resume',
     'test_cost_untracked_distinguishes_null_from_zero',
     'test_cost_untracked_subtree_flags_untracked_child',
     'test_kill_marks_all_active',
     'test_max_depth_enforcement',
-    'test_max_children_enforcement',
-    'test_max_descendants_enforcement',
+    'test_max_children_counts_only_unsettled',
     'test_max_depth_ancestor_enforcement',
-    'test_max_descendants_ancestor_enforcement',
+    'test_max_descendants_counts_only_unsettled',
+    'test_spawn_limit_enforced_inside_lock',
+    'test_resume_re_checks_width_gate',
+    'test_resume_re_checks_descendant_gate',
+    'test_spawn_gate_reconciles_crashed_active',
+    'test_resume_gate_reconciles_crashed_active',
+    'test_unretire_re_checks_width_gate',
+    'test_unretire_re_checks_descendant_gate',
+    'test_unretire_settled_restore_passes_at_cap',
+    'test_unretire_gate_reconciles_crashed_active',
     'test_max_cost_enforcement',
     'test_max_cost_bounds_child_by_subtree_remaining',
+    'test_max_cost_child_bound_re_arms_after_prior_run',
     'test_parent_run_id_scopes_subtree_cost',
     'test_init_registers_child',
     'test_spawn_event_recorded_on_parent',
@@ -224,7 +256,7 @@ def test_init_scope(git_repo: pathlib.Path) -> None:
 
     node = Node(git_repo)
     node.init(agent='claude', user=True)
-    output = node.init(name='scoped', scope='packages/core')
+    output = node.init(name='scoped', scope=['packages/core'])
     project_dir = _parse_project_dir(output)
 
     # .fractal/ is at project root, not inside scope
@@ -232,9 +264,9 @@ def test_init_scope(git_repo: pathlib.Path) -> None:
     node_dir = project_dir / '.fractal' / branch
     assert node_dir.is_dir()
 
-    # config records scope
+    # config records scope as a list of roots
     scoped_node = Node(project_dir)
-    assert scoped_node.config_get('scope') == 'packages/core'
+    assert scoped_node.config_get('scope') == ['packages/core']
 
 
 def test_init_options(git_repo: pathlib.Path) -> None:
@@ -653,10 +685,9 @@ def test_merge_refuses_when_parent_worktree_is_dirty(git_repo: pathlib.Path) -> 
 def test_merge_event_survives_child_delete(git_repo: pathlib.Path) -> None:
     """The parent-side ``merge`` event outlives the merged child's deletion.
 
-    ``merge`` is logged on the *parent* (the surviving target), not the child,
-    so squash-merging a child and then deleting it leaves the whole parent<->
-    child trail on the parent's timeline. Were ``merge`` logged on the child
-    (the pre-flip bug), the child's deletion would destroy the only record of it.
+    ``merge`` is logged on the *parent* (the surviving target), not the child.
+    Were it logged on the child, the child's deletion would destroy the only
+    record of it.
     """
     project_dir, branch = _init_and_commit(git_repo, 'feature')
     parent = Node(git_repo)
@@ -719,7 +750,7 @@ def test_init_rejects_inside_worktrees(
     # simulate a running node so the parent resolves and init.sh runs
     monkeypatch.setenv('_NODE', f'{repo / ".fractal" / "main"}')
     node = Node(worktree_path)
-    with pytest.raises(RuntimeError, match=r'inside \.worktrees'):
+    with pytest.raises(RuntimeError, match=r'inside .*\.worktrees'):
         node.init(name='bad')
 
 
@@ -985,23 +1016,25 @@ def test_init_rejects_invalid_name_chars(
         node.init(name=name)
 
 
-def test_init_rejects_over_long_name(git_repo: pathlib.Path) -> None:
-    """Init rejects a name whose branch ref would exceed git's 255-char limit.
+def test_init_caps_name_length_at_64(git_repo: pathlib.Path) -> None:
+    """Init rejects a single name segment over 64 characters.
 
-    The bound is the full parent-prefixed branch plus git's ``.lock`` suffix, not
-    the bare name -- so a name well under 255 still overflows once the parent
-    prefix is prepended. For a child of ``main`` the budget is 245: ``main.`` (5)
-    + 245 + ``.lock`` (5) = 255 fits, 246 overflows.
+    Without a segment cap, names would be bounded only by git's 255-char
+    *branch* limit -- a 200-char name would pass end-to-end and produce
+    unusable worktree paths and radio columns. The cap is per segment --
+    branches accrete one name per level, and the 255 composed-branch guard
+    (reachable only from a deep parent prefix, not in one hop) owns the
+    deep-tree bound.
     """
     node = Node(git_repo)
     node.init(agent='claude', user=True)
 
-    # 246 overflows even though it is under 256 -- the prefix-aware guard catches it
-    with pytest.raises(ValueError, match='too long'):
-        node.init(name='a' * 246)
-    # 245 fits the budget (the rest of init is mocked)
+    # 65 overflows the segment cap with a legible, name-scoped rejection
+    with pytest.raises(ValueError, match=r'too long.*max 64'):
+        node.init(name='a' * 65)
+    # 64 fits (the rest of init is mocked)
     with patch.object(Node, '_run_script'):
-        node.init(name='a' * 245)
+        node.init(name='a' * 64)
 
 
 def test_init_ignores_cross_repo_ambient_node(
@@ -1036,10 +1069,10 @@ def test_init_node_default_path_ignores_cross_repo_ambient(
 ) -> None:
     """``init_node('.')`` does not redirect to a foreign ``_NODE`` repo.
 
-    The CLI default-path flow redirected to the ``_NODE`` repo *before* ``init``'s
-    same-repo guard ran, so a stale ``_NODE`` pointing at another repo would
-    register the node there (split-brain). ``init_node`` must honor ``_NODE`` only
-    when it lives in the cwd's repo -- the gap the Node-API-only test missed.
+    Redirecting to the ``_NODE`` repo *before* ``init``'s same-repo guard runs
+    would let a stale ``_NODE`` pointing at another repo register the node
+    there (split-brain). ``init_node`` must honor ``_NODE`` only when it lives
+    in the cwd's repo -- the gap a Node-API-only test cannot catch.
     """
     repo_a = _make_git_repo(tmp_path / 'a')
     Node(repo_a).init(agent='claude', user=True)
@@ -1093,8 +1126,8 @@ def test_resolve_init_target_anchors_subproject_at_git_root(
 
     ``node init --path=<subproject>`` must anchor at the git root -- ``_node_dir``
     derives the ``<project>/`` prefix from the ``.project`` cache, so anchoring at
-    the sub-project folder would double it (the ``FileNotFoundError`` that broke
-    the documented monorepo ``node init``).
+    the sub-project folder would double it, breaking the documented monorepo
+    ``node init`` with a ``FileNotFoundError``.
     """
     (git_repo / 'app').mkdir()
     node, project = resolve_init_target(f'{git_repo / "app"}')
@@ -1162,6 +1195,205 @@ def test_full_run_lifecycle(node_with_db: Node) -> None:
     assert runs[0]['ended_at'] is not None
 
 
+def _streamed_step(node: Node, *, step: int = 1) -> tuple[int, int, int]:
+    """Open a run/iter/step and capture a session (stream opened, no flush)."""
+    run_id = node.run_start()
+    iter_id = node.iter_start(run_id=run_id, iter=1)
+    step_id = node.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=step,
+        step_name='EXECUTE',
+    )
+    node.step_session(
+        'claude',
+        step_id=step_id,
+        model='claude-fable-5',
+        session='session-119',
+    )
+    return run_id, iter_id, step_id
+
+
+@pytest.mark.parametrize(
+    ('status', 'reason', 'expected'),
+    [
+        ('killed', 'timed out', 'timed out; unpriced'),
+        ('failed', 'agent error', 'agent error; unpriced'),
+        ('stopped', None, 'unpriced'),
+        ('exited', None, 'unpriced'),
+    ],
+)
+def test_abnormal_end_marks_streamed_step_unpriced(
+    node_with_db: Node,
+    status: str,
+    reason: Optional[str],
+    expected: str,
+) -> None:
+    """A step killed before its first usage flush is marked unpriced.
+
+    The stream opened but no usage frame ever flushed -- spend plausibly
+    burned with no figure recorded. The end must stamp an explicit
+    ``unpriced`` marker on the row's metadata (composing with the kill
+    reason) so ledgers can tell "free step" from "unpriced step"; the cost
+    column stays NULL -- SUM honesty is the disclosure count's job.
+    """
+    node = node_with_db
+    _, _, step_id = _streamed_step(node)
+    node.step_end(step_id=step_id, status=status, exit_code=1, metadata=reason)
+    row = node.db.read('steps', where={'step_id': step_id})[0]
+    assert row['metadata'] == expected
+    assert row['cost'] is None
+
+
+def test_no_unpriced_marker_without_stream_or_flushed_cost(
+    node_with_db: Node,
+) -> None:
+    """The marker is scoped to burn-plausible rows only.
+
+    A step whose agent never streamed (no session) has nothing to price --
+    it stays a plain NULL row; a step whose usage already flushed carries a
+    real figure; a clean completion is never marked even with a session (a
+    token-priced codex step legitimately completes with NULL cost).
+    """
+    node = node_with_db
+    run_id = node.run_start()
+    iter_id = node.iter_start(run_id=run_id, iter=1)
+    # never streamed: killed pre-launch, no burn -- no marker
+    unstreamed = node.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='EXECUTE',
+    )
+    node.step_end(step_id=unstreamed, status='killed', exit_code=1)
+    # flushed: the metered partial is on the row -- no marker
+    flushed = node.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=2,
+        step_name='EXECUTE',
+    )
+    node.step_session(
+        'claude',
+        step_id=flushed,
+        model='claude-fable-5',
+        session='session-119f',
+    )
+    node.step_cost(step_id=flushed, cost=0.5)
+    node.step_end(
+        step_id=flushed,
+        status='killed',
+        exit_code=1,
+        metadata='timed out',
+    )
+    # clean end with a session and no cost (untracked agent shape) -- no marker
+    untracked = node.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=3,
+        step_name='EXECUTE',
+    )
+    node.step_session(
+        'codex',
+        step_id=untracked,
+        model=None,
+        session='session-119u',
+    )
+    node.step_end(step_id=untracked, status='completed', exit_code=0)
+    rows = {
+        row['step_id']: row for row in node.db.read('steps', where={'iter_id': iter_id})
+    }
+    assert rows[unstreamed]['metadata'] == ''
+    assert rows[unstreamed]['cost'] is None
+    assert rows[flushed]['metadata'] == 'timed out'
+    assert rows[flushed]['cost'] == 0.5
+    assert rows[untracked]['metadata'] == ''
+    assert rows[untracked]['cost'] is None
+
+
+def test_late_flush_replaces_unpriced_marker_with_cost(
+    node_with_db: Node,
+) -> None:
+    """A flush landing after the kill prices the row and drops the marker.
+
+    ``step_cost`` may run after ``step_end`` (the per-frame flush racing a
+    kill): the real figure replaces the placeholder state, so the stale
+    ``unpriced`` marker must not survive next to a recorded cost.
+    """
+    node = node_with_db
+    _, _, step_id = _streamed_step(node)
+    node.step_end(
+        step_id=step_id,
+        status='killed',
+        exit_code=1,
+        metadata='timed out',
+    )
+    node.step_cost(step_id=step_id, cost=0.25)
+    row = node.db.read('steps', where={'step_id': step_id})[0]
+    assert row['cost'] == 0.25
+    assert row['metadata'] == 'timed out'
+
+
+def test_reconcile_marks_streamed_step_unpriced(node_with_db: Node) -> None:
+    """The stranded-row reconcile marks a dead loop's streamed step.
+
+    A loop killed outright never runs a step end; the next ``run_start``
+    stamps the orphaned open rows ``exited`` -- the same pre-first-flush
+    window, through the ``_close_open_rows`` funnel, so the marker must
+    land there too.
+    """
+    node = node_with_db
+    _, _, step_id = _streamed_step(node)
+    # a new run reconciles the stranded lifecycle (crashed-loop shape)
+    node.run_start()
+    row = node.db.read('steps', where={'step_id': step_id})[0]
+    assert row['status'] == 'exited'
+    assert row['metadata'] == 'unpriced'
+    assert row['cost'] is None
+
+
+def test_cost_unpriced_counts_ended_null_cost_steps(node_with_db: Node) -> None:
+    """``cost_unpriced`` counts ended NULL-cost steps per scope.
+
+    The disclosure half of the unpriced-step remedy: SUM() skips NULL rows
+    without a trace, so ledger-facing queries need the gap count -- ended
+    rows only (an open step is merely not priced *yet*), across the same
+    scopes ``cost_spent`` answers for.
+    """
+    node = node_with_db
+    run_id = node.run_start()
+    iter_id = node.iter_start(run_id=run_id, iter=1)
+    # a priced completed step: not a gap
+    priced = node.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='PLAN',
+    )
+    node.step_cost(step_id=priced, cost=0.5)
+    node.step_end(step_id=priced, status='completed', exit_code=0)
+    # a killed streamed step with no flush: the gap
+    killed = node.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=2,
+        step_name='EXECUTE',
+    )
+    node.step_session(
+        'claude',
+        step_id=killed,
+        model='claude-fable-5',
+        session='session-119c',
+    )
+    node.step_end(step_id=killed, status='killed', exit_code=1)
+    # a still-open step: NULL cost but not ended -- never counted
+    node.step_start(iter_id=iter_id, run_id=run_id, step=3, step_name='REVIEW')
+    assert node.cost_unpriced(step_id=priced) == 0
+    assert node.cost_unpriced(step_id=killed) == 1
+    assert node.cost_unpriced(iter_id=iter_id) == 1
+    assert node.cost_unpriced(run_id=run_id, max_depth=0) == 1
+
+
 def test_plan_init_seeds_heading_and_lists(node_with_db: Node) -> None:
     """plan_init seeds the H1; plan_list resolves an iteration's plans by run.iter."""
     node = node_with_db
@@ -1220,7 +1452,7 @@ def test_run_iteration_record_default_agent_model_session(node_with_db: Node) ->
 
 
 def test_step_records_agent_model_session(node_with_db: Node) -> None:
-    """A step records the agent, its configured model, and the real session."""
+    """A step records the agent, the model that ran it, and the real session."""
     node = node_with_db
     run_id = node.run_start()
     iter_id = node.iter_start(run_id=run_id, iter=1)
@@ -1230,7 +1462,7 @@ def test_step_records_agent_model_session(node_with_db: Node) -> None:
         step=1,
         step_name='EXECUTE',
     )
-    # captured from the agent stream (model None when it ran on its own default)
+    # captured from the agent stream (stream-reported model, configured fallback)
     node.step_session(
         'claude',
         step_id=step_id,
@@ -1242,6 +1474,34 @@ def test_step_records_agent_model_session(node_with_db: Node) -> None:
     assert step['agent'] == 'claude'
     assert step['model'] == 'claude-opus-4-8'
     assert step['session'] == 'sess-xyz'
+
+
+def test_iter_end_backfills_model_from_steps(node_with_db: Node) -> None:
+    """``iter_end`` fills an unset iteration model from the steps' recorded one.
+
+    A defaulted spawn configures no model, so ``iter_start`` records none --
+    but the steps record the actual model the agent stream reported, and
+    the iteration inherits it when every step agrees.
+    """
+    node = node_with_db
+    run_id = node.run_start()
+    iter_id = node.iter_start(run_id=run_id, iter=1)
+    step_id = node.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='EXECUTE',
+    )
+    node.step_session(
+        'claude',
+        step_id=step_id,
+        model='claude-fable-5',
+        session='sess-fill',
+    )
+    node.iter_end(iter_id=iter_id, status='completed', exit_code=0)
+
+    iter_row = node.db.read('iters', where={'iter_id': iter_id})[0]
+    assert iter_row['model'] == 'claude-fable-5'
 
 
 def test_run_cost_rollup_spans_iterations_and_sync_steps(node_with_db: Node) -> None:
@@ -1745,6 +2005,25 @@ def test_start_resume_from_terminal(node_with_db: Node, status: str) -> None:
         node.start(resume=True)
 
 
+def test_start_resume_re_arms_after_drained_run(node_with_db: Node) -> None:
+    """A resume re-arms the full cap: prior-run spend never blocks a launch.
+
+    Runs are isolated by design: a launch after a drained run proceeds with the
+    full ``max_cost`` re-armed -- there is no lifetime gate reading prior spend.
+    """
+    node = node_with_db
+    node.config_set(max_cost=0.15)
+    # run 1 drains past the cap, then exits (the resume-re-arm setup)
+    run_1 = node.run_start()
+    _record_step_cost(node, run_id=run_1, cost=0.20)
+    node.run_end(run_id=run_1, status='exited', exit_code=1)
+    node.status_set('exited')
+    # the launch re-arms the full cap and proceeds
+    with patch.object(node, '_run_script') as run_script:
+        node.start(resume=True)
+    assert run_script.called
+
+
 def test_start_without_max_cost_warns_and_runs(
     node_with_db: Node,
     capsys: pytest.CaptureFixture[str],
@@ -1752,7 +2031,7 @@ def test_start_without_max_cost_warns_and_runs(
     """Start without a cost cap runs uncapped, warning instead of refusing.
 
     A token-priced agent (e.g. a ChatGPT-account codex) can only run uncapped, so
-    a missing ``max_cost`` no longer blocks start -- it proceeds with a loud
+    a missing ``max_cost`` does not block start -- it proceeds with a loud
     stderr warning that spend is untracked.
     """
     node = node_with_db
@@ -1770,7 +2049,8 @@ def test_start_resume_reconciles_crashed_active(node_with_db: Node) -> None:
     A loop that dies without ending leaves the status ``active`` with no tmux
     session, which would wedge ``--resume`` (it rejects an active status). With
     the session provably gone (one-loop-per-node), start reconciles the status
-    to the honest ``exited`` terminal and proceeds.
+    to the honest ``exited`` terminal and proceeds -- re-arming to ``idle``
+    under the resume gate.
     """
     node = node_with_db
     # configure a cost budget (required to start)
@@ -1782,7 +2062,8 @@ def test_start_resume_reconciles_crashed_active(node_with_db: Node) -> None:
         with patch.object(node, '_run_script') as run_script:
             node.start(resume=True)
     assert run_script.called
-    assert node.status() == 'exited'
+    # healed to exited mid-flight, then re-armed idle by the gate
+    assert node.status() == 'idle'
 
 
 # ------ crashed-active reconciliation
@@ -1926,10 +2207,40 @@ def test_retire_rejects_active(node_with_db: Node) -> None:
         node.retire()
 
 
-def test_unretire_sets_idle(node_with_db: Node) -> None:
-    """Unretire resets status to idle."""
+def test_unretire_restores_pre_retire_status(node_with_db: Node) -> None:
+    """Unretire restores the status the node held before it was retired.
+
+    Retiring a completed node must not erase its completion marker: unretire
+    lands back on ``completed`` (not a hard-coded ``idle``) in both stores --
+    the ``.status`` file and the ``nodes`` registry row stay in lockstep.
+    """
     node = node_with_db
-    # set status to retired
+    # register the node so the registry row tracks the round-trip too
+    node.db.write({'node': node._branch, 'status': 'completed'}, 'nodes')
+    node.status_set('completed')
+    node.run_start()
+    # retire then unretire (mock shell scripts)
+    with patch.object(node, '_run_script'):
+        node.retire()
+        node.unretire()
+    # verify the pre-retire status is restored in both stores
+    assert node.status() == 'completed'
+    rows = node.db.read('nodes', where={'node': node._branch}, limit=1)
+    assert rows[0]['status'] == 'completed'
+
+
+def test_unretire_without_recorded_prior_falls_back_to_idle(
+    node_with_db: Node,
+) -> None:
+    """Unretire falls back to idle when no retire event recorded a prior status.
+
+    A retired node with no prior status recorded on its retire event (a
+    ``.status`` file set by hand, or a retire event carrying no prior)
+    has nothing to restore; unretire resets it to ``idle`` rather than
+    guessing.
+    """
+    node = node_with_db
+    # set status to retired directly -- no retire event, no recorded prior
     node.status_set('retired')
     node.run_start()
     # unretire (mock shell script)
@@ -1937,6 +2248,36 @@ def test_unretire_sets_idle(node_with_db: Node) -> None:
         node.unretire()
     # verify status
     assert node.status() == 'idle'
+
+
+def test_unretire_restores_the_latest_prior_when_raced(node_with_db: Node) -> None:
+    """A raced unretire restores the latest recorded prior, not a stale one.
+
+    A rival cycle -- a winning unretire, a run to ``stopped``, a re-retire
+    recording it -- lands between this caller's validation and its lock
+    acquisition. The restore target is resolved under the flock, so the
+    loser restores the fresh ``stopped``, never the ``completed`` the
+    first retire recorded.
+    """
+    node = node_with_db
+    node.db.write({'node': node._branch, 'status': 'completed'}, 'nodes')
+    node.status_set('completed')
+    node.run_start()
+    real_flock = fcntl.flock
+
+    def raced_flock(fd: object, op: int) -> None:
+        # the rival's full cycle lands before this caller's acquisition,
+        # re-retiring with 'stopped' recorded as the fresh prior
+        node.status_set('stopped')
+        node.retire()
+        real_flock(fd, op)
+
+    # retire records 'completed', then the raced unretire (mock shell scripts)
+    with patch.object(node, '_run_script'):
+        node.retire()
+        with patch('fractal.core.node.fcntl.flock', side_effect=raced_flock):
+            node.unretire()
+    assert node.status() == 'stopped'
 
 
 @pytest.mark.parametrize('op', ['retire', 'unretire'])
@@ -1995,9 +2336,8 @@ def test_delete_recursively_removes_subtree(
 ) -> None:
     """Deleting a node tears down its whole subtree, deepest first.
 
-    A live (non-active) child no longer blocks the parent -- recursive delete
-    removes the child's worktree and branch too, and deregisters the whole
-    subtree from the root registry.
+    A live (non-active) child does not block the parent -- its worktree,
+    branch, and registry rows go with the subtree.
     """
     node = Node(git_repo)
     node.init(agent='claude', user=True)
@@ -2061,8 +2401,8 @@ def test_delete_reconciles_crashed_self(
     """A crashed-but-active node can be deleted, not wedged.
 
     Its status reads ``active`` but the tmux session is gone, so delete
-    reconciles it to ``exited`` and tears the worktree down -- previously this
-    needed a hand-edited status file or a restart of the loop.
+    reconciles it to ``exited`` and tears the worktree down -- no hand-edited
+    status file or loop restart needed.
     """
     node = Node(git_repo)
     node.init(agent='claude', user=True)
@@ -2081,7 +2421,7 @@ def test_delete_reconciles_crashed_descendant(
     git_repo: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A crashed-but-active descendant no longer wedges an ancestor's delete."""
+    """A crashed-but-active descendant does not wedge an ancestor's delete."""
     node = Node(git_repo)
     node.init(agent='claude', user=True)
     node.init(name='parent')
@@ -2132,16 +2472,75 @@ def test_delete_clears_registry_and_subs_but_keeps_history(
     assert db.read('messages', where={'sender': child_branch})
 
 
+def test_run_script_resolves_invoking_installation_cli(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Script subprocesses resolve the invoking installation's ``fractal``.
+
+    The lifecycle scripts shell back into ``fractal`` (config/event calls on
+    the init/delete/merge paths), and resolving that off ambient PATH lets a
+    foreign install answer -- a root venv speaking another branch's
+    dialect can flip a suite verdict on byte-identical source. The invoking
+    interpreter's own bin dir must win over anything fronted on PATH.
+    """
+    _, child = _spawn_parent_child(git_repo, monkeypatch)
+    # front a decoy `fractal` on PATH that records any consultation -- its exit 1
+    # lands in the scripts' `|| echo true` fallbacks, so the flow stays local
+    decoy_dir = tmp_path / 'decoy_bin'
+    decoy_dir.mkdir()
+    marker = decoy_dir / 'consulted'
+    decoy = decoy_dir / 'fractal'
+    decoy.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
+    decoy.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{decoy_dir}{os.pathsep}{os.environ["PATH"]}')
+    # drive a script that shells back into fractal (delete.sh reads config)
+    child.status_set('completed')
+    child.delete()
+    assert not marker.exists()
+
+
+def test_commit_resolves_invoking_installation_cli(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """``Node.commit`` subprocesses resolve the invoking installation's ``fractal``.
+
+    ``Node.commit`` invokes ``_commit.sh`` via a raw subprocess that does
+    not flow through ``_run_script``, so ``_run_script``'s PATH prepend cannot
+    cover it. The invoking interpreter's own bin dir must win over anything
+    fronted on PATH.
+    """
+    _, child = _spawn_parent_child(git_repo, monkeypatch)
+    # front a decoy `fractal` on PATH that records any consultation -- its exit 1
+    # lands in the commit script's `|| echo`/`|| true` fallbacks, so the commit
+    # itself still completes on the local path
+    decoy_dir = tmp_path / 'decoy_bin'
+    decoy_dir.mkdir()
+    marker = decoy_dir / 'consulted'
+    decoy = decoy_dir / 'fractal'
+    decoy.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
+    decoy.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{decoy_dir}{os.pathsep}{os.environ["PATH"]}')
+    # drive a real commit -- _commit.sh shells back into fractal for its
+    # config reads before any mode branch, then the commit event pair
+    (child._root / 'probe.md').write_text('# probe\n', encoding='utf-8')
+    child.commit('add commit-path probe')
+    assert not marker.exists()
+
+
 def test_cost_spent_includes_deleted_child(
     git_repo: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A deleted child's recorded spend still counts in the parent's subtree.
 
-    Regression: the per-run subtree walk used to read each child's own
-    database, so deleting a child erased its spend from the parent's
-    ``cost_spent`` -- and a ``max_cost`` budget silently regained headroom it
-    had already burned. The central database keeps the lineage priced.
+    A subtree walk reading each child's own database would let a deleted
+    child erase its spend from the parent's ``cost_spent`` -- a ``max_cost``
+    budget silently regaining headroom it already burned. The central
+    database keeps the lineage priced.
     """
     parent, child = _spawn_parent_child(git_repo, monkeypatch)
     child_branch = child._branch
@@ -2261,7 +2660,7 @@ def test_delete_not_blocked_by_pruned_child_worktree(
     # prune the kid's worktree dir -- git still lists it, but the dir is gone
     shutil.rmtree(kid_wt)
 
-    # the phantom child no longer blocks the parent's delete (real delete.sh
+    # the phantom child does not block the parent's delete (real delete.sh
     # mocked so only the Python guard/deregister logic runs)
     done = subprocess.CompletedProcess([], 0, '', '')
     with patch.object(Node, '_run_script', return_value=done):
@@ -2348,11 +2747,9 @@ def test_rm_rf_worktree_lists_orphan_and_deregisters_keeping_history(
     """An ``rm -rf``'d worktree reads as gone, so list flags it and delete works.
 
     ``git worktree list`` still lists a hand-``rm -rf``'d worktree (as
-    ``prunable``), so the on-disk probe -- not git's stale porcelain -- is what
-    decides a node is gone. Plain ``list`` then flags the node ``orphan`` (not a
-    healthy ``idle``) and ``deregister`` (``delete --force``'s fallback) stops
-    being wedged by the dead path: it sweeps the registry, keeps the node's run
-    history, and points at ``git worktree prune`` for git's lingering metadata.
+    ``prunable``), so the on-disk probe -- not git's stale porcelain -- is
+    what decides a node is gone; ``deregister`` (``delete --force``'s
+    fallback) must not be wedged by the dead path.
     """
     _, child = _spawn_parent_child(git_repo, monkeypatch)
     child_branch = child._branch
@@ -2363,7 +2760,7 @@ def test_rm_rf_worktree_lists_orphan_and_deregisters_keeping_history(
     rows = {row['node']: row['status'] for row in Node(git_repo).list()}
     assert rows[child_branch] == 'orphan'
 
-    # deregister is no longer wedged by the dead worktree path: it clears the
+    # deregister is not wedged by the dead worktree path: it clears the
     # registry row, keeps the run history, and hints the one-shot git cleanup
     message = Node(git_repo).deregister(child_branch)
     assert child_branch not in {row['node'] for row in Node(git_repo).child_list()}
@@ -2376,11 +2773,11 @@ def test_delete_aborts_cleanly_when_remote_delete_fails(
 ) -> None:
     """A failed remote-branch delete leaves the node intact and retryable.
 
-    ``delete.sh`` removed the worktree before the networked, failure-prone
-    ``git push origin --delete``. When that push failed (a protected branch,
-    ``receive.denyDeletes``, an unreachable remote), ``set -e`` aborted with the
-    worktree already gone but the local branch and ``.project`` cache still
-    present -- a half-deleted node ``Node.delete`` can no longer even retry (its
+    Were the worktree removed before the networked, failure-prone
+    ``git push origin --delete``, a failed push (a protected branch,
+    ``receive.denyDeletes``, an unreachable remote) would abort under ``set -e``
+    with the worktree already gone but the local branch and ``.project`` cache
+    still present -- a half-deleted node ``Node.delete`` cannot even retry (its
     ``exists()`` guard fails once the worktree is gone). The remote delete must
     run first, so a push failure aborts with nothing removed.
     """
@@ -2529,6 +2926,32 @@ def test_signals_recurse_to_active_descendants(
     assert child.signal_get(signal) is not None
 
 
+@pytest.mark.parametrize('signal', ['stop', 'finish', 'kill'])
+def test_recursive_signals_attribute_the_propagating_node(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signal: str,
+) -> None:
+    """A propagated signal's row names the node it came from.
+
+    A parent's budget wind-down finishes its whole subtree with the parent's
+    reason; stamped verbatim on a descendant's signal row it reads as the
+    descendant's OWN event -- a "cost budget reserve reached" landing far
+    under the descendant's own cap is an ancestor's boundary firing
+    correctly, yet files as a high-severity mis-fire. The descendant's row
+    must carry the attribution; the target's own row keeps the bare reason.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # signal the parent with a budget-style reason (shell hooks mocked)
+    with patch.object(Node, '_run_script'):
+        getattr(parent, signal)(reason='cost budget reserve reached')
+    assert parent.signal_get(signal) == 'cost budget reserve reached'
+    assert (
+        child.signal_get(signal)
+        == f'cost budget reserve reached (via {signal} of main.parent)'
+    )
+
+
 def test_recursion_skips_inactive_descendants(
     git_repo: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2594,6 +3017,37 @@ def test_list_live_relabels_crashed_active(
     assert live[child._branch] == 'exited'
     # display-only: the child's own .status file is untouched
     assert child.status() == 'active'
+
+
+def test_list_renders_config_caps_over_stale_registry(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Listings render a present child's config caps, not the stale row.
+
+    A rescue top-up edits the child's config directly (no ``node update``),
+    so the registry row keeps the pre-rescue cap and ``node list`` lies to
+    the parent verifying the top-up landed. Config is enforcement truth, so
+    both listing flavors must render it -- display-only, the row itself
+    stays a cache (it heals at ``node update`` and exit).
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # seed the registry cap via the blessed path, then top up config only --
+    # the rescue move (config edit + resume, no node update)
+    parent.child_update('kid', max_cost=12.0)
+    child.config_set(max_cost=15.0)
+    # both listing flavors render the config cap
+    cached = {row['node']: row['max_cost'] for row in parent.list()}
+    assert cached[child._branch] == 15.0
+    monkeypatch.setattr(
+        'fractal.core.node._live_tmux_sessions',
+        lambda: frozenset({child._tmux_session_name}),
+    )
+    live = {row['node']: row['max_cost'] for row in parent.list(live=True)}
+    assert live[child._branch] == 15.0
+    # display-only: the registry row keeps its cache until update/exit heals
+    row = child.db.read('nodes', where={'node': child._branch}, limit=1)[0]
+    assert row['max_cost'] == 12.0
 
 
 def test_list_flags_orphan_rows(node_with_db: Node) -> None:
@@ -2799,11 +3253,10 @@ def test_commit_pushes_unless_local(tmp_path: pathlib.Path) -> None:
 def test_commit_event_records_sha_and_emits_once(tmp_path: pathlib.Path) -> None:
     """A real commit logs one ``commit`` event keyed on the new sha.
 
-    The event fires from ``_commit.sh`` for every real commit (the sha is the
-    metadata), is skipped for an ``--init`` baseline, and -- since the script
-    emits from a single point gated on ``git commit`` succeeding -- a
-    reformat-hook abort-and-retry advances HEAD once and logs exactly one event.
-    The subject also drops the repo-name prefix (``<branch>: iteration N (msg)``).
+    ``_commit.sh`` emits from a single point gated on ``git commit``
+    succeeding, so a reformat-hook abort-and-retry advances HEAD once and
+    logs exactly one event; an ``--init`` baseline or a clean-tree no-op
+    logs none -- the log counts commits, never command invocations.
     """
     repo = _make_git_repo(tmp_path / 'repo')
     Node(repo).init(agent='claude', user=True)
@@ -2867,7 +3320,12 @@ def test_commit_event_records_sha_and_emits_once(tmp_path: pathlib.Path) -> None
     # exactly one commit event, keyed on the new sha (no double-log on retry)
     events = node.db.read('events', where={'event': 'commit'})
     assert [row['metadata'] for row in events] == [_head()]
-    # the subject drops the repo-name prefix
+    # a no-op invocation (clean tree, nothing staged) logs no event -- the
+    # log counts commits, not command invocations
+    node.commit('nothing to land')
+    events = node.db.read('events', where={'event': 'commit'})
+    assert [row['metadata'] for row in events] == [_head()]
+    # the subject carries no repo-name prefix
     subject = subprocess.run(
         ['git', '-C', f'{project_dir}', 'log', '-1', '--format=%s'],
         capture_output=True,
@@ -2934,15 +3392,125 @@ def test_commit_ignore_scope_bypasses_scope_but_not_lint(
         node.commit('again', ignore_scope=True, force=True)
 
 
+def test_multi_scope_commit_boundary(tmp_path: pathlib.Path) -> None:
+    """Multiple ``scope`` roots are all committable; outside them refuses.
+
+    ``--scope`` is repeatable, so a node can own
+    several roots. A commit touching any recorded root (plus the
+    always-allowed node data dir) passes the boundary check; a change
+    outside every root is refused with each root named in the error.
+    """
+    repo = _make_git_repo(tmp_path / 'repo')
+    Node(repo).init(agent='claude', user=True)
+    output = Node(repo).init(
+        name='task',
+        agent='claude',
+        local=True,
+        scope=['inscope_a', 'inscope_b'],
+    )
+    project_dir = _parse_project_dir(output)
+    # configure git identity in the worktree
+    for key, val in (('user.email', 'test@test.com'), ('user.name', 'Test')):
+        subprocess.run(
+            ['git', 'config', key, val],
+            cwd=project_dir,
+            capture_output=True,
+            check=True,
+        )
+    node = Node(project_dir)
+    # baseline cleans the tree (sweeping init's root .gitattributes); stub the
+    # lint gate (not under test) so the boundary check alone decides
+    node.commit('baseline', init=True)
+    branch = _resolve_branch(project_dir)
+    lint = project_dir / '.fractal' / branch / 'scripts' / 'lint.sh'
+    lint.write_text('#!/usr/bin/env bash\nexit 0\n', encoding='utf-8')
+    # work under BOTH scoped roots
+    for scope_root in ('inscope_a', 'inscope_b'):
+        (project_dir / scope_root).mkdir()
+        work = project_dir / scope_root / 'work.txt'
+        work.write_text('in-scope work\n', encoding='utf-8')
+    node.commit('touch both roots')
+    tracked = subprocess.run(
+        ['git', '-C', f'{project_dir}', 'ls-files', 'inscope_a', 'inscope_b'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert 'inscope_a/work.txt' in tracked
+    assert 'inscope_b/work.txt' in tracked
+    # a change outside every root refuses, naming each root
+    (project_dir / 'outside.txt').write_text('out-of-scope work\n', encoding='utf-8')
+    with pytest.raises(RuntimeError) as excinfo:
+        node.commit('touch outside')
+    assert 'inscope_a' in str(excinfo.value)
+    assert 'inscope_b' in str(excinfo.value)
+
+
+def test_scoped_child_baseline_commits_init_gitattributes(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A scoped child's baseline sweeps the ``.gitattributes`` init wrote.
+
+    Node init writes a worktree-root ``.gitattributes`` (the
+    memory wiki's ``merge=wiki`` attribute) when the base lacks it --
+    an init artifact outside every scope root, which a scoped child's baseline
+    would otherwise refuse as out-of-scope, leaving the tree dirty forever. The
+    baseline must sweep init's own artifact, like the user-init commit does.
+    """
+    repo = _make_git_repo(tmp_path / 'repo')
+    Node(repo).init(agent='claude', user=True)
+    output = Node(repo).init(
+        name='task',
+        agent='claude',
+        local=True,
+        scope=['inscope'],
+    )
+    project_dir = _parse_project_dir(output)
+    # configure git identity in the worktree
+    for key, val in (('user.email', 'test@test.com'), ('user.name', 'Test')):
+        subprocess.run(
+            ['git', 'config', key, val],
+            cwd=project_dir,
+            capture_output=True,
+            check=True,
+        )
+    node = Node(project_dir)
+    # the baseline sweeps init's own artifact -- no manual add/commit first
+    node.commit('baseline', init=True)
+    # the artifact is committed: tracked on the branch and clean in the tree
+    tracked = subprocess.run(
+        ['git', '-C', f'{project_dir}', 'ls-files', '.gitattributes'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert '.gitattributes' in tracked
+    status = subprocess.run(
+        [
+            'git',
+            '-C',
+            f'{project_dir}',
+            'status',
+            '--porcelain',
+            '--',
+            '.gitattributes',
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert status == ''
+
+
 def test_commit_check_detects_untracked_work(tmp_path: pathlib.Path) -> None:
     """``commit(check=True)`` reports an untracked-only dirty tree as dirty.
 
     The loop's post-iteration safety net runs ``_commit.sh --check`` and
     force-commits when it reports the tree dirty (``_run.sh``). The tracked-only
     query ``git diff --name-only HEAD`` never lists untracked files, so a step
-    that left only new untracked work was reported clean -- the force-commit was
-    skipped and a later ``--resume`` (``git clean -fd``) discarded the work.
-    ``--check`` must use a query that sees untracked files.
+    that leaves only new untracked work would be reported clean -- the
+    force-commit skipped, and a later ``--resume`` (``git clean -fd``) would
+    discard the work. ``--check`` must use a query that sees untracked files.
     """
     repo = _make_git_repo(tmp_path / 'repo')
     Node(repo).init(agent='claude', user=True)
@@ -2971,12 +3539,12 @@ def test_commit_check_detects_untracked_work(tmp_path: pathlib.Path) -> None:
 def test_commit_surfaces_hook_aborted_commit(tmp_path: pathlib.Path) -> None:
     """A pre-commit hook that aborts the commit must surface, not be masked.
 
-    ``_commit.sh`` ran ``git commit -m ... || true`` to tolerate the benign
-    "nothing to commit" no-op -- but the ``|| true`` also swallowed a non-zero
-    exit from a pre-commit hook (black/isort reformatting and aborting, or a
-    check-only hook failing). The script then reported success and pushed while
-    ``HEAD`` never advanced, leaving the iteration's work uncommitted and exposed
-    to a later ``--resume`` (``git clean -fd``). The genuine no-op must still
+    A bare ``git commit -m ... || true`` tolerates the benign "nothing to
+    commit" no-op -- but it would also swallow a non-zero exit from a
+    pre-commit hook (black/isort reformatting and aborting, or a check-only
+    hook failing): the script would report success and push while ``HEAD``
+    never advanced, leaving the iteration's work uncommitted and exposed to a
+    later ``--resume`` (``git clean -fd``). The genuine no-op must still
     exit 0; a real hook/commit failure must propagate (non-zero -> RuntimeError).
     """
     repo = _make_git_repo(tmp_path / 'repo')
@@ -3022,8 +3590,8 @@ def test_commit_surfaces_hook_aborted_commit(tmp_path: pathlib.Path) -> None:
     )
     # leave real work -- the script stages it, then the hook aborts the commit
     (project_dir / 'work.txt').write_text('iteration work\n', encoding='utf-8')
-    # the masking bug: the aborted commit must surface (script exits non-zero ->
-    # RuntimeError), not be reported as success
+    # a masked abort would read as success: the aborted commit must surface
+    # (script exits non-zero -> RuntimeError)
     with pytest.raises(RuntimeError):
         node.commit('work', init=True)
     # HEAD did not advance -- the work is genuinely uncommitted, so a masked
@@ -3200,6 +3768,83 @@ def test_child_update_writes_config_before_registry(node_with_db: Node) -> None:
     assert row['max_cost'] == 8.0
 
 
+def test_caps_reconcile_heals_registry_from_config(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``caps_reconcile`` pushes drifted config caps over the registry row.
+
+    A post-spawn cap edit in the config file is live enforcement truth (the
+    loop reads config), but the registry row keeps the spawn-time values and
+    silently fools every reader (a node can be killed at the stale cap
+    this way). Config wins: the row is healed, the drift is reported as
+    ``{key: (config, registry)}``, undrifted and config-absent keys are left
+    alone, and a node without a registry row (the user node) is a no-op.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # seed the registry caps via the blessed path, then drift the config
+    # directly -- a committed edit, no node update
+    parent.child_update('kid', max_cost=100.0, max_children=2)
+    child.config_set(max_cost=175.0)
+    drifted = child.caps_reconcile()
+    assert drifted == {'max_cost': (175.0, 100.0)}
+    row = child.db.read('nodes', where={'node': child._branch}, limit=1)[0]
+    assert row['max_cost'] == 175.0
+    assert row['max_children'] == 2
+    # a reconciled node has nothing further to report
+    assert child.caps_reconcile() == {}
+    # the user node has no registry row -- reconcile is a no-op
+    user = Node(git_repo)
+    assert user.caps_reconcile() == {}
+
+
+def test_reconcile_status_heals_caps_on_crashed_node(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stamping an out-of-band death ``exited`` also heals cap drift.
+
+    A mid-run retune that only reached the config file leaves the registry
+    row at the old cap, and a loop that dies before the next iteration
+    boundary never runs the boundary reconcile -- so, without terminal
+    healing, the drift would outlive the node permanently.
+    ``_reconcile_status`` is the dead node's terminal cleanup, so the row
+    it settles must read config truth.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # seed the registry caps via the blessed path, then retune the config
+    # only -- a mid-run edit the boundary reconcile never gets to apply
+    parent.child_update('kid', max_cost=16.0)
+    child.config_set(max_cost=22.0)
+    # the loop dies out-of-band; the next reject-active op reconciles
+    with patch.object(child, '_tmux_session_exists', return_value=False):
+        child._reconcile_status()
+    assert child.status() == 'exited'
+    # the settled row reads config truth, not the stale spawn-time cap
+    row = child.db.read('nodes', where={'node': child._branch}, limit=1)[0]
+    assert row['max_cost'] == 22.0
+
+
+def test_init_on_existing_node_refuses_loudly(
+    git_repo: pathlib.Path,
+) -> None:
+    """Re-init of an existing node fails loudly and leaves config untouched.
+
+    Were ``node init`` against an already-initialized node to exit 0 with
+    the old node fully in place, the requested caps would silently never
+    land while the operator believed they applied. Reuse is explicit in
+    this CLI (``node start --resume``, ``--reset``), so an implicit adopt
+    is refused by name.
+    """
+    Node(git_repo).init(agent='claude', user=True)
+    Node(git_repo).init(name='retune', max_cost=0.10)
+    node = Node(git_repo / '.worktrees' / 'main.retune')
+    # re-init with different caps: refused, and the node is untouched
+    with pytest.raises(ValueError, match=r"'main\.retune' already exists"):
+        Node(git_repo).init(name='retune', max_cost=100.0)
+    assert node.config_get('max_cost') == 0.10
+
+
 def test_init_materializes_title_in_registry(initialized_node: dict) -> None:
     """A real init stamps the de-slugged title onto the central registry row.
 
@@ -3267,6 +3912,33 @@ def test_cost_remaining_scopes_to_per_level_caps(node_with_db: Node) -> None:
     assert node.cost_remaining() == pytest.approx(8.5)
     assert node.cost_remaining(iter_id=iter_id) == pytest.approx(2.5)
     assert node.cost_remaining(step_id=step_id) == pytest.approx(0.5)
+
+
+def test_cost_spent_reads_current_run_after_resume(node_with_db: Node) -> None:
+    """Bare cost views read the current run only; a prior run needs ``--run``.
+
+    Runs are isolated by design: a resume opens a fresh run, so the bare
+    reading forgets prior spend and ``cost_remaining`` charges ``max_cost``
+    with the current run alone. A prior run stays readable via its id.
+    """
+    node = node_with_db
+    node.config_set(max_cost=10.0)
+
+    # run 1 spends, then exits (a resume never reuses a run)
+    run_1 = node.run_start()
+    _record_step_cost(node, run_id=run_1, cost=1.75)
+    node.run_end(run_id=run_1, status='exited', exit_code=1)
+
+    # run 2 (the resume) spends against a fresh per-run budget
+    run_2 = node.run_start()
+    _record_step_cost(node, run_id=run_2, cost=2.25)
+
+    # bare calls read the current run; the cap charges it alone
+    assert node.cost_spent(max_depth=0) == pytest.approx(2.25)
+    assert node.cost_remaining() == pytest.approx(7.75)
+
+    # an explicit run id still reads the drained prior run
+    assert node.cost_spent(run_id=run_1, max_depth=0) == pytest.approx(1.75)
 
 
 def test_cost_untracked_distinguishes_null_from_zero(node_with_db: Node) -> None:
@@ -3426,77 +4098,53 @@ def test_max_depth_enforcement(
 
 
 @pytest.mark.parametrize(
-    ('parent_max', 'existing_direct', 'should_raise'),
+    ('kid_status', 'should_raise'),
     [
-        (2, 0, False),
-        (2, 1, False),
-        (2, 2, True),
+        ('active', True),
+        ('idle', True),
+        ('completed', False),
+        ('stopped', False),
+        ('exited', False),
+        ('killed', False),
+        ('retired', False),
     ],
     ids=[
-        'under-limit',
-        'one-remaining',
-        'at-limit',
+        'active-holds',
+        'idle-holds',
+        'completed-frees',
+        'stopped-frees',
+        'exited-frees',
+        'killed-frees',
+        'retired-frees',
     ],
 )
-def test_max_children_enforcement(
-    node_with_db: Node,
-    parent_max: int,
-    existing_direct: int,
+def test_max_children_counts_only_unsettled(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kid_status: str,
     should_raise: bool,
 ) -> None:
-    """Max children caps direct children (width), not total descendants.
+    """Width slots are held by unsettled children and freed by settled ones.
 
-    No ceiling check -- a child may set a larger ``max_children`` than
-    its parent.
+    The gate binds on children still in play -- active, or idle
+    awaiting start -- while a settled or retired child frees its slot
+    automatically, so ``max_children`` bounds concurrency rather than
+    lifetime spawn count. No ceiling check -- a child may set a larger
+    ``max_children`` than its parent.
     """
-    node_with_db.config_set(max_children=parent_max)
-    # simulate existing direct children (max_depth=1 in the _live_descendants call)
-    live = [
-        ({'node': f'main.existing_{i}'}, node_with_db) for i in range(existing_direct)
-    ]
-    with patch.object(node_with_db, '_live_descendants', return_value=live):
-        if should_raise:
-            with pytest.raises(ValueError, match='Max children reached'):
-                node_with_db.init('child')
-        else:
-            with patch.object(node_with_db, '_run_script'):
-                # child sets a larger max_children than parent -- no ceiling
-                node_with_db.init('child', max_children=parent_max + 10)
-
-
-@pytest.mark.parametrize(
-    ('parent_max', 'existing', 'should_raise'),
-    [
-        (3, 0, False),
-        (3, 2, False),
-        (3, 3, True),
-    ],
-    ids=[
-        'under-limit',
-        'one-remaining',
-        'at-limit',
-    ],
-)
-def test_max_descendants_enforcement(
-    node_with_db: Node,
-    parent_max: int,
-    existing: int,
-    should_raise: bool,
-) -> None:
-    """Max descendants caps total live descendants in the subtree.
-
-    Enforced across the ancestor chain -- even if the immediate parent
-    has no limit, an ancestor's budget blocks the spawn.
-    """
-    node_with_db.config_set(max_descendants=parent_max)
-    live = [({'node': f'main.existing_{i}'}, node_with_db) for i in range(existing)]
-    with patch.object(node_with_db, '_live_descendants', return_value=live):
-        if should_raise:
-            with pytest.raises(ValueError, match='Max descendants reached'):
-                node_with_db.init('child')
-        else:
-            with patch.object(node_with_db, '_run_script'):
-                node_with_db.init('child', max_descendants=parent_max + 10)
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    parent.config_set(max_children=1)
+    # settle (or keep live) the only existing child, then spawn a sibling
+    child.status_set(kid_status)
+    parent_wt = parent._root
+    monkeypatch.setenv('_NODE', f'{parent_wt / ".fractal" / "main.parent"}')
+    if should_raise:
+        with pytest.raises(ValueError, match='Max children reached'):
+            Node(git_repo).init(name='kid2')
+    else:
+        # the settled child freed its slot; a larger child cap is no ceiling
+        Node(git_repo).init(name='kid2', max_children=5)
+        assert _find_worktree(git_repo, 'main.parent.kid2') is not None
 
 
 def test_max_depth_ancestor_enforcement(
@@ -3518,24 +4166,30 @@ def test_max_depth_ancestor_enforcement(
     assert p._branch in str(excinfo.value)
 
 
-def test_max_descendants_ancestor_enforcement(
+def test_max_descendants_counts_only_unsettled(
     git_repo: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A full ancestor ``max_descendants`` budget blocks a deeper spawn.
+    """Settled descendants free subtree capacity; the ancestor cap still binds.
 
-    The chain gives ``p`` two live descendants (``c`` and ``g``). With ``p``
-    capped at 2 and the immediate parent ``g`` set far higher, a spawn under
-    ``g`` is still rejected on ``p`` -- the ancestor's stricter limit wins.
+    With ``c`` completed and ``g`` active, ``p``'s two-node subtree holds one
+    slot: a cap of 1 on ``p`` binds on the live ``g`` even with the immediate
+    parent set far higher (the ancestor's stricter limit wins).
     """
     p, _, g = _spawn_chain(git_repo, monkeypatch)
-    # p's subtree already holds c and g; cap it there
-    p.config_set(max_descendants=2)
+    # spawn under g (_NODE makes it the resolved caller, the CLI shape)
+    monkeypatch.setenv('_NODE', f'{g._root / ".fractal" / "main.p.c.g"}')
+    # p's subtree holds one unsettled node (g); cap it there
+    p.config_set(max_descendants=1)
     # a larger limit on the immediate parent must not override the ancestor's
     g.config_set(max_descendants=100)
     with pytest.raises(ValueError, match='Max descendants reached') as excinfo:
-        g.init('child')
+        Node(git_repo).init(name='child')
     assert p._branch in str(excinfo.value)
+    # a cap of 2 has a free slot -- the settled c no longer counts
+    p.config_set(max_descendants=2)
+    Node(git_repo).init(name='child')
+    assert _find_worktree(git_repo, 'main.p.c.g.child') is not None
 
 
 def test_spawn_limit_enforced_inside_lock(
@@ -3544,11 +4198,9 @@ def test_spawn_limit_enforced_inside_lock(
 ) -> None:
     """An over-limit spawn is rejected by the in-lock cap, off a fresh re-read.
 
-    The limit check moved inside the ``.worktrees`` flock (a TOCTOU fix), so this
-    drives the full ``init`` path -- the real flock + a live re-read of the
-    registry, not a patched ``_live_descendants`` -- and confirms a second child
-    past ``max_children=1`` still raises and leaves no second worktree or
-    registry row behind.
+    The limit check runs inside the ``.worktrees`` flock (TOCTOU safety), so
+    this drives the full ``init`` path -- the real flock + a live re-read of
+    the registry, not a patched ``_live_descendants``.
     """
     parent, _ = _spawn_parent_child(git_repo, monkeypatch)
     # parent already has one live child (kid); cap it there
@@ -3562,6 +4214,245 @@ def test_spawn_limit_enforced_inside_lock(
     assert _find_worktree(git_repo, 'main.parent.kid2') is None
     branches = {row['node'] for row in parent.child_list()}
     assert 'main.parent.kid2' not in branches
+
+
+def test_resume_re_checks_width_gate(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resume needs a free width slot: respawn-to-cap refuses the re-arm.
+
+    Spawn-to-cap -> settle -> respawn hands the settled node's slot to its
+    replacement, so ``--resume`` re-checks the parent's ``max_children`` with
+    the spawn gate's unsettled counting and refuses -- the spawn refusal, no
+    override flag -- while the replacement holds the slot.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    parent.config_set(max_children=1)
+    # settle the child, then spawn its replacement into the freed slot
+    child.status_set('exited')
+    parent_wt = parent._root
+    monkeypatch.setenv('_NODE', f'{parent_wt / ".fractal" / "main.parent"}')
+    Node(git_repo).init(name='kid2')
+    monkeypatch.delenv('_NODE')
+    # the idle replacement holds the only slot -- the resume must refuse
+    with patch.object(child, '_run_script') as run_script:
+        with pytest.raises(ValueError, match='Max children reached'):
+            child.start(resume=True)
+    assert not run_script.called
+    # the refused node stays settled -- no half-armed state holds a slot
+    assert child.status() == 'exited'
+    # settling the replacement frees the slot; the resume re-arms to idle
+    kid2 = Node(git_repo / '.worktrees' / 'main.parent.kid2')
+    kid2.status_set('completed')
+    with patch.object(child, '_run_script'):
+        child.start(resume=True)
+    assert child.status() == 'idle'
+
+
+def test_resume_re_checks_descendant_gate(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resume binds on every ancestor's ``max_descendants``, like a spawn.
+
+    With the grandchild ``g`` settled, its slot in ``p``'s subtree goes to
+    the re-armed intermediate ``c``; a cap of 1 on ``p`` refuses ``g``'s
+    resume naming the ancestor, and raising it to 2 admits the same resume.
+    """
+    p, c, g = _spawn_chain(git_repo, monkeypatch)
+    # settle the grandchild; the intermediate holds p's only subtree slot
+    g.status_set('exited')
+    c.status_set('idle')
+    p.config_set(max_descendants=1)
+    with patch.object(g, '_run_script') as run_script:
+        with pytest.raises(ValueError, match='Max descendants reached') as excinfo:
+            g.start(resume=True)
+    assert p._branch in str(excinfo.value)
+    assert not run_script.called
+    # a cap of 2 has a free slot for the re-arm
+    p.config_set(max_descendants=2)
+    with patch.object(g, '_run_script'):
+        g.start(resume=True)
+    assert g.status() == 'idle'
+
+
+def test_spawn_gate_reconciles_crashed_active(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashed-but-active child stops holding a width slot at the spawn gate.
+
+    A loop that dies out of band leaves ``active`` with no tmux session; the
+    gate heals it (persisted, the same reconcile ``list`` applies) before
+    counting, so the dead loop's slot is free and the spawn proceeds instead
+    of bouncing off a phantom child.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    parent.config_set(max_children=1)
+    # the child's loop dies out of band: status active, session gone
+    sessions = frozenset({parent._tmux_session_name})
+    monkeypatch.setattr('fractal.core.node._live_tmux_sessions', lambda: sessions)
+    parent_wt = parent._root
+    monkeypatch.setenv('_NODE', f'{parent_wt / ".fractal" / "main.parent"}')
+    Node(git_repo).init(name='kid2')
+    monkeypatch.delenv('_NODE')
+    # the spawn landed and the heal persisted the honest terminal
+    assert _find_worktree(git_repo, 'main.parent.kid2') is not None
+    assert child.status() == 'exited'
+
+
+def test_resume_gate_reconciles_crashed_active(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashed sibling's phantom slot never blocks a resume.
+
+    The re-arm counts its crashed-but-active sibling the same way a spawn
+    does: healed first (persisted), so the dead loop frees the only width
+    slot and the resume proceeds.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # spawn a sibling and settle it (the node the resume re-arms)
+    parent_wt = parent._root
+    monkeypatch.setenv('_NODE', f'{parent_wt / ".fractal" / "main.parent"}')
+    Node(git_repo).init(name='kid2')
+    monkeypatch.delenv('_NODE')
+    kid2 = Node(git_repo / '.worktrees' / 'main.parent.kid2')
+    kid2.status_set('stopped')
+    parent.config_set(max_children=1)
+    # the child's loop dies out of band: status active, session gone
+    sessions = frozenset({parent._tmux_session_name})
+    monkeypatch.setattr('fractal.core.node._live_tmux_sessions', lambda: sessions)
+    with patch.object(kid2, '_run_script'):
+        kid2.start(resume=True)
+    # the resume landed and the heal persisted the honest terminal
+    assert kid2.status() == 'idle'
+    assert child.status() == 'exited'
+
+
+def test_unretire_re_checks_width_gate(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle-restoring unretire needs a free width slot, like a resume.
+
+    Retire-to-cap -> respawn hands the retired node's slot to its
+    replacement, so an unretire that would land ``idle`` re-checks the
+    parent's ``max_children`` with the spawn gate's unsettled counting and
+    refuses -- the spawn refusal, no override flag -- while the replacement
+    holds the slot.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    parent.config_set(max_children=1)
+    # retire the idle child, then spawn its replacement into the freed slot
+    child.status_set('idle')
+    with patch.object(child, '_run_script'):
+        child.retire()
+    parent_wt = parent._root
+    monkeypatch.setenv('_NODE', f'{parent_wt / ".fractal" / "main.parent"}')
+    Node(git_repo).init(name='kid2')
+    monkeypatch.delenv('_NODE')
+    # the idle replacement holds the only slot -- the unretire must refuse
+    with patch.object(child, '_run_script') as run_script:
+        with pytest.raises(ValueError, match='Max children reached'):
+            child.unretire()
+    assert not run_script.called
+    # the refused node stays retired -- no half-restored state holds a slot
+    assert child.status() == 'retired'
+    # settling the replacement frees the slot; the unretire restores idle
+    kid2 = Node(git_repo / '.worktrees' / 'main.parent.kid2')
+    kid2.status_set('completed')
+    with patch.object(child, '_run_script'):
+        child.unretire()
+    assert child.status() == 'idle'
+
+
+def test_unretire_re_checks_descendant_gate(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle-restoring unretire binds on every ancestor's ``max_descendants``.
+
+    With the grandchild ``g`` retired, its slot in ``p``'s subtree goes to
+    the re-armed intermediate ``c``; a cap of 1 on ``p`` refuses ``g``'s
+    unretire naming the ancestor, and raising it to 2 admits the same
+    unretire.
+    """
+    p, c, g = _spawn_chain(git_repo, monkeypatch)
+    # retire the idle grandchild; the intermediate holds p's only subtree slot
+    g.status_set('idle')
+    with patch.object(g, '_run_script'):
+        g.retire()
+    c.status_set('idle')
+    p.config_set(max_descendants=1)
+    with patch.object(g, '_run_script') as run_script:
+        with pytest.raises(ValueError, match='Max descendants reached') as excinfo:
+            g.unretire()
+    assert p._branch in str(excinfo.value)
+    assert not run_script.called
+    # a cap of 2 has a free slot for the restore
+    p.config_set(max_descendants=2)
+    with patch.object(g, '_run_script'):
+        g.unretire()
+    assert g.status() == 'idle'
+
+
+def test_unretire_settled_restore_passes_at_cap(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settled restore is admitted at cap -- it returns no node to play.
+
+    Unretiring a node whose pre-retire status was settled changes nothing
+    the width/descendant gates count, so a full tree does not block it:
+    the node lands back on its settled status (a later resume still pays
+    the gate).
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    parent.config_set(max_children=1)
+    # retire the completed child, then spawn its replacement into the slot
+    child.status_set('completed')
+    with patch.object(child, '_run_script'):
+        child.retire()
+    parent_wt = parent._root
+    monkeypatch.setenv('_NODE', f'{parent_wt / ".fractal" / "main.parent"}')
+    Node(git_repo).init(name='kid2')
+    monkeypatch.delenv('_NODE')
+    # the replacement holds the only slot, but a completed restore needs none
+    with patch.object(child, '_run_script'):
+        child.unretire()
+    assert child.status() == 'completed'
+
+
+def test_unretire_gate_reconciles_crashed_active(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashed sibling's phantom slot never blocks an idle restore.
+
+    The restore counts its crashed-but-active sibling the same way a spawn
+    does: healed first (persisted), so the dead loop frees the only width
+    slot and the unretire proceeds.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # spawn a sibling and retire it while idle (the node the unretire restores)
+    parent_wt = parent._root
+    monkeypatch.setenv('_NODE', f'{parent_wt / ".fractal" / "main.parent"}')
+    Node(git_repo).init(name='kid2')
+    monkeypatch.delenv('_NODE')
+    kid2 = Node(git_repo / '.worktrees' / 'main.parent.kid2')
+    with patch.object(kid2, '_run_script'):
+        kid2.retire()
+    parent.config_set(max_children=1)
+    # the child's loop dies out of band: status active, session gone
+    sessions = frozenset({parent._tmux_session_name})
+    monkeypatch.setattr('fractal.core.node._live_tmux_sessions', lambda: sessions)
+    with patch.object(kid2, '_run_script'):
+        kid2.unretire()
+    # the unretire landed and the heal persisted the honest terminal
+    assert kid2.status() == 'idle'
+    assert child.status() == 'exited'
 
 
 def test_max_cost_enforcement(node_with_db: Node) -> None:
@@ -3626,6 +4517,26 @@ def test_max_cost_bounds_child_by_subtree_remaining(node_with_db: Node) -> None:
     with patch.object(node, '_run_script'):
         node.init('first', max_cost=6.0)
         node.init('second', max_cost=6.0)
+
+
+def test_max_cost_child_bound_re_arms_after_prior_run(
+    node_with_db: Node,
+) -> None:
+    """A drained prior run never shrinks the spawn gate's budget bound.
+
+    Runs are isolated by design: with no active run, the next run starts
+    fresh, so a child may claim up to the parent's full ``max_cost`` --
+    prior-run spend is invisible to the bound.
+    """
+    node = node_with_db
+    node.config_set(max_cost=10.0)
+    # a prior run records $8, then ends -- no active run remains
+    run_id = node.run_start()
+    _record_step_cost(node, run_id=run_id, cost=8.0)
+    node.run_end(run_id=run_id, status='exited', exit_code=1)
+    # the next run starts fresh, so the full cap is claimable
+    with patch.object(node, '_run_script'):
+        node.init('fresh', max_cost=10.0)
 
 
 def test_parent_run_id_scopes_subtree_cost(

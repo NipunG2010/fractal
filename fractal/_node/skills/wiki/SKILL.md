@@ -15,11 +15,29 @@ two:
 - **Memory** (`$MEMORY_DIR`) — this node's private knowledge base. See
   the `memory` skill for how to maintain it.
 
+Todo lists follow the same split: a private working checklist lives in
+memory; a task list other nodes should see and track lives in the
+project wiki. Either way it is living state — current open items, pruned
+as they complete — never an append-only log.
+
 Run `wiki --help` and `wiki <command> --help` for the CLI (init, update,
 lint, map, search, read). Always pass `--path` (`$WIKI_DIR` or
 `$MEMORY_DIR`) — the wiki CLI does not walk up to find a wiki from the
 node directory. Run `wiki update --path=<dir>` after adding, moving, or
 deleting pages; `wiki lint --path=<dir>` validates structure.
+
+## Editing discipline
+
+`wiki update` regenerates derived state: each page's entry line in
+`_index.md` (name and description) is pulled from the page's own
+frontmatter, so fix a `desc:` on the page and rerun update — hand edits
+to an index line are overwritten by the next update. `wiki lint` is
+regenerate-and-compare: it prints the diff `wiki update` would apply
+plus any real defects, and separates issues (must fix) from advisory
+notes. Work the loop — edit pages, `wiki update`, `wiki lint` — until
+clean (clean = lint exits 0; scripts branch on the exit code, not the
+prose summary); lint validates structure, not content truth, so verify
+facts against your sources yourself.
 
 ## Cross-linking
 

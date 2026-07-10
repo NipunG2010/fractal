@@ -10,6 +10,7 @@ silently corrupting the loop -- the same invariants ``init`` enforces.
 
 from __future__ import annotations
 
+import json
 import pathlib
 
 import pytest
@@ -22,6 +23,9 @@ __all__ = [
     'test_set_rejects_mistyped_coerced_values',
     'test_set_accepts_well_typed_coerced_values',
     'test_public_node_config_get_set_round_trip',
+    'test_public_set_scope_space_form_normalizes_to_init_shape',
+    'test_cost_scope_key_is_gone',
+    'test_init_scope_space_form_stores_init_shape',
     'test_node_config_set_cannot_flip_user_flag',
     'test_corrupt_config_errors_naming_the_file',
 ]
@@ -109,7 +113,10 @@ def test_set_accepts_well_typed_coerced_values(task: pathlib.Path) -> None:
     }
     for key, (value, expected) in cases.items():
         before = _run(task, 'config', '_get', key).stdout.strip()
-        assert _run(task, 'config', '_set', f'{key}={value}').returncode == 0
+        # the private script surface stays silent -- only the public set confirms
+        written = _run(task, 'config', '_set', f'{key}={value}')
+        assert written.returncode == 0
+        assert written.stdout == ''
         assert _run(task, 'config', '_get', key).stdout.strip() == expected
         # restore the key's prior value (null when it was unset)
         restore = before if before else 'null'
@@ -124,8 +131,12 @@ def test_public_node_config_get_set_round_trip(task: pathlib.Path) -> None:
     cost) is rejected as ``BadParameter`` (exit 2) without landing.
     """
     before = _run(task, 'node', 'config', 'get', 'max_iters').stdout.strip()
-    # a well-typed value writes via the public setter and reads via the getter
-    assert _run(task, 'node', 'config', 'set', 'max_iters=9').returncode == 0
+    # a well-typed value writes via the public setter and reads via the getter,
+    # confirming the change old -> new (a mid-run retune is otherwise silent)
+    prior = before if before else 'unset'
+    written = _run(task, 'node', 'config', 'set', 'max_iters=9')
+    assert written.returncode == 0
+    assert f'max_iters: {prior} -> 9' in written.stdout
     assert _run(task, 'node', 'config', 'get', 'max_iters').stdout.strip() == '9'
     # a mistyped value is rejected (the shared typed validation), leaving 9
     rejected = _run(task, 'node', 'config', 'set', 'max_cost=true')
@@ -135,6 +146,88 @@ def test_public_node_config_get_set_round_trip(task: pathlib.Path) -> None:
     # restore the key's prior value (null when it was unset)
     restore = before if before else 'null'
     assert _run(task, 'node', 'config', 'set', f'max_iters={restore}').returncode == 0
+
+
+def test_public_set_scope_space_form_normalizes_to_init_shape(
+    task: pathlib.Path,
+) -> None:
+    """The public setter splits a space-form scope into the init shape.
+
+    A comma-only split at the write boundary would persist a one-entry
+    list that consumers of the canonical list form mis-read: space, comma,
+    and mixed forms must all land as the init-canonical split list, and a
+    string-form scope must keep reading back split.
+    """
+    config_path = task / '.fractal' / 'main.task' / 'config.json'
+    # the space form lands split, not as a one-entry ['roots/a roots/b']
+    written = _run(task, 'node', 'config', 'set', 'scope=roots/a roots/b')
+    assert written.returncode == 0
+    stored = json.loads(config_path.read_text(encoding='utf-8'))['scope']
+    assert stored == ['roots/a', 'roots/b']
+    # comma and mixed forms agree on the same canonical shape
+    written = _run(task, 'node', 'config', 'set', 'scope=roots/a,roots/b roots/c')
+    assert written.returncode == 0
+    stored = json.loads(config_path.read_text(encoding='utf-8'))['scope']
+    assert stored == ['roots/a', 'roots/b', 'roots/c']
+    # a space-joined string value still reads back split (read normalization intact)
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    config['scope'] = 'roots/a roots/b'
+    config_path.write_text(json.dumps(config), encoding='utf-8')
+    got = _run(task, 'node', 'config', 'get', 'scope')
+    assert got.returncode == 0
+    assert got.stdout.splitlines() == ['roots/a', 'roots/b']
+    # restore: clear scope so later tests see the fixture's initial shape
+    assert _run(task, 'node', 'config', 'set', 'scope=null').returncode == 0
+
+
+def test_cost_scope_key_is_gone(task: pathlib.Path) -> None:
+    """``cost_scope`` is not a config key: runs are isolated by design.
+
+    There is no lifetime scope knob, so ``cost_scope`` must stay absent
+    from both the write surface and the init path.
+    """
+    root = task.parents[1]  # task == <root>/.worktrees/main.task
+    # the setter rejects cost_scope like any unknown key
+    result = _run(root, 'node', 'config', 'set', 'cost_scope=run')
+    assert result.returncode == 2, result.stderr
+    assert 'Unknown config key' in (result.stdout + result.stderr)
+    # a fresh child config carries no cost_scope entry
+    assert _run(root, 'node', 'init', 'cs_gone', '--agent', 'claude').returncode == 0
+    child = root / '.worktrees' / 'main.cs_gone'
+    config = json.loads(
+        (child / '.fractal' / 'main.cs_gone' / 'config.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    assert 'cost_scope' not in config
+
+
+def test_init_scope_space_form_stores_init_shape(task: pathlib.Path) -> None:
+    """Init-path space and mixed scope forms land as the canonical list.
+
+    ``init.sh`` writes ``--scope`` through the shared ``config _set``
+    normalization, so a space form cannot mis-parse into one mangled root
+    -- this pins init against a writer that bypasses the shared split.
+    """
+    root = task.parents[1]  # task == <root>/.worktrees/main.task
+    # one mixed comma+space value exercises both separators in one init
+    result = _run(
+        root,
+        'node',
+        'init',
+        'sc_mixed',
+        '--agent',
+        'claude',
+        '--scope=roots/a,roots/b roots/c',
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    child = root / '.worktrees' / 'main.sc_mixed'
+    config = json.loads(
+        (child / '.fractal' / 'main.sc_mixed' / 'config.json').read_text(
+            encoding='utf-8'
+        )
+    )
+    assert config['scope'] == ['roots/a', 'roots/b', 'roots/c']
 
 
 def test_node_config_set_cannot_flip_user_flag(task: pathlib.Path) -> None:

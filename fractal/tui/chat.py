@@ -2,7 +2,7 @@
 
 Everything chat and textual-free: the transport decision
 (``resolve_transport`` -- fork the live loop session, resume a thread,
-start fresh, or degrade to an inbox steer), the stream parsers that turn agent
+or start fresh), the stream parsers that turn agent
 output lines into ``ChatEvent`` deltas, the ``ChatTurn`` subprocess
 runner the app drives from a worker thread, and the ``ChatController``
 transcript buffers the message pane renders. The agent invocation itself comes
@@ -55,15 +55,11 @@ class ChatEvent:
 class Transport:
     """How a chat turn reaches a node (the resolved delivery decision)."""
 
-    kind: str  # 'fork' | 'resume' | 'fresh' | 'degraded'
-    label: str  # mode note / degrade notice
+    kind: str  # 'fork' | 'resume' | 'fresh'
+    label: str  # mode note for the transcript
     session: Optional[str] = None  # the session involved, if any
     resume: bool = False  # continue in place instead of forking
-
-    @property
-    def is_live(self: Transport) -> bool:
-        """Whether the turn reaches a real agent (vs an inbox steer)."""
-        return self.kind != 'degraded'
+    warn: bool = False  # surface the label as a warning, not just a meta line
 
     @property
     def chat_kwargs(self: Transport) -> dict:
@@ -84,19 +80,21 @@ def resolve_transport(
 ) -> Transport:
     """Resolve how a chat turn reaches a node.
 
-    An explicit ``session`` wins: the cockpit's own chat thread resumes in
-    place, a claude session forks, a settled codex thread resumes in place --
-    but a codex node's *live* thread cannot be touched (no fork), so it
-    degrades. With no explicit session, an active claude node's live session
-    forks; an active node that cannot fork (codex, detached, or no session
-    woven yet) degrades to an inbox steer the running loop will read; anything
-    settled or idle gets a fresh seeded session.
+    Chat always reaches a real agent -- no node state diverts a turn
+    anywhere else. An explicit ``session`` wins: the cockpit's own chat
+    thread resumes in place, a claude session forks, a settled codex thread
+    resumes in place -- but a codex node's *live* thread cannot be forked
+    (and resuming it in place would perturb the running loop), so it falls
+    back to a fresh session with a warning. With no explicit session, an
+    active claude node's live session forks; every other active shape
+    (codex, detached, or no session woven yet) and anything settled or idle
+    gets a fresh seeded session.
 
     Args:
         agent: The node's agent (``'claude'``/``'codex'``).
         status: The node's live status.
         detached: Whether the node runs detached (no woven session).
-        live_session: The live loop session, when the node is active.
+        live_session: The node's newest woven session, when active.
         session: An explicitly selected session (compose field / step fork).
         own_chat: Whether ``session`` is the cockpit's own prior chat thread.
 
@@ -115,8 +113,9 @@ def resolve_transport(
         if agent == 'codex':
             if status == 'active' and session == live_session:
                 return Transport(
-                    kind='degraded',
-                    label='codex live thread -- steering inbox',
+                    kind='fresh',
+                    label="codex live thread can't fork -- fresh session",
+                    warn=True,
                 )
             return Transport(
                 kind='resume',
@@ -142,7 +141,7 @@ def resolve_transport(
             reason = 'detached node'
         else:
             reason = 'no live session yet'
-        return Transport(kind='degraded', label=f'{reason} -- steering inbox')
+        return Transport(kind='fresh', label=f'fresh session ({reason})')
     return Transport(kind='fresh', label='fresh session')
 
 

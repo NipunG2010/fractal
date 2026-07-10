@@ -13,8 +13,8 @@ source and the run loop:
   run/iter deadlines -- the time until the next timeout fires.
 
 The discriminating test is ``test_run_scope_anchors_on_run_iter_scope_on_iter``:
-aging only the iteration must not shrink the run budget (under the old
-per-iteration ``--timeout`` it would have), and vice versa.
+aging only the iteration must not shrink the run budget (a per-iteration
+``--timeout`` would), and vice versa.
 
 Uses the in-process ``node_with_db`` fixture and controls elapsed time by
 back-dating ``started_at`` (deterministic, no sleeps), mirroring
@@ -150,10 +150,10 @@ def test_iter_timeout_none_without_active_iteration(node_with_db: Node) -> None:
 def test_run_scope_anchors_on_run_iter_scope_on_iter(node_with_db: Node) -> None:
     """``--timeout`` anchors on run start; ``--iter-timeout`` on iteration start.
 
-    This is the redefinition's load-bearing test. Aging *only the iteration* must
-    leave the run budget nearly full (under the old per-iteration ``--timeout`` it
-    would have drained it); the iteration budget, anchored on the iteration, is
-    the one that shrinks.
+    This is the run-anchoring's load-bearing test. Aging *only the iteration*
+    must leave the run budget nearly full (a per-iteration ``--timeout`` would
+    drain it); the iteration budget, anchored on the iteration, is the one that
+    shrinks.
     """
     node = node_with_db
     node.config_set(timeout=TIMEOUT, iter_timeout=TIMEOUT)

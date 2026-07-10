@@ -6,21 +6,26 @@ set -euo pipefail
 
 usage() {
     cat <<USAGE
-Usage: delete.sh <path>
+Usage: delete.sh <path> [options]
 
 Remove a node's worktree and delete its branch.
 
 Options:
+    --merge-target=<branch>    Branch to warn unmerged commits against
+                               (default: the node's base, else its dotted
+                               parent)
     --help|-h    Show this help message
 USAGE
     exit 0
 }
 
 WORKTREE_DIR=""
+MERGE_TARGET=""
 
 for arg in "$@"; do
     case "$arg" in
         --help | -h) usage ;;
+        --merge-target=*) MERGE_TARGET="${arg#*=}" ;;
         *)
             if [[ -z "$WORKTREE_DIR" ]]; then
                 WORKTREE_DIR="$arg"
@@ -66,7 +71,7 @@ fi
 # a locked worktree can't be removed; with remote-first ordering (below) a failed
 # removal would otherwise leave the remote gone while the node lingers, with no
 # safe retry (Node.delete's exists() guard fails on a half-deleted node) -- bail
-# here so a locked worktree never costs the remote (SCRIPT-4)
+# here so a locked worktree never costs the remote
 WORKTREE_GIT_DIR=$(git -C "$WORKTREE_DIR" rev-parse --absolute-git-dir 2>/dev/null || echo "")
 if [[ -n "$WORKTREE_GIT_DIR" && -f "$WORKTREE_GIT_DIR/locked" ]]; then
     echo "Error: worktree is locked, cannot remove: $WORKTREE_DIR" >&2
@@ -77,16 +82,18 @@ fi
 # ------ warn on unmerged commits before the destructive teardown
 # `branch -D` force-deletes even with commits the parent never absorbed, so
 # surface that loss on the automation path too (the interactive prompt warns only
-# the user); resolve the merge target like merge.sh -- the node's base, else the
-# dotted parent -- and warn unless the work is preserved there; a missing target
-# is best-effort, never blocks the delete
-DELETE_BASE=$(fractal config _get base --path="$WORKTREE_DIR" 2>/dev/null || true)
-if [[ -n "$DELETE_BASE" ]]; then
-    MERGE_TARGET="$DELETE_BASE"
-elif [[ "$BRANCH" == *.* ]]; then
-    MERGE_TARGET="${BRANCH%.*}"
-else
-    MERGE_TARGET=""
+# the user); resolve the merge target like merge.sh and warn unless the work is
+# preserved there; a missing target is best-effort, never blocks the delete; a
+# recursive caller threads the deletion root's surviving target instead: a
+# descendant's self-derived target is its own parent, which dies in the same
+# teardown, so the advice would name a deleted branch
+if [[ -z "$MERGE_TARGET" ]]; then
+    DELETE_BASE=$(fractal config _get base --path="$WORKTREE_DIR" 2>/dev/null || true)
+    if [[ -n "$DELETE_BASE" ]]; then
+        MERGE_TARGET="$DELETE_BASE"
+    elif [[ "$BRANCH" == *.* ]]; then
+        MERGE_TARGET="${BRANCH%.*}"
+    fi
 fi
 if [[ -n "$MERGE_TARGET" ]] \
     && git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$MERGE_TARGET"; then

@@ -96,7 +96,7 @@ class Radio:
         The permission check is best-effort, not atomic across connections: the
         ``write_only`` read and the ``db.write`` use separate connections, so a
         concurrent ``channel_delete`` of the target channel can race between them.
-        Strict atomicity is a known future enhancement.
+        Strict atomicity is intentionally not provided.
 
         Args:
             node: Target node branch. Defaults to self.
@@ -174,7 +174,7 @@ class Radio:
         The cascade is best-effort, not atomic across connections: each
         ``db.delete`` opens its own connection, so a reply that arrives mid-cascade
         from another node can race it (the pre-delete re-check narrows but does not
-        close the window). Strict atomicity is a known future enhancement.
+        close the window). Strict atomicity is intentionally not provided.
 
         Args:
             message_uuid: 8-char message UUID.
@@ -234,6 +234,10 @@ class Radio:
     ) -> list[dict]:
         """Query this node's messages with reply/react counts.
 
+        Listing is always passive -- it never writes read receipts, so the
+        unread view is stable across calls; ``read`` is the receipt-writing
+        surface.
+
         Args:
             channel: Filter by channel name.
             limit: Maximum rows to return.
@@ -268,6 +272,9 @@ class Radio:
         """Query messages this node sent, across every host's channel-space.
 
         Each row's ``node`` column names the recipient (the channel host).
+        Replies list first-class -- unlike the mailbox listings, an authored
+        reply that threads in place is not hidden behind its parent's reply
+        count.
 
         Args:
             channel: Filter by channel name.
@@ -287,6 +294,7 @@ class Radio:
             limit=limit,
             since=since,
             recent=recent,
+            roots_only=False,
         )
 
     def feed(
@@ -303,9 +311,11 @@ class Radio:
 
         Reads this node's subs, optionally filtered by target node and/or
         channel. For each matching subscription, queries the target's
-        channel where ``read_only = 0``. Merges, re-sorts by priority
-        DESC / created_at ASC, and writes the reader's receipts to the
-        ``reads`` table. Each row's ``node`` column names its source.
+        channel where ``read_only = 0``. Merges and re-sorts by priority
+        DESC / created_at ASC. Each row's ``node`` column names its
+        source. Listing is always passive -- it never writes read
+        receipts, so the unread view is stable across calls;
+        ``read(feed=True)`` is the receipt-writing surface.
 
         Args:
             node: Filter subscriptions by target node.
@@ -356,70 +366,121 @@ class Radio:
             messages.sort(key=lambda m: (-m['priority'], m['created_at']))
         if limit is not None:
             messages = messages[:limit]
-        # write read receipts only for the messages actually returned
-        for message in messages:
-            receipt = {
-                'message_id': message['message_id'],
-                'node': reader,
-                'channel': message['channel'],
-            }
-            self.db.merge(receipt, 'reads')
         # return rows
         return messages
 
     def read(
         self: Radio,
-        message_uuid: str,
-    ) -> dict:
-        """Read a message by UUID.
+        *message_uuids: str,
+        node: Optional[str] = None,
+        channel: Optional[str] = None,
+        feed: bool = False,
+        unread: bool = False,
+    ) -> list[dict]:
+        """Read messages by UUID and/or selector, receipting each as this node.
 
-        Looks the message up globally (UUIDs are unique across the tree)
-        and writes the reader's receipt to the ``reads`` table.
+        The body surface: reading is the act that consumes unread state
+        (listing never does), and every returned row lands this node's
+        receipt in the ``reads`` table -- receipts always attribute to
+        the actual reader, never to the mailbox viewed. UUIDs resolve
+        globally (unique across the tree) and return in argument order;
+        selector rows follow priority DESC / created_at ASC and mirror
+        the listings' row sets (thread roots plus cross-space replies);
+        duplicates collapse to their first occurrence. Receipts land
+        only after every lookup resolves, so a failed UUID receipts
+        nothing.
 
         Args:
-            message_uuid: 8-char message UUID.
+            *message_uuids: 8-char message UUIDs.
+            node: Mailbox node branch the selectors view. Defaults to self.
+            channel: Read this channel's messages.
+            feed: Read messages from the subscribed nodes.
+            unread: Restrict the selectors to rows this reader has no
+                receipt for (explicit UUIDs always return).
 
         Returns:
-            Full message dict with data and reply/react counts.
+            Full message dicts with data and reply/react counts.
 
         Raises:
-            ValueError: If the message is not found.
-            PermissionError: If the channel is read-only and the reader
+            ValueError: If a message or the mailbox node is not found.
+            PermissionError: If a channel is read-only and the reader
                 is not the owner.
 
         """
-        # process message uuid
-        message_uuid = message_uuid.upper()
-        # find message by UUID
         db = self.db
-        rows = db.read('messages', where={'message_uuid': message_uuid}, limit=1)
-        if rows:
-            message = rows[0]
-        else:
-            raise self._message_not_found(message_uuid)
-        # reject a non-owner reaching a read-only channel
-        self._reject_read_only(message['channel'], message['node'])
-        # mark as read
-        receipt = {
-            'message_id': message['message_id'],
-            'node': self.node._branch,
-            'channel': message['channel'],
-        }
-        db.merge(receipt, 'reads')
-        # add reply/react counts
-        message['replies'] = db.count(
-            'messages',
-            where={'parent_message_id': message['message_id']},
-        )
-        message['pos_reacts'] = db.count(
-            'reacts',
-            where={'message_id': message['message_id'], 'value': 1},
-        )
-        message['neg_reacts'] = db.count(
-            'reacts',
-            where={'message_id': message['message_id'], 'value': -1},
-        )
-        return message
+        messages = []
+        # resolve explicit uuids globally, in argument order
+        for message_uuid in message_uuids:
+            message_uuid = message_uuid.upper()
+            rows = db.read('messages', where={'message_uuid': message_uuid}, limit=1)
+            if rows:
+                message = rows[0]
+            else:
+                raise self._message_not_found(message_uuid)
+            # reject a non-owner reaching a read-only channel
+            self._reject_read_only(message['channel'], message['node'])
+            # add reply/react counts (selector rows already carry them)
+            message['replies'] = db.count(
+                'messages',
+                where={'parent_message_id': message['message_id']},
+            )
+            message['pos_reacts'] = db.count(
+                'reacts',
+                where={'message_id': message['message_id'], 'value': 1},
+            )
+            message['neg_reacts'] = db.count(
+                'reacts',
+                where={'message_id': message['message_id'], 'value': -1},
+            )
+            messages.append(message)
+        # the unread filter follows this reader's receipts
+        read = False if unread else None
+        # expand the channel selector over the mailbox's channel-space
+        if channel is not None:
+            mailbox = self._resolve_target(node)
+            self._reject_read_only(channel, mailbox)
+            messages += self._query_messages(
+                node=mailbox,
+                channel=channel,
+                read=read,
+            )
+        # expand the feed selector across the mailbox's subscriptions
+        if feed:
+            mailbox = self._resolve_target(node)
+            fanned = []
+            for sub in db.read('subs', where={'node': mailbox}):
+                # check channel is readable on the target (mirrors feed)
+                rows = db.read(
+                    'channels',
+                    where={'node': sub['target'], 'channel': sub['channel']},
+                    limit=1,
+                )
+                if not rows or rows[0]['read_only']:
+                    continue
+                fanned += self._query_messages(
+                    node=sub['target'],
+                    channel=sub['channel'],
+                    read=read,
+                )
+            fanned.sort(key=lambda m: (-m['priority'], m['created_at']))
+            messages += fanned
+        # collapse duplicates (a uuid may also match a selector), keeping first
+        result = []
+        seen = set()
+        for message in messages:
+            if message['message_id'] in seen:
+                continue
+            seen.add(message['message_id'])
+            result.append(message)
+        # write this reader's receipt for exactly the returned rows
+        for message in result:
+            receipt = {
+                'message_id': message['message_id'],
+                'node': self.node._branch,
+                'channel': message['channel'],
+            }
+            db.merge(receipt, 'reads')
+        return result
 
     def thread(
         self: Radio,
@@ -444,7 +505,7 @@ class Radio:
         Raises:
             ValueError: If the message is not found.
             PermissionError: If the channel is read-only and the reader
-                is not the owner.
+                is neither the owner nor a thread participant.
 
         """
         # process message uuid
@@ -456,8 +517,6 @@ class Radio:
             message = rows[0]
         else:
             raise self._message_not_found(message_uuid)
-        # reject a non-owner reaching a read-only channel
-        self._reject_read_only(message['channel'], message['node'])
         # walk up to root
         root = message
         while root['parent_message_id'] is not None:
@@ -470,14 +529,36 @@ class Radio:
                 root = parents[0]
             else:
                 break
-        # collect tree (read state follows the caller's receipts)
+        # collect the full tree first -- the permission decision below needs
+        # every participant, and the read filter applies only afterwards so a
+        # matching descendant under a filtered-out ancestor is not pruned
         result = []
         self._collect_thread(
             message=root,
             depth=0,
-            read=read,
             result=result,
         )
+        # reject a non-owner reaching a read-only channel -- thread participants
+        # are exempt, so a rerouted conversation reads whole for both parties
+        branch = self.node._branch
+        participant = any(
+            row['sender'] == branch or row['node'] == branch for row in result
+        )
+        if not participant:
+            self._reject_read_only(message['channel'], message['node'])
+        # apply the read filter to each row (following the caller's receipts)
+        if read is not None:
+            kept = []
+            for row in result:
+                receipts = db.read(
+                    'reads',
+                    where={'message_id': row['message_id'], 'node': branch},
+                    limit=1,
+                )
+                include = bool(receipts) if read else not receipts
+                if include:
+                    kept.append(row)
+            result = kept
         return result
 
     def reply(
@@ -486,21 +567,27 @@ class Radio:
         data: str,
         *,
         priority: Optional[int] = None,
-    ) -> str:
+    ) -> tuple[str, str, str]:
         """Reply to a message.
 
-        Locates the parent by UUID (globally unique) and creates the
-        reply in the same host's channel-space, so a thread never
-        straddles hosts. Inherits subject (``Re: ...``) and priority
-        from the parent if not specified. Also marks the parent read
-        (like ``react``) so a replied-to message does not resurface
+        Locates the parent by UUID (globally unique) and routes by where
+        the parent sits: a reply to a message in the caller's own inbox
+        is a conversation turn, so it lands in the original sender's
+        inbox; so does a reply into another node's write-only channel --
+        the reaction to a broadcast reaches its author's inbox rather
+        than piercing the owner-only channel; any other reply is
+        created in the parent's host channel-space. ``thread``
+        walks parent ids regardless of host, so a rerouted conversation
+        still renders as one thread. Inherits subject (``Re: ...``) and
+        priority from the parent if not specified. Also marks the parent
+        read (like ``react``) so a replied-to message does not resurface
         every SYNC.
 
-        The write-only permission check is best-effort, not atomic across
+        The channel-flag probe is best-effort, not atomic across
         connections: the channel read and the ``db.write`` use separate
         connections, so a concurrent ``channel_delete`` or ``unsend`` of the
-        parent can race between them. Strict atomicity is a known future
-        enhancement.
+        parent can race between them. Strict atomicity is intentionally not
+        provided.
 
         Args:
             message_uuid: 8-char UUID of the parent message.
@@ -508,13 +595,13 @@ class Radio:
             priority: Reply priority (0-10). Inherited if omitted.
 
         Returns:
-            8-char message UUID of the reply.
+            Tuple of the reply's 8-char message UUID and the resolved
+            destination ``(node, channel)``, so callers can surface the
+            routing the way ``send`` does.
 
         Raises:
             ValueError: If the parent message is not found, or
                 ``priority`` is out of range.
-            PermissionError: If the parent's channel is write-only and
-                the replier is not the owner.
 
         """
         # process message uuid
@@ -526,18 +613,15 @@ class Radio:
             parent = rows[0]
         else:
             raise self._message_not_found(message_uuid)
-        # reject replies into another node's write-only channel (owner only)
+        # probe the parent's channel flags (write-only reroutes the reply below)
+        write_only = False
         if parent['node'] != self.node._branch:
             rows = db.read(
                 'channels',
                 where={'node': parent['node'], 'channel': parent['channel']},
                 limit=1,
             )
-            if rows and rows[0]['write_only']:
-                channel = parent['channel']
-                raise PermissionError(
-                    f'Channel {channel!r} is write-only (owner only).'
-                )
+            write_only = bool(rows and rows[0]['write_only'])
         # inherit subject and priority, normalizing any existing reply prefix to
         # a single canonical 'Re: ' (a parent 'RE: x' / 're: x' becomes 'Re: x')
         subject = parent['subject']
@@ -548,15 +632,24 @@ class Radio:
             priority = parent['priority']
         if not 0 <= priority <= 10:
             raise ValueError(f'Priority must be 0-10, got {priority}.')
-        # create reply in the parent's channel-space
+        # route the reply: a turn in my own inbox or into a write-only channel
+        # goes back to the sender's inbox; anything else threads in place
+        own_inbox = parent['node'] == self.node._branch and parent['channel'] == 'inbox'
+        if own_inbox or write_only:
+            node = parent['sender']
+            channel = 'inbox'
+        else:
+            node = parent['node']
+            channel = parent['channel']
+        # create the reply
         reply_uuid = self._unique_uuid()
         session = self._sender_session()
         row = {
-            'node': parent['node'],
+            'node': node,
             'message_uuid': reply_uuid,
             'parent_message_id': parent['message_id'],
             'parent_message_uuid': parent['message_uuid'],
-            'channel': parent['channel'],
+            'channel': channel,
             'sender': self.node._branch,
             'session': session,
             'priority': priority,
@@ -572,7 +665,7 @@ class Radio:
             'channel': parent['channel'],
         }
         db.merge(receipt, 'reads')
-        return reply_uuid
+        return reply_uuid, node, channel
 
     def react(
         self: Radio,
@@ -796,7 +889,7 @@ class Radio:
         The cascade is best-effort, not atomic across connections: each
         ``db.delete`` opens its own connection, so a send/reply into the channel
         that races the cascade can leave a row behind the channel row's removal.
-        Strict atomicity is a known future enhancement.
+        Strict atomicity is intentionally not provided.
 
         Args:
             name: Channel name.
@@ -944,6 +1037,7 @@ class Radio:
         since: Optional[str] = None,
         read: Optional[bool] = None,
         recent: bool = False,
+        roots_only: bool = True,
     ) -> list[dict]:
         """Build and execute a messages query with counts.
 
@@ -956,14 +1050,24 @@ class Radio:
             read: Read filter, following this node's receipts.
             recent: Sort by ``created_at DESC`` instead of
                 ``priority DESC``.
+            roots_only: Keep thread roots (and cross-space replies) only.
 
         Returns:
             List of message dicts with counts.
 
         """
-        # build WHERE clauses
-        conditions = ['m.parent_message_id IS NULL']
+        # build WHERE clauses -- mailbox views keep thread roots, plus any reply
+        # routed across channel-spaces (a rerouted conversation turn is new
+        # mail for its host; in-place replies stay behind the parent's count)
+        conditions = []
         params = []
+        if roots_only:
+            conditions.append(
+                '(m.parent_message_id IS NULL OR NOT EXISTS'
+                ' (SELECT 1 FROM messages p'
+                ' WHERE p.message_id = m.parent_message_id'
+                ' AND p.node = m.node AND p.channel = m.channel))'
+            )
         if node is not None:
             conditions.append('m.node = ?')
             params.append(node)
@@ -1013,7 +1117,6 @@ class Radio:
         *,
         message: dict,
         depth: int,
-        read: Optional[bool],
         result: list[dict],
     ) -> None:
         """Recursively collect a thread tree into a flat list.
@@ -1021,25 +1124,11 @@ class Radio:
         Args:
             message: Current message dict.
             depth: Current nesting depth.
-            read: Read filter, following this node's receipts.
             result: Accumulator list (mutated in place).
 
         """
-        # apply read filter to this message only -- always recurse below so a
-        # matching descendant under a filtered-out ancestor is not pruned
-        include = True
-        if read is not None:
-            reader = self.node._branch
-            receipts = self.db.read(
-                'reads',
-                where={'message_id': message['message_id'], 'node': reader},
-                limit=1,
-            )
-            has_read = bool(receipts)
-            include = has_read if read else not has_read
-        if include:
-            message['depth'] = depth
-            result.append(message)
+        message['depth'] = depth
+        result.append(message)
         # find children
         children = self.db.read(
             'messages',
@@ -1051,7 +1140,6 @@ class Radio:
             self._collect_thread(
                 message=child,
                 depth=depth + 1,
-                read=read,
                 result=result,
             )
 

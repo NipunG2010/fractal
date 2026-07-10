@@ -39,17 +39,36 @@ if [[ ! "$WORKTREE_DIR" = /* ]]; then
 fi
 
 REPO_NAME=${WORKTREE_DIR##*/}
+REPO_ROOT=""
 if COMMON_DIR=$(git -C "$WORKTREE_DIR" rev-parse --git-common-dir 2>/dev/null); then
     if [[ "$COMMON_DIR" = /* ]]; then
-        REPO_NAME=$(cd "$COMMON_DIR/.." && basename "$PWD")
+        REPO_ROOT=$(cd "$COMMON_DIR/.." && pwd)
     else
-        REPO_NAME=$(cd "$WORKTREE_DIR/$COMMON_DIR/.." && basename "$PWD")
+        REPO_ROOT=$(cd "$WORKTREE_DIR/$COMMON_DIR/.." && pwd)
     fi
+    REPO_NAME=${REPO_ROOT##*/}
 fi
 
 TMUX_SESSION_NAME="$REPO_NAME"
+BRANCH=""
 if BRANCH=$(git -C "$WORKTREE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null); then
     TMUX_SESSION_NAME="$REPO_NAME (${BRANCH//./-})"
+fi
+
+# derive the node's data directory (mirrors Node._node_dir): the project
+# prefix comes from the .worktrees/.project/<branch> cache in the main repo
+PGID_FILE=""
+if [[ -n "$REPO_ROOT" && -n "$BRANCH" ]]; then
+    PROJECT="."
+    PROJECT_FILE="$REPO_ROOT/.worktrees/.project/$BRANCH"
+    if [[ -f "$PROJECT_FILE" ]]; then
+        PROJECT=$(cat "$PROJECT_FILE")
+    fi
+    if [[ "$PROJECT" == "." ]]; then
+        PGID_FILE="$WORKTREE_DIR/.fractal/$BRANCH/.pgid"
+    else
+        PGID_FILE="$WORKTREE_DIR/$PROJECT/.fractal/$BRANCH/.pgid"
+    fi
 fi
 
 # resolve pane pid by exact session_name match (spaces/parens
@@ -66,6 +85,15 @@ if [[ -n "$PANE_PID" ]]; then
     PGID=$(ps -o pgid= -p "$PANE_PID" 2>/dev/null | tr -d ' ') || true
 fi
 
+# fall back to the pgid recorded at run start when the pane lookup is empty --
+# an out-of-band pane death leaves the agent group headless with no tmux handle
+if [[ -z "$PGID" && -n "$PGID_FILE" && -f "$PGID_FILE" ]]; then
+    RECORDED_PGID=$(tr -d '[:space:]' <"$PGID_FILE") || true
+    if [[ -n "$RECORDED_PGID" ]] && kill -0 -- "-$RECORDED_PGID" 2>/dev/null; then
+        PGID="$RECORDED_PGID"
+    fi
+fi
+
 # grep -qxF (exact match), not tmux -t: -t resolves targets by
 # prefix/fnmatch, so a short name false-matches longer session names
 SESSION_EXISTS=
@@ -74,7 +102,7 @@ if tmux list-sessions -F '#{session_name}' 2>/dev/null \
     SESSION_EXISTS=1
 fi
 
-if [[ -z "$PANE_PID" && -z "$SESSION_EXISTS" ]]; then
+if [[ -z "$PANE_PID" && -z "$SESSION_EXISTS" && -z "$PGID" ]]; then
     if tmux list-sessions >/dev/null 2>&1; then
         echo "No running node found: $TMUX_SESSION_NAME"
     else
@@ -113,4 +141,6 @@ if _alive; then
 fi
 
 tmux kill-session -t "$TMUX_SESSION_NAME" 2>/dev/null || true
+# drop the recorded pgid handle -- the group is dead either way
+[[ -n "$PGID_FILE" ]] && rm -f "$PGID_FILE" 2>/dev/null || true
 echo "Killed node: $TMUX_SESSION_NAME"

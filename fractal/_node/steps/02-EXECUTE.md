@@ -13,8 +13,14 @@ status, editing their NODE.md, sending directives, merging completed
 work) is also execution.
 
 Verify with `bash $NODE_DIR/scripts/test.sh` if configured (exit 0 or
-no-op = proceed). Run `bash $NODE_DIR/scripts/lint.sh` as you go to
-catch issues early and fix what you introduce; it is enforced at COMMIT.
+no-op = proceed) -- the loop never runs test.sh for you, and it runs in
+your ambient CWD, so invoke it from the worktree root. Run
+`bash $NODE_DIR/scripts/lint.sh` as you go to catch issues early and fix
+what you introduce; the commit script enforces it at COMMIT. Under fleet
+load a test suite can run far slower than its solo baseline (concurrent
+nodes' test workers compound) -- budget step time for it, and read
+slowness *with progressing output* as load; slowness with no new output
+is a hang, not load.
 
 The full memory update happens in REVIEW. But if you discover something
 that would be lost if the session ended (a finding, blocker, or

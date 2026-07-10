@@ -9,10 +9,12 @@ shape ``test_core`` uses for its repo helpers.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 import pathlib
 import shutil
+import signal
 import subprocess
 import sys
 from typing import Optional
@@ -85,3 +87,48 @@ def _run(
         text=True,
         env=_cli_env(**env),
     )
+
+
+def _reap_group(proc: subprocess.Popen) -> None:
+    """SIGKILL ``proc``'s whole process group and reap the direct child.
+
+    Agent-loop launches use ``start_new_session=True``, so the group id is the
+    launch's own pid and spans the full chain (``_run.sh`` -> ``_agent.sh`` ->
+    stub agent) that a pid-only ``proc.kill()`` would leave reparented and
+    alive past the pytest session. Safe for teardowns to call unconditionally:
+    a clean exit's already-dead group is a no-op.
+    """
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    # drain and reap unless a completed communicate()/wait() already did (its
+    # streams are closed then, and a second communicate() would blow up)
+    if proc.returncode is None:
+        proc.communicate()
+
+
+def _run_reaped(
+    cmd: list[str],
+    *,
+    cwd: str,
+    env: dict,
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    """``subprocess.run`` for agent-loop launches, group-reaped at teardown.
+
+    A plain ``run(timeout=)`` expiry kills only the direct ``bash`` child and
+    leaks the rest of the chain (``TimeoutExpired`` still propagates here).
+    """
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    finally:
+        _reap_group(proc)
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)

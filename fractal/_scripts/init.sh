@@ -11,6 +11,7 @@ REPO_DIR=""
 TITLE=""
 PARENT=""
 ROOT=""
+PROJECT=""
 SCOPE=""
 BASE=""
 META=""
@@ -45,7 +46,8 @@ Options:
     --title=<name>               Human-readable display name (default: de-slugged name)
     --parent=<branch>            Parent node branch (resolved by the caller)
     --root=<branch>              Tree root branch (resolved by the caller)
-    --scope=<relpath>            Subdirectory scope within the worktree
+    --project=<relpath>          Sub-project within the repo (default: inherit the parent's)
+    --scope=<subdirs>            Subdirectory scope within the worktree (comma-separated; repeatable)
     --base=<branch>              Branch to start from
     --meta=<branch>              Meta-configure the target node (stores its branch)
     --agent=<agent>              Agent type (currently claude or codex)
@@ -60,7 +62,7 @@ Options:
     --interval=<duration>        Run iterations on a fixed schedule (e.g. 30m, 1h)
     --sleep=<duration>           Delay between iterations (e.g. 30s, 5m)
     --wait=<duration>            Sleep between approval-wait sync invocations (default: 1s)
-    --max-cost=<usd>             Maximum cost per run in USD
+    --max-cost=<usd>             Maximum cost in USD per run; every new run re-arms the full cap
     --max-iter-cost=<usd>        Maximum cost per iteration in USD
     --max-step-cost=<usd>        Cost per step in USD (warn-only when unenforceable)
     --reserve-budget=<usd>       Budget reserved for cleanup (shifts reserve mode)
@@ -80,8 +82,9 @@ for arg in "$@"; do
         --title=*) TITLE="${arg#*=}" ;;
         --parent=*) PARENT="${arg#*=}" ;;
         --root=*) ROOT="${arg#*=}" ;;
+        --project=*) PROJECT="${arg#*=}" ;;
         --base=*) BASE="${arg#*=}" ;;
-        --scope=*) SCOPE="${arg#*=}" ;;
+        --scope=*) SCOPE="${SCOPE:+$SCOPE,}${arg#*=}" ;;
         --agent=*) AGENT="${arg#*=}" ;;
         --model=*) MODEL="${arg#*=}" ;;
         --max-iters=*)
@@ -265,13 +268,17 @@ NODE_SEED_DIR="$(cd "$SCRIPT_DIR/../_node" && pwd -P)"
 # ------ validate repo root
 
 # the caller (Node.init) resolves and passes the git root; reject a path inside
-# .worktrees/ (a worktree, not the repo root) so a node never anchors there
-case "$REPO_DIR" in
-    */.worktrees/*)
-        echo "Error: $REPO_DIR is inside .worktrees/; pass the repo root instead" >&2
+# fractal's own worktrees dir (a .worktrees ancestor whose parent is itself a
+# git repo -- a worktree, not the repo root) so a node never anchors there; a
+# repo that merely lives under an unrelated .worktrees path is fine
+ANCESTOR="$REPO_DIR"
+while [[ "$ANCESTOR" == */* && -n "${ANCESTOR%/*}" ]]; do
+    if [[ "${ANCESTOR##*/}" == .worktrees && -e "${ANCESTOR%/*}/.git" ]]; then
+        echo "Error: $REPO_DIR is inside ${ANCESTOR%/*}'s .worktrees/; pass the repo root instead" >&2
         exit 1
-        ;;
-esac
+    fi
+    ANCESTOR="${ANCESTOR%/*}"
+done
 
 # ------ parent branch
 
@@ -291,8 +298,8 @@ if [[ -z "$PARENT_WORKTREE_DIR" ]]; then
 fi
 PARENT_PROJECT=$(cat "$REPO_DIR/.worktrees/.project/$PARENT_BRANCH" \
     2>/dev/null || echo ".")
-# inherit parent's project path
-PROJECT_PATH="$PARENT_PROJECT"
+# inherit parent's project path unless --project selects a sub-project
+PROJECT_PATH="${PROJECT:-$PARENT_PROJECT}"
 if [[ "$PARENT_PROJECT" == "." ]]; then
     PARENT_NODE_DIR="$PARENT_WORKTREE_DIR/.fractal/$PARENT_BRANCH"
 else
@@ -334,6 +341,16 @@ if [[ "$PARENT_BRANCH" != *.* ]] \
     echo "Error: branch '$PARENT_BRANCH' has uncommitted changes in $PARENT_WORKTREE_DIR" >&2
     echo "Commit them before initializing a top-level node." >&2
     exit 1
+fi
+
+# enforce one fractal per branch -- a reused branch keeps its recorded project
+if [[ -f "$WORKTREES_DIR/.project/$BRANCH" ]]; then
+    EXISTING_PROJECT=$(cat "$WORKTREES_DIR/.project/$BRANCH")
+    if [[ "$EXISTING_PROJECT" != "$PROJECT_PATH" ]]; then
+        echo "Error: branch '$BRANCH' already maps to project '$EXISTING_PROJECT';" \
+            "one branch maps to a single project -- use a separate branch" >&2
+        exit 1
+    fi
 fi
 
 # ------ create worktree
@@ -417,6 +434,12 @@ if [[ "$RESET" == true ]]; then
 fi
 mkdir -p "$NODE_DIR/plans"
 touch "$NODE_DIR/plans/.gitkeep"
+
+# the sanctioned git-ignored scratch dir (the info/exclude block covers it)
+if [[ "$RESET" == true ]]; then
+    rm -rf "$NODE_DIR/tmp"
+fi
+mkdir -p "$NODE_DIR/tmp"
 
 if [[ "$RESET" == true ]]; then
     rm -rf "$MEMORY_DIR"
@@ -564,3 +587,9 @@ fi
 
 echo ""
 echo "Initialized $WORKTREE_DIR"
+
+# surface the next steps: the task contract location and the start command
+echo ""
+echo "Next: author the node's task in $NODE_DIR/NODE.md"
+echo "(its Instructions and Completion Requirements sections start blank),"
+echo "then start the loop: fractal node start $BRANCH"

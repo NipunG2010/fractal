@@ -150,8 +150,8 @@ def node_config_set(app: typer.Typer) -> typer.Typer:
         values: list[str] = values,
         path: str = path,
     ) -> None:
-        """Set node config values (key=value pairs)."""
-        _config_set(values, path)
+        """Set node config values (key=value pairs), confirming old -> new."""
+        _config_set(values, path, echo=True)
 
     return app
 
@@ -168,20 +168,32 @@ def _config_get(key: str, path: str) -> None:
         # emit booleans as lowercase true/false for shell consumers
         if isinstance(value, bool):
             typer.echo('true' if value else 'false')
+        # emit list values one item per line so shell consumers can read
+        # them without a JSON parser (the COMMIT_SCOPES boundary check)
+        elif isinstance(value, list):
+            typer.echo('\n'.join(str(item) for item in value))
         # emit structured values as JSON so they round-trip with set
-        elif isinstance(value, (dict, list)):
-            typer.echo(json.dumps(value))
+        elif isinstance(value, dict):
+            encoded = json.dumps(value)
+            typer.echo(encoded)
         else:
             typer.echo(value)
 
 
-def _config_set(values: list[str], path: str, check: bool = True) -> None:
+def _config_set(
+    values: list[str],
+    path: str,
+    check: bool = True,
+    echo: bool = False,
+) -> None:
     """Parse, type-validate, and write config key=value pairs (shared by set/_set).
 
     The single boundary for both the public ``node config set`` and the private
     ``config _set`` (used by init.sh): parses each ``key=value``, enforces each
     key's type at the JSON boundary, then validates the merged config the way
     init does before writing -- so neither path can store a value init rejects.
+    ``echo`` confirms each written key ``old -> new`` (the public surface); the
+    private ``_set`` leaves it off so init.sh's script output stays clean.
     """
     # parse key=value pairs into a config dict
     config = {}
@@ -213,6 +225,10 @@ def _config_set(values: list[str], path: str, check: bool = True) -> None:
         # branch name is not silently turned into an int/bool)
         if value == 'null':
             config[key] = None
+        # scope stores a JSON list -- accept both the CLI init's comma-joined
+        # form and the space-joined string form the read normalization splits
+        elif key == 'scope':
+            config[key] = value.replace(',', ' ').split()
         elif key in _COERCED_KEYS:
             try:
                 parsed = json.loads(value)
@@ -292,4 +308,26 @@ def _config_set(values: list[str], path: str, check: bool = True) -> None:
         for key in _CONFIG_KEYS
     }
     validate_config_values(merged)
+    # the confirmation echo needs each key's stored value from before the write
+    priors = {key: node.config_get(key) for key in config} if echo else {}
     node.config_set(**config)
+    # confirm each write, old -> new -- a silent mid-run retune is
+    # indistinguishable from a dropped one
+    if echo:
+        for key, value in config.items():
+            prior = _render_value(priors[key])
+            current = _render_value(value)
+            typer.echo(f'{key}: {prior} -> {current}')
+
+
+def _render_value(value: object) -> str:
+    """Render one config value for the set confirmation (``get``'s conventions)."""
+    # unset/cleared keys render as 'unset'; booleans and structured values
+    # render exactly as `config get` prints them, so the echo round-trips
+    if value is None:
+        return 'unset'
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return str(value)

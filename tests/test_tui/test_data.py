@@ -9,7 +9,7 @@ past the seeded reference instant, so live-elapsed values are exact constants.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -62,7 +62,7 @@ _TREE = (
         ('main', None, 'Main'),
     ],
 )
-def test_display_name_of(branch: str, title: str | None, expected: str) -> None:
+def test_display_name_of(branch: str, title: Optional[str], expected: str) -> None:
     """A node's display name is its stored title, else the de-slugged leaf."""
     assert display_name_of(branch, title) == expected
 
@@ -149,9 +149,10 @@ def test_active_card_streams_live_state(builder: SnapshotBuilder) -> None:
     assert m['cost_step'] is None
     assert m['cost_iter'] == pytest.approx(0.10)
     assert m['cost_run'] == pytest.approx(2.82)
-    # distinct loop sessions, newest first; the open iteration's session lives
-    # only on its step until iter_end stamps it
+    # distinct woven sessions, newest first -- the open iteration's session is
+    # already offered (stamped on its step as soon as the stream opened)
     assert snap.sessions == (
+        session_for('main.alpha', 2, 2),
         session_for('main.alpha', 2, 1),
         session_for('main.alpha', 1, 1),
     )
@@ -401,7 +402,11 @@ _READ_SURFACE: dict[str, Callable[[TuiData, SnapshotBuilder], Any]] = {
     'react-counts': lambda data, builder: _query(data, 'main.alpha', data.react_counts),
     'channel-rows': lambda data, builder: _query(data, 'main.alpha', data.channel_rows),
     'archive-rows': lambda data, builder: _query(data, 'main', data.archive_rows),
-    'live-session': lambda data, builder: _query(data, 'main.alpha', data.live_session),
+    'live-session': lambda data, builder: _query(
+        data,
+        'main.alpha',
+        lambda connection, branch: data.live_session(connection, branch, 'claude'),
+    ),
     'snapshot': lambda data, builder: builder.build(
         'main.alpha',
         want_feed=True,

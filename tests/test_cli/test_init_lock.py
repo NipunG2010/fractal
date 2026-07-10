@@ -5,8 +5,7 @@ exclusive ``fcntl.flock`` on ``<repo>/.worktrees/.lock``, held across the whole
 critical section (the sibling parent ``nodes``-table writes already serialize via
 SQLite's default busy timeout, but the worktree add does not). It is a kernel
 lock: mutual exclusion across processes, auto-released when the holder dies (no
-PID, no stale-break -- the symlink lock it replaced had races around exactly
-those).
+PID, no stale-break -- a symlink lock would race around exactly those).
 
 These race the real ``fractal node init`` against one repo and contend the real
 lock file directly, each bounded by a subprocess timeout so a regression that
@@ -116,7 +115,7 @@ def test_held_lock_blocks_init_until_holder_dies(
 
     Proves both halves of the kernel lock: exclusive contention (init does not
     proceed while the lock is held) and auto-release on holder death -- including
-    the uncatchable SIGKILL that *stranded* the old symlink lock and was the
+    the uncatchable SIGKILL that would strand a symlink lock and is the
     precondition for its stale-break races.
     """
     # start a holder that grabs the lock and blocks
@@ -168,7 +167,7 @@ def _init_proc(repo: pathlib.Path, name: str) -> subprocess.Popen:
     """Launch ``fractal node init <name>`` against ``repo`` as a background process.
 
     Uses the hermetic CLI env so the subprocess runs *this* worktree's code (the
-    flock fix), not the frozen site-packages install.
+    flock under test), not the frozen site-packages install.
     """
     return subprocess.Popen(
         [

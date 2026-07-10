@@ -9,7 +9,7 @@ color/glyph stays single-sourced.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Optional
+from typing import Optional, Union
 
 from rich.text import Text
 
@@ -139,7 +139,7 @@ def cell(markup: str, width: int, justify: str = 'left') -> Text:
     return result
 
 
-def row(*cells: Text | str, gap: int = theme.GAP) -> Text:
+def row(*cells: Union[Text, str], gap: int = theme.GAP) -> Text:
     """Join ``cell`` Texts (or markup strings) into one aligned row."""
     result = Text()
     for index, item in enumerate(cells):

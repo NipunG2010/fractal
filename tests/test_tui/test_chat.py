@@ -2,9 +2,9 @@
 
 The transport decision table and both stream parsers are pure and run on
 canned input; ``ChatTurn`` is exercised against real tiny subprocesses (python
-one-liners standing in for an agent). The two app-level tests pin the chat
-contract on the writable pair tree: a degraded turn writes exactly one inbox
-steer, and a live turn writes nothing to any node database.
+one-liners standing in for an agent). The app-level tests pin the chat
+contract on the writable pair tree: every turn spawns a real agent and writes
+nothing to any node database -- radio included.
 """
 
 from __future__ import annotations
@@ -41,20 +41,21 @@ __all__ = [
     'test_chat_turn_surfaces_nonzero_exit_with_stderr_tail',
     'test_chat_turn_cancel_kills_without_error',
     'test_chat_turn_launch_failure',
-    'test_degraded_chat_writes_one_inbox_steer',
+    'test_sessionless_chat_spawns_fresh_never_radio',
     'test_live_chat_writes_nothing',
     'test_stale_done_does_not_clear_the_new_turn',
 ]
 
 
 @pytest.mark.parametrize(
-    ('kwargs', 'kind', 'session', 'resume'),
+    ('kwargs', 'kind', 'session', 'resume', 'warn'),
     [
         pytest.param(
             {'session': 'mine01', 'own_chat': True},
             'resume',
             'mine01',
             True,
+            False,
             id='own-chat-thread-resumes-in-place',
         ),
         pytest.param(
@@ -62,20 +63,23 @@ __all__ = [
             'fork',
             'abc123',
             False,
+            False,
             id='explicit-claude-session-forks',
         ),
         pytest.param(
             {'agent': 'codex', 'live_session': 'thr001', 'session': 'thr001'},
-            'degraded',
+            'fresh',
             None,
             False,
-            id='codex-live-thread-degrades',
+            True,
+            id='codex-live-thread-falls-back-fresh-with-warning',
         ),
         pytest.param(
             {'agent': 'codex', 'live_session': 'thr001', 'session': 'old001'},
             'resume',
             'old001',
             True,
+            False,
             id='codex-historical-thread-resumes-in-place',
         ),
         pytest.param(
@@ -83,33 +87,38 @@ __all__ = [
             'fork',
             'live01',
             False,
+            False,
             id='active-claude-forks-its-live-session',
         ),
         pytest.param(
             {},
-            'degraded',
+            'fresh',
             None,
             False,
-            id='active-claude-without-a-session-degrades',
+            False,
+            id='active-claude-without-a-session-goes-fresh',
         ),
         pytest.param(
             {'agent': 'codex'},
-            'degraded',
+            'fresh',
             None,
             False,
-            id='active-codex-degrades',
+            False,
+            id='active-codex-goes-fresh',
         ),
         pytest.param(
             {'detached': True},
-            'degraded',
+            'fresh',
             None,
             False,
-            id='active-detached-degrades',
+            False,
+            id='active-detached-goes-fresh',
         ),
         pytest.param(
             {'status': 'completed'},
             'fresh',
             None,
+            False,
             False,
             id='settled-node-gets-a-fresh-session',
         ),
@@ -117,6 +126,7 @@ __all__ = [
             {'status': 'idle'},
             'fresh',
             None,
+            False,
             False,
             id='idle-node-gets-a-fresh-session',
         ),
@@ -127,8 +137,9 @@ def test_resolve_transport_decision_table(
     kind: str,
     session: Optional[str],
     resume: bool,
+    warn: bool,
 ) -> None:
-    """Each (state, selection) lands on its transport; only degraded is offline."""
+    """Each (state, selection) lands on its transport; chat is never offline."""
     base = {
         'agent': 'claude',
         'status': 'active',
@@ -136,12 +147,12 @@ def test_resolve_transport_decision_table(
         'live_session': None,
     }
     transport = resolve_transport(**{**base, **kwargs})
-    assert (transport.kind, transport.session, transport.resume) == (
+    assert (transport.kind, transport.session, transport.resume, transport.warn) == (
         kind,
         session,
         resume,
+        warn,
     )
-    assert transport.is_live == (kind != 'degraded')
     # the kwargs hand Node.chat_command exactly the resolved session decision
     if session is None:
         assert transport.chat_kwargs == {}
@@ -391,41 +402,43 @@ def test_chat_turn_degrades_a_raising_parser(
 # ------ the app-level chat contract (the writable pair tree)
 
 
-async def test_degraded_chat_writes_one_inbox_steer(
+async def test_sessionless_chat_spawns_fresh_never_radio(
     pair_tree: pathlib.Path,
 ) -> None:
-    """An active node with no live session gets exactly one inbox steer."""
-    # flip alpha active with no live session: the unforkable case
+    """An active node with no woven session gets a fresh turn, never radio."""
+    # flip alpha active with no live session: the no-session-woven-yet window
     Node(pair_tree / '.worktrees' / 'main.alpha').status_set('active')
-    app = FractalApp(resolve_node(pair_tree), branch='main.alpha')
+    events = [
+        ChatEvent(kind='session', text='chat-sess-2'),
+        ChatEvent(kind='text', text='on it'),
+        ChatEvent(kind='meta', text='done · 1 turns · 0.1s · $0.01'),
+    ]
+    app = FractalApp(
+        resolve_node(pair_tree),
+        branch='main.alpha',
+        turn_factory=lambda command: FakeTurn(events),
+    )
     async with app.run_test(size=(150, 48)) as pilot:
         app.start_chat('prioritize the flaky test')
-        await pilot.pause()
+        for _ in range(100):  # the worker thread streams in the background
+            await pilot.pause(0.05)
+            if app._turn is None:
+                break
         convo = app.chat.convo('main.alpha')
     assert convo[0] == ('you', 'prioritize the flaky test')
-    assert convo[1][0] == 'meta'
-    assert 'steering inbox' in convo[1][1]
-    assert app._turn is None  # no agent was spawned
+    # the transport went fresh (with its reason) and a real turn streamed
+    metas = [text for who, text in convo if who == 'meta']
+    assert any('fresh session (no live session yet)' in text for text in metas)
+    assert [text for who, text in convo if who == 'auth'] == ['on it']
+    # chat never becomes radio: no message row lands in any node database
     data = TuiData(resolve_node(pair_tree))
     data.refresh_worktrees()
     connection = data.connect()
     try:
-        rows = data.rows(
-            connection,
-            'SELECT node, channel, sender, subject, priority, data FROM messages',
-        )
+        rows = data.rows(connection, 'SELECT * FROM messages')
     finally:
         connection.close()
-    assert rows == [
-        {
-            'node': 'main.alpha',
-            'channel': 'inbox',
-            'sender': 'main',
-            'subject': 'chat',
-            'priority': 10,
-            'data': 'prioritize the flaky test',
-        }
-    ]
+    assert rows == []
 
 
 async def test_live_chat_writes_nothing(pair_tree: pathlib.Path) -> None:

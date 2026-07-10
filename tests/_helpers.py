@@ -13,6 +13,7 @@ __all__ = [
     '_past_timestamp',
     '_age_iter',
     '_age_run',
+    '_age_step',
 ]
 
 
@@ -52,4 +53,13 @@ def _age_run(node: Node, run_id: int, seconds_ago: float) -> None:
         {'started_at': _past_timestamp(seconds_ago)},
         'runs',
         where={'run_id': run_id},
+    )
+
+
+def _age_step(node: Node, step_id: int, seconds_ago: float) -> None:
+    """Back-date a step's ``started_at`` to simulate elapsed time."""
+    node.db.update(
+        {'started_at': _past_timestamp(seconds_ago)},
+        'steps',
+        where={'step_id': step_id},
     )

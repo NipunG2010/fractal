@@ -1,5 +1,5 @@
 # Git worktrees
-.worktrees/
+/.worktrees/
 
 # Virtual environment
 .venv
@@ -10,6 +10,9 @@
 
 # Status file
 .status
+
+# Process group handle
+.pgid
 
 # Obsidian config
 .obsidian/
@@ -22,6 +25,12 @@
 # Agent stderr
 claude.err
 codex.err
+
+# Setup log
+setup.log
+
+# Scratch directory
+tmp/
 
 # Agent session IDs
 .session

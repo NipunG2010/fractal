@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import pathlib
 import sys
 from typing import Optional
@@ -12,6 +11,7 @@ import typer
 from fractal.cli.utils import (
     command,
     parse_reserve_budget,
+    pricing_has_model,
     print_rows,
     require_non_negative,
     resolve_init_target,
@@ -28,6 +28,7 @@ __all__ = [
     'node_kill',
     'node_merge',
     'node_delete',
+    'node_reconcile',
     'node_retire',
     'node_unretire',
     'node_attach',
@@ -38,6 +39,7 @@ __all__ = [
     'node_pending',
     'node_chat',
     'node_update',
+    'node_reconcile_caps',
     'node_render',
 ]
 
@@ -76,7 +78,7 @@ def node_init(app: typer.Typer) -> typer.Typer:
     title_help = 'Human-readable display name (default: de-slugged node name).'
     title = typer.Option(None, '--title', help=title_help)
     # scope option
-    scope_help = 'Subdirectory scope within the worktree.'
+    scope_help = 'Subdirectory scope within the worktree (comma-separated; repeatable).'
     scope = typer.Option(None, '--scope', help=scope_help)
     # base option
     base_help = 'Branch to start from; also the squash-merge target when set.'
@@ -121,7 +123,11 @@ def node_init(app: typer.Typer) -> typer.Typer:
     wait_help = 'Sleep between approval-wait sync invocations (default: 1s).'
     wait = typer.Option(None, '--wait', help=wait_help)
     # max-cost option
-    max_cost_help = 'Maximum cost per run in USD.'
+    max_cost_help = (
+        'Maximum cost in USD per run: every new run RE-ARMS the full cap'
+        ' (`node start` on a finished/killed node included) -- runs are'
+        ' isolated, so a resume opens a fresh budget.'
+    )
     max_cost = typer.Option(None, '--max-cost', help=max_cost_help)
     # max-iter-cost option
     max_iter_cost_help = 'Maximum cost per iteration in USD.'
@@ -152,7 +158,7 @@ def node_init(app: typer.Typer) -> typer.Typer:
         name: str = name,
         path: str = path,
         title: Optional[str] = title,
-        scope: Optional[str] = scope,
+        scope: Optional[list[str]] = scope,
         base: Optional[str] = base,
         meta: Optional[str] = meta,
         agent: Optional[str] = agent,
@@ -176,7 +182,12 @@ def node_init(app: typer.Typer) -> typer.Typer:
         detached: bool = detached,
         reset: bool = reset,
     ) -> None:
-        """Create an agent node."""
+        """Create an agent node.
+
+        The node's task contract lives in ``<node_dir>/NODE.md`` --
+        author its Instructions and Completion Requirements sections,
+        then ``fractal node start <name>``.
+        """
         # a per-iter/step cap with no run ceiling can't be enforced
         # (once the per-iter budget drains, later steps run unbounded)
         # -- reject at creation so the operator fixes it now, not at
@@ -209,9 +220,10 @@ def node_init(app: typer.Typer) -> typer.Typer:
             }
         )
         reserve_budget = parse_reserve_budget(reserve_budget, max_cost)
-        node, _ = resolve_init_target(path)
+        node, path = resolve_init_target(path)
         output = node.init(
             name=name,
+            path=path,
             title=title,
             scope=scope,
             base=base,
@@ -239,17 +251,28 @@ def node_init(app: typer.Typer) -> typer.Typer:
         )
         if output:
             typer.echo(output)
-        # a manual init from inside a worktree (no _NODE caller context) nests the
-        # new node under the root user node, not the worktree's node -- surface it
-        # so it is not a silent surprise (an agent loop always sets _NODE)
-        worktrees = (node._repo_dir / '.worktrees').resolve()
-        in_worktree = worktrees in pathlib.Path.cwd().resolve().parents
-        if in_worktree and not os.environ.get('_NODE'):
-            typer.echo(
-                f"Note: nested '{name}' at the top level (under the root node) --"
-                " manual init does not nest under the current worktree's node.",
-                err=True,
+        # an uncapped node runs and spends without bound -- warn on stderr
+        # (advisory, never a block); codex without a priced model has no
+        # tracked spend to meter, so it stays quiet
+        if max_cost is None and max_iters is None:
+            # resolve the effective agent the way init does: the flag, else
+            # the nearest ancestor's configured default
+            effective_agent = agent
+            if effective_agent is None:
+                for ancestor in node._self_and_ancestors():
+                    if ancestor_agent := ancestor.config_get('agent'):
+                        effective_agent = ancestor_agent
+                        break
+            base_command = effective_agent.split()[0] if effective_agent else ''
+            unpriced = base_command == 'codex' and (
+                model is None or not pricing_has_model(model)
             )
+            if not unpriced:
+                typer.echo(
+                    'Warning: no --max-cost/--max-iters -- this node can run'
+                    ' and spend without bound.',
+                    err=True,
+                )
 
     return app
 
@@ -260,7 +283,10 @@ def node_start(app: typer.Typer) -> typer.Typer:
     node_help = 'Target node branch (default: this node).'
     node = typer.Argument(None, help=node_help)
     # resume flag
-    resume_help = 'Resume a stopped/exited node (continue iterations).'
+    resume_help = (
+        'Resume a stopped/exited node (continue iterations); the new run'
+        ' RE-ARMS the full --max-cost.'
+    )
     resume = typer.Option(False, '--resume', help=resume_help)
     # path option
     path_help = 'Worktree directory.'
@@ -275,7 +301,9 @@ def node_start(app: typer.Typer) -> typer.Typer:
         """Launch a node in a tmux session.
 
         Run parameters come from ``config.json`` (set at init or
-        edited before launch); only ``--resume`` is set here.
+        edited before launch); only ``--resume`` is set here. Every
+        launch opens a fresh run with the full budget re-armed -- runs
+        are isolated, so budget a resume like a fresh launch.
         """
         node = resolve_target(path, node)
         output = node.start(resume=resume)
@@ -293,6 +321,9 @@ def node_finish(app: typer.Typer) -> typer.Typer:
     # reason option
     reason_help = 'Optional reason for finishing.'
     reason = typer.Option(None, '--reason', help=reason_help)
+    # cancel flag
+    cancel_help = 'Withdraw the pending finish signal instead of sending one.'
+    cancel = typer.Option(False, '--cancel', help=cancel_help)
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
@@ -301,11 +332,15 @@ def node_finish(app: typer.Typer) -> typer.Typer:
     def _finish(
         node: Optional[str] = node,
         reason: Optional[str] = reason,
+        cancel: bool = cancel,
         path: str = path,
     ) -> None:
-        """Stop after the current iteration."""
+        """Stop after the current iteration (``--cancel`` withdraws a pending finish)."""
         node = resolve_target(path, node)
-        result = node.finish(reason)
+        if cancel:
+            result = node.finish_cancel(reason)
+        else:
+            result = node.finish(reason)
         typer.echo(result)
 
     return app
@@ -421,7 +456,8 @@ def node_delete(app: typer.Typer) -> typer.Typer:
                         if row['node'] == node or name == node:
                             matches.append(row['node'])
                 if len(matches) == 1:
-                    typer.echo(caller.deregister(matches[0]))
+                    output = caller.deregister(matches[0])
+                    typer.echo(output)
                     return
             raise
         if not force:
@@ -440,9 +476,43 @@ def node_delete(app: typer.Typer) -> typer.Typer:
                 err=True,
             )
             typer.confirm(prompt, abort=True)
-        output = node.delete()
+        output, notices = node.delete()
         if output:
             typer.echo(output)
+        # unmerged-work warnings ride stderr so piped stdout stays parseable
+        if notices:
+            typer.echo(notices, err=True)
+
+    return app
+
+
+def node_reconcile(app: typer.Typer) -> typer.Typer:
+    """Register the ``reconcile`` command."""
+    # node argument
+    node_help = 'Target node branch (default: this node).'
+    node = typer.Argument(None, help=node_help)
+    # path option
+    path_help = 'Worktree directory.'
+    path = typer.Option('.', '--path', help=path_help)
+
+    @command(app, 'reconcile')
+    def _reconcile(
+        node: Optional[str] = node,
+        path: str = path,
+    ) -> None:
+        """Record orphaned descendants in the events log; registry rows kept.
+
+        The audit step after cleaning up a node's worktree/branch with plain
+        git instead of ``delete``: each newly observed orphan gets one
+        ``orphan`` event row (already-recorded branches are skipped).
+        """
+        node = resolve_target(path, node)
+        recorded = node.reconcile()
+        if not recorded:
+            typer.echo('No orphaned nodes to record.')
+            return
+        for branch in recorded:
+            typer.echo(f'Recorded orphaned node {branch}.')
 
     return app
 
@@ -461,7 +531,7 @@ def node_retire(app: typer.Typer) -> typer.Typer:
         node: Optional[str] = node,
         path: str = path,
     ) -> None:
-        """Mark a node as retired."""
+        """Park a node: hidden from list, unstartable; branch and history kept."""
         node = resolve_target(path, node)
         result = node.retire()
         typer.echo(result)
@@ -483,7 +553,12 @@ def node_unretire(app: typer.Typer) -> typer.Typer:
         node: Optional[str] = node,
         path: str = path,
     ) -> None:
-        """Remove retired flag from a node."""
+        """Restore a retired node to its pre-retire status.
+
+        An idle restore returns the node to the unsettled pool, so the
+        width/descendant caps are re-checked as at spawn (refused over
+        cap, no override); a settled restore holds no slot.
+        """
         node = resolve_target(path, node)
         result = node.unretire()
         typer.echo(result)
@@ -528,7 +603,12 @@ def node_status(app: typer.Typer) -> typer.Typer:
     ) -> None:
         """Show a node's current status."""
         node = resolve_target(path, node)
-        typer.echo(node.status_display())
+        # reconcile a crashed-but-active node first: reads are where staleness
+        # is observed, and the probe is a no-op unless the stored status
+        # is 'active'
+        node._reconcile_status()
+        display = node.status_display()
+        typer.echo(display)
 
     return app
 
@@ -793,8 +873,25 @@ def node_update(app: typer.Typer) -> typer.Typer:
     title_help = 'Child display name.'
     title = typer.Option(None, '--title', help=title_help)
     # max-cost option
-    max_cost_help = 'Child maximum cost per run in USD.'
+    max_cost_help = (
+        'Child maximum cost in USD per run: every new run RE-ARMS the full'
+        ' cap (`node start` on a finished/killed node included) -- runs are'
+        ' isolated, so a resume opens a fresh budget.'
+    )
     max_cost = typer.Option(None, '--max-cost', help=max_cost_help)
+    # max-iter-cost option
+    max_iter_cost_help = 'Child maximum cost per iteration in USD.'
+    max_iter_cost = typer.Option(None, '--max-iter-cost', help=max_iter_cost_help)
+    # max-step-cost option
+    max_step_cost_help = (
+        'Child maximum cost per step in USD (warn-only when unenforceable).'
+    )
+    max_step_cost = typer.Option(None, '--max-step-cost', help=max_step_cost_help)
+    # reserve-budget option
+    reserve_budget_help = (
+        'Budget reserved for cleanup; USD or N% of the effective --max-cost.'
+    )
+    reserve_budget = typer.Option(None, '--reserve-budget', help=reserve_budget_help)
     # max-depth option
     max_depth_help = 'Child maximum nesting depth.'
     max_depth = typer.Option(None, '--max-depth', help=max_depth_help)
@@ -813,24 +910,40 @@ def node_update(app: typer.Typer) -> typer.Typer:
         node: str = node,
         title: Optional[str] = title,
         max_cost: Optional[float] = max_cost,
+        max_iter_cost: Optional[float] = max_iter_cost,
+        max_step_cost: Optional[float] = max_step_cost,
+        reserve_budget: Optional[str] = reserve_budget,
         max_depth: Optional[int] = max_depth,
         max_children: Optional[int] = max_children,
         max_descendants: Optional[int] = max_descendants,
         path: str = path,
     ) -> None:
-        """Update a child node's configuration."""
+        """Update a child node's configuration, confirming each change old -> new.
+
+        The supported retune path: updates the registry row and the child's
+        ``config.json`` together, and a running loop picks the new caps up at
+        its next iteration. (A direct config-file edit is honored at the same
+        boundary, back-filled to the registry with a warning.)
+        """
         # validate arguments
         kwargs = {
             'max_cost': max_cost,
+            'max_iter_cost': max_iter_cost,
+            'max_step_cost': max_step_cost,
             'max_depth': max_depth,
             'max_children': max_children,
             'max_descendants': max_descendants,
         }
         require_non_negative(**kwargs)
-        if title is None and all(v is None for v in kwargs.values()):
+        if (
+            title is None
+            and reserve_budget is None
+            and all(v is None for v in kwargs.values())
+        ):
             raise typer.BadParameter(
-                'Specify at least one of'
-                ' --title/--max-cost/--max-depth/--max-children/--max-descendants.'
+                'Specify at least one of --title/--max-cost/--max-iter-cost'
+                '/--max-step-cost/--reserve-budget/--max-depth/--max-children'
+                '/--max-descendants.'
             )
         # resolve the target tree-wide (short names too) like every other node
         # command, then derive its parent -- only the parent can rewrite a child
@@ -840,27 +953,100 @@ def node_update(app: typer.Typer) -> typer.Typer:
             parent = resolve_target(path, parent_branch)
         else:
             raise typer.BadParameter(f'Cannot update the user node: {target._branch}.')
+        # resolve the reserve before validating; a default-mode reserve (equal
+        # to what init's 10% default materialized for the old cap) retunes to
+        # track a new cap instead of going stale
+        old_max_cost = target.config_get('max_cost')
+        old_reserve = target.config_get('reserve_budget')
+        effective_max_cost = max_cost if max_cost is not None else old_max_cost
+        new_reserve = None
+        if reserve_budget is not None:
+            new_reserve = parse_reserve_budget(reserve_budget, effective_max_cost)
+        elif max_cost is not None and max_cost > 0 and old_reserve is not None:
+            # a degenerate cap skips the retune -- the merged-config validation
+            # below owns that rejection and its wording
+            if old_reserve == parse_reserve_budget(None, old_max_cost):
+                new_reserve = parse_reserve_budget(None, max_cost)
+        # a per-iter/step cap on an effectively uncapped child mirrors init's
+        # rejection -- unenforceable once the per-iter budget drains
+        if effective_max_cost is None:
+            if max_iter_cost is not None:
+                raise typer.BadParameter('--max-iter-cost requires --max-cost.')
+            if max_step_cost is not None:
+                raise typer.BadParameter('--max-step-cost requires --max-cost.')
         # validate the merged config the way init/config _set do -- a bare
-        # require_non_negative still admits max_cost==0 and a max_cost lowered
-        # below the child's stored max_iter_cost/max_step_cost (broken ordering)
+        # require_non_negative still admits max_cost==0 and step<=iter<=run
+        # orderings broken from either side (a lowered cap or a raised sub-cap)
         merged = {
-            'max_cost': max_cost,
-            'max_iter_cost': target.config_get('max_iter_cost'),
-            'max_step_cost': target.config_get('max_step_cost'),
-            'reserve_budget': target.config_get('reserve_budget'),
+            'max_cost': effective_max_cost,
+            'max_iter_cost': (
+                max_iter_cost
+                if max_iter_cost is not None
+                else target.config_get('max_iter_cost')
+            ),
+            'max_step_cost': (
+                max_step_cost
+                if max_step_cost is not None
+                else target.config_get('max_step_cost')
+            ),
+            'reserve_budget': new_reserve if new_reserve is not None else old_reserve,
         }
-        if max_cost is None:
-            merged['max_cost'] = target.config_get('max_cost')
         validate_config_values(merged)
+        # the confirmation echo needs each provided key's stored value from
+        # before the write -- a retuned reserve counts even without its flag
+        updates = {'title': title, **kwargs}
+        if new_reserve is not None:
+            updates['reserve_budget'] = new_reserve
+        priors = {
+            key: target.config_get(key)
+            for key, value in updates.items()
+            if value is not None
+        }
         # update node configuration
         parent.child_update(
             name=name,
             title=title,
             max_cost=max_cost,
+            max_iter_cost=max_iter_cost,
+            max_step_cost=max_step_cost,
+            reserve_budget=new_reserve,
             max_depth=max_depth,
             max_children=max_children,
             max_descendants=max_descendants,
         )
+        # confirm each change, old -> new -- a silent mid-run retune is
+        # indistinguishable from a dropped one
+        for key, value in updates.items():
+            if value is None:
+                continue
+            prior = priors[key] if priors[key] is not None else 'unset'
+            typer.echo(f'{key}: {prior} -> {value}')
+
+    return app
+
+
+def node_reconcile_caps(app: typer.Typer) -> typer.Typer:
+    """Register the ``_reconcile_caps`` command."""
+    # path option
+    path_help = 'Worktree directory.'
+    path = typer.Option('.', '--path', help=path_help)
+
+    @command(app, '_reconcile_caps')
+    def _reconcile_caps(
+        path: str = path,
+    ) -> None:
+        """Heal the registry cap row from ``config.json``, one warning per drift."""
+        node = resolve_node(path)
+        drifted = node.caps_reconcile()
+        # scream per drifted key -- a silent heal would hide that enforcement
+        # and the registry ever disagreed
+        for key, values in drifted.items():
+            config_value, registry_value = values
+            typer.echo(
+                f'WARNING: config {key}={config_value} != registry'
+                f' {registry_value} -- registry updated to match config'
+                f" (retune with 'fractal node update')"
+            )
 
     return app
 

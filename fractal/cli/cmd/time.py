@@ -31,15 +31,11 @@ def time_remaining(app: typer.Typer) -> typer.Typer:
         node = resolve_target(path, node)
         remaining = node.time_remaining()
         if remaining is None:
-            # None countdown means no run/iter deadline is active (only the run
-            # and iter scopes have one); pick a status: "no limit" when no timeout
-            # is set at all; "running" when active with only a step_timeout
-            # (a limit, but nothing to count down); otherwise "not running"
+            # None countdown means no deadline is active for any configured
+            # scope (run/iter/step all count down)
             timeouts = ('timeout', 'iter_timeout', 'step_timeout')
             if not any(node.config_get(key) for key in timeouts):
                 typer.echo('no limit')
-            elif node.status() == 'active':
-                typer.echo('running')
             else:
                 typer.echo('not running')
             return

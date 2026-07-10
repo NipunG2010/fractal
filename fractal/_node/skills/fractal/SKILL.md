@@ -40,21 +40,28 @@ CLI.
   grandchildren). Enforced locally on the spawning node. A child may set
   a larger `--max-children` than its parent.
 - **Depth (`--max-depth`) and descendants (`--max-descendants`).**
-  Enforced across the **entire ancestor chain** at spawn time —
-  `fractal node init` checks every ancestor's config and rejects the
-  spawn if any limit would be exceeded. You do not need to split or
-  decrement budgets when spawning; set whatever limits make sense for
-  the child's subtask and let init enforce the ancestors' caps. A spawn
-  that would breach any ancestor's cap fails fast with an error naming
-  the offending node, so glance at `$MAX_DEPTH` and `$MAX_DESCENDANTS`
-  before spawning to avoid wasted failed inits.
-- **Cost.** A `--max-cost` (per-run USD ceiling) is strongly recommended
-  for every child — without one the child launches uncapped, with a loud
-  warning at start and bounded only by `--max-iters`/`--timeout`; a
-  non-positive `--max-cost` is rejected. Set it at init (`--max-cost`,
-  \<= your remaining when `$COST_BUDGET` is finite) and optionally
-  `--max-iter-cost`. Allocate conservatively; you may over-allocate
-  across children optimistically, but monitor
+  Enforced across the **entire ancestor chain** — `fractal node init`
+  checks every ancestor's config and rejects the spawn if any limit
+  would be exceeded. You do not need to split or decrement budgets when
+  spawning; set whatever limits make sense for the child's subtask and
+  let init enforce the ancestors' caps. A spawn that would breach any
+  ancestor's cap fails fast with an error naming the offending node, so
+  glance at `$MAX_DEPTH` and `$MAX_DESCENDANTS` before spawning to avoid
+  wasted failed inits.
+- **Re-entry re-checks.** Width and descendant caps count children in
+  play — active, or idle awaiting start — so a completed, stopped,
+  exited, killed, or retired child frees its slot. `node start --resume`
+  and a `node unretire` that lands `idle` put a node back in play and
+  re-check both caps exactly like a spawn (refused over cap, no
+  override); depth is structural, so only spawn checks it.
+- **Cost.** A `--max-cost` (per-run USD ceiling — every new `node start`
+  re-arms it; runs are isolated, so a resume opens a fresh budget) is
+  strongly recommended for every child — without one the child launches
+  uncapped, with a loud warning at start and bounded only by
+  `--max-iters`/`--timeout`; a non-positive `--max-cost` is rejected.
+  Set it at init (`--max-cost`, \<= your remaining when `$COST_BUDGET`
+  is finite) and optionally `--max-iter-cost`. Allocate conservatively;
+  you may over-allocate across children optimistically, but monitor
   (`fractal node cost spent`, `fractal node cost breakdown`) and kill
   over-spenders. Caps are **soft** — a child is not *hard*-stopped when
   it nears `--max-cost`; once it drains into the reserve it gets cleanup
@@ -62,7 +69,27 @@ CLI.
   then the loop ends its run at that iteration's boundary (the child
   does not run `finish` itself) — but a single iteration or its subtree
   can still overshoot, so reining in an over-spender is on you, the
-  parent. In-step overshoot is bounded for claude children (each step
+  parent. Price a cap as solve + wind-down + reserve: a clean finish
+  costs a full iteration of close overhead on top of the last unit of
+  work (typically a few dollars per leaf child — environment- and
+  model-specific), so a cap sized to the solve alone strands a *done*
+  child `exited` at the reserve boundary instead of `completed`. Size
+  `--max-iter-cost` to one wind-down pass as well: the iteration cap,
+  not the run-level cap, is what bounds each close attempt. Iteration
+  caps bind at step boundaries, never mid-step — plan each iteration to
+  end under the cap, and read a trip as disclosure that an iteration ran
+  hot, not as a hard stop. If a done child strands anyway, prefer
+  raise-cap + resume + stop over a full re-finish — the re-finish
+  re-pays the whole close severalfold and can still near-miss — and
+  treat `exited` with recorded DB finish signals as a defensible
+  terminal once the work is merged and verified. Child-side corollary:
+  `fractal node cost remaining` reports against `--max-cost`, NOT
+  against (`--max-cost` - reserve); a node inside the reserve band reads
+  positive remaining and plans an iteration the loop will never grant.
+  Plan your last productive iteration against (`--max-cost` - reserve),
+  and if you intend to signal `finish`, fire it BEFORE draining into the
+  reserve — wind-down work scheduled for "next iteration" does not
+  happen. In-step overshoot is bounded for claude children (each step
   runs under a hard per-invocation budget and stops cleanly at it), but
   the run-level cap stays soft. A child's spend (including its sync)
   counts against your own budget. Some agents report cost directly;
@@ -80,6 +107,16 @@ CLI.
 > children a budget large enough that a single step is a small slice, or
 > hand a small budget to a cheaper `--model`.
 
+For well-specified single-mission leaf work, a cheaper model at the same
+dollar cap (e.g. `--model=sonnet`) is a first-class choice —
+cost-per-point favors it on numeric, single-task work — but give it
+iter-cap headroom: micro caps bind on step granularity, and a fast
+drafter can pack a full iteration into one large step. Keep frontier
+models for manager, audit, long-horizon, and judgment-call roles: a
+cheaper model can hold process hygiene and mechanical output while its
+judgment quality collapses — at no cost saving, since under a binding
+budget pool a cheaper token rate buys more steps, not a lower bill.
+
 ## Spawn
 
 1. **Init:** run `fractal node init --help` to see available options,
@@ -91,31 +128,82 @@ CLI.
    timing) are set here and stored in the child's `config.json` —
    editable before launch. Capture the output for the child's
    project/node dirs. Init is lockfile-serialized — run calls
-   sequentially.
+   sequentially. A worked example of spawn hygiene — every cap, the
+   model, and the step timeout explicit at init (leaf caps shown — give
+   a manager child depth/children/descendants), then a registry verify
+   before any configuration; the init call is wrapped to capture the
+   child worktree path from the init output's `Initialized <path>` line
+   — an unset `$child_worktree` silently reads YOUR OWN config
+   (`--path=` resolves to the current directory; `--path` on
+   `config get` names the child's worktree, not the project root):
+
+   ```bash
+   child_worktree="$(fractal node init sub_a --path="$PROJECT_DIR" \
+       --model=sonnet --max-cost=12 --max-iter-cost=4 \
+       --max-iters=4 --step-timeout=10m \
+       --max-depth=0 --max-children=0 --max-descendants=0 \
+       | sed -n 's/^Initialized //p')"
+   fractal node list                                # registry row: sub_a present
+   fractal node config get max_cost --path="$child_worktree"   # 12.0 — caps landed
+   fractal node config get model --path="$child_worktree"      # sonnet
+   ```
+
 2. **Configure:** edit the child's `NODE.md` (instructions + completion
    requirements), `steps/`, `setup.sh`/`test.sh`/`lint.sh`, and
    `skills/` — invest here, it's the highest-leverage work (you can
    still steer after launch; see Configure below).
+
+   For a well-specified single-mission leaf, consider the **leaf step
+   profile**: before the config commit, trim the child's `steps/` to
+   PLAN + EXECUTE + COMMIT (delete the PREPARE and REVIEW files — the
+   loop runs whatever `steps/` contains, in digit-prefix order). Loop
+   overhead dominates single-mission leaf cost, and a trimmed profile
+   cuts it — expect the overhead cut, not an outcome guarantee. Two
+   caveats: PREPARE is where a node merges its parent and children —
+   keep it for any node that spawns, and for leaves whose upstream moves
+   mid-run — when you cannot rule that out at spawn time, keep PREPARE;
+   REVIEW is where memory folds — when you trim it, relocate its duties
+   into a surviving step (e.g. append the fold to EXECUTE's tail) or,
+   minimally, tell the child in its NODE.md to fold memory before
+   COMMIT. Managers keep the full profile.
+
 3. **Commit the config** so the child starts from a committed baseline
    (resume cleans uncommitted changes, so an unconfigured baseline would
    otherwise be lost). Run the commit **from the child's worktree** — a
    bare `commit` acts on the current directory's worktree (yours), not
    the child's (or pass `--path=<child worktree>`):
+
    ```bash
    cd <child worktree>  # .worktrees/<branch>
    fractal commit "configure <name>" --init
    ```
+
+   Material you copy into a child's tree passes through the repo's
+   commit hooks (if any) at this init commit (CRLF->LF, formatter
+   reflow) — so a byte-frozen store and its delivered copies diverge *by
+   construction* on the first hooked commit; do not read that divergence
+   as tamper. If you freeze reference bytes for audit, freeze the
+   post-hook form (commit once, then re-pin) or compare normalized (line
+   endings/whitespace) rather than raw.
+
 4. **Launch:**
+
    ```bash
    fractal node start <branch>
    ```
+
    `start` takes no config arguments — all run parameters come from
    `config.json` (set at init; adjust a value with
    `fractal node config set <key>=<value>`, read one with
    `fractal node config get <key>`, or edit the file directly). A
    configured `max_cost` must be positive; a missing `max_cost` launches
    uncapped with a loud warning. Add `--resume` only to continue a
-   stopped/exited child.
+   stopped/exited child. Starting is its own turn: when a spawn gate
+   (child/descendant census, budget arithmetic) decides the launch, read
+   it in one command and start in a separate one — a chained start
+   commits before you can see the read's output. The init gate re-checks
+   census and budget at start, so treat a rejected start as the gate
+   working; re-read before retrying.
 
 ### Configure
 
@@ -144,9 +232,11 @@ NODE.md instructions to direct decomposition.
   runs automatically before each step to handle radio communication. The
   first and last steps (PREPARE and COMMIT in the stock set) are
   structurally important to the lifecycle (merging parent changes,
-  committing work) — do not remove or fundamentally alter them. Middle
-  steps can be freely renamed, added, or replaced. A step file may begin
-  with YAML frontmatter: `agent: <command>` runs it on a different agent
+  committing work) — do not remove or fundamentally alter them (one
+  scoped exception: the leaf step profile in Spawn step 2 drops PREPARE
+  for a childless leaf whose upstream won't move mid-run). Middle steps
+  can be freely renamed, added, or replaced. A step file may begin with
+  YAML frontmatter: `agent: <command>` runs it on a different agent
   (each agent keeps its own woven session across the steps it runs),
   `model: <name>` overrides the model, and `detached: true` isolates
   that step in its own session within a continuous node. Pass
@@ -187,12 +277,20 @@ writes a high-quality seed; once done, merge it and launch the target.
   finished and signalled `finish` -- a deliberate under-claim (a
   budget-*aborted* node must never read `completed`). So treat a capped
   node's `exited` as "inspect the work", not "failed": check its
-  memory/plans and merge if the work is done.
+  memory/plans and merge if the work is done. Verify a child's
+  *executable* artifacts -- checkers, scripts, anything you will run --
+  from a clean checkout of its committed bytes
+  (`tmp=$(mktemp -d) && git archive <branch> | tar -xf - -C "$tmp"`),
+  never in-place in a working tree: artifacts that depend on uncommitted
+  or path-relative state pass in-place and fail everywhere else.
+  (Textual claims need only `git show <branch>:<path>`.)
 - **Stop:** `fractal node finish <branch>` (after iteration),
   `fractal node stop <branch>` (after step),
   `fractal node kill <branch>` (immediately).
-- **Clean up:** `fractal node merge <branch>`, then
-  `fractal node delete <branch>`. Delete is destructive -- it
+- **Clean up:** `fractal node merge <branch>`. Deleting after the merge
+  (`fractal node delete <branch>`) is OPTIONAL hygiene, never automatic
+  -- a merged node's branch and records keep audit value, so keep them
+  unless clutter demands otherwise. Delete is destructive -- it
   force-removes the worktree and force-deletes the branch (and the whole
   subtree) regardless of merge state, discarding any unmerged work, so
   confirm the merge succeeded first.

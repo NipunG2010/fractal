@@ -10,7 +10,7 @@ explorer, row-selected), and ``rows`` (the event log, row-selected).
 from __future__ import annotations
 
 import typing
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from rich.table import Table
 from rich.text import Text
@@ -318,7 +318,7 @@ class NodePane:
             f'[{theme.DIM}]session[/]      {session}'
         )
 
-    def _measures(self: NodePane, m: Optional[dict]) -> Text | str:
+    def _measures(self: NodePane, m: Optional[dict]) -> Union[Text, str]:
         """Render the scope x metric matrix (rows step/iter/run, time/cost).
 
         Each cell is ``<current>/<ceiling>`` plus a green->red gauge of the
@@ -608,7 +608,7 @@ class NodePane:
         event: dict,
         *,
         expanded: bool = False,
-    ) -> Text | Table:
+    ) -> Union[Text, Table]:
         """Render one activity row; ``expanded`` unfolds it to full text."""
         duration = fmt.dur(event['duration']) if event['duration'] else ''
         cost = fmt.money(event['cost']) if event['cost'] is not None else ''

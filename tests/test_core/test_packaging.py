@@ -16,6 +16,7 @@ __all__ = [
     'test_exclude_template_ships_as_package_data',
     'test_init_writes_git_excludes',
     'test_init_excludes_subproject_user_seed',
+    'test_git_exclude_anchors_workspace_dirs',
     'test_track_is_fixed_after_init',
     'test_git_exclude_preserves_content_and_collapses_blocks',
     'test_git_exclude_orphan_begin_preserves_tail',
@@ -126,6 +127,34 @@ def test_init_excludes_subproject_user_seed(tmp_path: pathlib.Path) -> None:
     assert not _check_ignore(repo, 'app/.fractal/main.child')
 
 
+def test_git_exclude_anchors_workspace_dirs(tmp_path: pathlib.Path) -> None:
+    """The managed block hides workspace dirs at the repo root only.
+
+    Unanchored directory patterns match at every depth, so an unanchored
+    ``.worktrees/`` or ``artifacts/`` exclude also hides committable
+    node-dir trees like ``.fractal/<node>/artifacts/``. Workspace dirs that
+    only ever exist at the repo root are anchored; node-dir runtime markers
+    stay unanchored on purpose, because they live under tracked
+    ``.fractal/<branch>/`` dirs at arbitrary project depth.
+    """
+    repo = _committed_repo(tmp_path)
+    Node(repo).init(user=True)
+    # workspace dirs: hidden at the root, committable at depth
+    assert 'info/exclude' in _check_ignore(repo, '.worktrees/wt')
+    assert not _check_ignore(repo, 'sub/dir/.worktrees/wt')
+    # node-dir committable trees are never swallowed by the block
+    assert not _check_ignore(repo, '.fractal/main.child/artifacts/data.csv')
+    assert not _check_ignore(repo, '.fractal/main.child/runs/checker.py')
+    # node-dir runtime markers stay ignored at any depth
+    assert 'info/exclude' in _check_ignore(repo, '.fractal/main.child/.status')
+    assert 'info/exclude' in _check_ignore(repo, '.fractal/main.child/claude.err')
+    # the sanctioned scratch dir is ignored at any depth, while
+    # a same-named tmp/ outside a node dir stays committable
+    assert 'info/exclude' in _check_ignore(repo, '.fractal/main.child/tmp/cache.json')
+    assert 'info/exclude' in _check_ignore(repo, 'app/.fractal/main.a/tmp/pages.txt')
+    assert not _check_ignore(repo, 'src/tmp/kept.txt')
+
+
 def test_track_is_fixed_after_init(tmp_path: pathlib.Path) -> None:
     """``track`` is repo-wide, so it is fixed at init -- a re-init that flips it raises.
 
@@ -154,14 +183,14 @@ def test_track_is_fixed_after_init(tmp_path: pathlib.Path) -> None:
             ['keep_before', 'keep_after'],
             ['stale_inner'],
         ),
-        # two stacked blocks collapse to exactly one (B2)
+        # two stacked blocks collapse to exactly one
         (
             '# >>> fractal >>>\nstale_one\n# <<< fractal <<<\n'
             '# >>> fractal >>>\nstale_two\n# <<< fractal <<<\nkeep_outer\n',
             ['keep_outer'],
             ['stale_one', 'stale_two'],
         ),
-        # a custom line that merely mentions the markers is left untouched (B3)
+        # a custom line that merely mentions the markers is left untouched
         (
             'doc mentions # >>> fractal >>> and # <<< fractal <<< inline\nkeep_plain\n',
             [
@@ -198,9 +227,9 @@ def test_git_exclude_preserves_content_and_collapses_blocks(
 
 
 def test_git_exclude_orphan_begin_preserves_tail(tmp_path: pathlib.Path) -> None:
-    """An unmatched begin marker is left as content, not swallowing the tail (B4).
+    """An unmatched begin marker is left as content, not swallowing the tail.
 
-    The old ``find()``-based strip deleted everything from a lone begin marker to
+    A ``find()``-based strip would delete everything from a lone begin marker to
     EOF; the whole-line walk leaves the orphan in place and still appends a fresh
     block, so content after the orphan survives.
     """
@@ -217,7 +246,7 @@ def test_git_exclude_orphan_begin_preserves_tail(tmp_path: pathlib.Path) -> None
 
 
 def test_git_exclude_concurrent_writers_preserve_custom(tmp_path: pathlib.Path) -> None:
-    """Concurrent ``_git_exclude`` writers never drop the user's custom lines (B1).
+    """Concurrent ``_git_exclude`` writers never drop the user's custom lines.
 
     The common-dir ``info/exclude`` is shared by every worktree, so sibling
     ``init``/``start`` fan-out races on it. The atomic unique-temp ``os.replace``

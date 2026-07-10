@@ -31,7 +31,7 @@ class _AllLive(frozenset):
 
 
 @pytest.fixture(autouse=True)
-def stub_live_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+def _stub_live_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
     """Report every node's tmux session as live (no real tmux in the suite)."""
     monkeypatch.setattr(TuiData, 'live_sessions', lambda self: _AllLive())
 

@@ -212,7 +212,7 @@ def build_tree(root: pathlib.Path) -> None:
 def build_pair(root: pathlib.Path, *, agent: str = 'claude') -> None:
     """Build a minimal writable tree: a user root plus one child ``main.alpha``.
 
-    The small fixture for tests that write (actions, degraded chat, poller) --
+    The small fixture for tests that write (actions, chat, poller) --
     the canonical tree stays read-only.
     """
     _git_repo(root)

@@ -1,8 +1,10 @@
 """Tests for ``fractal`` CLI."""
 
+from .test_commit_hooks import *
 from .test_config_cli import *
 from .test_cost_resume import *
 from .test_data_cli import *
+from .test_exit_notice import *
 from .test_fractal_cmd import *
 from .test_init_bootstrap import *
 from .test_init_lock import *
@@ -21,3 +23,4 @@ from .test_signal_guards import *
 from .test_start import *
 from .test_stream import *
 from .test_time_remaining import *
+from .test_user_init import *

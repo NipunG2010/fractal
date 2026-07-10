@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import pathlib
+from typing import Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -18,10 +19,18 @@ __all__ = [
     'test_handles_malformed_input',
     'test_claude_stream_null_duration',
     'test_claude_stream_renders_records_and_captures',
+    'test_claude_stream_records_stream_model',
     'test_claude_stream_detached_keeps_session_unpersisted',
     'test_claude_stream_records_full_per_invocation_cost',
     'test_claude_stream_marks_budget_exceeded',
     'test_claude_stream_normal_result_leaves_no_budget_marker',
+    'test_claude_stream_truncated_records_accumulated_cost',
+    'test_claude_stream_survives_missing_pricing_cache',
+    'test_claude_stream_flushes_cost_per_assistant_event',
+    'test_claude_stream_result_overwrites_accumulated_estimate',
+    'test_claude_stream_unpriced_model_accumulates_no_cost',
+    'test_compute_claude_cost_prices_disjoint_buckets',
+    'test_compute_claude_cost_unpriced_model_returns_none',
     'test_codex_stream_renders_records_and_captures',
     'test_codex_stream_uses_last_cumulative_usage_not_sum',
     'test_codex_stream_detached_keeps_session_unpersisted',
@@ -33,6 +42,7 @@ __all__ = [
     'test_codex_stream_ignores_zero_usage_terminal_frame',
     'test_codex_stream_subtracts_prior_sibling_on_same_session',
     'test_codex_stream_increment_never_negative',
+    'test_codex_stream_flushes_cost_per_turn',
     'test_compute_codex_cost_floors_uncached_at_zero',
 ]
 
@@ -187,6 +197,41 @@ def test_claude_stream_renders_records_and_captures() -> None:
     node.step_cost.assert_called_once_with(step_id=9, cost=0.42)
 
 
+@pytest.mark.parametrize(
+    ('init_model', 'cli_model', 'recorded'),
+    [
+        # defaulted spawn: no --model, so only the init frame names the
+        # actual model backing the session -- the row must record it (an
+        # empty model would make model-per-node unrecoverable)
+        pytest.param('claude-fable-5', None, 'claude-fable-5', id='defaulted'),
+        # explicit spawn: the stream's resolved id beats the configured alias
+        pytest.param('claude-opus-4-8', 'opus', 'claude-opus-4-8', id='alias'),
+        # a frame without a model falls back to the configured one
+        pytest.param(None, 'claude-opus-4-8', 'claude-opus-4-8', id='fallback'),
+    ],
+)
+def test_claude_stream_records_stream_model(
+    init_model: Optional[str],
+    cli_model: Optional[str],
+    recorded: str,
+) -> None:
+    """The step row records the actual model the stream reports."""
+    node = MagicMock()
+    init = {'type': 'system', 'subtype': 'init', 'session_id': 'sess_m'}
+    if init_model is not None:
+        init['model'] = init_model
+    input_stream = _stream_lines(init)
+
+    render_stream(node, agent='claude', step_id=7, model=cli_model, input=input_stream)
+
+    node.step_session.assert_called_once_with(
+        'claude',
+        step_id=7,
+        model=recorded,
+        session='sess_m',
+    )
+
+
 def test_claude_stream_detached_keeps_session_unpersisted() -> None:
     """A detached claude turn stamps the step row but never persists .session.
 
@@ -223,7 +268,8 @@ def test_claude_stream_records_full_per_invocation_cost() -> None:
 
     render_stream(node, agent='claude', step_id=2, detached=False, input=input_stream)
 
-    # recorded as-is (0.05), NOT 0.05 - 0.10 (the old, wrong cumulative-delta)
+    # recorded as-is (0.05), NOT 0.05 - 0.10 (a cumulative-delta subtraction
+    # would be wrong here -- claude's figure is per-invocation)
     node.step_cost.assert_called_once_with(step_id=2, cost=0.05)
 
 
@@ -267,6 +313,181 @@ def test_claude_stream_normal_result_leaves_no_budget_marker(
     )
     render_stream(None, agent='claude', input=input_stream)
     assert not (tmp_path / '.budget_exceeded').exists()
+
+
+def test_claude_stream_truncated_records_accumulated_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream cut before the result still records the metered cost.
+
+    A timeout- or SIGKILL-terminated agent never emits its ``result``
+    frame: the assistant messages' usage must have been priced and
+    recorded by then, or the step bills $0 and every cap and ledger is
+    blind to the spend.
+    """
+    monkeypatch.setattr(utils, '_load_pricing', lambda: _CLAUDE_PRICING)
+    node = MagicMock()
+    input_stream = _stream_lines(
+        {'type': 'system', 'subtype': 'init', 'session_id': 'sess_cut'},
+        {
+            'type': 'assistant',
+            'message': {'usage': _USAGE_FIRST},
+        },
+        {
+            'type': 'assistant',
+            'message': {'usage': _USAGE_SECOND},
+        },
+        # no result frame: the agent was killed here
+    )
+
+    render_stream(
+        node,
+        agent='claude',
+        step_id=11,
+        model='claude-fable-5',
+        input=input_stream,
+    )
+
+    recorded = node.step_cost.call_args.kwargs['cost']
+    assert recorded == pytest.approx(_USAGE_FIRST_COST + _USAGE_SECOND_COST)
+
+
+def test_claude_stream_survives_missing_pricing_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A claude stream with no pricing cache degrades to unpriced, not a crash.
+
+    ``needs_pricing`` gates the run-start cache bootstrap to token-priced
+    agents, so a claude-only host may carry no ``~/.fractal/pricing.json`` at
+    all -- best-effort accrual must skip pricing (no flush), never break the
+    stream pipeline mid-step.
+    """
+    monkeypatch.setattr(utils, '_PRICING_CACHE', str(tmp_path / 'absent.json'))
+    utils._load_pricing.cache_clear()
+    node = MagicMock()
+    input_stream = _stream_lines(
+        {'type': 'system', 'subtype': 'init', 'session_id': 'sess_nocache'},
+        {'type': 'assistant', 'message': {'usage': _USAGE_FIRST}},
+        {'type': 'result', 'session_id': 'sess_nocache', 'total_cost_usd': 0.5},
+    )
+
+    render_stream(
+        node,
+        agent='claude',
+        step_id=12,
+        model='claude-fable-5',
+        input=input_stream,
+    )
+    utils._load_pricing.cache_clear()
+
+    # the unpriceable assistant frame flushed nothing; the result frame's
+    # authoritative figure is the only recorded cost
+    assert node.step_cost.call_count == 1
+    assert node.step_cost.call_args.kwargs['cost'] == 0.5
+
+
+def test_claude_stream_flushes_cost_per_assistant_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cost is flushed as each assistant message arrives, not at stream end.
+
+    ``_stream`` itself can die by signal (an out-of-band pane kill), so an
+    end-of-stream write is not durable enough -- each priced assistant
+    event must already be in the step row when the next one arrives.
+    """
+    monkeypatch.setattr(utils, '_load_pricing', lambda: _CLAUDE_PRICING)
+    node = MagicMock()
+    input_stream = _stream_lines(
+        {'type': 'assistant', 'message': {'usage': _USAGE_FIRST}},
+        {'type': 'assistant', 'message': {'usage': _USAGE_SECOND}},
+    )
+
+    render_stream(
+        node,
+        agent='claude',
+        step_id=12,
+        model='claude-fable-5',
+        input=input_stream,
+    )
+
+    costs = [call.kwargs['cost'] for call in node.step_cost.call_args_list]
+    assert costs == [
+        pytest.approx(_USAGE_FIRST_COST),
+        pytest.approx(_USAGE_FIRST_COST + _USAGE_SECOND_COST),
+    ]
+
+
+def test_claude_stream_result_overwrites_accumulated_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The authoritative result cost replaces the accumulated estimate.
+
+    Claude's ``total_cost_usd`` includes spend the per-event estimate
+    cannot see (subagents, server-side tools), so a normally-ended step
+    must record exactly the result figure, never the estimate.
+    """
+    monkeypatch.setattr(utils, '_load_pricing', lambda: _CLAUDE_PRICING)
+    node = MagicMock()
+    input_stream = _stream_lines(
+        {'type': 'assistant', 'message': {'usage': _USAGE_FIRST}},
+        {'type': 'result', 'duration_ms': 1000, 'total_cost_usd': 0.9, 'num_turns': 1},
+    )
+
+    render_stream(
+        node,
+        agent='claude',
+        step_id=13,
+        model='claude-fable-5',
+        input=input_stream,
+    )
+
+    assert node.step_cost.call_args.kwargs['cost'] == 0.9
+
+
+def test_claude_stream_unpriced_model_accumulates_no_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown/unpriced model accumulates nothing rather than crashing.
+
+    Mirrors the codex behavior: without a priceable model the estimate
+    is impossible, so a truncated stream records no cost (the result
+    frame, when present, still records claude's own figure).
+    """
+    monkeypatch.setattr(utils, '_load_pricing', lambda: {})
+    node = MagicMock()
+    input_stream = _stream_lines(
+        {'type': 'assistant', 'message': {'usage': _USAGE_FIRST}},
+    )
+
+    render_stream(
+        node,
+        agent='claude',
+        step_id=14,
+        model='mystery',
+        input=input_stream,
+    )
+
+    node.step_cost.assert_not_called()
+
+
+def test_compute_claude_cost_prices_disjoint_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anthropic usage buckets are disjoint and each priced at its own rate."""
+    monkeypatch.setattr(utils, '_load_pricing', lambda: _CLAUDE_PRICING)
+    cost = utils._compute_claude_cost(_USAGE_FIRST, 'claude-fable-5')
+    assert cost == pytest.approx(_USAGE_FIRST_COST)
+
+
+def test_compute_claude_cost_unpriced_model_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown or rate-less model prices to ``None``, never $0."""
+    monkeypatch.setattr(utils, '_load_pricing', lambda: {'bare': {}})
+    assert utils._compute_claude_cost(_USAGE_FIRST, 'mystery') is None
+    assert utils._compute_claude_cost(_USAGE_FIRST, 'bare') is None
+    assert utils._compute_claude_cost(_USAGE_FIRST, None) is None
 
 
 def test_codex_stream_renders_records_and_captures(
@@ -508,6 +729,36 @@ def test_codex_stream_increment_never_negative(monkeypatch: pytest.MonkeyPatch) 
     assert node.recorded[2] == 0.0
 
 
+def test_codex_stream_flushes_cost_per_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Codex cost is flushed at each turn summary, not only at stream end.
+
+    Same durability property as the claude per-event flush: if ``_stream``
+    dies by signal mid-stream (a pane kill), the last completed turn's
+    increment must already be on the step row.
+    """
+    monkeypatch.setattr(utils, '_load_pricing', lambda: _PRICING)
+    node = _FakeNode([{'step_id': 8, 'session': None, 'cost': None}])
+    calls: list[float] = []
+    original = node.step_cost
+
+    def counting(*, step_id: int, cost: float) -> None:
+        calls.append(cost)
+        original(step_id=step_id, cost=cost)
+
+    node.step_cost = counting  # type: ignore[method-assign]
+    input_stream = _stream_lines(
+        {'type': 'turn.completed', 'usage': {'input_tokens': 100, 'output_tokens': 10}},
+        {'type': 'turn.completed', 'usage': {'input_tokens': 300, 'output_tokens': 30}},
+    )
+
+    render_stream(node, agent='codex', step_id=8, model='o3', input=input_stream)
+
+    # one flush per turn (cumulative snapshots), plus the end-of-stream record
+    assert calls[0] == pytest.approx(0.00018)
+    assert calls[-1] == pytest.approx(0.00054)
+    assert len(calls) >= 2
+
+
 def test_compute_codex_cost_floors_uncached_at_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -532,6 +783,33 @@ _PRICING = {
         'cache_read_input_token_cost': 1e-7,
     },
 }
+
+# claude pricing with all four Anthropic bucket rates distinct, so a bucket
+# priced at the wrong rate (or dropped) breaks the expected figure -- used by
+# the truncated-stream cost-recording tests
+_CLAUDE_PRICING = {
+    'claude-fable-5': {
+        'input_cost_per_token': 3e-6,
+        'output_cost_per_token': 1.5e-5,
+        'cache_read_input_token_cost': 3e-7,
+        'cache_creation_input_token_cost': 3.75e-6,
+    },
+}
+
+# per-call usage fixtures (Anthropic convention: buckets are disjoint;
+# input_tokens EXCLUDES the cache buckets) and their hand-computed costs
+_USAGE_FIRST = {
+    'input_tokens': 100,
+    'cache_creation_input_tokens': 1000,
+    'cache_read_input_tokens': 10000,
+    'output_tokens': 200,
+}
+_USAGE_FIRST_COST = 100 * 3e-6 + 1000 * 3.75e-6 + 10000 * 3e-7 + 200 * 1.5e-5
+_USAGE_SECOND = {
+    'input_tokens': 50,
+    'output_tokens': 100,
+}
+_USAGE_SECOND_COST = 50 * 3e-6 + 100 * 1.5e-5
 
 
 class _FakeDB:

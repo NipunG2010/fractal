@@ -23,7 +23,7 @@ Covered (contract pinned from the ``--detached``/``--sync`` help + ``modes/``):
   a normal launch does not.
 - **per-step ``agent:`` frontmatter** -- a step's ``agent:`` override switches just
   that step's agent (others keep the base); in a continuous node each agent keeps its
-  own woven session across the steps it runs, so the override no longer requires
+  own woven session across the steps it runs, so the override does not require
   detached mode.
 - **approval-wait SYNC honors ``--no-sync``** -- while the loop blocks on a
   ``requires_approval`` step it periodically runs ``modes/SYNC.md`` so the node
@@ -38,6 +38,12 @@ Covered (contract pinned from the ``--detached``/``--sync`` help + ``modes/``):
   (SYNC prompts during the wait when enabled, silent polling under ``--no-sync``);
   and a short ``--timeout`` interrupts the wait -> force-commit + run end while
   the child is still active (the run terminates rather than hanging).
+- **timeout force-commit bypasses hooks** -- the timeout backstop's ``--force``
+  commit lands dirty work past a hard-failing host pre-commit hook (every call
+  site is ``|| true``, so a hook veto would silently lose the work).
+- **resume preserves operator seed edits** -- ``--resume``'s working-tree
+  restore commits dirty node-dir paths (operator-attributed, ``--no-verify``)
+  before its checkout/clean, so between-run steering edits survive a resume.
 
 The finish-wait scenarios drive the wait deterministically with a **gate**: the
 stub blocks a designated step on a marker file until the driver releases it,
@@ -47,27 +53,32 @@ set the loop's-own-run finish signal before the commit-step gate is reached.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import io
 import json
 import os
 import pathlib
 import shutil
+import signal
 import subprocess
 import time
+import uuid
+from collections.abc import Callable, Iterator
 from typing import Any, Optional
 
 import pytest
 
 from tests._helpers import _git
 
-from .conftest import _cli_env, _run, _worktree_root
+from .conftest import _cli_env, _reap_group, _run, _run_reaped, _worktree_root
 
 __all__ = [
     'test_sync_runs_before_every_step',
     'test_session_wiring_continuous_vs_detached',
     'test_resume_mode_injects_resume_doc',
     'test_max_iters_is_per_run_budget_across_resumes',
+    'test_resume_commits_operator_seed_edits_instead_of_discarding',
     'test_per_step_agent_override_runs_in_detached',
     'test_per_step_agent_override_weaves_sessions',
     'test_codex_continuous_session_weaving',
@@ -75,22 +86,37 @@ __all__ = [
     'test_finish_waits_for_children_before_commit',
     'test_finish_wait_sync_respects_sync_flag',
     'test_finish_wait_interrupted_by_timeout',
+    'test_run_end_wait_books_no_step_rows_after_iteration_close',
     'test_subtree_cost_ceiling_finishes_the_run',
     'test_total_cost_reserve_ends_run_after_one_winddown',
+    'test_reserve_boundary_keys_on_max_cost_not_max_iter_cost',
+    'test_midrun_cap_retune_takes_effect_next_iteration',
+    'test_midrun_max_iters_retune_takes_effect_at_boundary',
+    'test_precap_death_heals_registry_drift_on_exit',
     'test_single_step_overshoot_ends_via_reserve_boundary',
     'test_over_budget_winddown_step_is_skipped_not_run',
     'test_no_cost_cap_leaves_step_uncapped',
     'test_reserve_window_caps_step_at_remaining',
     'test_iter_cost_reserve_continues_next_iteration',
+    'test_step_header_stays_self_consistent_across_midrun_retune',
     'test_goal_finish_records_completed',
+    'test_self_finish_over_cap_records_exited',
+    'test_cascaded_budget_finish_records_exited',
     'test_codex_preflight_probe_aborts_on_model_rejection',
     'test_codex_preflight_failure_is_loud_and_recoverable',
     'test_codex_preflight_runs_without_timeout_binary',
     'test_stop_during_approval_wait_records_iteration_stopped',
     'test_run_exits_with_status_exited_on_timeout',
+    'test_timeout_killed_step_records_partial_cost',
+    'test_timeout_pre_flush_kill_marks_step_unpriced',
+    'test_timeout_force_commit_bypasses_a_failing_hook',
     'test_failing_setup_records_iteration_failed_not_loop_brick',
+    'test_setup_failure_cap_ends_run_exited',
+    'test_setup_log_is_git_invisible_after_run',
+    'test_setup_runs_from_worktree_root_cwd',
     'test_run_completes_when_max_iters_reached',
     'test_iter_failure_reason_names_missing_steps_not_agent',
+    'test_gate_teardown_reaps_full_process_group',
 ]
 
 # distinctive lines lifted from the seed mode docs -- present in a prompt only
@@ -111,9 +137,10 @@ _GATE_MARKER = 'GATE-AND-WAIT'
 # fake claude/codex on PATH; records per invocation: the agent name (basename
 # of $0), the session flag+id if any (the continuous-mode wiring), and the step
 # prompt; claude emits a stream-json result so fractal _stream records the
-# step's cost (as a real run would); codex is invoked directly by the loop (no
-# stream pipe), so it only needs to exit 0; a prompt carrying _GATE_MARKER arms the
-# gate: the stub touches gate_ready and blocks until gate_release appears, so
+# step's cost (as a real run would); codex rides the same fractal _stream pipe
+# but is priced from tokens, so the stub only emits thread.started (persisting
+# the thread id for the weave) and exits 0; a prompt carrying _GATE_MARKER arms
+# the gate: the stub touches gate_ready and blocks until gate_release appears, so
 # the driver gets a deterministic mid-step pause (children unchanged) to set the
 # loop's finish signal before the commit-step gate is reached -- inert otherwise
 _AGENT_STUB = """#!/usr/bin/env bash
@@ -167,6 +194,21 @@ if [[ "$SELF" == "claude" ]]; then
     SID="${SESSION##* }"
     [[ -n "$SID" ]] || SID=$(uuidgen | tr '[:upper:]' '[:lower:]')
     printf '{"type":"system","subtype":"init","session_id":"%s"}\\n' "$SID"
+    # a prompt carrying USAGE-THEN-HANG emits one usage-bearing frame and hangs
+    # with NO result, so the timeout kill yields the killed-mid-stream shape;
+    # the usage_flushed marker tells load starvation from a recording gap
+    if [[ "$PROMPT" == *USAGE-THEN-HANG* ]]; then
+        printf '{"type":"assistant","session_id":"%s","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":1000,"cache_read_input_tokens":10000,"output_tokens":200}}}\\n' "$SID"
+        touch "$CAPTURE_DIR/usage_flushed"
+        exec sleep 60
+    fi
+    # a prompt carrying INIT-THEN-HANG hangs right after the init frame -- the
+    # timeout kill lands BEFORE any usage flush (session captured, cost never
+    # recorded); the marker tells load starvation from a streamed-then-hung stub
+    if [[ "$PROMPT" == *INIT-THEN-HANG* ]]; then
+        touch "$CAPTURE_DIR/init_hung"
+        exec sleep 60
+    fi
     printf '{"type":"result","session_id":"%s","total_cost_usd":%s,"num_turns":1,"duration_ms":1}\\n' \
         "$SID" "${STUB_COST:-0.001}"
 else
@@ -214,6 +256,35 @@ _GATE_STEPS = {
     '02-commit.md': '# Commit\n\nCommit step.\n',
 }
 
+# the hang step's body arms the stub's usage-then-hang mode (see the stub): a
+# short run timeout kills the agent mid-stream, after one priced frame
+_USAGE_HANG_MARKER = 'USAGE-THEN-HANG'
+_USAGE_HANG_STEPS = {
+    '01-hang.md': f'# Hang\n\nHanging step. {_USAGE_HANG_MARKER}\n',
+    '02-commit.md': '# Commit\n\nCommit step.\n',
+}
+
+# the init-hang step's body arms the stub's init-then-hang mode: a short run
+# timeout kills the agent before its first usage flush -- the unpriced window
+_INIT_HANG_MARKER = 'INIT-THEN-HANG'
+_INIT_HANG_STEPS = {
+    '01-hang.md': f'# Hang\n\nHanging step. {_INIT_HANG_MARKER}\n',
+    '02-commit.md': '# Commit\n\nCommit step.\n',
+}
+
+# rates + expected cost for the killed-step assertion (Anthropic convention:
+# disjoint buckets); the usage figures must match the stub's emitted frame
+_STUB_MODEL = 'claude-fable-5'
+_STUB_PRICING = {
+    _STUB_MODEL: {
+        'input_cost_per_token': 3e-6,
+        'output_cost_per_token': 1.5e-5,
+        'cache_read_input_token_cost': 3e-7,
+        'cache_creation_input_token_cost': 3.75e-6,
+    },
+}
+_STUB_USAGE_COST = 100 * 3e-6 + 1000 * 3.75e-6 + 10000 * 3e-7 + 200 * 1.5e-5
+
 # banners the wait emits -- distinctive lines a test can grep from the teed log
 _WAIT_BANNER = 'waiting for child nodes to finish'  # wait_for_children entry
 _DRAINED_BANNER = 'all child nodes finished'  # every child went non-active
@@ -228,7 +299,9 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     ``_make_node`` so their configs never interfere. ``claude`` and ``codex`` are
     the same recording stub under two names (it keys on ``basename $0``).
     """
-    root = tmp_path_factory.mktemp('run_modes')
+    # tmux session names embed this dirname machine-wide: a run-unique suffix
+    # keeps sibling suite runs and stale leaked sessions from duplicate-colliding
+    root = tmp_path_factory.mktemp(f'run_modes_{uuid.uuid4().hex[:8]}')
     _git(root, 'init', '-b', 'main')
     _git(root, 'config', 'user.email', 'runmodes@test.local')
     _git(root, 'config', 'user.name', 'runmodes')
@@ -253,7 +326,7 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
 
 
 @pytest.fixture(autouse=True)
-def _kill_repo_sessions(repo: dict[str, Any]) -> Any:
+def _kill_repo_sessions(repo: dict[str, Any]) -> Iterator[None]:
     """Reap the exact tmux sessions a test started, on teardown.
 
     ``_register_active_child`` records each tmux session it starts (so the
@@ -414,6 +487,42 @@ def test_max_iters_is_per_run_budget_across_resumes(repo: dict) -> None:
     assert recorded == ['1', '1'], recorded
 
 
+def test_resume_commits_operator_seed_edits_instead_of_discarding(repo: dict) -> None:
+    """Uncommitted seed edits made between runs survive a ``--resume``.
+
+    The seed's documented steering flow edits ``NODE.md`` in the stopped node's
+    worktree between runs, uncommitted; resume's working-tree restore
+    (``checkout -- .`` + ``clean -fd``) must not silently revert it. The resume
+    block commits dirty node-dir paths (operator-attributed) before its clean,
+    so the edit both survives in the tree and is reachable from ``HEAD`` --
+    the committed-baseline invariant and the edit-to-steer contract hold at
+    once.
+    """
+    node = _make_node(repo, 'seededit', detached=False, sync=False, commit=True)
+    # first run completes normally
+    _, first = _run_loop(repo, node, capture_name='seededit_1')
+    assert first.returncode == 0, first.stderr
+    # operator steering between runs: NODE.md edited, deliberately uncommitted
+    node_md = node['node_dir'] / 'NODE.md'
+    original = node_md.read_text(encoding='utf-8')
+    node_md.write_text(
+        original + '\nOPERATOR-STEERING-EDIT: current phase is 2.\n',
+        encoding='utf-8',
+    )
+    # resumed launch: the restore must preserve the edit, not discard it
+    _, second = _run_loop(repo, node, capture_name='seededit_2', resume=True)
+    assert second.returncode == 0, second.stderr
+    survived = node_md.read_text(encoding='utf-8')
+    assert 'OPERATOR-STEERING-EDIT' in survived
+    # the edit is committed before the clean, so HEAD carries it too
+    committed = _git(
+        node['worktree'],
+        'show',
+        'HEAD:.fractal/main.seededit/NODE.md',
+    ).stdout
+    assert 'OPERATOR-STEERING-EDIT' in committed
+
+
 # ------ per-step agent: frontmatter
 
 
@@ -468,7 +577,7 @@ def test_codex_continuous_session_weaving(repo: dict) -> None:
 
     Step 1 runs ``exec -C`` (new thread); ``fractal _stream`` records the codex
     thread id (from ``thread.started``) to ``.session``; step 2 runs ``exec resume
-    <same id>``. The stub now emits ``thread.started``, covering this round-trip.
+    <same id>``. The stub emits ``thread.started``, covering this round-trip.
     """
     node = _make_node(repo, 'codexweave', detached=False, sync=False, agent='codex')
     calls, result = _run_loop(repo, node, capture_name='codexweave')
@@ -558,6 +667,11 @@ def test_finish_waits_for_children_before_commit(repo: dict) -> None:
     try:
         # park at the gate step, then finish (run now exists) with the child active
         assert _await_gate(capture, deadline=time.monotonic() + 60), log.read_text()
+        # the parked run recorded its live process group beside .status -- the
+        # handle kill/reconcile reap an orphaned agent by
+        pgid_file = node['node_dir'] / '.pgid'
+        assert pgid_file.exists(), 'run start must record .pgid'
+        os.killpg(int(pgid_file.read_text(encoding='utf-8').strip()), 0)
         active = _run(
             worktree,
             'node',
@@ -592,6 +706,8 @@ def test_finish_waits_for_children_before_commit(repo: dict) -> None:
     assert _DRAINED_BANNER in result.stdout, result.stdout
     commit_calls = [n for n, c in calls.items() if 'Commit step' in c['prompt']]
     assert commit_calls, (calls, result.stdout)
+    # the in-band exit dropped the pgid handle -- nothing left to reap
+    assert not pgid_file.exists()
 
 
 @pytest.mark.parametrize('sync', [True, False])
@@ -697,6 +813,73 @@ def test_finish_wait_interrupted_by_timeout(repo: dict) -> None:
     assert active == '1', active
 
 
+def test_run_end_wait_books_no_step_rows_after_iteration_close(repo: dict) -> None:
+    """The run-end child drain books no SYNC step rows against a closed iteration.
+
+    After the final ``iter _end`` a finishing run drains its children
+    (``wait_for_children "run end"``) before the loop exits. The wait SYNC is
+    gated on a live iteration, but ``ITER_ID`` survives iteration close, so a
+    gate keyed on ``ITER_ID`` alone would book a zombie SYNC row against the
+    already-closed iteration on every poll -- each instant and cost-free,
+    because the over-budget guard skips the launch inside the reserve window.
+    Reserve boundary + an active child open exactly that window: the run ends
+    after one wind-down iteration, the wait engages and drains, and the steps
+    table must carry no row started after its own iteration ended.
+    """
+    node = _make_node(
+        repo,
+        'zombierows',
+        detached=False,
+        sync=True,
+        max_iters=2,
+    )
+    worktree = node['worktree']
+    # an active child at run end is what arms the wait -- a childless run
+    # returns before any booking could happen; register it before the cost
+    # cap lands (a capped parent rejects a capless child at init)
+    child = _register_active_child(repo, node, 'kid')
+    # cap the run and carve a wide reserve so the boundary ends it after one
+    # iteration (with sync on, the pre-step SYNCs bill too -- it still trips)
+    assert _run(worktree, 'config', '_set', 'max_cost=1.0').returncode == 0
+    assert _run(worktree, 'config', '_set', 'reserve_budget=0.7').returncode == 0
+
+    proc, capture, log = _launch_finish_wait(
+        repo, node, capture_name='zombie_rows', stub_cost='0.4'
+    )
+    try:
+        # the loop reaches the run-end wait on its own (reserve boundary after
+        # iteration 1); let it spin several poll intervals (WAIT_SECONDS=1) so
+        # a zombie booking -- if the gate leaks one -- has fired, then drain
+        assert _await_log(
+            log,
+            'waiting for child nodes to finish (run end)',
+            deadline=time.monotonic() + 90,
+        ), log.read_text()
+        time.sleep(3)
+        assert _run(child, '_status', 'completed').returncode == 0
+    finally:
+        _, result = _finish_wait_result(proc, capture, log)
+
+    # the wait engaged and drained -- the zombie window was really open
+    assert _DRAINED_BANNER in result.stdout, result.stdout
+    # the run itself landed terminal via the boundary (exited, not hung)
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'exited', result.stdout
+    # the zombie signature: step rows started after their iteration ended
+    zombies = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            'SELECT COUNT(*) FROM steps JOIN iters ON steps.iter_id = iters.iter_id'
+            ' WHERE steps.started_at > iters.ended_at',
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert zombies == '0', (zombies, result.stdout)
+
+
 def test_subtree_cost_ceiling_finishes_the_run(repo: dict) -> None:
     """A subtree-budget abort ends the run ``exited``/1, not ``completed``/0.
 
@@ -789,6 +972,233 @@ def test_total_cost_reserve_ends_run_after_one_winddown(repo: dict) -> None:
         .splitlines()[-1]
     )
     assert run == 'exited/1', (run, result.stdout)
+    # the recorded reason carries the boundary's operands (spent/max/reserve),
+    # so a run or signal row is self-diagnosing without config archaeology
+    reason = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            'SELECT metadata FROM runs ORDER BY rowid DESC LIMIT 1',
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert 'cost budget reserve reached (spent $' in reason, (reason, result.stdout)
+    assert 'reserve)' in reason, (reason, result.stdout)
+
+
+def test_reserve_boundary_keys_on_max_cost_not_max_iter_cost(repo: dict) -> None:
+    """The reserve threshold is ``max_cost - reserve_budget``, never iter-cap keyed.
+
+    An iter-cap-keyed threshold would fire early wherever ``max_iter_cost``
+    sits below ``max_cost``, and such a mis-fire is indistinguishable from
+    a correct reserve stop without this pin: with a ``max_iter_cost`` below
+    ``max_cost`` and spend ($0.90) at/above every iter-keyed threshold yet
+    below the true one ($1.08), the boundary must not fire -- the run ends
+    by ``--max-iters``, ``completed``/0.
+    """
+    node = _make_node(
+        repo,
+        'keyed',
+        detached=False,
+        sync=False,
+        max_iters=1,
+        max_cost=1.2,
+    )
+    worktree = node['worktree']
+    # a wrong-key threshold would sit at or below the iteration spend: two $0.45
+    # steps spend $0.90 >= 0.95 - 0.12 (iter-cap keyed) but < 1.2 - 0.12 (true);
+    # max_iter_cost stays above the $0.90 iteration so no iter machinery fires
+    assert _run(worktree, 'config', '_set', 'max_iter_cost=0.95').returncode == 0
+    assert _run(worktree, 'config', '_set', 'reserve_budget=0.12').returncode == 0
+    calls, result = _run_loop(repo, node, capture_name='keyed', stub_cost='0.45')
+
+    # both steps ran and no budget stop fired -- the run ended by max-iters alone
+    assert len(calls) == 2, (calls, result.stdout)
+    assert 'Total cost budget reserve reached' not in result.stdout, result.stdout
+    assert 'Subtree cost budget reached' not in result.stdout, result.stdout
+    run = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT status || '/' || exit_code FROM runs ORDER BY rowid DESC LIMIT 1",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert run == 'completed/0', (run, result.stdout)
+
+
+def test_midrun_cap_retune_takes_effect_next_iteration(repo: dict) -> None:
+    """A mid-run config cap edit is enforced at the next iteration boundary.
+
+    Cap keys read once at run start would leave a post-spawn retune -- a
+    direct config edit or a ``fractal node update`` -- silently ignored by
+    enforcement until the next run (nodes killed at a stale cap, raises never
+    honored mid-run). Here iteration 1's setup drops ``max_cost`` from $5 to
+    $0.10 while the two $0.40 steps spend $0.80: the iteration-2 boundary
+    must pick up the new cap and end the run in the budget family instead of
+    burning to ``--max-iters``, and the drifted registry row (still at the
+    spawn-time cap, fooling every ``node list`` reader) must be healed
+    config->registry with a loud warning.
+    """
+    node = _make_node(
+        repo,
+        'retune',
+        detached=False,
+        sync=False,
+        max_iters=2,
+        max_cost=5.0,
+    )
+    worktree = node['worktree']
+    # iteration 1's setup lowers the cap below the spend the two steps leave
+    # behind -- a mid-run retune, invisible to a run-start-only cap read (the
+    # reserve shrinks with it: init's 10% default fails the <99%-of-cap check)
+    setup = node['node_dir'] / 'scripts' / 'setup.sh'
+    setup.write_text(
+        '#!/usr/bin/env bash\n'
+        f'fractal config _set max_cost=0.1 reserve_budget=0.005 --path="{worktree}"\n',
+        encoding='utf-8',
+    )
+    calls, result = _run_loop(repo, node, capture_name='retune', stub_cost='0.4')
+
+    # iteration 2 stopped at the refreshed cap instead of running both steps
+    # at the stale one and closing completed/0 "Reached max iterations"
+    assert len(calls) < 4, (sorted(calls), result.stdout)
+    assert 'cost budget' in result.stdout, result.stdout
+    assert 'Reached max iterations' not in result.stdout, result.stdout
+    run = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT status || '/' || exit_code FROM runs ORDER BY rowid DESC LIMIT 1",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert run == 'exited/1', (run, result.stdout)
+    # the drifted registry row was healed config->registry, loudly
+    assert '!= registry' in result.stdout, result.stdout
+    assert 'max_cost=0.1' in result.stdout, result.stdout
+    row_cap = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT max_cost FROM nodes WHERE node = 'main.retune'",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert row_cap == '0.1', (row_cap, result.stdout)
+
+
+def test_midrun_max_iters_retune_takes_effect_at_boundary(repo: dict) -> None:
+    """A mid-run ``max_iters`` raise is honored at the next loop-top gate.
+
+    ``max_iters``'s stop gate runs before the per-iteration cost-cap re-read
+    block, so an arm-once-at-process-start cap would pin a live loop to its
+    stale value however config is retuned (a loop stopped at its old cap
+    while config reads higher with budget remaining). Here iteration 1's
+    setup raises ``max_iters`` from 1 to 2: the next boundary must re-read
+    the cap and run iteration 2 instead of closing the run at the stale 1.
+    """
+    node = _make_node(repo, 'itersup', detached=False, sync=False, max_iters=1)
+    worktree = node['worktree']
+    # iteration 1's setup raises the cap -- a mid-run retune, invisible to a
+    # run-start-only cap read (setup runs after this iteration's caps armed)
+    setup = node['node_dir'] / 'scripts' / 'setup.sh'
+    setup.write_text(
+        f'#!/usr/bin/env bash\nfractal config _set max_iters=2 --path="{worktree}"\n',
+        encoding='utf-8',
+    )
+    calls, result = _run_loop(repo, node, capture_name='itersup')
+
+    # the raised cap reached the loop-top gate: iteration 2 ran its two
+    # steps and the run closed at the new cap, not the stale spawn-time one
+    assert len(calls) == 4, (sorted(calls), result.stdout)
+    assert 'Reached max iterations (2)' in result.stdout, result.stdout
+    iters = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT COUNT(*) FROM iters WHERE node = 'main.itersup'",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert iters == '2', (iters, result.stdout)
+    run = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT status || '/' || exit_code FROM runs ORDER BY rowid DESC LIMIT 1",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert run == 'completed/0', (run, result.stdout)
+
+
+def test_precap_death_heals_registry_drift_on_exit(repo: dict) -> None:
+    """A pre-boundary death still leaves the registry row healed, loudly.
+
+    A mid-iteration cap raise cannot rescue the current iteration (cap edits
+    land at the next boundary; ceiling checks hold iteration-start values),
+    so a child crossing its old cap dies before the boundary reconcile that
+    would have healed config->registry ever runs -- and without an exit-trap
+    heal the dead row would keep the drift forever. Here iteration 1's setup
+    raises the $0.30 cap to $22.50 while step 1 spends $0.40: the subtree
+    ceiling ends the run at the old cap before step 2, and the exit trap
+    must still leave the dead registry row reading config truth.
+    """
+    node = _make_node(
+        repo,
+        'healexit',
+        detached=False,
+        sync=False,
+        max_iters=1,
+        max_cost=0.3,
+    )
+    worktree = node['worktree']
+    # iteration 1's setup raises the cap in config only -- the rescue attempt
+    # that cannot reach this iteration's enforcement (caps read at run start)
+    setup = node['node_dir'] / 'scripts' / 'setup.sh'
+    setup.write_text(
+        f'#!/usr/bin/env bash\nfractal config _set max_cost=22.5 --path="{worktree}"\n',
+        encoding='utf-8',
+    )
+    calls, result = _run_loop(repo, node, capture_name='healexit', stub_cost='0.4')
+
+    # the raise rescued nothing: step 1's $0.40 crossed the old $0.30 cap and
+    # the ceiling stopped step 2 from launching
+    assert len(calls) == 1, (sorted(calls), result.stdout)
+    # the exit-trap heal left the dead row reading config truth, loudly
+    assert '!= registry' in result.stdout, result.stdout
+    assert 'max_cost=22.5' in result.stdout, result.stdout
+    row_cap = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT max_cost FROM nodes WHERE node = 'main.healexit'",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert row_cap == '22.5', (row_cap, result.stdout)
 
 
 def test_single_step_overshoot_ends_via_reserve_boundary(repo: dict) -> None:
@@ -841,14 +1251,14 @@ def test_over_budget_winddown_step_is_skipped_not_run(repo: dict) -> None:
 
     The subtree ceiling stops a node at its cap, but it is disarmed once finish
     is set -- so a wind-down step can reach ``run_step`` already over budget,
-    where its ``--max-budget-usd`` leash is empty (remaining clamps to 0). That
-    used to launch the step *uncapped* at the worst moment; the loop now skips
-    the launch. With the run over its ``--max-cost`` and finish set, the commit
-    (last) step's agent is never invoked, the step is recorded ``stopped`` with
-    an ``over budget`` reason, and the iteration is not failed -- the
-    force-commit backstop still saves the work. The gate parks step 1 (whose
-    $1.00 spend blows the $0.50 cap) so finish can be set mid-iteration; with no
-    child the commit step is reached at once.
+    where its ``--max-budget-usd`` leash is empty (remaining clamps to 0). An
+    empty leash would launch the step *uncapped* at the worst moment, so the
+    loop skips the launch instead. With the run over its ``--max-cost`` and
+    finish set, the commit (last) step's agent is never invoked, the step is
+    recorded ``stopped`` with an ``over budget`` reason, and the iteration is
+    not failed -- the force-commit backstop still saves the work. The gate
+    parks step 1 (whose $1.00 spend blows the $0.50 cap) so finish can be set
+    mid-iteration; with no child the commit step is reached at once.
     """
     node = _make_node(
         repo,
@@ -912,8 +1322,8 @@ def test_no_cost_cap_leaves_step_uncapped(repo: dict) -> None:
 
     The skip/cap machinery is reserved for a *configured* budget: a node with no
     ``--max-cost``/``--max-iter-cost``/``--max-step-cost`` passes no per-step leash
-    at all, so both steps launch uncapped (an empty budget flag), exactly as before
-    -- the fix must not turn "no cap configured" into a zero/trip-immediately cap.
+    at all, so both steps launch uncapped (an empty budget flag) -- the skip
+    machinery must not turn "no cap configured" into a zero/trip-immediately cap.
     """
     node = _make_node(repo, 'nocap', detached=False, sync=False)
     calls, result = _run_loop(repo, node, capture_name='nocap')
@@ -932,8 +1342,8 @@ def test_reserve_window_caps_step_at_remaining(repo: dict) -> None:
     to the full remaining and handed to the step as its leash. Mirrors the
     reserve-boundary test: ``--max-cost 1.0``, a $0.70 reserve, $0.40/step. Step 2
     enters RESERVE ($0.60 remaining <= the reserve) yet must still *run*, capped at
-    ~$0.60 -- never skipped and never zero -- proving the fix did not swallow the
-    floor.
+    ~$0.60 -- never skipped and never zero -- proving the skip path does not
+    swallow the floor.
     """
     node = _make_node(
         repo,
@@ -961,7 +1371,7 @@ def test_reserve_window_caps_step_at_remaining(repo: dict) -> None:
 def test_iter_cost_reserve_continues_next_iteration(repo: dict) -> None:
     """Per-iteration-cost reserve steers the iteration but does NOT end the run.
 
-    The total-cost-vs-per-iter-cost split is the change's other half: a
+    The total-cost-vs-per-iter-cost split is the reserve contract's other half: a
     ``--max-iter-cost`` node (with no ``--max-cost``) that hits its per-iteration
     cap is steered into RESERVE for the rest of that iteration, then continues
     with a fresh per-iter budget next iteration -- the boundary run-end is gated
@@ -1003,12 +1413,67 @@ def test_iter_cost_reserve_continues_next_iteration(repo: dict) -> None:
     assert run == 'completed/0', (run, result.stdout)
 
 
+def test_step_header_stays_self_consistent_across_midrun_retune(repo: dict) -> None:
+    """A mid-run retune never splits the step header's budget figures.
+
+    The step-context ``Cost budget`` line is rebuilt per step: a remaining
+    taken live from the CLI (which reads CURRENT config) beside ``of $X`` /
+    ``max $Y/iter`` labels stamped from the loop's iteration-start cap globals
+    would let a retune landing mid-iteration render new-cap remaining beside
+    old-cap labels. Caps are immutable within an iteration by design, so the
+    honest header holds SELF-CONSISTENT iteration-start figures until the
+    retune lands at the next boundary. The gate parks the loop mid-step-1
+    while the driver retunes both cost keys (``config _set`` -- the loop's
+    read contract is config): the same iteration's next header must still
+    read the pinned caps with a remaining computed against them, and the
+    next iteration's headers must carry the retuned figures.
+    """
+    node = _make_node(
+        repo,
+        'hdrretune',
+        detached=False,
+        sync=False,
+        steps=_GATE_STEPS,
+        max_iters=2,
+        max_cost=100.0,
+    )
+    worktree = node['worktree']
+    assert _run(worktree, 'config', '_set', 'max_iter_cost=40.0').returncode == 0
+
+    proc, capture, log = _launch_finish_wait(repo, node, capture_name='hdrretune')
+    try:
+        # park mid-step-1, retune both cost caps, then let the loop run out; the
+        # release marker persists, so iteration 2's gate step sails through
+        assert _await_gate(capture, deadline=time.monotonic() + 60), log.read_text()
+        retune = _run(
+            worktree, 'config', '_set', 'max_cost=150.0', 'max_iter_cost=60.0'
+        )
+        assert retune.returncode == 0, retune.stderr
+        (capture / 'gate_release').touch()
+    finally:
+        calls, result = _finish_wait_result(proc, capture, log)
+
+    # one commit-step header per iteration, in call order
+    prompts = [
+        calls[n]['prompt'] for n in sorted(calls) if 'Commit step' in calls[n]['prompt']
+    ]
+    assert len(prompts) == 2, (sorted(calls), result.stdout)
+    # same iteration: pinned caps, remaining computed against them ($0.001 spent),
+    # no leak of the retuned figures
+    assert '$99.9990 remaining of $100.0 (max $40.0/iter)' in prompts[0], prompts[0]
+    assert 'of $150.0' not in prompts[0], prompts[0]
+    # next boundary: the retune lands whole -- labels and remaining both new-cap
+    assert 'of $150.0' in prompts[1], prompts[1]
+    assert '(max $60.0/iter)' in prompts[1], prompts[1]
+    assert 'of $100.0' not in prompts[1], prompts[1]
+
+
 def test_goal_finish_records_completed(repo: dict) -> None:
     """A goal-met finish (no budget abort) ends the run ``completed``/0.
 
     The terminal block keys the outcome on ``BUDGET_HIT``: a budget stop is
     ``exited``/1, but a plain finish signal with ``BUDGET_HIT`` false must record
-    ``completed``/0 -- the side the new ``BUDGET_HIT`` discriminator must not
+    ``completed``/0 -- the side the ``BUDGET_HIT`` discriminator must not
     mislabel. With no ``--max-cost``, the node's finish signal is set mid-run
     (while a gated step parks, so it scopes to the active run) and the loop ends
     in iteration 1 -- before ``--max-iters 2`` -- recording ``completed``/0 via
@@ -1047,6 +1512,138 @@ def test_goal_finish_records_completed(repo: dict) -> None:
         .splitlines()[-1]
     )
     assert run == 'completed/0', (run, result.stdout)
+
+
+def test_self_finish_over_cap_records_exited(repo: dict) -> None:
+    """A self-signalled finish whose run crossed the cap ends ``exited``/1.
+
+    The in-loop budget checks skip once a finish signal is set (they exist to
+    send one), so a node that signals ``finish`` itself and then crosses
+    ``--max-cost`` reaches the terminal block with ``BUDGET_HIT`` false --
+    which, keyed on ``BUDGET_HIT`` alone, would be recorded ``completed``/0,
+    hiding the overrun from parents and ``node merge``. Over-cap is a budget
+    abort whatever set the finish: with a $0.50 cap and a $1.00 gate step,
+    finish is set while the step parks (the ceiling is disarmed from then on),
+    the over-budget commit step is skipped (its own guard), and the run must
+    close ``exited``/1 -- the shape of ``test_goal_finish_records_completed``
+    with the cap crossed.
+    """
+    node = _make_node(
+        repo,
+        'overcapfinish',
+        detached=False,
+        sync=False,
+        steps=_GATE_STEPS,
+        max_iters=2,
+        max_cost=0.50,
+    )
+    worktree = node['worktree']
+    proc, capture, log = _launch_finish_wait(
+        repo, node, capture_name='overcapfinish', stub_cost='1.0'
+    )
+    try:
+        # once the gated step parks, the run is active -> finish scopes to it
+        assert _await_gate(capture, deadline=time.monotonic() + 60), log.read_text()
+        assert _run(worktree, 'signal', '_set', 'finish', 'goal met').returncode == 0
+        (capture / 'gate_release').touch()
+    finally:
+        calls, result = _finish_wait_result(proc, capture, log, timeout=30)
+
+    # the finish signal disarmed the ceiling: only the gate step's agent ran
+    # (the over-budget commit step is skipped), and no in-loop abort fired
+    assert len(calls) == 1, (calls, result.stdout)
+    assert 'Subtree cost budget reached' not in result.stdout, result.stdout
+    # over-cap is a budget abort, not a goal-met completion, whatever set finish
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'exited', result.stdout
+    run = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT status || '/' || exit_code FROM runs ORDER BY rowid DESC LIMIT 1",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert run == 'exited/1', (run, result.stdout)
+
+
+@pytest.mark.parametrize(
+    ('name', 'reason', 'node_status', 'run_row'),
+    [
+        (
+            'cascadebudget',
+            'cost budget reserve reached (spent $5.00 >= $6.00 max'
+            ' - $1.00 reserve) (via finish of main.fake)',
+            'exited',
+            'exited/1',
+        ),
+        (
+            'cascadeplain',
+            'wrap up the tree (via finish of main.fake)',
+            'completed',
+            'completed/0',
+        ),
+    ],
+    ids=['budget-cascade', 'plain-cascade'],
+)
+def test_cascaded_budget_finish_records_exited(
+    repo: dict, name: str, reason: str, node_status: str, run_row: str
+) -> None:
+    """A budget-reason finish cascaded from an ancestor ends ``exited``/1.
+
+    An ancestor's budget abort propagates ``finish`` to every active descendant,
+    but ``BUDGET_HIT`` stays local to the tripping loop -- so without
+    reclassification the killed descendant would close ``completed``/0 as if
+    goal-met. The descendant's signal reason carries the budget prefix plus the
+    ``(via finish of <branch>)`` attribution, so the terminal reclassifier
+    flips exactly those runs to ``exited``/1 (and the exit notice fires) --
+    while a propagated *non-budget* finish (a user finishing a whole tree)
+    still closes ``completed``/0.
+    """
+    node = _make_node(
+        repo,
+        name,
+        detached=False,
+        sync=False,
+        steps=_GATE_STEPS,
+        max_iters=2,
+        max_cost=100.0,
+    )
+    worktree = node['worktree']
+    proc, capture, log = _launch_finish_wait(repo, node, capture_name=name)
+    try:
+        # once the gated step parks, the run is active -> the signal scopes to it
+        assert _await_gate(capture, deadline=time.monotonic() + 60), log.read_text()
+        assert _run(worktree, 'signal', '_set', 'finish', reason).returncode == 0
+        (capture / 'gate_release').touch()
+    finally:
+        _, result = _finish_wait_result(proc, capture, log, timeout=30)
+
+    # the cap is never crossed, so only the cascade reclassifier decides status
+    assert 'Subtree cost budget reached' not in result.stdout, result.stdout
+    assert _run(worktree, 'node', 'status').stdout.strip() == node_status, result.stdout
+    run = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT status || '/' || exit_code FROM runs ORDER BY rowid DESC LIMIT 1",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert run == run_row, (run, result.stdout)
+    # a budget cascade screams on radio with the attributed reason; a plain
+    # propagated finish stays quiet
+    sent = _run(worktree, 'radio', 'sent').stdout
+    if node_status == 'exited':
+        assert 'run exited' in sent, (sent, result.stdout)
+        assert 'via finish of main.fake' in sent, (sent, result.stdout)
+    else:
+        assert 'run exited' not in sent, (sent, result.stdout)
 
 
 def test_codex_preflight_probe_aborts_on_model_rejection(repo: dict) -> None:
@@ -1117,10 +1714,11 @@ def test_codex_preflight_failure_is_loud_and_recoverable(repo: dict) -> None:
     assert 'exited' in plain.stderr, plain.stderr
     assert 'resume' in plain.stderr, plain.stderr
     # (3b) --resume is accepted by the status guard -- plant a non-positive
-    # max_cost straight in config.json (bypassing the _set guard, now that an unset
-    # cap is a valid uncapped start) so the launch halts at the next node-level
-    # guard not tmux, proving resume passed the status check rather than dead-ending
-    # at the 'Cannot resume from status: idle' the un-stamped wedge produced
+    # max_cost straight in config.json (bypassing the _set guard; an unset cap
+    # is a valid uncapped start, so the halt needs an explicitly non-positive
+    # value) so the launch halts at the next node-level guard not tmux, proving
+    # resume passed the status check rather than dead-ending at the 'Cannot
+    # resume from status: idle' an un-stamped wedge would produce
     config_path = node_dir / 'config.json'
     config = json.loads(config_path.read_text(encoding='utf-8'))
     config['max_cost'] = -1
@@ -1156,11 +1754,9 @@ def test_codex_preflight_runs_without_timeout_binary(repo: dict) -> None:
     capture.mkdir()
     env = _cli_env(CAPTURE_DIR=f'{capture}', STUB_COST='0')
     env['PATH'] = _path_without_timeout(repo['bindir'], repo['root'])
-    result = subprocess.run(
+    result = _run_reaped(
         ['bash', f'{_LOOP}', f'{worktree}'],
         cwd=f'{worktree}',
-        capture_output=True,
-        text=True,
         env=env,
         timeout=180,
     )
@@ -1175,8 +1771,8 @@ def test_codex_preflight_runs_without_timeout_binary(repo: dict) -> None:
 def test_stop_during_approval_wait_records_iteration_stopped(repo: dict) -> None:
     """A stop during an approval wait ends the iteration stopped, not failed.
 
-    The step is correctly recorded stopped, but the loop used to force
-    ``EXIT_CODE=1`` after any approval interruption, so the iteration logged
+    The step is correctly recorded stopped, but a loop that forced
+    ``EXIT_CODE=1`` after any approval interruption would log the iteration
     ``failed`` (plus a false "failed on <step>" commit). A stop/finish (not a
     timeout) must leave the iteration ``stopped``/``completed``.
     """
@@ -1203,6 +1799,7 @@ def test_stop_during_approval_wait_records_iteration_stopped(repo: dict) -> None
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        start_new_session=True,
     )
     try:
         # wait for the step to run, then -- while the loop spins in the approval
@@ -1212,9 +1809,7 @@ def test_stop_during_approval_wait_records_iteration_stopped(repo: dict) -> None
         assert _run(worktree, 'signal', '_set', 'stop', 'manual stop').returncode == 0
         stdout, stderr = proc.communicate(timeout=60)
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.communicate()
+        _reap_group(proc)
 
     # the iteration recorded stopped (not failed): no false failure
     query = (
@@ -1264,6 +1859,155 @@ def test_run_exits_with_status_exited_on_timeout(repo: dict) -> None:
     assert run == 'exited/1', (run, result.stdout)
 
 
+def test_timeout_killed_step_records_partial_cost(repo: dict) -> None:
+    """A timeout-killed claude step bills the usage it metered.
+
+    The stub emits one usage-bearing assistant frame and then hangs with no
+    result frame; the run timeout kills it mid-stream. The per-event flush
+    must leave the metered spend on the step row -- an abnormal termination
+    records what the harness saw, never $0 -- while the run still ends
+    ``exited``/1. Pricing comes from a test-scoped ``HOME`` cache, so the
+    accrual needs no network and no operator cache.
+    """
+    node = _make_node(
+        repo,
+        'tmocost',
+        detached=False,
+        sync=False,
+        steps=_USAGE_HANG_STEPS,
+        max_iters=1,
+    )
+    worktree = node['worktree']
+    # short run timeout: the hanging step is killed mid-stream -- 8s so the
+    # stub can start and flush its frame first even under full-suite load
+    assert _run(worktree, 'config', '_set', 'timeout=8s').returncode == 0
+    # a priced model wires STEP_MODEL -> `_stream --model` -> the accrual
+    assert _run(worktree, 'config', '_set', f'model={_STUB_MODEL}').returncode == 0
+    home = repo['root'] / 'home_tmocost'
+    (home / '.fractal').mkdir(parents=True, exist_ok=True)
+    (home / '.fractal' / 'pricing.json').write_text(
+        json.dumps(_STUB_PRICING), encoding='utf-8'
+    )
+    _, result = _run_loop(repo, node, capture_name='tmo_cost', home=home)
+
+    # under full-suite load the 8s window can elapse before the stub even
+    # starts; the flush marker separates that starvation (nothing metered --
+    # nothing to record, skip) from the recording gap this test guards (fail)
+    if not (repo['root'] / 'capture_tmo_cost' / 'usage_flushed').exists():
+        pytest.skip('load starvation: the stub never flushed its usage frame')
+    # the killed step carries the flushed partial cost, not $0
+    cost = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT cost FROM steps WHERE status = 'exited' ORDER BY rowid DESC LIMIT 1",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert float(cost) == pytest.approx(_STUB_USAGE_COST), (cost, result.stdout)
+    # and the abnormal terminal is unchanged: run row exited/1
+    run = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT status || '/' || exit_code FROM runs ORDER BY rowid DESC LIMIT 1",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert run == 'exited/1', (run, result.stdout)
+
+
+def test_timeout_pre_flush_kill_marks_step_unpriced(repo: dict) -> None:
+    """A step killed before its first usage flush is marked unpriced.
+
+    The stub streams only its session init frame and hangs; the run timeout
+    kills it before any usage flush, so the step row has a session but a
+    NULL cost -- the close must stamp the ``unpriced`` metadata marker so
+    ledgers can tell "free step" from "unpriced step". The fully-untracked
+    scope still reads ``untracked`` on ``cost spent`` with no disclosure
+    note: every row is NULL there, so the count would only restate it.
+    """
+    node = _make_node(
+        repo,
+        'tmounpriced',
+        detached=False,
+        sync=False,
+        steps=_INIT_HANG_STEPS,
+        max_iters=1,
+    )
+    worktree = node['worktree']
+    # short run timeout: the hanging step is killed before any usage frame
+    assert _run(worktree, 'config', '_set', 'timeout=8s').returncode == 0
+    _, result = _run_loop(repo, node, capture_name='tmo_unpriced')
+
+    # under full-suite load the 8s window can elapse before the stub even
+    # starts; the init marker separates that starvation from the unpriced
+    # window this test guards (streamed, then killed with nothing metered)
+    if not (repo['root'] / 'capture_tmo_unpriced' / 'init_hung').exists():
+        pytest.skip('load starvation: the stub never streamed its init frame')
+    # the killed streamed step carries the marker and stays NULL-cost
+    marked = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            'SELECT COUNT(*) FROM steps WHERE session IS NOT NULL'
+            " AND cost IS NULL AND metadata LIKE '%unpriced%'",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert marked == '1', (marked, result.stdout)
+    # a fully-untracked scope reads untracked, with no disclosure noise
+    spent = _run(worktree, 'node', 'cost', 'spent')
+    assert spent.stdout.strip() == 'untracked', spent.stdout
+    assert 'unpriced' not in spent.stderr, spent.stderr
+
+
+def test_timeout_force_commit_bypasses_a_failing_hook(repo: dict) -> None:
+    """The timeout backstop's force-commit saves work past a failing hook.
+
+    Every backstop call site is ``|| true``, so a hook that can veto the force
+    commit loses the work silently -- and a later ``--resume`` cleans it away
+    (bypassing hooks here is deliberate). ``--force`` passes
+    ``--no-verify``, so the last-resort save cannot be rejected: the gate step
+    blocks past the timeout with dirty work in the tree and a hook rejecting
+    every commit, and the work must still land.
+    """
+    node = _make_node(
+        repo,
+        'bkstop',
+        detached=False,
+        sync=False,
+        steps=_GATE_STEPS,
+        max_iters=1,
+    )
+    worktree = node['worktree']
+    assert _run(worktree, 'config', '_set', 'timeout=4s').returncode == 0
+    # work worth saving, and a hook rejecting every commit; hooks are shared
+    # repo-wide (the module repo is reused), so drop the hook afterwards
+    (worktree / 'rescue.txt').write_text('work worth saving\n', encoding='utf-8')
+    hook = repo['root'] / '.git' / 'hooks' / 'pre-commit'
+    hook.write_text('#!/usr/bin/env bash\nexit 1\n', encoding='utf-8')
+    hook.chmod(0o755)
+    try:
+        _, result = _run_loop(repo, node, capture_name='hook_backstop')
+    finally:
+        hook.unlink()
+    # the backstop landed the dirty work despite the hook: clean tree, the
+    # rescued file committed at HEAD
+    assert _git(worktree, 'status', '--porcelain').stdout.strip() == '', result.stdout
+    saved = _git(worktree, 'show', 'HEAD:rescue.txt').stdout
+    assert saved == 'work worth saving\n'
+
+
 def test_failing_setup_records_iteration_failed_not_loop_brick(repo: dict) -> None:
     """A failing setup script fails the iteration cleanly -- it never bricks the loop.
 
@@ -1302,6 +2046,135 @@ def test_failing_setup_records_iteration_failed_not_loop_brick(repo: dict) -> No
     assert iter_row == 'failed/setup failed/1', (iter_row, result.stdout)
 
 
+def test_setup_failure_cap_ends_run_exited(repo: dict) -> None:
+    """Three consecutive setup failures end the run ``exited``/1, not at max-iters.
+
+    Uncapped, a deterministically broken ``setup.sh`` would crash-loop the
+    whole remaining iteration budget in minutes and then close ``completed``/0
+    "Reached max iterations" -- byte-identical to a healthy full run, with
+    the setup error lost to the tmux tty and zero radio. The
+    consecutive-failure cap ends the run after 3 with the honest reason,
+    the last setup output survives in the node dir (and the iteration
+    metadata carries its tail), and the exit notice makes the death legible
+    from the parent's feed.
+    """
+    node = _make_node(repo, 'setupcap', detached=False, sync=False, max_iters=6)
+    worktree = node['worktree']
+    setup = node['node_dir'] / 'scripts' / 'setup.sh'
+    setup.write_text(
+        '#!/usr/bin/env bash\necho "boom: missing dep" >&2\nexit 1\n',
+        encoding='utf-8',
+    )
+    calls, result = _run_loop(repo, node, capture_name='setup_cap')
+
+    # setup failed before any step, so no agent ever ran
+    assert calls == {}, (calls, result.stdout)
+    # the cap ended the run after 3 failed iterations, not the max-iters 6
+    iters = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT COUNT(*) FROM iters WHERE node = 'main.setupcap'"
+            " AND status = 'failed'",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert iters == '3', (iters, result.stdout)
+    # the run and node record the abort honestly, never a goal-met completion
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'exited', result.stdout
+    run = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT status || '/' || exit_code || '/' || COALESCE(metadata, '')"
+            ' FROM runs ORDER BY rowid DESC LIMIT 1',
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert run == 'exited/1/setup failed x3', (run, result.stdout)
+    # the last setup run's output survives durably in the node dir
+    setup_log = node['node_dir'] / 'setup.log'
+    assert setup_log.exists(), result.stdout
+    assert 'boom: missing dep' in setup_log.read_text(encoding='utf-8')
+    # the iteration metadata carries the output tail, not just the constant
+    iter_row = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT COALESCE(metadata, '') FROM iters"
+            " WHERE node = 'main.setupcap' ORDER BY rowid DESC LIMIT 1",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
+    assert iter_row == 'setup failed: boom: missing dep', (iter_row, result.stdout)
+    # the machinery screamed on radio (the agent never ran -- only it can)
+    sent = _run(worktree, 'radio', 'sent').stdout
+    assert 'run exited' in sent, (sent, result.stdout)
+    assert 'setup failed x3' in sent, (sent, result.stdout)
+
+
+def test_setup_log_is_git_invisible_after_run(repo: dict) -> None:
+    """The teed ``setup.log`` never reaches git -- not as churn, not in commits.
+
+    The loop tees every iteration's setup output to ``<node_dir>/setup.log``
+    so the last run's errors survive the tmux tty, but unignored, the file
+    would land untracked in every running node's worktree and the loop's
+    ensure-commit backstop would sweep it into the ``auto`` commit as
+    per-iteration churn. The shipped exclude template carries the
+    node-dir-qualified pattern, so the log keeps existing for failure
+    forensics while staying invisible to git.
+    """
+    node = _make_node(repo, 'setuplog', detached=False, sync=False)
+    worktree = node['worktree']
+    _, result = _run_loop(repo, node, capture_name='setup_log')
+
+    # the tee target survives for forensics
+    setup_log = node['node_dir'] / 'setup.log'
+    assert setup_log.exists(), result.stdout
+    # ...but git never sees it: no untracked churn left behind
+    porcelain = _git(worktree, 'status', '--porcelain').stdout
+    assert 'setup.log' not in porcelain, (porcelain, result.stdout)
+    # ...and no commit the run created swept it in
+    committed = _git(worktree, 'log', '--all', '--name-only', '--format=').stdout
+    assert 'setup.log' not in committed, (committed, result.stdout)
+
+
+def test_setup_runs_from_worktree_root_cwd(repo: dict) -> None:
+    """``setup.sh`` runs from the worktree root regardless of the launch CWD.
+
+    The loop inherits its CWD from whoever launched it (tmux gets no ``-c``;
+    ``_run_script`` passes no ``cwd``; agent processes sit in their node dir),
+    so with a natural worktree-relative setup line like
+    ``python3 -m venv .venv`` an unpinned CWD would land the artifact wherever
+    the launch happened to sit -- a child can burn whole iterations
+    discovering its venv inside ``.fractal/<node>/``. The loop pins setup's
+    CWD to the worktree root, making the launch directory irrelevant.
+    """
+    node = _make_node(repo, 'setupcwd', detached=False, sync=False)
+    worktree = node['worktree']
+    # a worktree-relative artifact: lands wherever setup's CWD points
+    setup = node['node_dir'] / 'scripts' / 'setup.sh'
+    setup.write_text(
+        '#!/usr/bin/env bash\ntouch ./cwd_marker\n',
+        encoding='utf-8',
+    )
+    # launch from the node dir -- the ambient CWD a real agent launch inherits
+    _, result = _run_loop(repo, node, capture_name='setup_cwd', cwd=node['node_dir'])
+
+    # the marker landed at the worktree root, not the launch CWD
+    assert (worktree / 'cwd_marker').exists(), result.stdout
+    assert not (node['node_dir'] / 'cwd_marker').exists(), result.stdout
+
+
 def test_run_completes_when_max_iters_reached(repo: dict) -> None:
     """Reaching ``max_iters`` (no timeout, no finish) ends the run ``completed``/0.
 
@@ -1332,10 +2205,10 @@ def test_iter_failure_reason_names_missing_steps_not_agent(repo: dict) -> None:
     """A step-discovery failure records ``no step files``, not ``agent error``.
 
     With an empty ``steps/`` dir, ``discover_steps`` fails before any agent runs,
-    yet the iteration used to be labeled ``agent error`` in ``node activity`` --
-    misattributing a setup failure to the agent. The reason marker now names the
-    real cause (the same plumbing that, at the step level, distinguishes an agent
-    error from a downstream ``fractal _stream`` failure).
+    so a generic ``agent error`` label in ``node activity`` would misattribute
+    a setup failure to the agent. The reason marker names the real cause (the
+    same plumbing that, at the step level, distinguishes an agent error from a
+    downstream ``fractal _stream`` failure).
     """
     node = _make_node(repo, 'nosteps', detached=False, sync=False, steps={})
     worktree = node['worktree']
@@ -1376,9 +2249,9 @@ def _make_node(
 
     Inits a worker (``--agent`` default ``claude``, ``--local``, ``--max-iters``
     (default 1), and an optional ``--max-cost``) in the requested detached/sync
-    mode, replaces the seed steps with ``steps`` (default two trivial steps), and
-    overwrites the node's ``_run.sh`` with this worktree's edited copy (node init
-    copies the frozen site-packages one). When ``commit`` is set, commits the
+    mode and replaces the seed steps with ``steps`` (default two trivial steps)
+    -- the launch runs this worktree's ``_run.sh`` directly (see ``_LOOP``), so
+    the node's own copy is irrelevant. When ``commit`` is set, commits the
     worktree so a ``--resume`` clean/checkout preserves it.
     """
     root = repo['root']
@@ -1449,6 +2322,8 @@ def _run_loop(
     capture_name: str,
     resume: bool = False,
     stub_cost: str = '0.001',
+    home: Optional[pathlib.Path] = None,
+    cwd: Optional[pathlib.Path] = None,
 ) -> tuple[dict, subprocess.CompletedProcess]:
     """Run one ``_run.sh`` launch; return ``({call_num: {...}}, process)``.
 
@@ -1467,17 +2342,14 @@ def _run_loop(
     # worktree (PYTHONPATH via _cli_env); CAPTURE_DIR/STUB_COST steer the stub
     env = _cli_env(CAPTURE_DIR=f'{capture}', STUB_COST=stub_cost)
     env['PATH'] = f'{repo["bindir"]}{os.pathsep}{env["PATH"]}'
+    # a caller-scoped HOME redirects ~-anchored reads (e.g. the pricing cache)
+    if home is not None:
+        env['HOME'] = f'{home}'
     cmd = ['bash', f'{_LOOP}', f'{worktree}']
     if resume:
         cmd.append('--resume')
-    result = subprocess.run(
-        cmd,
-        cwd=f'{worktree}',
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=180,
-    )
+    # cwd overrides the launch directory (real launches inherit an ambient CWD)
+    result = _run_reaped(cmd, cwd=f'{cwd or worktree}', env=env, timeout=180)
     return _collect_calls(capture), result
 
 
@@ -1512,13 +2384,57 @@ def _path_without_timeout(bindir: pathlib.Path, tmp: pathlib.Path) -> str:
     return os.pathsep.join(out_dirs)
 
 
-def _await_capture(capture: pathlib.Path, marker: str, *, deadline: float) -> None:
-    """Block until a captured prompt contains ``marker`` (or the deadline passes)."""
+def _await_progress(
+    check: Callable[[], bool],
+    progress: Callable[[], object],
+    *,
+    deadline: float,
+) -> bool:
+    """Block until ``check`` passes, with an idle-based deadline.
+
+    Whenever ``progress`` returns a new value the full allowance (the original
+    ``deadline`` minus the start time) is re-armed, so a loaded host that slows
+    the observed pipeline stretches the wait instead of failing it, while a
+    genuinely wedged pipeline (no observable progress at all) still trips the
+    deadline. Returns whether ``check`` passed.
+    """
+    allowance = deadline - time.monotonic()
+    seen: object = object()
     while time.monotonic() < deadline:
-        for prompt_file in capture.glob('prompt_*.txt'):
-            if marker in prompt_file.read_text(encoding='utf-8'):
-                return
-        time.sleep(0.1)
+        if check():
+            return True
+        current = progress()
+        if current != seen:
+            seen = current
+            deadline = time.monotonic() + allowance
+        time.sleep(0.05)
+    return False
+
+
+def _capture_activity(capture: pathlib.Path) -> object:
+    """Fingerprint a capture dir's contents (names and sizes) as a progress signal."""
+    if not capture.exists():
+        return None
+    try:
+        return sorted((entry.name, entry.stat().st_size) for entry in capture.iterdir())
+    except OSError:  # the stub adds and removes markers concurrently with the scan
+        return None
+
+
+def _await_capture(capture: pathlib.Path, marker: str, *, deadline: float) -> None:
+    """Block until a captured prompt contains ``marker`` (or the wait idles out).
+
+    Idle-based via ``_await_progress``: capture-dir activity refreshes the
+    allowance.
+    """
+    _await_progress(
+        lambda: any(
+            marker in prompt_file.read_text(encoding='utf-8')
+            for prompt_file in capture.glob('prompt_*.txt')
+        ),
+        lambda: _capture_activity(capture),
+        deadline=deadline,
+    )
 
 
 def _approve_pending(root: pathlib.Path, worktree: pathlib.Path) -> None:
@@ -1566,6 +2482,7 @@ def _run_loop_with_approval(
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        start_new_session=True,
     )
     try:
         # wait for the work step's call to fire, then a margin (several poll
@@ -1575,9 +2492,7 @@ def _run_loop_with_approval(
         _approve_pending(root, worktree)
         stdout, stderr = proc.communicate(timeout=60)
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.communicate()
+        _reap_group(proc)
     result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     return _collect_calls(capture), result
 
@@ -1621,32 +2536,40 @@ def _register_active_child(repo: dict, parent: dict, name: str) -> pathlib.Path:
     # child active (the session name start.sh derives: <repo dirname> (<branch,
     # dots dashed>)); recorded for the _kill_repo_sessions teardown to reap
     session = f'{root.name} ({child.name.replace(".", "-")})'
+    # a killed suite run leaves this session behind (the teardown never ran)
+    # and tmux refuses the duplicate name -- reap any stale twin first
+    subprocess.run(['tmux', 'kill-session', '-t', session], capture_output=True)
     subprocess.run(['tmux', 'new-session', '-d', '-s', session], check=True)
     repo.setdefault('sessions', []).append(session)
     return child
 
 
 def _await_log(log: pathlib.Path, marker: str, *, deadline: float) -> bool:
-    """Block until ``log`` contains ``marker`` (or the deadline passes).
+    """Block until ``log`` contains ``marker`` (or the wait idles out).
 
     The finish-wait launches tee the loop's output to a file so a banner can be
     observed *mid-run* (the wait blocks the loop, so its stdout is not yet
-    drainable from a finished process). Returns whether the marker appeared.
+    drainable from a finished process). Idle-based via ``_await_progress``: log
+    growth refreshes the allowance. Returns whether the marker appeared.
     """
-    while time.monotonic() < deadline:
-        if log.exists() and marker in log.read_text(encoding='utf-8'):
-            return True
-        time.sleep(0.05)
-    return False
+    return _await_progress(
+        lambda: log.exists() and marker in log.read_text(encoding='utf-8'),
+        lambda: log.stat().st_size if log.exists() else None,
+        deadline=deadline,
+    )
 
 
 def _await_gate(capture: pathlib.Path, *, deadline: float) -> bool:
-    """Block until the gated step parks (its ``gate_ready`` marker appears)."""
-    while time.monotonic() < deadline:
-        if (capture / 'gate_ready').exists():
-            return True
-        time.sleep(0.05)
-    return False
+    """Block until the gated step parks (its ``gate_ready`` marker appears).
+
+    Idle-based via ``_await_progress``: capture-dir activity refreshes the
+    allowance.
+    """
+    return _await_progress(
+        lambda: (capture / 'gate_ready').exists(),
+        lambda: _capture_activity(capture),
+        deadline=deadline,
+    )
 
 
 def _launch_finish_wait(
@@ -1684,6 +2607,7 @@ def _launch_finish_wait(
             stderr=subprocess.STDOUT,
             text=True,
             env=env,
+            start_new_session=True,
         )
     return proc, capture, log
 
@@ -1699,13 +2623,96 @@ def _finish_wait_result(
 
     Kills the launch if it overran (a wait that never released would otherwise
     hang the test) so a regression surfaces as a failed assertion, not a stuck
-    suite. The teed log stands in for the process's combined stdout/stderr.
+    suite -- and sweeps the launch's whole process group either way, so a
+    straggler from the chain never outlives the test. The teed log stands in
+    for the process's combined stdout/stderr.
     """
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        pass
+    _reap_group(proc)
     output = log.read_text(encoding='utf-8')
     result = subprocess.CompletedProcess(proc.args, proc.returncode, output, output)
     return _collect_calls(capture), result
+
+
+# ------ teardown process-group hygiene
+
+
+def _chain_pids(pid: int) -> list[int]:
+    """The transitive descendants of ``pid``, from one ``ps`` snapshot."""
+    out = subprocess.run(
+        ['ps', '-axo', 'pid=,ppid='], capture_output=True, text=True, check=True
+    ).stdout
+    children: dict[int, list[int]] = {}
+    for line in out.splitlines():
+        child, parent = line.split()
+        children.setdefault(int(parent), []).append(int(child))
+    chain: list[int] = []
+    frontier = [pid]
+    while frontier:
+        kids = [k for p in frontier for k in children.get(p, [])]
+        chain.extend(kids)
+        frontier = kids
+    return chain
+
+
+def _alive_pids(pids: list[int]) -> list[int]:
+    """The subset of ``pids`` still running (zombies count as dead)."""
+    if not pids:
+        return []
+    out = subprocess.run(
+        ['ps', '-o', 'pid=,stat=', '-p', ','.join(str(p) for p in pids)],
+        capture_output=True,
+        text=True,
+    ).stdout
+    alive = []
+    for line in out.splitlines():
+        pid, stat = line.split(None, 1)
+        if not stat.startswith('Z'):
+            alive.append(int(pid))
+    return alive
+
+
+def test_gate_teardown_reaps_full_process_group(repo: dict) -> None:
+    """A launch torn down mid-gate leaves no agent-chain survivors.
+
+    The gate parks a live chain under the launch (``_run.sh`` -> ``_agent.sh``
+    -> stub agent spinning on ``gate_release``); tearing the launch down at
+    that point -- what every fixture teardown does when its test ends or the
+    pytest session unwinds mid-gate -- must reap the FULL process group. A
+    pid-only kill of the direct bash child leaves the rest of the chain
+    reparented and alive -- a leaked chain can outlive its pytest session
+    by days.
+    """
+    node = _make_node(repo, 'leakgate', detached=False, sync=False, steps=_GATE_STEPS)
+    proc, capture, log = _launch_finish_wait(repo, node, capture_name='leak_gate')
+    chain: list[int] = []
+    try:
+        assert _await_gate(capture, deadline=time.monotonic() + 60), (
+            log.read_text(encoding='utf-8') if log.exists() else ''
+        )
+        # snapshot the parked chain (at least _agent.sh + the stub) so the
+        # survivor scan below cannot pass vacuously
+        chain = _chain_pids(proc.pid)
+        assert len(chain) >= 2, chain
+    finally:
+        # the teardown under test: the gate never releases, so the short wait
+        # deterministically takes the reap path
+        _finish_wait_result(proc, capture, log, timeout=2)
+
+    # kill delivery is asynchronous: idle-wait on the shrinking survivor set
+    _await_progress(
+        lambda: not _alive_pids(chain),
+        lambda: tuple(_alive_pids(chain)),
+        deadline=time.monotonic() + 15,
+    )
+    survivors = _alive_pids(chain)
+    # reap survivors and release the gate before asserting -- a red run must
+    # not itself leak the chain it just proved leaked
+    for pid in survivors:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    (capture / 'gate_release').touch()
+    assert survivors == [], (survivors, chain)

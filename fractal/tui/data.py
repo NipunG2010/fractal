@@ -470,18 +470,26 @@ class TuiData:
         self: TuiData,
         connection: sqlite3.Connection,
         branch: str,
+        agent: str,
     ) -> Optional[str]:
-        """Return the node's live loop session (active run's active iteration).
+        """Return the node's newest woven session in its active run.
 
-        ``None`` when the node is settled, detached, or weaves no session
-        (codex) -- the value a "chat with this agent" would fork.
+        The loop stamps each step's real session onto its ``steps`` row as
+        soon as the agent's stream opens, so the newest stamped step is
+        forkable within seconds of launch and carries the node's working
+        context across iteration boundaries. ``None`` when the node is
+        settled, or weaves no session yet -- the value a "chat with this
+        agent" would fork.
         """
+        # steps record the agent's base command (config may carry flags)
+        base = agent.split()[0] if agent else agent
         rows = self.rows(
             connection,
-            'SELECT i.session FROM iters i'
-            ' JOIN runs r ON i.run_id = r.run_id'
-            " WHERE i.node = ? AND r.status = 'active' AND i.status = 'active'"
-            ' ORDER BY i.iter_id DESC LIMIT 1',
-            (branch,),
+            'SELECT s.session FROM steps s'
+            ' JOIN runs r ON s.run_id = r.run_id'
+            " WHERE s.node = ? AND r.status = 'active'"
+            ' AND s.agent = ? AND s.session IS NOT NULL'
+            ' ORDER BY s.step_id DESC LIMIT 1',
+            (branch, base),
         )
         return rows[0]['session'] if rows else None

@@ -1,45 +1,32 @@
-"""Per-run cost budget (``max_cost``) resets each run, surviving ``--resume``.
+"""Per-run cost budget (``max_cost``) re-arms each launch: runs are isolated.
 
-``--max-cost`` is a node's *per-run* spend ceiling, not a lifetime one (it mirrors
-``--max-iters``, also per-run): each launch opens a fresh run with a fresh budget.
-The loop displays it as ``"$<remaining> remaining of $<max_cost>"``, gates child
-spawns on the parent's per-run remaining, and drives the soft ceiling from
-``fractal node cost remaining`` -- at each iteration's start ``_run.sh`` flips the
-node into ``RESERVE.md`` (budget) mode once the *current run's* remaining ``<= 0``
-(never auto-stops; the parent mitigates over-spend).
+``--max-cost`` is a node's *per-run* spend ceiling: every launch re-arms
+the full cap, and no cumulative reading exists anywhere.
 
-The behavior this pins: ``cost_remaining``/``cost_spent`` scope to the current run
-(``WHERE run_id = ...``), and ``_run.sh`` starts a fresh run on every launch --
-including ``--resume`` -- so after a resume the new run has no steps yet and the
-budget is full again. A node drained in run 1 is therefore *not* steered in run 2;
-the operator/parent decides when to resume, exactly as with ``--max-iters``.
+The launch-time twin (``node start --resume`` re-arming the cap) is covered
+in ``test_core/test_node.py`` -- this module drives ``_run.sh`` directly,
+pinning the loop's own budget guard.
 
-``_run.sh``'s budget logic is unreachable except through the loop and the script
-cannot be sourced (interleaved module-scope git/config/validation that
+``_run.sh``'s budget logic is unreachable except through the loop and the
+script cannot be sourced (interleaved module-scope git/config/validation that
 ``exit``s), so this drives the real ``_run.sh`` as a subprocess against a real
 node with a **stubbed ``claude``** -- the smallest hermetic harness. The stub
 emits a ``stream-json`` ``result`` event carrying a fixed cost so ``fractal
 _stream`` records each step's spend, exactly as a real run would.
-
-The observable proof is that the first step of the **resumed** run is *never*
-steered into ``RESERVE.md`` -- even when run 1 drained the cap -- because run 2's
-budget is fresh. Run 1's first step also runs before any spend is recorded, so it
-is never steered either -- the built-in control.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 
 import pytest
 
 from tests._helpers import _git
 
-from .conftest import _cli_env, _run, _worktree_root
+from .conftest import _cli_env, _run, _run_reaped, _worktree_root
 
-__all__ = ['test_max_cost_budget_resets_each_run']
+__all__ = ['test_resume_re_arms_per_run_budgets']
 
 # distinctive heading from modes/RESERVE.md -- present in a step's prompt only
 # when the loop has flipped the node into reserve (budget) mode
@@ -79,21 +66,23 @@ printf '%s' "$PROMPT" > "$CAPTURE_DIR/prompt_$N.txt"
 
 [[ -n "$SID" ]] || SID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 printf '{"type":"system","subtype":"init","session_id":"%s"}\\n' "$SID"
-printf '{"type":"result","session_id":"%s","total_cost_usd":%s,"num_turns":1,"duration_ms":1}\\n' \
+printf '{"type":"result","session_id":"%s","total_cost_usd":%s,"num_turns":1,"duration_ms":1}\\n' \\
     "$SID" "$STUB_COST"
 """
+
+# every case's stub cost: two steps per one-iteration run record $0.20/run
+STUB_COST = 0.10
 
 
 @pytest.fixture
 def node_env(tmp_path_factory: pytest.TempPathFactory) -> dict:
     """A fresh worker node wired for two deterministic loop launches.
 
-    Function-scoped so each case starts with an empty database -- the lifetime
-    rollup must reflect only this case's runs. Builds ``fractal init`` + a
+    Function-scoped so each case starts with an empty database -- the spend
+    reading must reflect only this case's runs. Builds ``fractal init`` + a
     ``claude`` worker capped at one iteration per launch with sync disabled, its
     steps replaced by two trivial files (so the loop makes exactly two agent
-    calls), this worktree's ``_run.sh`` copied in, and a stub ``claude`` on a
-    private bindir.
+    calls), and a stub ``claude`` on a private bindir.
     """
     root = tmp_path_factory.mktemp('cost_resume')
     _git(root, 'init', '-b', 'main')
@@ -146,46 +135,31 @@ def node_env(tmp_path_factory: pytest.TempPathFactory) -> dict:
 # ------ enforcement
 
 
-@pytest.mark.parametrize(
-    ('max_cost', 'stub_cost'),
-    [
-        # run 1 drains at the iteration boundary (2*$0.10 >= $0.15 cap; both
-        # steps run since neither alone trips the ceiling) -- yet run 2 resets
-        (0.15, 0.10),
-        (10.0, 0.001),  # never near the cap -- sanity that nothing steers
-    ],
-)
-def test_max_cost_budget_resets_each_run(
-    node_env: dict,
-    max_cost: float,
-    stub_cost: float,
-) -> None:
-    """A new run gets a fresh ``--max-cost`` budget (per-run, like ``--max-iters``).
+def test_resume_re_arms_per_run_budgets(node_env: dict) -> None:
+    """Every launch re-arms the full cap: runs are isolated.
 
-    Run 1 may drain its budget, but ``--resume`` opens run 2 with a fresh budget,
-    so run 2's first step is never reserve-steered -- even in the drain case, where
-    lifetime accounting would have carried the drain across. ``cost spent`` reports
-    the current (resumed) run.
+    Run isolation end-to-end: the drain parameters leave run 1 over the
+    cap, yet run 2 (``--resume``) opens with a fresh budget (both steps
+    run, never steered) and bare ``cost spent`` reads the current run only.
     """
     worktree = node_env['worktree']
-    # set the per-run cap, then commit the setup so the resume clean/checkout
-    # preserves the seed, edited _run.sh, two steps, and this cap (the gitignored
-    # database -- carrying run 1's spend -- survives git clean -fd)
-    assert _run(worktree, 'config', '_set', f'max_cost={max_cost}').returncode == 0
+    # the drain parameters: run 1 records $0.20 >= the $0.15 cap (neither step
+    # alone trips the ceiling, so both run); commit the setup so the resume
+    # clean/checkout preserves the seed, the two steps, and the cap (the
+    # gitignored database -- carrying run 1's spend -- survives git clean -fd)
+    assert _run(worktree, 'config', '_set', 'max_cost=0.15').returncode == 0
     _git(worktree, 'add', '-A')
-    _git(worktree, 'commit', '-m', 'setup cost-resume node')
-    # run 1: fresh budget -> first step never steered (built-in control)
-    run1 = _run_loop(node_env, capture_name='run1', resume=False, stub_cost=stub_cost)
+    _git(worktree, 'commit', '-m', 'setup cost-resume node (per-run scope)')
+    # run 1 drains the cap at the boundary; run 2 re-arms and repeats
+    run1 = _run_loop(node_env, capture_name='run1', resume=False)
     assert RESERVE_MARKER not in run1[1]
-    # run 2 (--resume): a fresh per-run budget -> first step still not steered, even
-    # when run 1 drained the cap (lifetime accounting would have steered here)
-    run2 = _run_loop(node_env, capture_name='run2', resume=True, stub_cost=stub_cost)
+    assert RESERVE_MARKER not in run1[2]
+    run2 = _run_loop(node_env, capture_name='run2', resume=True)
     assert RESERVE_MARKER not in run2[1]
-    # bare cost spent reports the current (resumed) run only; claude's
-    # total_cost_usd is per-invocation, so each of the two steps per iteration
-    # records stub_cost: run 2's single iteration => 2 * stub_cost
+    assert RESERVE_MARKER not in run2[2]
+    # bare cost spent reads the current run ($0.20, never a cross-run rollup)
     spent = _run(worktree, 'node', 'cost', 'spent').stdout.strip().removeprefix('$')
-    assert float(spent) == pytest.approx(2 * stub_cost)
+    assert float(spent) == pytest.approx(2 * STUB_COST)
 
 
 # ------ helpers
@@ -196,13 +170,13 @@ def _run_loop(
     *,
     capture_name: str,
     resume: bool,
-    stub_cost: float,
 ) -> dict:
     """Run one loop launch and return the captured per-step prompts.
 
     Runs the real ``_run.sh`` (optionally with ``--resume``) with the stub
     ``claude`` on ``PATH`` and a fresh capture dir, returning
-    ``{step_number: prompt_text}`` for this launch only.
+    ``{step_number: prompt_text}`` for this launch only. Asserts the launch
+    executed both steps -- a budget-skipped step leaves no capture.
     """
     root = node_env['root']
     worktree = node_env['worktree']
@@ -214,27 +188,19 @@ def _run_loop(
     capture.mkdir()
     # run the loop directly (no tmux): stub claude shadows PATH, the loop's own
     # fractal calls resolve to this worktree (PYTHONPATH via _cli_env)
-    env = _cli_env(CAPTURE_DIR=f'{capture}', STUB_COST=str(stub_cost))
+    env = _cli_env(CAPTURE_DIR=f'{capture}', STUB_COST=str(STUB_COST))
     env['PATH'] = f'{node_env["bindir"]}{os.pathsep}{env["PATH"]}'
     cmd = ['bash', f'{_LOOP}', f'{worktree}']
     if resume:
         cmd.append('--resume')
-    result = subprocess.run(
-        cmd,
-        cwd=f'{worktree}',
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=180,
-    )
-    # collect captured prompts; missing files mean the loop did not reach a step
+    result = _run_reaped(cmd, cwd=f'{worktree}', env=env, timeout=180)
+    # collect captured prompts; a missing file means the loop never ran that step
     prompts = {}
     for prompt_file in capture.glob('prompt_*.txt'):
         num = int(prompt_file.stem.removeprefix('prompt_'))
         prompts[num] = prompt_file.read_text(encoding='utf-8')
-    missing = [step for step in (1, 2) if step not in prompts]
-    assert not missing, (
-        f'expected two step prompts, missing {missing} (got {sorted(prompts)})\n'
+    assert sorted(prompts) == [1, 2], (
+        f'expected step prompts [1, 2] (got {sorted(prompts)})\n'
         f'rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}'
     )
     return prompts

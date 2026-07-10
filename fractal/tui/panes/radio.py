@@ -32,6 +32,7 @@ if typing.TYPE_CHECKING:
 
 __all__ = ['RadioPane']
 
+# the source tabs, in display and cycle order (left/right steps through them)
 _SOURCES = ('Messages', 'Feed', 'Archive')
 
 
@@ -417,10 +418,11 @@ class RadioPane:
 
         One read-only lookup on the explicit open, never on a poll path.
         """
+        agent = self.app.data.config(row['sender']).get('agent') or ''
         try:
             connection = self.app.data.connect()
             try:
-                return self.app.data.live_session(connection, row['sender'])
+                return self.app.data.live_session(connection, row['sender'], agent)
             finally:
                 connection.close()
         except sqlite3.Error:

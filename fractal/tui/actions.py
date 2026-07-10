@@ -71,7 +71,7 @@ class TuiActions:
         data: str,
         priority: Optional[int] = None,
     ) -> str:
-        """Reply to a message (lands in its host's channel-space).
+        """Reply to a message (routed to its resolved destination).
 
         Args:
             message_uuid: The parent message's UUID.
@@ -82,11 +82,12 @@ class TuiActions:
             The reply's 8-char UUID.
 
         """
-        return self._radio.reply(
+        reply_uuid, _, _ = self._radio.reply(
             message_uuid,
             data,
             priority=priority,
         )
+        return reply_uuid
 
     def react(self: TuiActions, *, message_uuid: str, value: int) -> None:
         """React (+1/-1) to a message as the root node."""
@@ -103,7 +104,8 @@ class TuiActions:
         on the next snapshot.
 
         Returns:
-            The message row, as ``Radio.read`` returns it.
+            The message row, unpacked from ``Radio.read``'s one-row list.
 
         """
-        return self._radio.read(message_uuid)
+        [message] = self._radio.read(message_uuid)
+        return message

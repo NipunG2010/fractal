@@ -201,20 +201,26 @@ MAX_DESCENDANTS=$(fractal config _get max_descendants \
 [[ -z "$MAX_CHILDREN" ]] && MAX_CHILDREN=-1
 [[ -z "$MAX_DESCENDANTS" ]] && MAX_DESCENDANTS=-1
 
-MAX_COST=$(fractal config _get max_cost --path="$WORKTREE_DIR" 2>/dev/null || echo "")
-MAX_ITER_COST=$(fractal config _get max_iter_cost \
-    --path="$WORKTREE_DIR" 2>/dev/null || echo "")
-MAX_STEP_COST=$(fractal config _get max_step_cost \
-    --path="$WORKTREE_DIR" 2>/dev/null || echo "")
-RESERVE_BUDGET=$(fractal config _get reserve_budget \
-    --path="$WORKTREE_DIR" 2>/dev/null || echo "")
-# a budget set out-of-band (config _set max_cost) bypasses node init's 10%
-# reserve default, leaving no cleanup buffer; mirror that default here so the
-# RESERVE nudge fires before the ceiling however max_cost was set
-if [[ -z "$RESERVE_BUDGET" ]] && [[ -n "$MAX_COST" ]]; then
-    RESERVE_BUDGET=$(awk "BEGIN {print 0.1 * $MAX_COST}")
-fi
-RESERVE_BUDGET="${RESERVE_BUDGET:-0}"
+# read the budget-cap keys; called at run start and again at each iteration
+# top so a mid-run retune (config edit or node update) reaches the boundary
+# checks instead of staying pinned to the run-start values
+read_cost_caps() {
+    MAX_COST=$(fractal config _get max_cost --path="$WORKTREE_DIR" 2>/dev/null || echo "")
+    MAX_ITER_COST=$(fractal config _get max_iter_cost \
+        --path="$WORKTREE_DIR" 2>/dev/null || echo "")
+    MAX_STEP_COST=$(fractal config _get max_step_cost \
+        --path="$WORKTREE_DIR" 2>/dev/null || echo "")
+    RESERVE_BUDGET=$(fractal config _get reserve_budget \
+        --path="$WORKTREE_DIR" 2>/dev/null || echo "")
+    # a budget set out-of-band (config _set max_cost) bypasses node init's 10%
+    # reserve default, leaving no cleanup buffer; mirror that default here so the
+    # RESERVE nudge fires before the ceiling however max_cost was set
+    if [[ -z "$RESERVE_BUDGET" ]] && [[ -n "$MAX_COST" ]]; then
+        RESERVE_BUDGET=$(awk "BEGIN {print 0.1 * $MAX_COST}")
+    fi
+    RESERVE_BUDGET="${RESERVE_BUDGET:-0}"
+}
+read_cost_caps
 # label the per-step cost cap honestly: enforced for claude (run_step passes it
 # as --max-budget-usd), warn-only for agents without a budget flag (codex)
 if [[ "$AGENT_BASE_COMMAND" == "claude" ]]; then
@@ -277,7 +283,13 @@ else
     PROJECT_DIR="$REPO_DIR/$PROJECT_PATH"
 fi
 if [[ -n "$SCOPE" ]]; then
-    SCOPE_DIR="$PROJECT_DIR/$SCOPE"
+    # newline-separated scope roots (config _get prints one per line), each
+    # anchored under the project dir
+    SCOPE_DIR=""
+    while IFS= read -r SCOPE_ROOT; do
+        [[ -n "$SCOPE_ROOT" ]] || continue
+        SCOPE_DIR="${SCOPE_DIR:+$SCOPE_DIR }$PROJECT_DIR/$SCOPE_ROOT"
+    done <<<"$SCOPE"
 else
     SCOPE_DIR=""
 fi
@@ -574,17 +586,30 @@ strip_frontmatter() {
     done <"$FILE"
 }
 
+# resolve the guard's cost figures pinned to this run (budgets are per-run;
+# runs are isolated) -- every budget check below keys on these two
+run_cost_spent() {
+    fractal node cost spent --path="$WORKTREE_DIR" --run="$RUN_ID" 2>/dev/null
+}
+
+run_cost_remaining() {
+    fractal node cost remaining --path="$WORKTREE_DIR" --run="$RUN_ID" 2>/dev/null
+}
+
 build_cost_budget() {
     # build the cost-budget label from the CURRENT remaining; cost is recorded at each
     # step's end, so this must be recomputed per step -- a once-per-iteration value
     # shows the iteration-start budget on every step (stale, and it appears to never
     # decrement within an iteration, contradicting reserve mode which keys on real spend);
     # uses a local so it never clobbers the reserve checks' COST_REMAINING
+    # the remaining derives from the iteration-pinned MAX_COST (fresh spend
+    # against the global), NOT the CLI's remaining, which reads CURRENT config
+    # and after a mid-run retune would mix new-cap figures into old-cap labels
     if [[ -n "$MAX_COST" ]]; then
-        local REMAINING
-        REMAINING=$(fractal node cost remaining --path="$WORKTREE_DIR" \
-            --run="$RUN_ID" 2>/dev/null || echo "$MAX_COST")
-        REMAINING="${REMAINING#\$}"
+        local SPENT REMAINING
+        SPENT=$(run_cost_spent || echo "")
+        SPENT="${SPENT#\$}"
+        REMAINING=$(awk "BEGIN {r = $MAX_COST - ${SPENT:-0}; if (r < 0) r = 0; printf \"%.4f\", r}")
         COST_BUDGET="\$${REMAINING} remaining of \$${MAX_COST}"
         [[ -n "$MAX_ITER_COST" ]] && COST_BUDGET="$COST_BUDGET (max \$${MAX_ITER_COST}/iter)"
         [[ -n "$MAX_STEP_COST" ]] \
@@ -610,8 +635,26 @@ send_budget_finish() {
     BUDGET_REASON="$REASON"
 }
 
+# post a radio notice for an abnormal run end so the death shows in a parent's
+# feed; REASON mirrors what the caller just recorded (never re-derived), and
+# the send is guarded -- radio must never break the exit path
+send_exit_notice() {
+    local STATUS="$1"
+    local REASON="$2"
+    local NOTICE="Run $RUN_ID ended $STATUS at iteration $ITER: $REASON."
+    # a cost-capped node reports the figures alongside the reason
+    if [[ -n "$MAX_COST" ]]; then
+        local SPENT
+        SPENT=$(run_cost_spent || echo "")
+        [[ -n "$SPENT" ]] && NOTICE="$NOTICE Spend $SPENT of \$$MAX_COST."
+    fi
+    fractal radio send "$NOTICE" --channel=outbox \
+        --subject="run $STATUS: $REASON" --priority=7 \
+        --path="$WORKTREE_DIR" 2>/dev/null || true
+}
+
 check_subtree_ceiling() {
-    # hard ceiling (mid-iteration): finish recursively when the per-run subtree
+    # hard ceiling (mid-iteration): finish recursively when the run's subtree
     # budget is fully spent, returning 0 if it tripped (caller stops queuing
     # steps), 1 otherwise; soft cap -- the parent mitigates over-spend; a
     # spawn-heavy iteration can blow the budget before the boundary, so this
@@ -621,14 +664,13 @@ check_subtree_ceiling() {
         return 1
     fi
     local SUBTREE_SPENT
-    SUBTREE_SPENT=$(fractal node cost spent --path="$WORKTREE_DIR" \
-        --run="$RUN_ID" 2>/dev/null || echo "")
+    SUBTREE_SPENT=$(run_cost_spent || echo "")
     SUBTREE_SPENT="${SUBTREE_SPENT#\$}"
     if [[ "$SUBTREE_SPENT" =~ ^[0-9.]+$ ]] \
         && [[ $(awk "BEGIN {print ($SUBTREE_SPENT >= $MAX_COST)}") -eq 1 ]]; then
         send_budget_finish \
             "Subtree cost budget reached (\$$SUBTREE_SPENT of \$$MAX_COST), finishing" \
-            "subtree cost budget reached"
+            "subtree cost budget reached (spent \$$SUBTREE_SPENT >= \$$MAX_COST max)"
         return 0
     fi
     return 1
@@ -645,15 +687,14 @@ check_reserve_boundary() {
         return 1
     fi
     local SUBTREE_SPENT
-    SUBTREE_SPENT=$(fractal node cost spent --path="$WORKTREE_DIR" \
-        --run="$RUN_ID" 2>/dev/null || echo "")
+    SUBTREE_SPENT=$(run_cost_spent || echo "")
     SUBTREE_SPENT="${SUBTREE_SPENT#\$}"
     # numeric-guard the CLI string before awk (matches the ceiling/reserve guards)
     if [[ "$SUBTREE_SPENT" =~ ^[0-9.]+$ ]] \
         && [[ $(awk "BEGIN {print ($SUBTREE_SPENT >= $MAX_COST - $RESERVE_BUDGET)}") -eq 1 ]]; then
         send_budget_finish \
             "Total cost budget reserve reached (\$$SUBTREE_SPENT of \$$MAX_COST spent), ending run" \
-            "cost budget reserve reached"
+            "cost budget reserve reached (spent \$$SUBTREE_SPENT >= \$$MAX_COST max - \$$RESERVE_BUDGET reserve)"
         return 0
     fi
     return 1
@@ -778,7 +819,7 @@ run_step() {
     fi
 
     # per-step USD budget for agents that accept one (claude --max-budget-usd):
-    # min(run remaining - reserve, iter headroom, step cap) over whichever are
+    # min(budget remaining - reserve, iter headroom, step cap) over whichever are
     # set -- a hard per-step ceiling that bounds the in-step overshoot the
     # boundary cost checks can't catch (codex has no such flag; it stays soft,
     # see _agent.sh); numeric guards mirror the boundary checks (a non-numeric
@@ -788,8 +829,7 @@ run_step() {
     if [[ -n "$MAX_COST" || -n "$MAX_ITER_COST" || -n "$MAX_STEP_COST" ]]; then
         local SMB="" RUN_REMAINING ITER_REMAINING
         if [[ -n "$MAX_COST" ]]; then
-            RUN_REMAINING=$(fractal node cost remaining --path="$WORKTREE_DIR" \
-                --run="$RUN_ID" 2>/dev/null || echo "$MAX_COST")
+            RUN_REMAINING=$(run_cost_remaining || echo "$MAX_COST")
             RUN_REMAINING="${RUN_REMAINING#\$}"
             if [[ "$RUN_REMAINING" =~ ^[0-9.]+$ ]]; then
                 SMB=$(awk "BEGIN{print $RUN_REMAINING - $RESERVE_BUDGET}")
@@ -919,8 +959,7 @@ run_iter() {
         # mid-iteration); the boundary then ends the run, never self-stop here
         if [[ "$RESERVE" != true ]] && [[ -n "$MAX_COST" ]]; then
             local COST_REMAINING
-            COST_REMAINING=$(fractal node cost remaining \
-                --path="$WORKTREE_DIR" --run="$RUN_ID" 2>/dev/null || echo "")
+            COST_REMAINING=$(run_cost_remaining || echo "")
             COST_REMAINING="${COST_REMAINING#\$}"
             if [[ "$COST_REMAINING" =~ ^[0-9.]+$ ]] \
                 && [[ $(awk "BEGIN {print ($COST_REMAINING <= $RESERVE_BUDGET)}") -eq 1 ]]; then
@@ -1204,6 +1243,16 @@ run_iter() {
 # ------ resume mode
 
 if [[ "$RESUME" == true ]]; then
+    # preserve operator edits: the documented steering flow edits node-dir files
+    # between runs without committing, and the checkout/clean below would revert
+    # them -- commit them first; --no-verify like every backstop save (a host
+    # hook must not veto it); no || true: failing loud beats destroying the edits
+    if [[ -n "$(git -C "$WORKTREE_DIR" status --porcelain -- "$NODE_DIR")" ]]; then
+        echo "Resuming: committing operator edits under .fractal/$CURRENT_BRANCH..."
+        git -C "$WORKTREE_DIR" add -A -- "$NODE_DIR"
+        git -C "$WORKTREE_DIR" commit --no-verify \
+            -m "$CURRENT_BRANCH: operator edits (committed at resume)"
+    fi
     echo "Resuming: cleaning uncommitted changes..."
     # preserve config.json across the clean -- the documented way to re-tune before
     # resuming (e.g. adjust max_iters), and the agent never owns it; ITER is
@@ -1393,8 +1442,14 @@ export RUN_ID
 # set -e against any residual failure (a missed stamp self-corrects as the loop runs)
 fractal _status active --path="$WORKTREE_DIR" || true
 
+# record the run's process group beside .status -- the handle kill.sh and
+# Node._reconcile_status fall back to when an out-of-band pane death leaves the
+# agent group running headless; removed by the EXIT trap below, so a surviving
+# file marks a death no trap could catch (SIGKILL / host crash)
+ps -o pgid= -p $$ | tr -d ' ' >"$NODE_DIR/.pgid" || true
+
 # an in-loop abort before the terminal cascade below (an `exit 1` / a set -e
-# failure -- e.g. the unguarded setup step) would otherwise strand .status at
+# failure on an unguarded command) would otherwise strand .status at
 # 'active'; on exit, stamp the honest terminal -- but only when the cascade never
 # recorded one (status still 'active'), so neither a clean exit nor a transient
 # failure of the cascade's own status write (a contended DB) gets relabeled; (a
@@ -1404,11 +1459,19 @@ _on_exit() {
     # preserve the triggering exit code -- an EXIT trap's final status becomes
     # the script's, so a bare `return` here would clobber a clean exit
     local rc=$?
+    # drop the pgid handle -- the loop is ending in-band, nothing to reap
+    rm -f "$NODE_DIR/.pgid" 2>/dev/null || true
+    # heal config/registry cap drift before the row goes dark -- a pre-boundary
+    # death never reaches the next boundary reconcile and would strand it forever
+    fractal node _reconcile_caps --path="$WORKTREE_DIR" 2>/dev/null || true
     if [[ "$(cat "$NODE_DIR/.status" 2>/dev/null)" == "active" ]]; then
         fractal _status exited --path="$WORKTREE_DIR" 2>/dev/null || true
         fractal run _end "$RUN_ID" --path="$WORKTREE_DIR" \
             --status=exited --exit-code=1 --metadata="Loop exited abnormally" \
             2>/dev/null || true
+        # the crash-path twin of the terminal cascade's notice, mirroring
+        # the reason this branch just recorded
+        send_exit_notice exited "Loop exited abnormally"
     fi
     return "$rc"
 }
@@ -1429,7 +1492,22 @@ export RUN_END_EPOCH
 BUDGET_HIT=false
 BUDGET_REASON=""
 
+# cap consecutive setup failures so a deterministically broken setup.sh ends
+# the run exited with the honest reason instead of crash-looping into a
+# healthy-looking completed max-iters end; the counter resets on any success
+SETUP_FAIL_CAP=3
+SETUP_FAILS=0
+SETUP_ABORT=false
+
 while true; do
+    # re-read max_iters here so a mid-run retune reaches the stop gate below
+    # (the cost-cap re-read sits after that gate, so it cannot cover this);
+    # skip the first pass -- run start read the same config moments earlier
+    if [[ "$ITER" -gt 0 ]]; then
+        MAX_ITERS=$(fractal config _get max_iters \
+            --path="$WORKTREE_DIR" 2>/dev/null || echo "-1")
+        [[ -z "$MAX_ITERS" ]] && MAX_ITERS=-1
+    fi
     if [[ "$MAX_ITERS" -gt 0 ]] && [[ "$ITER" -ge "$MAX_ITERS" ]]; then
         echo "Reached max iterations ($MAX_ITERS). Stopping."
         break
@@ -1472,9 +1550,17 @@ while true; do
     [[ -z "$TIME_BUDGET" ]] && TIME_BUDGET="no limit"
     export TIME_BUDGET
 
+    # refresh the budget caps and heal registry drift: a cap retuned mid-run
+    # must reach this iteration's boundary checks, and a config-vs-registry
+    # mismatch must warn loudly, not linger; iteration 1 skips both -- run
+    # start read the same config moments earlier
+    if [[ "$ITER" -gt 1 ]]; then
+        read_cost_caps
+        fractal node _reconcile_caps --path="$WORKTREE_DIR" || true
+    fi
+
     if [[ -n "$MAX_COST" ]]; then
-        COST_REMAINING=$(fractal node cost remaining --path="$WORKTREE_DIR" \
-            --run="$RUN_ID" 2>/dev/null || echo "$MAX_COST")
+        COST_REMAINING=$(run_cost_remaining || echo "$MAX_COST")
         COST_REMAINING="${COST_REMAINING#\$}"
         COST_BUDGET="\$${COST_REMAINING} remaining of \$${MAX_COST}"
         if [[ -n "$MAX_ITER_COST" ]]; then
@@ -1519,15 +1605,21 @@ while true; do
     # run setup -- guard under set -e: setup.sh is the mutable, agent-editable node
     # copy, so a bad edit must record a clean iteration failure (and run the commit
     # backstop + iter_end below), not abort the whole loop and strand the open
-    # iter/step rows for reconcile to settle at the next start
+    # iter/step rows for reconcile to settle at the next start; tee the output
+    # to the node dir so the last run's errors survive the tmux tty; pin the
+    # CWD to the worktree root so relative setup lines land beside the work,
+    # not in the ambient launch dir
     SETUP_FAILED=false
-    bash "$SETUP_SCRIPT" || SETUP_FAILED=true
+    (cd "$WORKTREE_DIR" && bash "$SETUP_SCRIPT") 2>&1 \
+        | tee "$NODE_DIR/setup.log" || SETUP_FAILED=true
 
     ITER_START=$SECONDS
     if [[ "$SETUP_FAILED" == true ]]; then
         echo "Error: setup.sh failed; skipping this iteration" >&2
         ITER_FAILED=true
+        SETUP_FAILS=$((SETUP_FAILS + 1))
     else
+        SETUP_FAILS=0
         run_iter && ITER_FAILED=false || ITER_FAILED=true
     fi
     ITER_DURATION=$((SECONDS - ITER_START))
@@ -1549,7 +1641,12 @@ while true; do
         if [[ "$TIMED_OUT" == true ]]; then
             ITER_REASON="timed out"
         elif [[ "$SETUP_FAILED" == true ]]; then
+            # carry the tail of the captured setup output so the actual error is
+            # durable in the iteration metadata, not just the (mortal) tmux tty
+            SETUP_TAIL=$(tail -n 5 "$NODE_DIR/setup.log" 2>/dev/null \
+                | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-200 || echo "")
             ITER_REASON="setup failed"
+            [[ -n "$SETUP_TAIL" ]] && ITER_REASON="setup failed: $SETUP_TAIL"
         elif [[ -f "$NODE_DIR/.fail_reason" ]]; then
             ITER_REASON=$(cat "$NODE_DIR/.fail_reason")
         else
@@ -1566,12 +1663,23 @@ while true; do
     [[ -n "$ITER_REASON" ]] && ITER_END_ARGS+=(--metadata="$ITER_REASON")
     fractal iter _end "$ITER_ID" --path="$WORKTREE_DIR" \
         "${ITER_END_ARGS[@]}" 2>/dev/null || true
+    # the iteration is closed: clear its id so the run-end child drains below
+    # book no zombie SYNC step rows (wait_for_children's SYNC gate keys on ITER_ID)
+    ITER_ID=""
 
     echo ""
     if [[ "$ITER_FAILED" == true ]]; then
         echo "=== Iteration $ITER_LABEL failed (${ITER_DURATION}s) ==="
     else
         echo "=== Iteration $ITER_LABEL completed (${ITER_DURATION}s) ==="
+    fi
+
+    # consecutive-setup-failure cap: end the run rather than grind the
+    # remaining iterations through the same broken setup
+    if [[ "$SETUP_FAILS" -ge "$SETUP_FAIL_CAP" ]]; then
+        echo "=== Setup failed $SETUP_FAILS consecutive times, ending run ==="
+        SETUP_ABORT=true
+        break
     fi
 
     # total-cost reserve stop: the just-finished iteration ran the RESERVE
@@ -1629,11 +1737,53 @@ if ! bash "$PACKAGE_DIR/_node/scripts/_commit.sh" --path="$WORKTREE_DIR" \
         --force "final" || true
 fi
 
+# over-cap sweep: the in-loop budget checks disarm once a finish signal is set
+# (they exist to send one), so a self-signalled finish that crossed the cap
+# reaches here with BUDGET_HIT false and would close as a goal-met completed --
+# reclassify before the terminal blocks read BUDGET_HIT
+if [[ "$BUDGET_HIT" != true ]] && [[ -n "$MAX_COST" ]] \
+    && fractal signal _get finish --path="$WORKTREE_DIR" --run="$RUN_ID" 2>/dev/null; then
+    SUBTREE_SPENT=$(run_cost_spent || echo "")
+    SUBTREE_SPENT="${SUBTREE_SPENT#\$}"
+    # numeric-guard the CLI string before awk (matches the ceiling/reserve guards)
+    if [[ "$SUBTREE_SPENT" =~ ^[0-9.]+$ ]] \
+        && [[ $(awk "BEGIN {print ($SUBTREE_SPENT >= $MAX_COST)}") -eq 1 ]]; then
+        echo "=== Cost budget exceeded in finish wind-down (\$$SUBTREE_SPENT of \$$MAX_COST spent) ==="
+        BUDGET_HIT=true
+        BUDGET_REASON="cost budget exceeded in finish wind-down"
+    fi
+fi
+
+# cascaded-budget sweep: an ancestor's budget abort propagates finish to every
+# active descendant, but BUDGET_HIT stays local to the tripping loop -- without
+# this the killed descendant closes as a goal-met completed; the propagated
+# reason carries the budget prefix plus the `(via finish of <branch>)`
+# attribution, so reclassify exactly those (a non-budget finish stays normal)
+if [[ "$BUDGET_HIT" != true ]]; then
+    FINISH_REASON=$(fractal signal _get finish --path="$WORKTREE_DIR" \
+        --run="$RUN_ID" 2>/dev/null || echo "")
+    if [[ "$FINISH_REASON" == *'(via finish of '* ]]; then
+        case "$FINISH_REASON" in
+            'cost budget reserve reached'* | 'subtree cost budget reached'* | \
+                'cost budget exceeded in finish wind-down'*)
+                echo "=== Budget abort cascaded from an ancestor ($FINISH_REASON) ==="
+                BUDGET_HIT=true
+                BUDGET_REASON="$FINISH_REASON"
+                ;;
+        esac
+    fi
+fi
+
 if [[ "$BUDGET_HIT" == true ]]; then
     # a budget finish is a cost abort -- record the reason the tripping check set
     # (reserve stop vs hard ceiling) so `node activity` explains the early stop
     # (the node is marked exited below)
     EXIT_REASON="$BUDGET_REASON"
+elif [[ "$SETUP_ABORT" == true ]]; then
+    # a setup crash-loop abort mirrors the budget abort: record the honest reason
+    # and the exit signal (matching the non-finish exits below) for `node activity`
+    EXIT_REASON="setup failed x$SETUP_FAILS"
+    fractal signal _set exit "$EXIT_REASON" --path="$WORKTREE_DIR" 2>/dev/null || true
 elif ! fractal signal _get finish --path="$WORKTREE_DIR" --run="$RUN_ID" 2>/dev/null; then
     if [[ "$TIMED_OUT" == true ]]; then
         EXIT_REASON="Timed out at iteration $ITER ($TIME_BUDGET)"
@@ -1651,6 +1801,12 @@ if [[ "$BUDGET_HIT" == true ]]; then
     # budget abort: a budget stop is not a goal-met completion -- mark it
     # exited so a parent (and `node merge`) can tell unfinished work from done,
     # even though the finish signal it set is checked below
+    NODE_STATUS="exited"
+    RUN_STATUS="exited"
+    RUN_EXIT_CODE=1
+elif [[ "$SETUP_ABORT" == true ]]; then
+    # setup crash-loop abort: never a goal-met completion, and never shadowed by
+    # the max-iters clause below (which would read a crash-loop as a full run)
     NODE_STATUS="exited"
     RUN_STATUS="exited"
     RUN_EXIT_CODE=1
@@ -1688,3 +1844,9 @@ RUN_END_ARGS=(--status="$RUN_STATUS" --exit-code="$RUN_EXIT_CODE")
 [[ -n "${EXIT_REASON:-}" ]] && RUN_END_ARGS+=(--metadata="$EXIT_REASON")
 fractal run _end "$RUN_ID" --path="$WORKTREE_DIR" \
     "${RUN_END_ARGS[@]}" 2>/dev/null || true
+
+# surface an abnormal end on radio; clean finishes, max-iters completions, and
+# requested stops stay quiet
+if [[ "$RUN_STATUS" == "exited" ]]; then
+    send_exit_notice "$RUN_STATUS" "${EXIT_REASON:-}"
+fi

@@ -41,8 +41,11 @@ __all__ = [
     'test_cost_remaining_subtracts_spend_from_budget',
     'test_cost_remaining_reports_no_budget',
     'test_cost_remaining_clamps_at_zero_when_overspent',
+    'test_cost_spent_marks_untracked_spend',
+    'test_cost_spent_and_breakdown_disclose_unpriced_count',
     'test_cost_spent_scope_flags',
     'test_cost_scope_flags_reject_two_scopes',
+    'test_cost_rejects_lifetime_selector',
     'test_run_start_enforces_single_active_run',
     'test_cost_breakdown_emits_header_for_no_children',
     'test_cost_breakdown_lists_a_registered_child',
@@ -230,9 +233,9 @@ def test_config_round_trips_scalars_bools_and_json(repo: dict) -> None:
 def test_config_set_rejects_bare_key_and_keeps_string_keys_literal(repo: dict) -> None:
     """``config _set`` requires key=value and never coerces a string key's value.
 
-    Regression: a bare key (or empty value) silently stored ``''`` (crashing later
-    numeric reads), and a numeric-looking string value (e.g. ``scope=123``) was
-    JSON-coerced into an int (crashing template rendering).
+    A bare key (or empty value) silently storing ``''`` would crash later
+    numeric reads, and JSON-coercing a numeric-looking string value (e.g.
+    ``scope=123``) into an int would crash template rendering.
     """
     task = repo['task']
     orig_scope = _ok(task, 'config', '_get', 'scope')
@@ -256,10 +259,10 @@ def test_config_set_rejects_bare_key_and_keeps_string_keys_literal(repo: dict) -
 def test_config_set_validates_cost_and_duration_like_init(repo: dict) -> None:
     """``config _set`` rejects values ``init`` would reject (cost + duration).
 
-    Regression: the private setter applied only JSON coercion, so it stored a
-    non-positive ceiling, an out-of-range reserve, a broken step<=iter<=run cost
-    ordering, or a bare-number duration -- each degrading or bricking the run
-    loop. Every rejected set below is a single atomic call refused before any
+    A setter that applied only JSON coercion would store a non-positive
+    ceiling, an out-of-range reserve, a broken step<=iter<=run cost ordering,
+    or a bare-number duration -- each degrading or bricking the run loop.
+    Every rejected set below is a single atomic call refused before any
     write, so nothing persists and the shared fixture is left unchanged.
     """
     task = repo['task']
@@ -424,6 +427,60 @@ def test_cost_remaining_clamps_at_zero_when_overspent(repo: dict) -> None:
     assert float(remaining.removeprefix('$')) == 0.0
 
 
+def test_cost_spent_marks_untracked_spend(repo: dict) -> None:
+    """``cost spent`` prints ``untracked`` when steps recorded no cost.
+
+    A step that ran without ever recording a cost sums to $0 without being
+    genuinely free. The marker keeps never-tracked spend distinct from a true
+    ``$0.0000`` (never a leaked literal ``null``).
+    """
+    root = repo['root']
+    # a fresh node whose only step never records a cost
+    assert _run(root, 'node', 'init', 'nocost', '--agent', 'claude').returncode == 0
+    nocost = root / '.worktrees' / 'main.nocost'
+    run_id = int(_ok(nocost, 'run', '_start'))
+    iter_id = int(_ok(nocost, 'iter', '_start', str(run_id), '--iter', '1'))
+    _ok(
+        nocost,
+        'step',
+        '_start',
+        '--iter',
+        str(iter_id),
+        '--run',
+        str(run_id),
+        '--step',
+        '1',
+        '--name',
+        'PLAN',
+    )
+    assert _ok(nocost, 'node', 'cost', 'spent').strip() == 'untracked'
+
+
+def test_cost_spent_and_breakdown_disclose_unpriced_count(repo: dict) -> None:
+    """``cost spent``/``breakdown`` disclose the run's unpriced-step count.
+
+    The seeded run mixes one priced step with a failed step whose cost was
+    never recorded, so the stdout SUM silently skips a row. Both readings
+    must note exactly the one NULL-cost step on stderr, while stdout stays
+    parseable.
+    """
+    task, run_id = repo['task'], repo['run_id']
+    note = '1 unpriced steps (NULL cost) excluded'
+    # spent: the priced step sums on stdout, the NULL row is noted aside
+    spent = _run(task, 'node', 'cost', 'spent', '--run', str(run_id))
+    assert spent.returncode == 0, spent.stderr
+    assert float(spent.stdout.strip().removeprefix('$')) == pytest.approx(STEP_COST)
+    assert note in spent.stderr, spent.stderr
+    # breakdown: same scope -- the table sums the priced step, stderr notes
+    # the same single gap
+    breakdown = _run(task, 'node', 'cost', 'breakdown', '--run', str(run_id), '--csv')
+    assert breakdown.returncode == 0, breakdown.stderr
+    rows = _csv_rows(breakdown.stdout)
+    own = next(row for row in rows if row['node'] == 'main.task')
+    assert float(own['spent']) == pytest.approx(STEP_COST)
+    assert note in breakdown.stderr, breakdown.stderr
+
+
 def test_cost_spent_scope_flags(repo: dict) -> None:
     """``cost spent --run`` scopes to a single run.
 
@@ -446,6 +503,20 @@ def test_cost_scope_flags_reject_two_scopes(repo: dict) -> None:
     assert spent.returncode == 2, spent.stderr
     remaining = _run(task, 'node', 'cost', 'remaining', '--run', '1', '--step', '1')
     assert remaining.returncode == 2, remaining.stderr
+
+
+def test_cost_rejects_lifetime_selector(repo: dict) -> None:
+    """No cost command recognizes ``--lifetime``: runs are isolated by design.
+
+    There is no cumulative all-runs read anywhere in the CLI. Asserts the
+    message, not just the exit code: a mutex rejection would also exit 2, so
+    the exit code alone cannot prove the option is unrecognized.
+    """
+    task = repo['task']
+    for subcommand in ('spent', 'remaining', 'breakdown'):
+        result = _run(task, 'node', 'cost', subcommand, '--lifetime')
+        assert result.returncode == 2, result.stderr
+        assert 'No such option' in (result.stdout + result.stderr)
 
 
 def test_run_start_enforces_single_active_run(repo: dict) -> None:

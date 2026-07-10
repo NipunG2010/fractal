@@ -22,6 +22,10 @@ Run `wiki --help` and `wiki <command> --help` for the CLI.
   don't append a new entry.
 - **No append-only logs.** If you're adding dated entries, stop —
   replace outdated content with current understanding.
+- **Todo lists are living state.** Keep your private working checklist
+  here as current open items, pruned as they complete — never a
+  done-log. A todo list other nodes should see and track belongs in the
+  project wiki instead.
 - **Keep indexes lean.** Keep each `_index.md` under ~100 lines below
   the `***`; factor overflow into child pages.
 - **Wikilinks stay within one wiki.** Reference anything outside this

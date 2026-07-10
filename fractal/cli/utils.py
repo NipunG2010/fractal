@@ -679,8 +679,7 @@ def _record_session(
     The real, agent-specific session is always written to the step row -- so it
     is resumable later (chat mode) and groups an agent's cost-delta. When not
     ``detached``, it is also persisted to ``.session`` so the next step in the
-    same continuous session can resume it. The step's configured model (or
-    ``None``) is recorded alongside it.
+    same continuous session can resume it.
     """
     if node is None:
         return
@@ -748,6 +747,7 @@ def _render_claude_stream(
     streaming_text = False
     session_recorded = False
     captured_session = None
+    accumulated_cost = None
 
     for line in input:
         if line := line.strip():
@@ -758,16 +758,19 @@ def _render_claude_stream(
         else:
             continue
 
-        # capture the real session (carried on every claude event)
+        # capture the real session (carried on every claude event); prefer the
+        # stream-reported model over the configured one, so a defaulted spawn
+        # (no --model) still stamps a recoverable model
         if not session_recorded:
             session = message.get('session_id')
             if session:
                 captured_session = session
+                model_ = message.get('model') or model
                 _record_session(
                     node=node,
                     step_id=step_id,
                     agent='claude',
-                    model=model,
+                    model=model_,
                     session=session,
                     detached=detached,
                 )
@@ -784,6 +787,17 @@ def _render_claude_stream(
             _handle_user(message)
             if streaming_text:
                 streaming_text = False
+
+        # assistant messages -- accumulate best-effort cost (a killed/timed-out
+        # agent never emits its result frame)
+        elif message_type == 'assistant':
+            accumulated_cost = _record_assistant_cost(
+                message,
+                node,
+                step_id,
+                model=model,
+                accumulated=accumulated_cost,
+            )
 
         # result summary
         elif message_type == 'result':
@@ -896,6 +910,78 @@ def _handle_result(
                 pass
 
 
+def _record_assistant_cost(
+    message: dict[str, Any],
+    node: Optional[Node],
+    step_id: Optional[int],
+    *,
+    model: Optional[str],
+    accumulated: Optional[float],
+) -> Optional[float]:
+    """Accumulate an assistant message's priced usage and flush it.
+
+    Claude's ``result`` frame is the authoritative cost record, but a killed
+    or timed-out agent never emits one -- so each assistant message's usage
+    is priced as it arrives and the running total flushed to the step row
+    per event (``_stream`` itself can die by signal). The eventual result
+    overwrites the estimate with claude's own figure.
+
+    Returns:
+        The updated running total, or the prior one when the message
+        carries no usage or the model cannot be priced.
+
+    """
+    usage = message.get('message', {}).get('usage')
+    if not usage:
+        return accumulated
+    cost = _compute_claude_cost(usage, model)
+    if cost is None:
+        return accumulated
+    total = (accumulated or 0.0) + cost
+    if node is not None and step_id is not None:
+        node.step_cost(step_id=step_id, cost=total)
+    return total
+
+
+def _compute_claude_cost(
+    usage: dict[str, Any],
+    model: Optional[str] = None,
+) -> Optional[float]:
+    """Compute cost from claude token usage and LiteLLM pricing.
+
+    Returns ``None`` if the model is unknown or unpriced. The usage shape
+    is Anthropic-specific: ``input_tokens`` EXCLUDES the cache buckets
+    (``cache_creation_input_tokens``/``cache_read_input_tokens`` are
+    disjoint, each priced at its own rate), and every assistant message
+    reports its own API call -- per-call costs sum to the invocation
+    total, unlike codex's cumulative snapshots.
+    """
+    if model is None:
+        return None
+    # look up per-token rates (missing cache rates fall back to the input rate)
+    pricing = _load_pricing()
+    rates = pricing.get(model)
+    if rates is None:
+        return None
+    # a model present without rate keys cannot be priced -- report unknown, not $0
+    if ('input_cost_per_token' not in rates) and ('output_cost_per_token' not in rates):
+        return None
+    input_rate = rates.get('input_cost_per_token', 0.0)
+    cache_read_rate = rates.get('cache_read_input_token_cost', input_rate)
+    cache_creation_rate = rates.get('cache_creation_input_token_cost', input_rate)
+    output_rate = rates.get('output_cost_per_token', 0.0)
+    input_tokens = usage.get('input_tokens', 0.0)
+    cache_read_tokens = usage.get('cache_read_input_tokens', 0.0)
+    cache_creation_tokens = usage.get('cache_creation_input_tokens', 0.0)
+    output_tokens = usage.get('output_tokens', 0.0)
+    return (
+        input_tokens * input_rate
+        + cache_read_tokens * cache_read_rate
+        + cache_creation_tokens * cache_creation_rate
+        + output_tokens * output_rate
+    )
+
+
 # ------ helper functions (codex stream)
 
 _PRICING_URL = (
@@ -909,13 +995,17 @@ _PRICING_CACHE = '~/.fractal/pricing.json'
 def _load_pricing() -> dict[str, Any]:
     """Load cached pricing data (once per process).
 
-    The cache is populated at run start by ``fractal _pricing``, which aborts the
-    node when a token-pricing agent has no obtainable pricing -- so by the time a
-    stream reads it the file is guaranteed to exist.
+    The cache is populated at run start by ``fractal _pricing``, but only for
+    token-priced agents (``needs_pricing``); claude's best-effort accrual reads
+    it opportunistically, so a missing or corrupt cache degrades to no pricing
+    (streams record unpriced, never crash mid-step).
     """
     cache = pathlib.Path(_PRICING_CACHE).expanduser()
-    with open(cache) as file:
-        return json.load(file)
+    try:
+        with open(cache) as file:
+            return json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def _compute_codex_cost(
@@ -1006,12 +1096,14 @@ def _render_codex_stream(
         # turn summary -- codex usage is cumulative per thread and only grows,
         # so keep the max: a zero/empty terminal usage frame (codex emits
         # usage:{} on some error/cancel paths) must not reset the running total
-        # and drive the per-step delta negative
+        # and drive the per-step delta negative; flush per turn so a stream
+        # killed by signal still has the last increment recorded
         elif event_type == 'turn.completed':
             usage = event.get('usage', {})
             cost = _compute_codex_cost(usage, model)
             if cost is not None and (cumulative_cost is None or cost > cumulative_cost):
                 cumulative_cost = cost
+                _record_codex_cost(node, step_id, cumulative_cost)
 
         # surface errors -- codex reports these on the JSON stream, not stderr,
         # so without this a failed turn leaves no explanation in the output
@@ -1029,32 +1121,47 @@ def _render_codex_stream(
             )
             error_detail = detail
 
-    # print summary, then record this step's cost increment: codex usage is cumulative
-    # per thread and continuous steps resume one thread, so subtract prior steps sharing
-    # this session (a detached step has its own thread, so the delta is the full cost)
+    # print summary, then record the final cost increment (idempotent with the
+    # per-turn flushes above -- the last flush already wrote this figure)
     cost_str = f'${cumulative_cost:.4f}' if cumulative_cost is not None else '$?'
     print(f'\n{_DIM}-- {cost_str}{_RESET}')
-    if node is not None and step_id is not None and cumulative_cost is not None:
-        rows = node.db.read('steps', where={'step_id': step_id}, limit=1)
-        session = rows[0].get('session') if rows else None
-        cost = cumulative_cost
-        if session is not None:
-            siblings = node.db.read(
-                'steps',
-                where={'session': session, 'node': node._branch},
-            )
-            prior = sum(
-                row['cost']
-                for row in siblings
-                if row['step_id'] != step_id and row['cost'] is not None
-            )
-            # clamp at 0: a step can't have negative spend, and a negative delta
-            # (price change mid-run, an un-recorded prior step) would otherwise be
-            # stored and poison the next step's prior-sibling subtraction
-            cost = max(0.0, cumulative_cost - prior)
-        node.step_cost(step_id=step_id, cost=cost)
+    if cumulative_cost is not None:
+        _record_codex_cost(node, step_id, cumulative_cost)
 
     # a codex error/turn.failed must fail the step (else it records completed/exit 0)
     if error_detail is not None:
         raise RuntimeError(f'codex reported an error: {error_detail}')
     return captured_session
+
+
+def _record_codex_cost(
+    node: Optional[Node],
+    step_id: Optional[int],
+    cumulative_cost: float,
+) -> None:
+    """Record a step's cost increment from the cumulative thread total.
+
+    Codex usage is cumulative per thread and continuous steps resume one
+    thread, so subtract prior steps sharing this session (a detached step
+    has its own thread, so the delta is the full cost).
+    """
+    if node is None or step_id is None:
+        return
+    rows = node.db.read('steps', where={'step_id': step_id}, limit=1)
+    session = rows[0].get('session') if rows else None
+    cost = cumulative_cost
+    if session is not None:
+        siblings = node.db.read(
+            'steps',
+            where={'session': session, 'node': node._branch},
+        )
+        prior = sum(
+            row['cost']
+            for row in siblings
+            if row['step_id'] != step_id and row['cost'] is not None
+        )
+        # clamp at 0: a step can't have negative spend, and a negative delta
+        # (price change mid-run, an un-recorded prior step) would otherwise be
+        # stored and poison the next step's prior-sibling subtraction
+        cost = max(0.0, cumulative_cost - prior)
+    node.step_cost(step_id=step_id, cost=cost)

@@ -143,7 +143,7 @@ def init(app: typer.Typer) -> typer.Typer:
 def commit(app: typer.Typer) -> typer.Typer:
     """Register the ``commit`` command."""
     # message argument
-    message_help = 'Short description for the commit message.'
+    message_help = 'Short description for the commit message (required unless --check).'
     message = typer.Argument(None, help=message_help)
     # init flag
     init_help = 'Baseline commit ("init" instead of "iteration <N>").'
@@ -155,7 +155,7 @@ def commit(app: typer.Typer) -> typer.Typer:
     ignore_scope_help = 'Commit out-of-scope changes but still lint.'
     ignore_scope = typer.Option(False, '--ignore-scope', help=ignore_scope_help)
     # force flag
-    force_help = 'Bypass scope and lint checks.'
+    force_help = 'Bypass scope and lint checks and git hooks.'
     force = typer.Option(False, '--force', help=force_help)
     # path option
     path_help = 'Worktree directory.'
@@ -202,7 +202,13 @@ def open(app: typer.Typer) -> typer.Typer:
         """Open the fractal TUI (the cockpit)."""
         # NOTE: import textual lazily: the TUI is an
         #   optional extra and must stay off cold start
-        from fractal.tui import FractalApp
+        try:
+            from fractal.tui import FractalApp
+        except ImportError as e:
+            raise RuntimeError(
+                f'The TUI needs the optional tui extra ({e}); install it'
+                " with `pip install 'plasma-fractal[tui]'` and re-run."
+            ) from None
 
         node = resolve_target(path, node)
         project_dir = node._repo_dir / node._project_path

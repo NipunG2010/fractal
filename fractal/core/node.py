@@ -11,6 +11,8 @@ import math
 import os
 import pathlib
 import re
+import shutil
+import signal
 import string
 import subprocess
 import sys
@@ -36,6 +38,11 @@ __all__ = [
 # git stores each branch as a ref file, so a node name is bounded by the
 # filesystem's 255-character path-component limit
 _MAX_NAME_LENGTH = 255
+
+# a single name segment is capped well under the branch bound -- branches
+# accrete one name per level, and per-segment discipline keeps worktree
+# paths, list columns, and radio senders usable
+_MAX_NODE_NAME_LENGTH = 64
 
 # codex exec has no fork (`exec resume` mutates the thread);
 # revisit when `codex exec fork` is implemented:
@@ -108,7 +115,9 @@ class Node:
         'approve',
         'merge',
         'delete',
+        'orphan',
         'finish',
+        'finish_cancel',
         'stop',
         'kill',
         'retire',
@@ -248,8 +257,11 @@ class Node:
         run -- both the ``.status`` file and the crashed run's still-open
         runs/iters/steps rows, so a later merge/delete/retire (none of which
         start a loop) cannot leave the DB reading ``active`` while the status
-        reads ``exited``. A no-op unless the status is ``active``, so a settled
-        node never pays the tmux probe.
+        reads ``exited``. The settle also heals any config/registry cap drift
+        (:meth:`caps_reconcile`): a loop that died before its next iteration
+        boundary never ran the boundary reconcile, and the dead row would
+        otherwise carry the drift forever. A no-op unless the status is
+        ``active``, so a settled node never pays the tmux probe.
 
         Never reconciles the node from inside its own running loop: the loop
         self-finishes (``send_budget_finish`` calls ``node finish``), and a
@@ -259,8 +271,44 @@ class Node:
         if self._is_own_loop():
             return
         if self.status() == 'active' and not self._tmux_session_exists():
+            self._reap_orphan()
             self._close_open_rows(status='exited', exit_code=1)
             self.status_set('exited')
+            self.caps_reconcile()
+
+    def _reap_orphan(self: Node) -> None:
+        """Kill a surviving agent group recorded by a dead loop.
+
+        ``_run.sh`` records its process group at run start (``.pgid``, removed
+        on any in-band exit), so a file that outlives the tmux session marks
+        an out-of-band pane death (tmux kill/crash, host OOM) whose agent may
+        still be running -- and spending -- headless. The reap follows
+        ``kill.sh``'s TERM-grace-KILL cadence and logs an ``orphan`` event
+        naming the reaped pgid. Best-effort: a dead, recycled, or foreign
+        group reads as already gone.
+        """
+        pgid_file = self._node_dir / '.pgid'
+        if not pgid_file.exists():
+            return
+        # trust the record only while its group is still alive
+        try:
+            pgid = int(pgid_file.read_text(encoding='utf-8').strip())
+            os.killpg(pgid, 0)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pgid = 0
+        # reap the group and audit the reap
+        if pgid > 0:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+                for _ in range(10):
+                    time.sleep(0.2)
+                    os.killpg(pgid, 0)
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            event_id = self.event_start('orphan', metadata=f'reaped pgid {pgid}')
+            self.event_end(event_id=event_id, status='completed')
+        pgid_file.unlink(missing_ok=True)
 
     def _is_own_loop(self: Node) -> bool:
         """Whether this process is running inside this node's own loop.
@@ -304,9 +352,9 @@ class Node:
         self: Node,
         name: Optional[str] = None,
         *,
-        path: Optional[str] = None,
+        path: Optional[Union[str, pathlib.Path]] = None,
         title: Optional[str] = None,
-        scope: Optional[str] = None,
+        scope: Optional[list[str]] = None,
         base: Optional[str] = None,
         meta: Optional[str] = None,
         agent: Optional[str] = None,
@@ -342,7 +390,10 @@ class Node:
 
         Args:
             name: Node name (current branch for user node).
-            path: Project path (relative to repo) for user node.
+            path: Project path (relative to repo) for user node; for a
+                child, a non-root value selects its sub-project (default:
+                inherit the parent's). A path under ``.worktrees/`` (the
+                cwd resolving into a worktree) names the parent instead.
             title: Human-readable display name (defaults to the de-slugged name).
             scope: Subdirectory scope within the worktree.
             base: Branch to start from.
@@ -378,6 +429,10 @@ class Node:
             Script output.
 
         """
+        # coerce path to a str -- downstream '.' comparisons and persisted
+        # caches expect the string form
+        if path is not None:
+            path = str(path)
         # handle user node init (name derived from current branch)
         if user:
             if name:
@@ -410,6 +465,22 @@ class Node:
             raise ValueError(
                 f'Node name may only contain letters, digits, and underscores: {name!r}'
             )
+        # cap the single name segment -- the composed-branch guard below still
+        # owns the deep-tree bound
+        if len(name) > _MAX_NODE_NAME_LENGTH:
+            raise ValueError(
+                f'Node name too long: {len(name)} characters'
+                f' (max {_MAX_NODE_NAME_LENGTH}): {name!r}'
+            )
+        # flatten scope entries -- the CLI form is comma-separated, with
+        # repeated flags tolerated, so each entry may carry several roots
+        if scope:
+            scope = [
+                root.strip()
+                for entry in scope
+                for root in entry.split(',')
+                if root.strip()
+            ]
         # expand --meta into --base + --scope
         if meta:
             # handle mutually exclusive flags
@@ -436,9 +507,9 @@ class Node:
             else:
                 target_project = '.'
             if target_project == '.':
-                scope = f'.fractal/{meta}'
+                scope = [f'.fractal/{meta}']
             else:
-                scope = f'{target_project}/.fractal/{meta}'
+                scope = [f'{target_project}/.fractal/{meta}']
         # prefer the calling node (_NODE) so an agent's child nests under it,
         # not the repo-root user node; fall back to self for a top-level spawn
         parent = self._resolve_caller()
@@ -446,6 +517,15 @@ class Node:
         # at a different repo would register the child in the wrong DB (split-brain)
         if parent is not None and parent._repo_dir != self._repo_dir:
             parent = None
+        # no ambient caller but a path under .worktrees/ (the CLI derives path
+        # from cwd, so this is a manual init from inside a worktree): parent on
+        # that worktree's node rather than the root default
+        if parent is None and path is not None:
+            parts = pathlib.Path(path).parts
+            if len(parts) >= 2 and parts[0] == '.worktrees':
+                candidate = Node(self._repo_dir / '.worktrees' / parts[1])
+                if candidate.exists():
+                    parent = candidate
         if parent is None or not parent.exists():
             parent = self
         # validate parent node
@@ -524,8 +604,14 @@ class Node:
         args.append(f'--title={title}')
         args.append(f'--parent={parent._branch}')
         args.append(f'--root={root}')
-        if scope:
-            args.append(f'--scope={scope}')
+        # a non-root path selects the child's sub-project (default: inherit); a
+        # .worktrees/ path is the cwd-in-a-worktree case above -- inherit too
+        if path is not None and path != '.':
+            parts = pathlib.Path(path).parts
+            if parts[0] != '.worktrees':
+                args.append(f'--project={path}')
+        for scope_root in scope or []:
+            args.append(f'--scope={scope_root}')
         if base:
             args.append(f'--base={base}')
         if meta:
@@ -588,6 +674,17 @@ class Node:
             # locate child worktree
             child_branch = f'{parent._branch}.{name}'
             child_worktree_dir = _find_worktree(self._repo_dir, child_branch)
+            # refuse an implicit adopt: exiting 0 against an existing node
+            # would leave its old config in place and silently drop the
+            # requested caps -- reuse is explicit in this CLI, never an accident
+            if not reset and child_worktree_dir is not None:
+                if self.__class__(child_worktree_dir).exists():
+                    raise ValueError(
+                        f'Node {child_branch!r} already exists; start it with'
+                        ' `fractal node start --resume`, remove it with'
+                        ' `fractal node delete`, or pass --reset to'
+                        ' reinitialize it.'
+                    )
             # check for pre-existing branch
             cmd = ['show-ref', '--verify', f'refs/heads/{child_branch}']
             pre_existing_branch = _git(cmd, cwd=self._repo_dir, check=False)
@@ -673,7 +770,7 @@ class Node:
 
     def _init_user(
         self: Node,
-        path: Optional[str] = None,
+        path: Optional[Union[str, pathlib.Path]] = None,
         *,
         agent: Optional[str] = None,
         track: Optional[bool] = None,
@@ -747,6 +844,8 @@ class Node:
             self.db.init()
             self.radio.init()
             created = self._ensure_project_wiki(path, wiki_name)
+            # re-check host hooks for the formatter lanes (informational)
+            self._verify_hook_formatters()
             message = f'User node already initialized on branch {branch!r}.'
             if agent is not None:
                 message += f' Updated default agent to {agent}.'
@@ -778,11 +877,49 @@ class Node:
         self.db.init()
         self.radio.init()
         # initialize the project wiki if it doesn't exist
-        self._ensure_project_wiki(path, wiki_name)
-        # report -- note the sub-project for monorepo nodes
+        created = self._ensure_project_wiki(path, wiki_name)
+        # check host hooks for the formatter lanes (informational)
+        self._verify_hook_formatters()
+        # report what landed and the baseline commit that must follow -- a
+        # node worktree can only branch from a committed tree
         if path == '.':
-            return f'Initialized user node on branch {branch}'
-        return f'Initialized user node on branch {branch} (project {path!r})'
+            headline = f'Initialized user node on branch {branch}'
+            seed, wiki = '.fractal', 'wiki'
+        else:
+            headline = f'Initialized user node on branch {branch} (project {path!r})'
+            seed, wiki = f'{path}/.fractal', f'{path}/wiki'
+        summary = f'Created {seed}/{branch}/ (config, database, radio)'
+        if created:
+            summary += f' and the project wiki at {wiki}/'
+        next_step = 'Next: commit the baseline: fractal commit "<message>" --init'
+        return f'{headline}\n{summary}\n{next_step}'
+
+    def _verify_hook_formatters(self: Node) -> None:
+        """Name the formatter-safe lanes when host pre-commit hooks exist.
+
+        Hooks that rewrite ``wiki/`` or ``.fractal/`` corrupt generated pages
+        and their commits fail loud (mdformat escapes wikilinks and mangles
+        nav delimiters). Stays silent once either safe lane is taken:
+        ``mdformat-wiki`` wired in, or a ``.fractal`` mention (the shape of
+        any path filter steering hooks off the generated paths). Verify-only:
+        the user's config is never edited, and no exclude is ever prescribed.
+        """
+        config_path = self._repo_dir / '.pre-commit-config.yaml'
+        if not config_path.exists():
+            return
+        config = config_path.read_text(encoding='utf-8')
+        if 'mdformat-wiki' in config or '.fractal' in config:
+            return
+        print(
+            'Note: this repo runs pre-commit hooks -- formatters that rewrite'
+            ' generated pages (project wiki, node data) corrupt them and'
+            ' their commits fail loud. Give mdformat the wikilink-aware'
+            ' plugin (additional_dependencies: [mdformat-wiki] on its hook,'
+            ' dropping mdformat-frontmatter if present -- both register a'
+            ' frontmatter renderer and whichever is discovered first wins),'
+            ' or keep formatters off the wiki paths.',
+            file=sys.stderr,
+        )
 
     def _ensure_project_wiki(self: Node, path: str, name: str) -> bool:
         """Create the project wiki if missing; report whether it was created.
@@ -816,12 +953,15 @@ class Node:
             )
         # seed the strict naming policy so fractal project wikis use identifiers
         settings = json.dumps({'naming': {'validate': ['ascii', 'identifier']}})
-        cmd = ['wiki', 'init', name, f'--path={wiki_dir}', f'--settings={settings}']
+        executable = _wiki_executable()
+        cmd = [executable, 'init', name, f'--path={wiki_dir}', f'--settings={settings}']
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             error = result.stderr.strip()
             raise RuntimeError(
-                f'wiki init failed (exit {result.returncode}): {error!r}'
+                f'wiki init failed (exit {result.returncode}): {error!r} --'
+                ' fix the cause and re-run init (a partial init is repaired'
+                ' in place)'
             )
         return True
 
@@ -921,6 +1061,11 @@ class Node:
         are read from ``config.json`` (set at init or edited
         before launch); ``resume`` is the only launch-time action.
 
+        A resume re-enters the unsettled pool, so it re-checks the
+        width/descendant gates (:meth:`_enforce_rearm_limits`) and re-arms to
+        ``idle`` under the ``.worktrees`` flock; the loop stamps ``active`` at
+        boot just as a fresh start does.
+
         Args:
             resume: Resume a stopped/exited node.
 
@@ -937,8 +1082,10 @@ class Node:
         current_status = self.status()
         if current_status == 'retired':
             raise RuntimeError('Cannot start a retired node. Unretire it first.')
+        # statuses a resume may re-arm from
+        resumable = ('completed', 'stopped', 'exited', 'killed')
         if resume:
-            if current_status not in ('completed', 'stopped', 'exited', 'killed'):
+            if current_status not in resumable:
                 raise RuntimeError(f'Cannot resume from status: {current_status!r}')
         else:
             if current_status != 'idle':
@@ -976,8 +1123,33 @@ class Node:
             args.append('--resume')
         # ensure git excludes
         self._git_exclude()
-        # run script
-        result = self._run_script('start.sh', *args)
+        if resume:
+            # gate re-check and idle re-arm stay atomic under the .worktrees
+            # flock (init's check+register atomicity) -- the loop stamps active
+            # only at boot, so a post-lock re-arm would let a concurrent gate
+            # read this node as settled and hand its slot away
+            lock_dir = self._repo_dir / '.worktrees'
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            with open(lock_dir / '.lock', 'a', encoding='utf-8') as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                # re-read under the lock -- a concurrent resume that won the
+                # race has already re-armed this node out of a settled status
+                current_status = self.status()
+                if current_status not in resumable:
+                    raise RuntimeError(f'Cannot resume from status: {current_status!r}')
+                self._enforce_rearm_limits()
+                self.status_set('idle')
+            # launch outside the lock -- the idle re-arm above already holds
+            # the slot; roll a failed launch back to the settled status so
+            # --resume stays the retry path (idle reads as never-started)
+            try:
+                result = self._run_script('start.sh', *args)
+            except Exception:
+                self.status_set(current_status)
+                raise
+        else:
+            # run script
+            result = self._run_script('start.sh', *args)
         return result.stdout.strip()
 
     def attach(self: Node) -> None:
@@ -1011,9 +1183,17 @@ class Node:
         _, _, run_id = self._resolve_context()
         if run_id is None:
             raise RuntimeError('Cannot finish: node has no run.')
+        # attribute the propagated reason so a descendant's signal row names
+        # this node as the source (an unattributed parent budget-reserve
+        # finish would read as the child's own boundary mis-fire)
+        propagated = (
+            f'{reason} (via finish of {self._branch})'
+            if reason
+            else f'via finish of {self._branch}'
+        )
         # finish descendants first, then self
         for _, descendant in self._live_descendants(status='active'):
-            descendant._finish(reason)
+            descendant._finish(propagated)
         self._finish(reason)
         # build confirmation
         result = 'Finish signal sent (will stop after current iteration)'
@@ -1027,6 +1207,47 @@ class Node:
         self.signal_set('finish', reason or '')
         self._run_script('finish.sh', f'{self._root}')
         self.event_end(event_id=event_id, status='completed')
+
+    def finish_cancel(self: Node, reason: Optional[str] = None) -> str:
+        """Withdraw this node's pending ``finish`` signal.
+
+        Deletes the signal rows for the current run, so the loop's boundary
+        checks no longer see a pending finish. Descendants are untouched: a
+        subtree ``finish`` fans out, but its cancel must not -- finishing is
+        a descendant's normal completion path, not something to withdraw.
+
+        Args:
+            reason: Optional reason for the cancellation.
+
+        Returns:
+            Confirmation message.
+
+        """
+        # reconcile a crashed-but-active node so it hits the clear
+        # not-active guard below, not the misleading no-run error
+        self._reconcile_status()
+        # validate status
+        if self.status() != 'active':
+            raise RuntimeError('Cannot cancel finish: node is not active.')
+        # an active node with no run has nothing pending
+        _, _, run_id = self._resolve_context()
+        if run_id is None:
+            raise RuntimeError('Cannot cancel finish: node has no run.')
+        if self.signal_get('finish', run_id=run_id) is None:
+            raise RuntimeError('Cannot cancel finish: no finish signal is set.')
+        # delete the pending rows, bracketed by an audit event -- signals are
+        # append-only everywhere else; this is the one deliberate withdrawal
+        event_id = self.event_start('finish_cancel', metadata=reason or '')
+        self.db.delete(
+            'signals',
+            where={'node': self._branch, 'run_id': run_id, 'signal': 'finish'},
+        )
+        self.event_end(event_id=event_id, status='completed')
+        # build confirmation
+        result = 'Finish signal cancelled (loop continues)'
+        if reason:
+            result += f': {reason}'
+        return result
 
     def stop(self: Node, reason: Optional[str] = None) -> str:
         """Stop the node and its active descendants (children first).
@@ -1050,9 +1271,16 @@ class Node:
         _, _, run_id = self._resolve_context()
         if run_id is None:
             raise RuntimeError('Cannot stop: node has no run.')
+        # attribute the propagated reason so a descendant's signal row names
+        # this node as the source (mirrors finish)
+        propagated = (
+            f'{reason} (via stop of {self._branch})'
+            if reason
+            else f'via stop of {self._branch}'
+        )
         # stop descendants first, then self
         for _, descendant in self._live_descendants(status='active'):
-            descendant._stop(reason)
+            descendant._stop(propagated)
         self._stop(reason)
         # build confirmation
         result = 'Stop signal sent (will stop after current step)'
@@ -1083,10 +1311,17 @@ class Node:
         current = self.status()
         if current != 'active':
             raise RuntimeError(f'Cannot kill: node is not active (status: {current}).')
+        # attribute the propagated reason so a descendant's signal row names
+        # this node as the source (mirrors finish)
+        propagated = (
+            f'{reason} (via kill of {self._branch})'
+            if reason
+            else f'via kill of {self._branch}'
+        )
         # reap descendants first (best-effort), then self
         for _, descendant in self._live_descendants(status='active'):
             try:
-                descendant._kill(reason)
+                descendant._kill(propagated)
             except Exception:
                 # best-effort: surface the failure but keep reaping
                 # the rest of the subtree -- a stuck child must not
@@ -1149,7 +1384,7 @@ class Node:
         result = self._run_script('merge.sh', f'{self._root}')
         return result.stdout.strip()
 
-    def delete(self: Node) -> str:
+    def delete(self: Node) -> tuple[str, str]:
         """Recursively remove the node and its whole subtree.
 
         Tears down every descendant too (deepest first), then the node itself:
@@ -1160,7 +1395,8 @@ class Node:
         kill the subtree first.
 
         Returns:
-            Script output for the node itself.
+            Tuple of per-node script output (deletion order) and collected
+            stderr notices (e.g. unmerged-work warnings).
 
         """
         # validate node
@@ -1243,8 +1479,18 @@ class Node:
             key=lambda x: x.count('.'),
             reverse=True,
         )
-        # collect each delete.sh's stderr notices (e.g. unmerged-work warnings) so
-        # they reach the operator, not vanish behind a silent force-delete
+        # thread the deletion root's surviving merge target (its base config,
+        # else its dotted parent -- delete.sh's own fallback) into each
+        # descendant's delete.sh: a descendant's self-derived parent dies in
+        # this same teardown, so its unmerged warning must name a survivor
+        merge_target = self.config_get('base') or ''
+        if not merge_target and '.' in branch:
+            merge_target = branch.rsplit('.', 1)[0]
+        target_args = [f'--merge-target={merge_target}'] if merge_target else []
+        # collect each delete.sh's stdout and stderr notices (e.g. unmerged-work
+        # warnings) separately so every node's removal is echoed and warnings
+        # ride the caller's stderr, not vanish behind a silent force-delete
+        outputs = []
         notices = []
         # serialize the worktree teardown against concurrent inits/teardowns --
         # git worktree remove is not parallel-safe (the .worktrees flock child_add
@@ -1257,7 +1503,12 @@ class Node:
                 worktree_dir = _find_worktree(repo_dir, descendant_branch)
                 if worktree_dir:
                     child = self.__class__(worktree_dir)
-                    child_result = child._run_script('delete.sh', f'{worktree_dir}')
+                    child_result = child._run_script(
+                        'delete.sh', f'{worktree_dir}', *target_args
+                    )
+                    child_output = child_result.stdout.strip()
+                    if child_output:
+                        outputs.append(child_output)
                     notice = child_result.stderr.strip()
                     if notice:
                         notices.append(notice)
@@ -1271,12 +1522,12 @@ class Node:
         # surface delete.sh stderr on success too -- the unmerged-work warning lives
         # there and is otherwise swallowed (only a failure surfaces stderr by default)
         output = result.stdout.strip()
+        if output:
+            outputs.append(output)
         notice = result.stderr.strip()
         if notice:
             notices.append(notice)
-        if notices:
-            output = '\n'.join([output, *notices]) if output else '\n'.join(notices)
-        return output
+        return '\n'.join(outputs), '\n'.join(notices)
 
     def deregister(self: Node, branch: str) -> str:
         """Deregister an orphaned (worktree-less) node from the registry.
@@ -1320,11 +1571,43 @@ class Node:
             message += ' Run `git worktree prune` to clear stale worktree metadata.'
         return message
 
+    def reconcile(self: Node) -> list[str]:
+        """Record orphaned descendants (worktree removed out of band) as events.
+
+        Cleaning up a node's worktree/branch with plain git instead of
+        ``delete`` legitimately leaves its registry rows behind, but nothing
+        records the removal (``list`` flags such rows display-only). Logs one
+        ``orphan`` event per newly observed orphan, giving out-of-band cleanup
+        an audit trail. Registry rows are kept -- ``delete --force``
+        (deregister) remains the removal path.
+
+        Returns:
+            Branches newly recorded as orphaned.
+
+        """
+        # scan the cached registry against one batched worktree probe
+        rows = self.child_list() or []
+        worktrees = _worktree_map(self._repo_dir)
+        recorded = []
+        for row in rows:
+            if row['node'] in worktrees:
+                continue
+            # skip a branch whose orphaning is already on the events log
+            where = {'event': 'orphan', 'metadata': row['node']}
+            if self.db.read('events', where=where):
+                continue
+            # log the observation (point-in-time: start plus immediate end)
+            event_id = self.event_start('orphan', metadata=row['node'])
+            self.event_end(event_id=event_id, status='completed')
+            recorded.append(row['node'])
+        return recorded
+
     def retire(self: Node) -> str:
         """Mark the node as retired.
 
         Retired nodes are hidden from ``list()`` by default
-        and cannot be started.
+        and cannot be started. The current status rides the
+        retire event so ``unretire`` can restore it.
 
         Returns:
             Confirmation message.
@@ -1338,8 +1621,10 @@ class Node:
         # validate status
         if self.status() == 'active':
             raise RuntimeError('Cannot retire an active node. Stop or kill it first.')
-        # set status and log event
-        event_id = self.event_start('retire')
+        # set status and log event -- the pre-retire status rides the event
+        # metadata so unretire can restore it instead of dropping it
+        prior = self.status()
+        event_id = self.event_start('retire', metadata=prior)
         self.status_set('retired')
         self._run_script('retire.sh', f'{self._root}')
         self.event_end(event_id=event_id, status='completed')
@@ -1348,9 +1633,14 @@ class Node:
     def unretire(self: Node) -> str:
         """Remove retired status from the node.
 
-        Resets the node's status to ``idle`` -- any prior terminal status
-        (``completed``/``stopped``/``exited``/``killed``) the node held before
-        it was retired is dropped.
+        Restores the status the node held before it was retired (recorded
+        on the retire event); when no retire event recorded one (e.g. a
+        ``.status`` file set by hand) the node resets to ``idle``.
+
+        An ``idle`` restore re-enters the unsettled pool, so it re-checks
+        the width/descendant gates (:meth:`_enforce_rearm_limits`) under
+        the ``.worktrees`` flock; a settled restore holds no slot and
+        passes ungated.
 
         Returns:
             Confirmation message.
@@ -1362,9 +1652,35 @@ class Node:
         # validate status
         if self.status() != 'retired':
             raise RuntimeError('Cannot unretire: node is not retired.')
-        # set status and log event
-        event_id = self.event_start('unretire')
-        self.status_set('idle')
+        # an idle restore re-enters the unsettled pool, so the gate re-check
+        # and the flip stay atomic under the .worktrees flock (init's
+        # check+register atomicity); a settled restore holds no slot
+        lock_dir = self._repo_dir / '.worktrees'
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        with open(lock_dir / '.lock', 'a', encoding='utf-8') as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            # re-read under the lock -- a concurrent unretire that won the
+            # race has already restored this node out of retired
+            if self.status() != 'retired':
+                raise RuntimeError('Cannot unretire: node is not retired.')
+            # restore the pre-retire status from the latest retire event --
+            # resolved under the lock too, so a rival unretire -> re-retire
+            # cycle cannot hand this caller a stale prior; fall back to idle
+            # when nothing usable was recorded (a re-retired node stored
+            # 'retired'; 'active' can only be a stale hand-edit)
+            rows = self.db.read(
+                'events',
+                where={'node': self._branch, 'event': 'retire'},
+                limit=1,
+            )
+            prior = rows[0]['metadata'] if rows else ''
+            if prior not in self._statuses or prior in ('active', 'retired'):
+                prior = 'idle'
+            if prior == 'idle':
+                self._enforce_rearm_limits()
+            # set status and log event
+            event_id = self.event_start('unretire')
+            self.status_set(prior)
         self._run_script('unretire.sh', f'{self._root}')
         self.event_end(event_id=event_id, status='completed')
         return 'Node unretired'
@@ -1489,7 +1805,12 @@ class Node:
         """List registered child nodes.
 
         Queries the ``nodes`` table with optional depth and
-        status filters.
+        status filters. A crashed-but-active row (worktree present, no live
+        tmux session) is reconciled -- persisted via
+        :meth:`_reconcile_status`, not just relabeled -- before listing, so
+        the fleet's default steering read never echoes a dead loop as
+        ``active``. Cap columns render each present child's live config
+        values; a gone worktree keeps the registry caps.
 
         Args:
             all_nodes: Include retired nodes in output.
@@ -1528,19 +1849,61 @@ class Node:
             rows = self.child_list(max_depth=max_depth)
             if rows is None:
                 return []
-            # flag a registry row whose worktree is gone (a phantom/orphan, removed
-            # out of band) as 'orphan' rather than a normal 'idle' -- plain list
-            # stays a pure reader (one batched worktree probe, no tmux) but no longer
-            # reports a vanished node as healthy; 'retired' is a kept state (the
-            # retired/all filters key on it), so it survives a gone worktree too
             worktrees = _worktree_map(self._repo_dir)
+            # heal a crashed-but-active row by persisting the child's
+            # reconcile: reads are where staleness is observed, and the plain
+            # list is the fleet's default steering read -- the tmux probe is
+            # paid only while the registry holds actives
+            if any(_base_status(row.get('status')) == 'active' for row in rows):
+                sessions = _live_tmux_sessions()
+                healed = []
+                for row in rows:
+                    worktree_dir = worktrees.get(row['node'])
+                    if (
+                        _base_status(row.get('status')) == 'active'
+                        and worktree_dir is not None
+                    ):
+                        node = self.__class__(worktree_dir)
+                        if node.exists() and node._tmux_session_name not in sessions:
+                            node._reconcile_status()
+                            row = {**row, 'status': node.status()}
+                    healed.append(row)
+                rows = healed
+            # flag a registry row whose worktree is gone (removed out of band)
+            # rather than reporting a vanished node as healthy: a settled/kept
+            # status keeps an '(orphaned)' suffix (filters match on the bare
+            # first chunk), while a live-ish row turns 'orphan' outright --
+            # artifacts vanishing mid-life is an anomaly, not cleanup
+            settled = ('completed', 'stopped', 'exited', 'killed', 'retired')
             flagged = []
             for row in rows:
                 if row['node'] not in worktrees:
-                    if _base_status(row.get('status')) != 'retired':
+                    stored = _base_status(row.get('status'))
+                    if stored in settled:
+                        row = {**row, 'status': f'{stored} (orphaned)'}
+                    else:
                         row = {**row, 'status': 'orphan'}
                 flagged.append(row)
             rows = flagged
+        # overlay each present child's config caps (display-only): a
+        # post-spawn config edit (the rescue top-up) is live enforcement
+        # truth the registry row's spawn-time values miss; a gone worktree
+        # keeps the registry caps (the only surviving source)
+        worktrees = _worktree_map(self._repo_dir)
+        capped = []
+        for row in rows:
+            worktree_dir = worktrees.get(row['node'])
+            node = self.__class__(worktree_dir) if worktree_dir else None
+            if node is None or not node.exists():
+                capped.append(row)
+                continue
+            drifted = {}
+            for key in ('max_cost', 'max_depth', 'max_children', 'max_descendants'):
+                config_value = node.config_get(key)
+                if config_value is not None and config_value != row[key]:
+                    drifted[key] = config_value
+            capped.append({**row, **drifted} if drifted else row)
+        rows = capped
         # decorate the displayed status with each active descendant's pending
         # stop/finish signal (display-only); the filters below match on the bare
         # first chunk, so e.g. status='active' still selects 'active (stopping)'
@@ -1616,7 +1979,12 @@ class Node:
         config_path = self._node_dir / 'config.json'
         if config_path.exists():
             config = self._load_config(config_path)
-            return config.get(key, default)
+            value = config.get(key, default)
+            # scope is stored as a JSON list; tolerate a string value
+            # holding the roots space-joined
+            if key == 'scope' and isinstance(value, str):
+                value = value.split()
+            return value
         return default
 
     def config_set(self: Node, **kwargs: Any) -> None:
@@ -1636,6 +2004,41 @@ class Node:
         # write config
         text = json.dumps(config, indent=2)
         config_path.write_text(text + '\n', encoding='utf-8')
+
+    def caps_reconcile(self: Node) -> dict[str, tuple[Any, Any]]:
+        """Reconcile the registry cap row to this node's config file.
+
+        The loop enforces the caps in ``config.json``, so a post-spawn config
+        edit is live budget truth -- but the ``nodes`` registry row keeps the
+        spawn-time values, and a registry reader can kill a node at a stale
+        cap. Config wins: drifted caps are pushed over the registry row and
+        reported. Keys absent from the config are left alone (a registry-only
+        cap is its own problem, not drift); ``fractal node update`` writes
+        both sides in one step and remains the supported retune path.
+
+        Returns:
+            Mapping of drifted key to ``(config, registry)`` values -- empty
+            when nothing drifted or the node has no registry row (user/root
+            node).
+
+        """
+        # skip nodes without a registry row (user/root node)
+        rows = self.db.read('nodes', where={'node': self._branch}, limit=1)
+        if not rows:
+            return {}
+        row = rows[0]
+        # collect config caps that drifted from the registry row
+        drifted = {}
+        for key in ('max_cost', 'max_depth', 'max_children', 'max_descendants'):
+            config_value = self.config_get(key)
+            if config_value is not None and config_value != row[key]:
+                drifted[key] = (config_value, row[key])
+        if not drifted:
+            return {}
+        # config wins: heal the registry row to the config caps
+        updates = {key: values[0] for key, values in drifted.items()}
+        self.db.update(updates, 'nodes', where={'node': self._branch})
+        return drifted
 
     def _validate_launch_config(self: Node) -> None:
         """Re-check the launch-time config invariants the loop depends on.
@@ -1718,6 +2121,44 @@ class Node:
             return agent
         return None
 
+    def _count_unsettled(
+        self: Node,
+        *,
+        max_depth: Optional[int] = None,
+    ) -> int:
+        """Count descendants holding a spawn slot: active, or idle awaiting start.
+
+        The width/descendant gates bind on UNSETTLED nodes only -- a settled
+        (completed/stopped/exited/killed) or retired node frees its slot
+        automatically, so the caps bound concurrency, not lifetime spawn
+        count. Crashed-but-active descendants are healed first (persisted
+        via :meth:`_reconcile_status`) so a dead loop's phantom ``active``
+        cannot wedge the gate; the tmux probe is paid only while something
+        reads ``active`` (one batched probe for the whole set).
+
+        Args:
+            max_depth: Maximum depth relative to this node.
+
+        Returns:
+            The number of unsettled live descendants.
+
+        """
+        live = self._live_descendants(max_depth=max_depth)
+        # heal crashed-but-active rows before counting (persisting the settle)
+        if any(row['status'] == 'active' for row, _ in live):
+            sessions = _live_tmux_sessions()
+            healed = []
+            for row, node in live:
+                if row['status'] == 'active':
+                    if node._tmux_session_name not in sessions:
+                        node._reconcile_status()
+                        row = {**row, 'status': node.status()}
+                healed.append((row, node))
+            live = healed
+        # statuses that hold a spawn slot: active, or idle awaiting start
+        unsettled = ('active', 'idle')
+        return sum(1 for row, _ in live if row['status'] in unsettled)
+
     def _enforce_spawn_limits(
         self: Node,
         *,
@@ -1728,12 +2169,16 @@ class Node:
         ``self`` is the parent. Checks the caps that depend on live state -- the
         parent's ``max_children`` (width), every ancestor's ``max_depth`` and
         ``max_descendants`` (subtree), and the child's ``max_cost`` against the
-        parent's remaining run budget. Each is re-read here rather than at the
-        top of :meth:`init` so the read is current: ``init`` calls this under the
-        ``.worktrees`` flock, just before registering the child, so concurrent
-        fan-out is serialized and the descendant counts are authoritative -- a
-        TOCTOU race that checked before the lock could let several inits each pass
-        and blow past the cap.
+        parent's remaining run budget. The width and descendant counts bind
+        on unsettled nodes only (:meth:`_count_unsettled`), bounding
+        concurrency, not lifetime spawn count. Each is re-read here rather
+        than at the top of :meth:`init` so the read is current: ``init``
+        calls this under the ``.worktrees`` flock, just before registering
+        the child, so concurrent fan-out is serialized and the descendant
+        counts are authoritative -- a TOCTOU race that checked before the
+        lock could let several inits each pass and blow past the cap (the
+        just-registered child lands idle, so it holds its slot for the next
+        serialized check).
 
         Args:
             child_max_cost: The child's requested ``--max-cost`` (USD), or
@@ -1746,18 +2191,19 @@ class Node:
         # enforce max-children (width) -- local to the spawning node only
         max_children = self.config_get('max_children')
         if max_children is not None:
-            direct = len(self._live_descendants(max_depth=1))
+            direct = self._count_unsettled(max_depth=1)
             if direct >= max_children:
                 raise ValueError(
                     f'Max children reached on {self._branch!r}'
-                    f' (limit {max_children}, {direct} direct children).'
+                    f' (limit {max_children}, {direct} unsettled direct children).'
                 )
         # enforce max-depth and max-descendants across the subtree -- every
         # ancestor's config is checked so limits hold without agent cooperation
         child_depth = self._branch.count('.') + 1
         for ancestor in self._self_and_ancestors():
             ancestor_depth = ancestor._branch.count('.')
-            # max-depth: child's depth relative to ancestor
+            # max-depth: child's depth relative to ancestor (structural --
+            # settled nodes still occupy their place in the tree)
             ancestor_max_depth = ancestor.config_get('max_depth')
             if ancestor_max_depth is not None:
                 if child_depth - ancestor_depth > ancestor_max_depth:
@@ -1766,15 +2212,15 @@ class Node:
                         f' (limit {ancestor_max_depth}, child would be'
                         f' at relative depth {child_depth - ancestor_depth}).'
                     )
-            # max-descendants: total live descendants vs ancestor's budget
+            # max-descendants: unsettled descendants vs ancestor's budget
             ancestor_max_descendants = ancestor.config_get('max_descendants')
             if ancestor_max_descendants is not None:
-                existing = len(ancestor._live_descendants())
+                existing = ancestor._count_unsettled()
                 if existing >= ancestor_max_descendants:
                     raise ValueError(
                         f'Max descendants reached on {ancestor._branch!r}'
                         f' (limit {ancestor_max_descendants},'
-                        f' {existing} live descendants).'
+                        f' {existing} unsettled descendants).'
                     )
         # enforce the child's max_cost against the parent's remaining run budget
         max_cost = self.config_get('max_cost')
@@ -1795,6 +2241,59 @@ class Node:
                 raise ValueError(
                     f'Max cost ${child_max_cost:.2f} exceeds remaining ${remaining:.2f}.'
                 )
+
+    def _enforce_rearm_limits(self: Node) -> None:
+        """Reject a re-arm that would exceed a live width or descendant cap.
+
+        ``self`` is the node about to re-arm to ``idle``. A re-arm returns
+        one unsettled node to the tree exactly as a spawn adds one, so it
+        re-checks the two concurrency caps the spawn gate enforces -- the
+        parent's ``max_children`` (width) and every ancestor's
+        ``max_descendants`` (subtree) -- with the same unsettled counting
+        (:meth:`_count_unsettled`); out of the pool here, this node holds no
+        slot, so spawn-to-cap -> settle -> respawn -> re-arm would otherwise
+        land the subtree over cap. ``max_depth`` is structural (the node
+        already sits at its spawn-time depth) and the budget bound is
+        spawn-time only (every run re-arms the node's own ``max_cost``), so
+        neither re-runs here. Called by :meth:`start` (resume) and
+        :meth:`unretire` (idle restore) under the ``.worktrees`` flock just
+        before the re-arm, mirroring ``init``'s check+register atomicity;
+        like the spawn gate, there is no override flag.
+
+        Raises:
+            ValueError: If a width or descendant cap would be exceeded.
+
+        """
+        # the re-arm adds one unsettled node to each subtree above, so every
+        # ancestor's budget is checked, as at spawn
+        parent_branch, *_ = self._branch.rsplit('.', 1)
+        for ancestor in self._self_and_ancestors():
+            # skip the node itself -- its own caps bound its subtree, which
+            # the re-arm leaves unchanged
+            if ancestor is self:
+                continue
+            # max-children (width): the direct parent only, counting this
+            # node's unsettled siblings
+            if ancestor._branch == parent_branch:
+                max_children = ancestor.config_get('max_children')
+                if max_children is not None:
+                    direct = ancestor._count_unsettled(max_depth=1)
+                    if direct >= max_children:
+                        raise ValueError(
+                            f'Max children reached on {ancestor._branch!r}'
+                            f' (limit {max_children},'
+                            f' {direct} unsettled direct children).'
+                        )
+            # max-descendants: unsettled descendants vs ancestor's budget
+            ancestor_max_descendants = ancestor.config_get('max_descendants')
+            if ancestor_max_descendants is not None:
+                existing = ancestor._count_unsettled()
+                if existing >= ancestor_max_descendants:
+                    raise ValueError(
+                        f'Max descendants reached on {ancestor._branch!r}'
+                        f' (limit {ancestor_max_descendants},'
+                        f' {existing} unsettled descendants).'
+                    )
 
     def child_add(
         self: Node,
@@ -1847,6 +2346,9 @@ class Node:
         *,
         title: Optional[str] = None,
         max_cost: Optional[float] = None,
+        max_iter_cost: Optional[float] = None,
+        max_step_cost: Optional[float] = None,
+        reserve_budget: Optional[float] = None,
         max_depth: Optional[int] = None,
         max_children: Optional[int] = None,
         max_descendants: Optional[int] = None,
@@ -1860,12 +2362,19 @@ class Node:
             name: Child node name.
             title: New display name.
             max_cost: New maximum cost in USD.
+            max_iter_cost: New per-iteration cost cap in USD; lives only in
+                the child's ``config.json`` (the ``nodes`` table has no column).
+            max_step_cost: New per-step cost cap in USD; lives only in the
+                child's ``config.json`` (the ``nodes`` table has no column).
+            reserve_budget: New cleanup reserve in USD; lives only in the
+                child's ``config.json`` (the ``nodes`` table has no column).
             max_depth: New maximum nesting depth.
             max_children: New maximum direct child nodes.
             max_descendants: New maximum total descendant nodes.
 
         """
-        # initialize updates
+        # initialize updates -- the iter/step caps and the reserve are
+        # config-only
         data = {}
         if title is not None:
             data['title'] = title
@@ -1877,7 +2386,14 @@ class Node:
             data['max_children'] = max_children
         if max_descendants is not None:
             data['max_descendants'] = max_descendants
-        if not data:
+        config_only = {}
+        if max_iter_cost is not None:
+            config_only['max_iter_cost'] = max_iter_cost
+        if max_step_cost is not None:
+            config_only['max_step_cost'] = max_step_cost
+        if reserve_budget is not None:
+            config_only['reserve_budget'] = reserve_budget
+        if not data and not config_only:
             return
         # verify child exists
         branch = f'{self._branch}.{name}'
@@ -1891,8 +2407,9 @@ class Node:
         # write the child's config.json first (the failure-prone step --
         # a malformed/locked config or vanished worktree raises here), then
         # the nodes table, so a config_set failure can't desync the two
-        self.__class__(child_worktree_dir).config_set(**data)
-        self.db.update(data, 'nodes', where={'node': branch})
+        self.__class__(child_worktree_dir).config_set(**data, **config_only)
+        if data:
+            self.db.update(data, 'nodes', where={'node': branch})
 
     def child_list(
         self: Node,
@@ -2040,13 +2557,14 @@ class Node:
         persisted state), so it works for any node, not only the running
         one. The ``run`` scope (``--timeout``) is anchored on the active
         run's ``started_at``; the ``iter`` scope (``--iter-timeout``) on
-        its active iteration's. With no ``scope`` the soonest of the
+        its active iteration's; the ``step`` scope (``--step-timeout``)
+        on its active step's. With no ``scope`` the soonest of the
         configured deadlines is returned -- the time until the next
         timeout fires.
 
         Args:
-            scope: ``'run'`` or ``'iter'`` to query one level; the
-                soonest of both if omitted.
+            scope: ``'run'``, ``'iter'``, or ``'step'`` to query one
+                level; the soonest of all if omitted.
             run_id: Run to query. Auto-resolved if omitted.
 
         Returns:
@@ -2060,12 +2578,13 @@ class Node:
             _, _, run_id = self._resolve_context()
         if run_id is None:
             return None
-        # no scope -> soonest across the configured run/iter deadlines
+        # no scope -> soonest across the configured run/iter/step deadlines
         if scope is None:
             run = self.time_remaining(scope='run', run_id=run_id)
             iter = self.time_remaining(scope='iter', run_id=run_id)
+            step = self.time_remaining(scope='step', run_id=run_id)
             candidates = [
-                remaining for remaining in (run, iter) if remaining is not None
+                remaining for remaining in (run, iter, step) if remaining is not None
             ]
             return min(candidates) if candidates else None
         # read the scope's timeout from config
@@ -2073,23 +2592,32 @@ class Node:
             timeout = self.config_get('timeout')
         elif scope == 'iter':
             timeout = self.config_get('iter_timeout')
+        elif scope == 'step':
+            timeout = self.config_get('step_timeout')
         else:
-            raise ValueError(f"scope must be 'run' or 'iter', got {scope!r}.")
+            raise ValueError(f"scope must be 'run', 'iter', or 'step', got {scope!r}.")
         if not timeout:
             return None
         seconds = parse_duration_seconds(timeout)
         if seconds is None:
             return None
-        # anchor on the active run (run scope) or active iteration (iter scope)
+        # anchor on the scope's active row: the run itself, or the run's
+        # active iteration/step
         if scope == 'run':
             rows = self.db.read(
                 'runs',
                 where={'run_id': run_id, 'ended_at': None},
                 limit=1,
             )
-        else:
+        elif scope == 'iter':
             rows = self.db.read(
                 'iters',
+                where={'status': 'active', 'run_id': run_id},
+                limit=1,
+            )
+        else:
+            rows = self.db.read(
+                'steps',
                 where={'status': 'active', 'run_id': run_id},
                 limit=1,
             )
@@ -2113,8 +2641,8 @@ class Node:
         ``max_cost`` minus the current run's subtree spend (own steps plus
         descendants chained by ``parent_run_id``; the active run, else the most
         recent), so a budget drained in one run is fresh again in the next. Pass
-        ``run_id`` for a specific run. ``iter_id``/``step_id`` instead scope to
-        the matching per-level cap (``max_iter_cost``/``max_step_cost``).
+        ``run_id`` for a specific run. ``iter_id``/``step_id`` instead
+        scope to the matching per-level cap (``max_iter_cost``/``max_step_cost``).
         Reflects completed steps only -- the active step's in-progress cost is not included
         (cost is recorded only at step end). The run budget is **subtree-shared
         with no reserved self-slice**: a manager that sizes children to its full
@@ -2170,12 +2698,12 @@ class Node:
         """Total cost for a run, iteration, step, or per-run subtree.
 
         Sums the current run's direct step cost by default (the active run, else
-        the most recent), so ``--max-cost`` reads per-run. Pass ``run_id`` for a
-        specific run. Includes child node costs: a child counts only the runs it
-        spawned under this run's lineage, chained via ``parent_run_id`` (the
-        per-run subtree) -- a deleted child's recorded runs still count. Pass
-        ``max_depth=0`` for this node only, ``max_depth=1`` to include children,
-        etc.
+        the most recent) -- the per-run reading behind ``--run`` scoping. Pass
+        ``run_id`` for a specific run. Includes child node costs: a child counts
+        only the runs it spawned under this run's lineage, chained via
+        ``parent_run_id`` (the per-run subtree) -- a deleted child's recorded
+        runs still count. Pass ``max_depth=0`` for this node only,
+        ``max_depth=1`` to include children, etc.
 
         When ``iter_id`` (or ``step_id``) is given, returns cost
         for that iteration (or step) only (children are not included).
@@ -2236,7 +2764,7 @@ class Node:
         A token-priced agent (codex) with no priced model records ``NULL`` cost,
         so its spend sums to ``0`` yet is not actually ``$0``. Returns ``True``
         when the scope has steps but none recorded a cost, letting the CLI show
-        ``null`` instead of ``$0`` so a parent can tell "spent nothing" from
+        ``untracked`` instead of ``$0`` so a parent can tell "spent nothing" from
         "untrackable". The run scope mirrors ``cost_spent``: it walks the per-run
         subtree (to ``max_depth``) so a fully-untracked child reads as untracked
         at the parent, not as ``$0`` -- a mixed subtree (any priced step) is
@@ -2282,6 +2810,61 @@ class Node:
         if rows := self.db.read(query=query, params=params):
             return rows[0]['total'] > 0 and rows[0]['priced'] == 0
         return False
+
+    def cost_unpriced(
+        self: Node,
+        *,
+        run_id: Optional[int] = None,
+        iter_id: Optional[int] = None,
+        step_id: Optional[int] = None,
+        max_depth: Optional[int] = None,
+    ) -> int:
+        """Count a scope's ended steps that recorded no cost.
+
+        ``SUM()`` skips NULL-cost rows without a trace, so ledger-facing
+        readings disclose this count when nonzero: kills before the first
+        usage flush (marked ``unpriced`` on their metadata), pre-stream
+        failures, and untracked-agent rows. Ended rows only -- an open step
+        is merely not priced *yet*. Scopes mirror ``cost_spent``.
+
+        Args:
+            run_id: A run to scope to; the current run if omitted.
+            iter_id: Scope to a specific iteration.
+            step_id: Scope to a specific step.
+            max_depth: Maximum child depth to include for the run scope
+                (``None`` all descendants, ``0`` this node only).
+
+        Returns:
+            Number of ended steps in the scope with ``NULL`` cost.
+
+        """
+        # iteration/step scope: own steps only (children not applicable,
+        # mirroring cost_spent)
+        if step_id is not None or iter_id is not None:
+            if step_id is not None:
+                where, param = 'step_id = ?', step_id
+            else:
+                where, param = 'iter_id = ?', iter_id
+            query = (
+                'SELECT COUNT(*) AS unpriced FROM steps'
+                f' WHERE {where} AND ended_at IS NOT NULL AND cost IS NULL'
+            )
+            rows = self.db.read(query=query, params=(param,))
+            return rows[0]['unpriced'] if rows else 0
+        # run scope: count the per-run subtree's rows like cost_spent
+        if run_id is None:
+            _, _, run_id = self._resolve_context()
+        if run_id is None:
+            return 0
+        cte, params = self._run_lineage(run_id, max_depth)
+        query = (
+            f'{cte}'
+            ' SELECT COUNT(*) AS unpriced'
+            ' FROM steps s JOIN lineage ON s.run_id = lineage.run_id'
+            ' WHERE s.ended_at IS NOT NULL AND s.cost IS NULL'
+        )
+        rows = self.db.read(query=query, params=params)
+        return rows[0]['unpriced'] if rows else 0
 
     def cost_breakdown(
         self: Node,
@@ -2376,7 +2959,7 @@ class Node:
             check: Error if uncommitted changes exist instead of committing.
             ignore_scope: Commit out-of-scope changes but still lint (a narrower
                 escape hatch than ``force``).
-            force: Bypass scope and lint checks.
+            force: Bypass scope and lint checks and git hooks.
 
         Returns:
             Script output.
@@ -2433,11 +3016,19 @@ class Node:
         if message:
             cmd.append(message)
         # run commit script
+        env = dict(os.environ)
+        # the commit script shells back into `fractal`, and this raw call
+        # bypasses _run_script -- mirror its PATH prepend so a fronted
+        # foreign install cannot answer the script's config reads
+        env['PATH'] = os.pathsep.join(
+            filter(None, (os.path.dirname(sys.executable), env.get('PATH'))),
+        )
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             cwd=self._root,
+            env=env,
         )
         if result.returncode != 0:
             msg = f'Commit failed (exit {result.returncode})'
@@ -2462,10 +3053,11 @@ class Node:
 
         User nodes have no ``_commit.sh``. By default the node's own ``.fractal/``
         data is git-excluded on the top-level branch, so this stages only the
-        project wiki (under ``<project>/`` for a sub-project); with ``--track`` the
-        node's seed dir rides along too. Everything is committed with a pathspec, so
-        the user's other staged work is never swept in, and does not push. A node
-        worktree branched later then starts from a committed tree.
+        project wiki (under ``<project>/`` for a sub-project) and the
+        ``.gitattributes`` merge attribute ``wiki init`` wrote; with ``--track``
+        the node's seed dir rides along too. Everything is committed with a
+        pathspec, so the user's other staged work is never swept in, and does not
+        push. A node worktree branched later then starts from a committed tree.
 
         Args:
             message: Short description appended to the commit message.
@@ -2488,6 +3080,24 @@ class Node:
             paths.append(f'{seed}/{self._branch}')
         if (self._root / wiki).is_dir():
             paths.append(wiki)
+        # sweep the ``**/_index.md`` merge attribute ``wiki init`` writes into the
+        # working tree (committing it is left to the caller): stage .gitattributes
+        # only while the attribute is init's own uncommitted edit -- the wiki tool
+        # writes the file only when it is clean, so a pending user edit means the
+        # attribute is absent and the file stays out of the baseline. The match is
+        # line-exact so an attribute line assigning some other merge driver to
+        # ``_index.md`` is never mistaken for init's own
+        attributes = self._root / '.gitattributes'
+        if attributes.is_file():
+            text = attributes.read_text(encoding='utf-8')
+            cmd = ['show', 'HEAD:.gitattributes']
+            committed = _git(cmd, cwd=self._root, check=False) or ''
+            attribute = '**/_index.md merge=wiki'
+            if (
+                attribute in text.splitlines()
+                and attribute not in committed.splitlines()
+            ):
+                paths.append('.gitattributes')
         # nothing to commit (default mode, no wiki yet): leave the index untouched
         # -- an empty pathspec would otherwise sweep the user's other staged work
         if not paths:
@@ -2502,7 +3112,29 @@ class Node:
         # staged; no push -- the user owns pushing their own base branch
         msg = f'{self._branch}: init ({message})'
         cmd = ['commit', '-m', msg, '--', *paths]
-        _git(cmd, cwd=self._root)
+        try:
+            _git(cmd, cwd=self._root)
+        except RuntimeError as exc:
+            # a formatting hook may have rewritten the staged pages in the
+            # working tree (mdformat escapes wikilinks); the index still holds
+            # the authored bytes, so restore them -- leaving the rewrite in
+            # place would hand a bare retry corrupted pages that commit cleanly
+            cmd = ['diff', '--name-only', '--', *paths]
+            mutated = _git(cmd, cwd=self._root)
+            if not mutated:
+                raise
+            cmd = ['checkout', '--', *paths]
+            _git(cmd, cwd=self._root)
+            raise RuntimeError(
+                'Commit failed after a git hook rewrote generated pages'
+                f' (restored, not committed): {", ".join(mutated.splitlines())}.'
+                ' Generated pages must round-trip byte-identical -- give'
+                ' mdformat the wikilink-aware plugin (additional_dependencies:'
+                ' [mdformat-wiki] on its hook, dropping mdformat-frontmatter'
+                ' if present -- both register a frontmatter renderer and'
+                ' whichever is discovered first wins), or keep formatters off'
+                ' the wiki paths.'
+            ) from exc
         return f'Committed user node baseline on {self._branch}.'
 
     def chat(
@@ -2784,9 +3416,9 @@ class Node:
         else:
             project_dir = repo_dir / self._project_path
             wiki_dir = worktree_dir / self._project_path / 'wiki'
-        # alias scope dir
+        # alias scope dir (space-joined when several roots are scoped)
         if scope := self.config_get('scope'):
-            scope_dir = f'{project_dir / scope}'
+            scope_dir = ' '.join(f'{project_dir / root}' for root in scope)
         else:
             scope_dir = ''
         # alias config limits and modes
@@ -2824,6 +3456,10 @@ class Node:
         :meth:`_mark_active_killed` so the cascade has one definition and the
         DB can never diverge from the ``.status`` file.
 
+        Every close here is abnormal, so an open step whose stream opened
+        (session recorded) but whose cost never flushed gets the ``unpriced``
+        metadata marker, mirroring ``step_end``.
+
         Args:
             status: Terminal status for the open rows.
             exit_code: Process exit code for the open rows.
@@ -2831,6 +3467,13 @@ class Node:
         """
         branch = self._branch
         now = _utc_now()
+        # read the open streamed-but-unpriced steps before closing them --
+        # they get the unpriced marker once stamped
+        unpriced = [
+            row
+            for row in self.db.read('steps', where={'node': branch, 'ended_at': None})
+            if row['cost'] is None and row['session'] is not None
+        ]
         for table in ('runs', 'iters', 'steps'):
             data = {
                 'status': status,
@@ -2838,6 +3481,12 @@ class Node:
                 'ended_at': now,
             }
             self.db.update(data, table, where={'node': branch, 'ended_at': None})
+        # stamp the marker on the closed streamed rows (a flush that raced
+        # the close strips it again via step_cost)
+        for row in unpriced:
+            meta = row['metadata']
+            data = {'metadata': f'{meta}; unpriced' if meta else 'unpriced'}
+            self.db.update(data, 'steps', where={'step_id': row['step_id']})
 
     def run_start(self: Node) -> int:
         """Create a run row with ``status='active'``.
@@ -2909,6 +3558,36 @@ class Node:
             data['metadata'] = metadata
         self.db.update(data, 'runs', where={'run_id': run_id, 'ended_at': None})
 
+    def run_latest(
+        self: Node,
+        *,
+        branch: Optional[str] = None,
+    ) -> Optional[int]:
+        """Latest recorded run ID for a branch -- active first, else most recent.
+
+        Mirrors the current-run resolution the cost family uses, but keyed
+        by an explicit ``branch`` so it also answers for a deleted node:
+        registry rows die with the node while its runs persist (keyed by
+        branch text), and this is the entry point for reading them.
+
+        Args:
+            branch: Branch to resolve; this node's own branch if omitted.
+
+        Returns:
+            Run ID, or ``None`` when the branch has no recorded runs.
+
+        """
+        # resolve the run: the active one, else the most recent (rowid DESC)
+        branch = branch or self._branch
+        rows = self.db.read(
+            'runs',
+            where={'node': branch, 'status': 'active'},
+            limit=1,
+        )
+        if not rows:
+            rows = self.db.read('runs', where={'node': branch}, limit=1)
+        return rows[0]['run_id'] if rows else None
+
     def iter_start(
         self: Node,
         *,
@@ -2952,7 +3631,10 @@ class Node:
         First-writer-wins via the ``ended_at IS NULL`` guard. Duration is
         derived from ``started_at``/``ended_at`` and cost rolls up from
         ``steps`` -- neither is stored. Records the default agent's session
-        (continuous mode) so the iteration stays resumable.
+        (continuous mode) so the iteration stays resumable. An iteration
+        whose configured model was unset inherits the steps' recorded
+        (stream-reported) model when every step agrees, so a defaulted
+        spawn's model stays recoverable from the row.
 
         Args:
             iter_id: Iteration to end.
@@ -2984,6 +3666,14 @@ class Node:
         # record a reason only when given (don't clobber existing metadata)
         if metadata is not None:
             data['metadata'] = metadata
+        # backfill an unset iteration model from the steps' recorded
+        # (stream-reported) one when every step agrees
+        iter_rows = self.db.read('iters', where={'iter_id': iter_id}, limit=1)
+        if iter_rows and not iter_rows[0]['model']:
+            steps = self.db.read('steps', where={'iter_id': iter_id})
+            models = {row['model'] for row in steps if row['model']}
+            if len(models) == 1:
+                data['model'] = models.pop()
         self.db.update(
             data,
             'iters',
@@ -3034,12 +3724,23 @@ class Node:
     ) -> None:
         """Record cost for a step.
 
+        A figure landing on a row already marked ``unpriced`` (the per-frame
+        flush racing a kill) strips the stale marker.
+
         Args:
             step_id: Step to update.
             cost: Cost in USD.
 
         """
         data = {'cost': cost}
+        # drop a stale unpriced marker -- the row carries a real figure now
+        rows = self.db.read('steps', where={'step_id': step_id})
+        if rows:
+            meta = rows[0]['metadata']
+            if meta == 'unpriced':
+                data['metadata'] = ''
+            elif meta.endswith('; unpriced'):
+                data['metadata'] = meta[: -len('; unpriced')]
         self.db.update(data, 'steps', where={'step_id': step_id})
 
     def step_session(
@@ -3059,8 +3760,10 @@ class Node:
         Args:
             agent: Agent that ran the step (e.g. ``claude`` or ``codex``).
             step_id: Step to update.
-            model: The step's configured model (frontmatter or node default),
-                or ``None`` when the agent ran on its own default.
+            model: The model that actually ran the step -- stream-reported
+                where the agent names it, else the configured model
+                (frontmatter or node default), or ``None`` when neither
+                names one.
             session: Real, agent-specific session.
 
         """
@@ -3082,6 +3785,13 @@ class Node:
         derived from ``started_at``/``ended_at``; the ``cost`` column is
         left untouched (recorded separately by ``step_cost()``, possibly
         after the step has ended).
+
+        An abnormal end (any terminal but ``completed``) whose row has a
+        session but no cost appends ``unpriced`` to its metadata: the agent
+        stream opened, so spend plausibly burned before the first usage
+        flush -- the marker lets ledgers tell "free step" from "unpriced
+        step". Cost stays NULL (``cost_unpriced`` discloses the gap count);
+        a flush that lands later strips the marker.
 
         Args:
             step_id: Step to end.
@@ -3105,6 +3815,13 @@ class Node:
         # record a reason only when given (don't clobber existing metadata)
         if metadata is not None:
             data['metadata'] = metadata
+        # mark an abnormal end unpriced when the stream opened but no usage
+        # flushed -- burn happened with no recorded figure
+        if status != 'completed':
+            rows = self.db.read('steps', where={'step_id': step_id, 'ended_at': None})
+            if rows and rows[0]['cost'] is None and rows[0]['session'] is not None:
+                reason = metadata if metadata is not None else rows[0]['metadata']
+                data['metadata'] = f'{reason}; unpriced' if reason else 'unpriced'
         self.db.update(data, 'steps', where={'step_id': step_id, 'ended_at': None})
 
     def step_pending(
@@ -3508,6 +4225,12 @@ class Node:
         """
         script_path = self._package_dir / '_scripts' / script
         env = dict(os.environ)
+        # scripts shell back into `fractal`; resolve helper CLIs from the
+        # invoking installation, not ambient PATH, so a fronted foreign
+        # install (e.g. the root venv's) cannot answer in this one's place
+        env['PATH'] = os.pathsep.join(
+            filter(None, (os.path.dirname(sys.executable), env.get('PATH'))),
+        )
         result = subprocess.run(
             ['bash', f'{script_path}', *args],
             capture_output=True,
@@ -3583,7 +4306,7 @@ class Node:
         detached loop. Returns the parent's **active** run, or ``None`` when
         this is a root node or the parent is idle -- in which case this run
         belongs to no parent run and is excluded from the parent's per-run
-        subtree cost (it still counts toward lifetime).
+        subtree cost.
 
         Returns:
             The parent's active run id, or ``None``.
@@ -3781,6 +4504,36 @@ def _derive_project_name(dir_name: str) -> str:
             ' and underscores (dashes are converted); rename the directory.'
         )
     return name
+
+
+def _wiki_executable() -> str:
+    """Resolve the ``wiki`` executable robustly.
+
+    Prefers the console script beside fractal's own interpreter -- the
+    ``plasma-wiki`` dependency installs it into the same environment -- and
+    falls back to the ambient ``PATH``. Ambient-only resolution breaks under
+    pyenv shims: an orphaned shim resolves but exits 127 with a confusing
+    "command not found" message.
+
+    Returns:
+        Path of the ``wiki`` executable.
+
+    Raises:
+        RuntimeError: If no ``wiki`` executable exists.
+
+    """
+    # prefer the running interpreter's bin dir (fractal's own environment)
+    candidate = pathlib.Path(sys.executable).parent / 'wiki'
+    if candidate.is_file():
+        return str(candidate)
+    # fall back to the ambient PATH
+    found = shutil.which('wiki')
+    if found is not None:
+        return found
+    raise RuntimeError(
+        "No 'wiki' executable found -- install fractal's plasma-wiki"
+        ' dependency into its environment and re-run init.'
+    )
 
 
 def _prune_branch(repo_dir: pathlib.Path, branch: str) -> None:

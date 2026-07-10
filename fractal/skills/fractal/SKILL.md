@@ -1,7 +1,7 @@
 ---
 name: fractal
 description: Hierarchical agent loops with recursive self-organization.
-argument-hint: <name> [<path>] [--scope=<relpath>] ... [--local] [--detached] [--resume]
+argument-hint: <name> [<path>] [--scope=<subdirs>] ... [--local] [--detached] [--resume]
 disable-model-invocation: true
 ---
 
@@ -35,7 +35,9 @@ present) to `fractal node start`.
   (default: `.`)
 - **`--title`**: human-readable display name (default: de-slugged node
   name)
-- **`--scope`**: restrict commits to a subdirectory within the worktree
+- **`--scope`**: restrict commits to subdirectories within the worktree
+  (comma-separated, e.g. `--scope=parent/child,tests`; repeated flags
+  tolerated and flattened)
 - **`--base`**: branch to start from (default: current branch)
 - **`--meta`**: target node branch for meta-configuration
 - **`--agent`**: agent command; inherits the user node's default when
@@ -54,7 +56,9 @@ present) to `fractal node start`.
 - **`--sleep`**: delay between iterations (e.g. `10s`)
 - **`--wait`**: sleep between approval-wait sync invocations (default:
   `1s`)
-- **`--max-cost`**: per-run cost ceiling in USD
+- **`--max-cost`**: cost ceiling in USD per run — every new run re-arms
+  the full cap (`node start` on a finished/killed node included); runs
+  are isolated, so a resume opens a fresh budget
 - **`--max-iter-cost`**: per-iteration cost ceiling in USD
 - **`--max-step-cost`**: per-step cost ceiling in USD (warn-only when
   unenforceable)
@@ -182,7 +186,20 @@ your main history; pass `fractal init --track` to commit it there too
 (chosen once at init). Fractal manages this — its runtime artifacts
 (worktrees, the central database, status, agent logs) plus the top-level
 `.fractal/` — via the repo-local `.git/info/exclude`, which it writes
-automatically; it never touches the committed `.gitignore`.
+automatically; it never touches the committed `.gitignore`. Keep your
+own ignore patterns anchored (`/artifacts/`, not `artifacts/`), or they
+also match — and silently hide — same-named subtrees at any depth, such
+as a node's committable `.fractal/<node>/artifacts/`.
+
+`fractal init` also wires the wiki merge driver: the committed
+`.gitattributes` assigns `merge=wiki` to the generated wiki `_index.md`
+files, while the driver itself lives in repo-local git config, so merges
+of branches carrying wiki pages auto-resolve the generated index
+sections. Local config does not survive a clone — on a fresh clone the
+attribute is present but the driver is not, and `_index.md` merges fall
+back to git's default and may conflict on generated content; re-running
+`fractal init` registers it (verify with
+`git config --get merge.wiki.driver`).
 
 The output includes the project directory (worktree root) and the node
 data directory. Read these from the output to use in later steps (e.g.
@@ -225,18 +242,22 @@ beyond the defaults — files or directories to avoid, patterns to follow,
 tools to use or skip, style preferences. If the user has additions,
 append them to the `## Rules` section. If not, move on.
 
-**d) Budget and scope.** Ask about cost limits (`--max-cost` caps total
-spend, `--max-iter-cost` caps per-iteration). `--max-cost` is optional
-but strongly recommended: without it the node runs **uncapped** — a
-warning at start, bounded only by `--max-iters`/`--timeout` — so settle
-on a cap unless you deliberately want an uncapped run, and also
-recommend `--max-iter-cost`. Note a cost cap on a token-priced agent
-(codex) forces a priced `--model`, which a ChatGPT-subscription codex
-account cannot select — so codex with a cap needs an API-key account,
-while a ChatGPT-subscription codex must run uncapped. If the node should
-only touch certain files or directories, ask about `--scope` (restricts
-what the node can commit). For open-ended work with no completion
-requirements, suggest `--max-iters` to cap iterations.
+**d) Budget and scope.** Ask about cost limits (`--max-cost` caps each
+run and re-arms on every new run, `--max-iter-cost` caps per-iteration).
+`--max-cost` is optional but strongly recommended: without it the node
+runs **uncapped** — a warning at start, bounded only by
+`--max-iters`/`--timeout` — so settle on a cap unless the user
+deliberately wants an uncapped run, confirmed explicitly: before
+launching any uncapped node, ask an are-you-sure and get a yes (a user's
+explicit uncapped request in this conversation counts) — never default
+into uncapped. Also recommend `--max-iter-cost`. Note a cost cap on a
+token-priced agent (codex) forces a priced `--model`, which a
+ChatGPT-subscription codex account cannot select — so codex with a cap
+needs an API-key account, while a ChatGPT-subscription codex must run
+uncapped. If the node should only touch certain files or directories,
+ask about `--scope` (restricts what the node can commit). For open-ended
+work with no completion requirements, suggest `--max-iters` to cap
+iterations.
 
 > [!WARNING]
 > A **low `--max-cost` paired with an expensive `--model`** is the
@@ -250,6 +271,22 @@ requirements, suggest `--max-iters` to cap iterations.
 > For a small budget, prefer a cheaper `--model` and set
 > `--max-iter-cost`; reserve expensive models for budgets large enough
 > that one step is a small slice.
+
+For well-specified single-mission leaf work, a cheaper model at the same
+dollar cap (e.g. `sonnet`) is a first-class choice — cost-per-point
+favors it on numeric, single-task work — but give it iter-cap headroom:
+micro `--max-iter-cost` values bind on step granularity, and a fast
+drafter can pack a full iteration into one large step. Keep frontier
+models for manager, audit, long-horizon, and judgment-call roles: a
+cheaper model can hold process hygiene and mechanical output while its
+judgment quality collapses — at no cost saving, since under a binding
+budget pool a cheaper token rate buys more steps, not a lower bill.
+
+When spawning runs whose outputs will be *compared* (A/B arms, benchmark
+variants), fork them from one pinned tip and declare the endowment in
+each run's config commit: the tip sha plus the baseline figures the
+comparison will read against. Comparisons read against the declared
+baseline, never against stale round figures.
 
 **e) Iteration steps.** Briefly explain how each iteration works: sync
 runs automatically before each numbered step to handle radio
@@ -314,17 +351,23 @@ tmux session.
 Once the node is running, briefly explain how to interact with it:
 
 - **Steering:** Edit `<node_dir>/NODE.md` directly to adjust goals,
-  rules, or instructions. The node reads it fresh at every step.
+  rules, or instructions. The node reads it fresh at every step. Retune
+  caps with `fractal node update` — it updates the registry row and the
+  child's `config.json` together, and a running loop picks the change up
+  at its next iteration boundary (a direct config edit is honored at the
+  same boundary but leaves the registry stale until the loop heals it).
 - **Monitoring:** From the node's worktree (`cd <worktree>`), commands
   act on it directly — `fractal node status`, `fractal node cost spent`,
   and `fractal node attach` (watch live output — use this, not raw
   `tmux -t`, whose prefix matching can attach the wrong session).
   `fractal node list` shows this node's subtree (from a leaf worktree,
   just its own descendants) — run it from the repo root to see the whole
-  tree. Read `<node_dir>/memory/` (knowledge) or `<node_dir>/plans/`
-  (plans). A run that ends `completed` after `--max-iters` only means
-  the iteration budget was exhausted, not that the goal was met — check
-  `fractal node activity` for the per-iteration outcomes.
+  tree; it lists live nodes only (`--all` includes retired ones,
+  `--retired` only those). Read `<node_dir>/memory/` (knowledge) or
+  `<node_dir>/plans/` (plans). A run that ends `completed` after
+  `--max-iters` only means the iteration budget was exhausted, not that
+  the goal was met — check `fractal node activity` for the per-iteration
+  outcomes.
 - **TUI:** For a live view of the whole tree — nodes, runs, costs, and
   output — suggest the user open the dashboard with `fractal open` (run
   from the repo root). It needs the `tui` extra; if `fractal open`
@@ -335,17 +378,21 @@ Once the node is running, briefly explain how to interact with it:
   - `fractal node kill` — kill immediately
 - **Worktree:** The node runs in a git worktree at
   `<repo>/.worktrees/<branch>/`. The user's repo is untouched. When
-  done, from the repo root, merge with `fractal node merge <branch>`,
-  then delete with `fractal node delete <branch>` (delete must run from
-  outside the worktree). **Delete is destructive:** it is recursive —
-  removing the node's whole subtree — and force-removes each worktree
-  and **force-deletes the branch(es) regardless of merge state**, so any
-  committed-but-unmerged work is lost. Always confirm the `merge`
-  succeeded first (check its output). To keep a node's branch while
-  hiding it, retire it instead. Delete prompts for confirmation `[y/N]`;
-  pass `--force`/`-f` to skip the prompt.
-- **Radio:** nodes communicate via `fractal radio` commands. Run
-  `fractal radio --help` to explore.
+  done, from the repo root, merge with `fractal node merge <branch>`.
+  Deleting afterward with `fractal node delete <branch>` is optional
+  hygiene, never automatic — a merged branch keeps audit value (delete
+  must run from outside the worktree). **Delete is destructive:** it is
+  recursive — removing the node's whole subtree — and force-removes each
+  worktree and **force-deletes the branch(es) regardless of merge
+  state**, so any committed-but-unmerged work is lost. Always confirm
+  the `merge` succeeded first (check its output). To keep a node's
+  branch while hiding it, retire it instead. Delete prompts for
+  confirmation `[y/N]`; pass `--force`/`-f` to skip the prompt.
+- **Radio:** nodes communicate via `fractal radio` commands. The
+  listings (`messages`/`feed`) show metadata and never touch read state;
+  `radio read` prints full bodies and writes your read receipts. Replies
+  route to the counterparty's inbox — a feed (outbox) post is never
+  replyable in place. Run `fractal radio --help` to explore.
 
 Offer to help the user edit `NODE.md`, check progress, or read plan
 files.
@@ -374,18 +421,20 @@ disrupting its loop — `--current` forks the live loop session and is
 claude-only; for codex nodes ask via a fresh chat (omit `--current`) or
 continue one in place with `--session ... --resume`. The root
 auto-subscribes to its children's `outbox` but has no auto-sync, so poll
-its radio yourself — `fractal radio messages` (its inbox) and `feed`
-(children, one hop) — send directives to a child's inbox
-(`radio send <message> --node=<branch> ...`), and post-and-continue (a
-node sees you only on its next sync). Steer by editing `NODE.md` files
-(re-read each step) or by radio; approve gates
+its radio yourself — `fractal radio read --channel=inbox --unread` (its
+inbox) and `read --feed --unread` (children, one hop); the
+`messages`/`feed` listings survey metadata without consuming unread
+state, and your reads receipt as you, the reader — send directives to a
+child's inbox (`radio send <message> --node=<branch> ...`), and
+post-and-continue (a node sees you only on its next sync). Steer by
+editing `NODE.md` files (re-read each step) or by radio; approve gates
 (`node pending`/`approve`), retune limits (`node update`), and merge
-then delete finished subtrees. Relay both ways: surface progress,
-blockers, and cost up to the user, and translate their intent down into
-edits, directives, and spawns. Ask the user for input and feedback
-freely, but never let a question block you unless it is absolutely
-critical — proceed on your best judgment, make reversible calls, and
-note them.
+finished subtrees (deleting after merge is optional hygiene, not a
+default). Relay both ways: surface progress, blockers, and cost up to
+the user, and translate their intent down into edits, directives, and
+spawns. Ask the user for input and feedback freely, but never let a
+question block you unless it is absolutely critical — proceed on your
+best judgment, make reversible calls, and note them.
 
 ## CLI Reference
 

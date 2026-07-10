@@ -40,8 +40,10 @@ pip install plasma-fractal
 ```
 
 Use `pipx install plasma-fractal` or `uv tool install plasma-fractal` to
-install in an isolated environment (in which case, also install
-`plasma-wiki`, since `fractal` shells out to its `wiki` command).
+install in an isolated environment. If you use one of these two methods,
+you must also install `plasma-wiki` (a plain `pip` install pulls
+`plasma-wiki` and puts `wiki` on your `PATH`, but this is not the case
+when using `pipx install` or `uv tool install`).
 
 `uv tool install plasma-fractal --with-executables-from plasma-wiki`
 does the same in one command.
@@ -119,6 +121,9 @@ Run the test suite:
 pytest .
 ```
 
+The suite runs with `--doctest-modules` enabled, and the integration
+tests create real git repositories and worktrees.
+
 ### Linting
 
 Run linters and formatters:
@@ -126,6 +131,14 @@ Run linters and formatters:
 ```bash
 pre-commit run --all-files
 ```
+
+### Contributing
+
+The contribution workflow is covered by the organization-wide
+[CONTRIBUTING.md](https://github.com/plasma-ai/.github/blob/main/CONTRIBUTING.md);
+repository conventions live in [AGENTS.md](AGENTS.md), and the release
+process (version sources, tagging, CI guard) in the organization-wide
+[RELEASING.md](https://github.com/plasma-ai/.github/blob/main/RELEASING.md).
 
 ## License
 

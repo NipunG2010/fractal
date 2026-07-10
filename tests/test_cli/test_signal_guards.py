@@ -41,6 +41,7 @@ import io
 import pathlib
 import shutil
 import subprocess
+import uuid
 from collections.abc import Callable, Iterator
 
 import pytest
@@ -52,6 +53,7 @@ from .conftest import _run
 __all__ = [
     'test_signal_rejected_from_non_active_status',
     'test_active_node_accepts_finish_and_stop',
+    'test_finish_cancel_withdraws_the_pending_signal',
     'test_list_surfaces_pending_signal_and_filters_on_base',
     'test_kill_marks_node_and_active_rows_killed',
     'test_stop_after_finish_records_both_and_keeps_active',
@@ -80,7 +82,9 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> dict:
     (non-mutating) guard-rejection matrix; mutating tests init their own
     uniquely-named workers so they never interfere with one another.
     """
-    root = tmp_path_factory.mktemp('fractal_signal')
+    # tmux session names embed this dirname machine-wide: a run-unique suffix
+    # keeps sibling suite runs and stale leaked sessions from duplicate-colliding
+    root = tmp_path_factory.mktemp(f'fractal_signal_{uuid.uuid4().hex[:8]}')
     _git(root, 'init', '-b', 'main')
     _git(root, 'config', 'user.email', 'signal@test.local')
     _git(root, 'config', 'user.name', 'signal')
@@ -179,9 +183,43 @@ def test_active_node_accepts_finish_and_stop(
     assert result.stdout.strip() != ''
     count = f"SELECT COUNT(*) FROM signals WHERE node='{wt.name}' AND signal='{signal}'"
     assert _cell(wt, count) == '1'
-    # the node stays active, now with the pending signal surfaced (F21)
+    # the node stays active, now with the pending signal surfaced
     suffix = 'stopping' if signal == 'stop' else 'finishing'
     assert _run(wt, 'node', 'status').stdout.strip() == f'active ({suffix})'
+
+
+def test_finish_cancel_withdraws_the_pending_signal(
+    repo: dict,
+    live_loop: Callable[[pathlib.Path], None],
+) -> None:
+    """``finish --cancel`` withdraws a pending finish and the loop keeps going.
+
+    Without a cancel, a post-finish mission extension would strand the node
+    (leaving direct DB surgery on the signals table as the only recourse).
+    """
+    wt, _ = _arm(repo['root'], 'arm_cancel')
+    live_loop(wt)
+    # finish arms the signal and the status surfaces it
+    assert _run(wt, 'node', 'finish', '--reason', 'wrap up').returncode == 0
+    assert _run(wt, 'node', 'status').stdout.strip() == 'active (finishing)'
+    # cancel withdraws it: signal rows gone, status back to plain active
+    cancelled = _run(wt, 'node', 'finish', '--cancel', '--reason', 'extended')
+    assert cancelled.returncode == 0, cancelled.stderr
+    assert cancelled.stdout.strip() != ''
+    count = f"SELECT COUNT(*) FROM signals WHERE node='{wt.name}' AND signal='finish'"
+    assert _cell(wt, count) == '0'
+    assert _run(wt, 'node', 'status').stdout.strip() == 'active'
+    # the withdrawal is audited -- a finish_cancel event pair closes completed
+    events = (
+        f"SELECT COUNT(*) FROM events WHERE node='{wt.name}'"
+        " AND event='finish_cancel' AND status='completed'"
+    )
+    assert _cell(wt, events) == '1'
+    # a second cancel has nothing to withdraw and refuses without mutating
+    empty = _run(wt, 'node', 'finish', '--cancel')
+    assert empty.returncode == 1
+    assert 'no finish signal' in empty.stderr
+    assert _run(wt, 'node', 'status').stdout.strip() == 'active'
 
 
 def test_list_surfaces_pending_signal_and_filters_on_base(
@@ -220,7 +258,9 @@ def test_kill_marks_node_and_active_rows_killed(repo: dict) -> None:
 
     The signal (node status) and the persisted row state must agree: after a
     kill, the node is ``killed`` and the open run, iteration, and step rows are
-    all ``killed`` -- no row is left dangling ``active``.
+    all ``killed`` -- no row is left dangling ``active``. The kill itself is
+    audited: a completed ``kill`` event row names the interrupted step, so
+    forensics never have to infer a kill from status transitions.
     """
     wt, ids = _arm(repo['root'], 'killrows', step=True)
     result = _run(wt, 'node', 'kill')
@@ -231,6 +271,12 @@ def test_kill_marks_node_and_active_rows_killed(repo: dict) -> None:
     assert iter_status == 'killed'
     step_status = _cell(wt, f'SELECT status FROM steps WHERE step_id={ids["step"]}')
     assert step_status == 'killed'
+    # the kill leaves an event row -- completed, pinned to the open step
+    events = (
+        f"SELECT COUNT(*) FROM events WHERE node='{wt.name}'"
+        f" AND event='kill' AND status='completed' AND step_id={ids['step']}"
+    )
+    assert _cell(wt, events) == '1'
 
 
 # ------ double-signal sequencing

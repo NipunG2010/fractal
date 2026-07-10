@@ -23,14 +23,13 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 from typing import Optional
 
 import pytest
 
 from tests._helpers import _git
 
-from .conftest import _cli_env, _run, _worktree_root
+from .conftest import _cli_env, _run, _run_reaped, _worktree_root
 
 __all__ = [
     'test_iter_cost_cap_steers_to_reserve',
@@ -181,15 +180,13 @@ def test_reserve_budget_steers_below_buffer(
 ) -> None:
     """The reserve budget moves reserve mode earlier -- to remaining <= reserve.
 
-    ``--max-cost`` is per-run, so each launch starts with the full ``$1`` budget
-    regardless of what earlier cases spent on the shared module node. Step 1's
-    spend then leaves ``$1 - stub_cost`` remaining -- with a $0.5 reserve, $0.6
-    leaves $0.4 (<= reserve but still > $0, so the old ``remaining <= 0`` trigger
-    would not fire) and step 2 is steered to RESERVE; $0.1 leaves $0.9 and it is
-    not. Step 2 still runs (its prompt is captured), so the reserve only steers,
-    never stops.
+    Step 1's spend leaves ``$1 - stub_cost`` of the per-run budget
+    remaining: with a $0.5 reserve, $0.6 leaves $0.4 (<= reserve but
+    still > $0, so a bare ``remaining <= 0`` exhaustion trigger would not
+    fire) and step 2 is steered to RESERVE; $0.1 leaves $0.9 and it is
+    not. Step 2 still runs, so the reserve only steers, never stops.
     """
-    # each run starts fresh under per-run --max-cost, so a fixed $1 budget gives
+    # each run starts fresh (per-run budgets), so a fixed $1 budget gives
     # this run full headroom independent of earlier cases on the shared node
     max_cost = 1.0
     prompts = _run_loop(
@@ -242,11 +239,9 @@ def _run_loop(
     # fractal calls resolve to this worktree (PYTHONPATH via _cli_env)
     env = _cli_env(CAPTURE_DIR=f'{capture}', STUB_COST=str(stub_cost))
     env['PATH'] = f'{node_env["bindir"]}{os.pathsep}{env["PATH"]}'
-    result = subprocess.run(
+    result = _run_reaped(
         ['bash', f'{_LOOP}', f'{worktree}'],
         cwd=f'{worktree}',
-        capture_output=True,
-        text=True,
         env=env,
         timeout=180,
     )

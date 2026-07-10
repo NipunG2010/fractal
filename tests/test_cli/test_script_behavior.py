@@ -6,6 +6,9 @@ real CLI, pinning edges the end-to-end lifecycle tests don't reach:
 - **``init.sh`` worktree resolution** parses ``git worktree list --porcelain``
   with ``substr`` (not ``$2``), so a repo path containing a space resolves the
   parent worktree intact instead of truncating at the first space.
+- **``init.sh`` worktree-anchor guard** rejects only fractal's own worktrees
+  (a ``.worktrees`` ancestor whose parent is itself a git repo), so a repo
+  that merely lives under a ``.worktrees``-named path still spawns nodes.
 - **``merge.sh`` interrupt safety** re-asserts the target worktree is clean
   immediately before the destructive squash, so an edit that lands in the
   target *during* the merge is refused -- never absorbed into the squash commit
@@ -30,6 +33,7 @@ from .conftest import _cli_env, _fractal_bin, _run
 
 __all__ = [
     'test_init_resolves_parent_worktree_under_a_space_path',
+    'test_init_allows_a_repo_under_a_worktrees_path',
     'test_merge_preserves_a_target_edit_that_lands_during_the_merge',
     'test_merge_re_merges_an_iterating_child_without_conflict',
     'test_delete_warns_on_unmerged_commits',
@@ -47,10 +51,10 @@ def test_init_resolves_parent_worktree_under_a_space_path(
     """A repo under a space-containing path still resolves the parent worktree.
 
     ``init.sh`` reads the parent worktree path from ``git worktree list
-    --porcelain``; splitting on whitespace (``$2``) truncated a path like
-    ``.../my dir/repo`` at the space, so the derived parent node dir did not
-    exist and every child ``node init`` failed with "no fractal node". Reading
-    the path with ``substr`` keeps it whole, so the child initializes.
+    --porcelain``; splitting on whitespace (``$2``) would truncate a path like
+    ``.../my dir/repo`` at the space, leaving a derived parent node dir that does
+    not exist and failing every child ``node init`` with "no fractal node".
+    Reading the path with ``substr`` keeps it whole, so the child initializes.
     """
     # the space is in a *parent* directory (the repo's own name must be a valid
     # project identifier); the parent worktree path then contains a space
@@ -58,6 +62,28 @@ def test_init_resolves_parent_worktree_under_a_space_path(
     result = _run(repo, 'node', 'init', 'task', '--agent', 'claude', '--local')
     assert result.returncode == 0, result.stderr
     # the child worktree was created (the parent worktree path resolved intact)
+    assert (repo / '.worktrees' / 'main.task').is_dir(), result.stdout
+
+
+# ------ init.sh: the worktree-anchor guard
+
+
+def test_init_allows_a_repo_under_a_worktrees_path(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A repo living under an unrelated ``.worktrees`` path still spawns nodes.
+
+    ``init.sh`` guards against anchoring a node inside a fractal worktree, but
+    a guard matching ``.worktrees`` anywhere in the absolute path would reject
+    outright a standalone repo that merely lives under a ``.worktrees``-named
+    directory. The guard fires only for fractal's own worktrees: a
+    ``.worktrees`` ancestor whose parent is itself a git repo.
+    """
+    # the .worktrees component is an ordinary directory, not a fractal
+    # worktrees dir (its parent is no git repo)
+    repo = _init_tree(tmp_path / '.worktrees' / 'myrepo')
+    result = _run(repo, 'node', 'init', 'task', '--agent', 'claude', '--local')
+    assert result.returncode == 0, result.stderr
     assert (repo / '.worktrees' / 'main.task').is_dir(), result.stdout
 
 

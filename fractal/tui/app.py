@@ -37,7 +37,11 @@ from fractal.tui.poller import NodePoller
 from fractal.tui.snapshot import SnapshotBuilder
 from fractal.tui.widgets import Pane
 
-__all__ = ['ChatDelta', 'ChatDone', 'FractalApp']
+__all__ = [
+    'ChatDelta',
+    'ChatDone',
+    'FractalApp',
+]
 
 # cancel an in-flight chat turn after this much stream silence
 _CHAT_IDLE_S = 120.0
@@ -274,43 +278,31 @@ class FractalApp(App):
     def start_chat(self: FractalApp, prompt: str) -> None:
         """Run one chat turn against the scoped node.
 
-        Resolves the transport (fork the live session, resume, fresh, or the
-        degraded inbox steer) and either spawns the agent into the chat worker
-        or sends the steer. Every outcome lands in the transcript.
+        Resolves the transport (fork the live session, resume, or fresh) and
+        spawns the agent into the chat worker. Every outcome lands in the
+        transcript; chat never writes radio.
         """
         branch = self.scope
         pane = self.message_pane
         pane.post(branch, 'you', prompt)
         card = self.snapshot.card or {}
         status = card.get('status', 'idle')
+        agent = card.get('agent') or ''
         explicit = pane.session if pane.session and pane.session != '-' else None
         own_chat = explicit is not None and explicit == self.chat.session(branch)
-        live = self._live_session(branch) if status == 'active' else None
+        live = self._live_session(branch, agent) if status == 'active' else None
         transport = resolve_transport(
-            agent=card.get('agent') or '',
+            agent=agent,
             status=status,
             detached=bool(card.get('detached')),
             live_session=live,
             session=explicit,
             own_chat=own_chat,
         )
-        # degraded: steer the running loop's inbox instead of spawning
-        if not transport.is_live:
-            try:
-                uuid = self.actions.send(
-                    target=branch,
-                    channel='inbox',
-                    subject='chat',
-                    data=prompt,
-                    priority=10,
-                )
-            except (ValueError, PermissionError, sqlite3.Error) as error:
-                pane.post(branch, 'error', f'{theme.WARN} {error}')
-                return
-            note = f'{theme.WARN} {transport.label} -- sent to inbox {uuid}'
-            pane.post(branch, 'meta', note)
+        # a fallback the user should notice (an unforkable live thread
+        # resolving to fresh) gets a toast on top of its meta line
+        if transport.warn:
             self.notify(transport.label, severity='warning')
-            return
         node = self.data.node(branch)
         if node is None:
             pane.post(branch, 'error', f'{theme.WARN} node unavailable')
@@ -336,12 +328,12 @@ class FractalApp(App):
         self._spinner.resume()
         self._chat_worker(turn, branch, self._turn_id)
 
-    def _live_session(self: FractalApp, branch: str) -> Optional[str]:
-        """Look up the node's live loop session (read-only, at send time)."""
+    def _live_session(self: FractalApp, branch: str, agent: str) -> Optional[str]:
+        """Look up the node's newest woven session (read-only, at send time)."""
         try:
             connection = self.data.connect()
             try:
-                return self.data.live_session(connection, branch)
+                return self.data.live_session(connection, branch, agent)
             finally:
                 connection.close()
         except sqlite3.Error:

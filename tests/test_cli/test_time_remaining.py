@@ -10,9 +10,10 @@ displayed seconds.
 ``time_remaining`` returns ``None`` (no timeout / nothing running) or a float;
 the command turns that into exactly one of:
 
-- ``"no limit"`` -- neither ``timeout`` nor ``iter_timeout`` configured;
-- ``"not running"`` -- a timeout is set but no run/iteration is active;
-- ``"<N>s"`` -- ``int(remaining)`` for the soonest active deadline.
+- ``"no limit"`` -- no ``timeout``/``iter_timeout``/``step_timeout`` configured;
+- ``"not running"`` -- a timeout is set but nothing active counts down;
+- ``"<N>s"`` -- ``int(remaining)`` for the soonest active deadline (run,
+  iteration, or step).
 
 These states are reached by driving the real ``fractal`` console script as a
 subprocess against a node whose run/iteration rows are created in-process via the
@@ -33,7 +34,7 @@ import pathlib
 import pytest
 
 from fractal.core.node import Node
-from tests._helpers import _age_iter, _age_run, _git
+from tests._helpers import _age_iter, _age_run, _age_step, _git
 
 from .conftest import _run
 
@@ -43,6 +44,7 @@ __all__ = [
     'test_remaining_reports_not_running_with_only_step_timeout',
     'test_remaining_counts_down_for_the_run',
     'test_remaining_counts_down_for_the_active_iteration',
+    'test_remaining_counts_down_for_the_active_step',
 ]
 
 # a 10-minute budget, in the suffix form the loop validates
@@ -114,9 +116,8 @@ def test_remaining_reports_not_running_without_active_run(time_node: dict) -> No
 def test_remaining_reports_not_running_with_only_step_timeout(time_node: dict) -> None:
     """A lone ``--step-timeout`` is still a limit -> ``"not running"``, not ``"no limit"``.
 
-    ``time_remaining`` has no step countdown (a step's cap is applied live, not
-    anchored in the DB), but a configured step timeout still means the node is
-    time-bounded, so it must not collapse to ``"no limit"``.
+    A configured step timeout still time-bounds the node -- there is just
+    nothing active to count down against.
     """
     node = time_node['node']
     node.config_set(step_timeout=TIMEOUT)
@@ -152,6 +153,27 @@ def test_remaining_counts_down_for_the_active_iteration(time_node: dict) -> None
     run_id = node.run_start()
     iter_id = node.iter_start(run_id=run_id, iter=1)
     _age_iter(node, iter_id, 100.0)
+    seconds = _remaining_seconds(time_node['repo'])
+    assert TIMEOUT_SECONDS - 150 <= seconds <= TIMEOUT_SECONDS - 100
+
+
+def test_remaining_counts_down_for_the_active_step(time_node: dict) -> None:
+    """A ``--step-timeout`` active step renders ``int(budget - elapsed)``.
+
+    A loop node commonly runs with only a step budget, so its one active
+    deadline must render as a countdown like the run and iteration scopes.
+    """
+    node = time_node['node']
+    node.config_set(step_timeout=TIMEOUT)
+    run_id = node.run_start()
+    iter_id = node.iter_start(run_id=run_id, iter=1)
+    step_id = node.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='EXECUTE',
+    )
+    _age_step(node, step_id, 100.0)
     seconds = _remaining_seconds(time_node['repo'])
     assert TIMEOUT_SECONDS - 150 <= seconds <= TIMEOUT_SECONDS - 100
 

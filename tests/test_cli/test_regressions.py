@@ -1,6 +1,6 @@
-"""Regression tests pinning corrected CLI behaviors.
+"""Regression tests pinning specific CLI behaviors.
 
-Each test asserts a specific behavior so it goes red if the fix regresses.
+Each test asserts a specific behavior so it goes red if that behavior regresses.
 
 Tests drive the real ``fractal`` CLI as a subprocess against a throwaway repo
 with a user node and two worker nodes, exercising the CLI, radio, and config
@@ -26,10 +26,12 @@ __all__ = [
     'test_db_has_no_status_subcommand',
     'test_radio_read_shows_uuid',
     'test_node_unretire_echoes_confirmation',
-    'test_radio_reply_rejects_write_only_channel',
+    'test_radio_reply_reroutes_write_only_channel',
     'test_radio_thread_shows_full_tree_by_default',
     'test_node_delete_removes_project_cache_entry',
     'test_init_subproject_records_project',
+    'test_node_init_path_records_subproject',
+    'test_recursive_delete_reports_every_node',
     'test_node_list_pipe_status_has_no_brackets',
     'test_empty_list_emits_a_header',
     'test_empty_private_list_emits_a_header',
@@ -71,7 +73,7 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> dict:
     }
 
 
-# ------ fixed bugs (assert the corrected behavior)
+# ------ pinned behaviors (assert the exact contract)
 
 
 def test_csv_output_uses_lf_not_crlf(repo: dict) -> None:
@@ -104,7 +106,7 @@ def test_db_query_write_is_friendly_read_only_error(repo: dict) -> None:
 
 
 def test_db_has_no_status_subcommand(repo: dict) -> None:
-    """The dead/misleading ``db _status`` command is gone."""
+    """``db`` exposes no ``_status`` subcommand."""
     result = _run(repo['task'], 'db', '_status')
     assert result.returncode != 0
 
@@ -137,8 +139,13 @@ def test_node_unretire_echoes_confirmation(repo: dict) -> None:
     assert 'unretire' in result.stdout.lower()
 
 
-def test_radio_reply_rejects_write_only_channel(repo: dict) -> None:
-    """Reply cannot inject into another node's write-only channel."""
+def test_radio_reply_reroutes_write_only_channel(repo: dict) -> None:
+    """Reply cannot inject into another node's write-only channel.
+
+    Rather than refusing, it reroutes to the owner's inbox as a conversation
+    turn -- the channel itself stays owner-only, and the echo names the real
+    destination.
+    """
     task, docs = repo['task'], repo['docs']
     sent = _run(
         task,
@@ -154,8 +161,8 @@ def test_radio_reply_rejects_write_only_channel(repo: dict) -> None:
     )
     uuid = sent.stdout.strip()
     result = _run(docs, 'radio', 'reply', uuid, 'inject')
-    assert result.returncode != 0
-    assert 'write-only' in (result.stdout + result.stderr).lower()
+    assert result.returncode == 0, result.stderr
+    assert "sent to main.task's 'inbox' channel" in result.stderr
 
 
 def test_radio_thread_shows_full_tree_by_default(repo: dict) -> None:
@@ -163,7 +170,7 @@ def test_radio_thread_shows_full_tree_by_default(repo: dict) -> None:
 
     Thread is a reply-tree view, not inbox triage, so it defaults to the full
     tree (read=None): a read root and a read child both appear without any
-    ``--read``/``--all`` flag (which the command no longer accepts).
+    ``--read``/``--all`` flag (the command accepts no such flags).
     """
     task = repo['task']
     root = _run(
@@ -228,6 +235,91 @@ def test_init_subproject_records_project(tmp_path: pathlib.Path) -> None:
     assert not (root / 'app' / 'app').exists()
 
 
+def test_node_init_path_records_subproject(tmp_path: pathlib.Path) -> None:
+    """``node init --path=<subdir>`` records the sub-project, not ``'.'``.
+
+    A monorepo child pointed at a sub-project via ``--path`` must record it
+    like the ``fractal init <subdir>`` user flow above: the resolved sub-path
+    reaches init.sh instead of being dropped for the parent's project.
+    """
+    root = tmp_path
+    _git(root, 'init', '-b', 'main')
+    _git(root, 'config', 'user.email', 'reg@test.local')
+    _git(root, 'config', 'user.name', 'reg')
+    (root / 'README.md').write_text('# mono\n', encoding='utf-8')
+    # both wikis committed in base: the root's for the user node, the
+    # sub-project's for the child's precondition lookup
+    for wiki in (root / 'wiki', root / 'app' / 'wiki'):
+        wiki.mkdir(parents=True)
+        (wiki / '_index.md').write_text(
+            '---\nname: wiki\n---\n# wiki\n\n***\n',
+            encoding='utf-8',
+        )
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-m', 'init')
+    # a root user node, then a child pointed at the sub-project
+    assert _run(root, 'init').returncode == 0
+    result = _run(root, 'node', 'init', 'sub', '--path', 'app', '--agent', 'claude')
+    assert result.returncode == 0, result.stderr
+    # the child records project 'app' and nests its data under it
+    cache = root / '.worktrees' / '.project' / 'main.sub'
+    assert cache.read_text(encoding='utf-8').strip() == 'app'
+    worktree = root / '.worktrees' / 'main.sub'
+    config = worktree / 'app' / '.fractal' / 'main.sub' / 'config.json'
+    assert config.is_file()
+    assert json.loads(config.read_text(encoding='utf-8'))['project'] == 'app'
+
+
+def test_recursive_delete_reports_every_node(tmp_path: pathlib.Path) -> None:
+    """Recursive ``node delete`` echoes every removal and unmerged edge.
+
+    Deleting a subtree must (a) echo the Removed-worktree/Deleted-branch pair
+    for each deleted node, not only the deletion root, and (b) warn about a
+    descendant's unmerged commits against the nearest SURVIVING ancestor --
+    the leaf's own parent dies in the same delete, so advice scoped to that
+    edge names a branch that no longer exists.
+    """
+    root = tmp_path
+    _git(root, 'init', '-b', 'main')
+    _git(root, 'config', 'user.email', 'reg@test.local')
+    _git(root, 'config', 'user.name', 'reg')
+    (root / 'README.md').write_text('# chain\n', encoding='utf-8')
+    wiki = root / 'wiki'
+    wiki.mkdir()
+    (wiki / '_index.md').write_text(
+        '---\nname: wiki\n---\n# wiki\n\n***\n',
+        encoding='utf-8',
+    )
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-m', 'init')
+    assert _run(root, 'init').returncode == 0
+    # a mid node and a leaf nested under it
+    assert _run(root, 'node', 'init', 'mid', '--agent', 'claude').returncode == 0
+    mid = root / '.worktrees' / 'main.mid'
+    mid_node_dir = mid / '.fractal' / 'main.mid'
+    leaf_init = _run(
+        root, 'node', 'init', 'leaf', '--agent', 'claude', _NODE=str(mid_node_dir)
+    )
+    assert leaf_init.returncode == 0, leaf_init.stderr
+    leaf = root / '.worktrees' / 'main.mid.leaf'
+    # give the leaf work no ancestor has -- the unmerged edge to report
+    (leaf / 'leaf_work.md').write_text('leaf work\n', encoding='utf-8')
+    _git(leaf, 'add', '-A')
+    _git(leaf, 'commit', '-m', 'leaf work')
+    # delete the subtree from the repo root
+    result = _run(root, 'node', 'delete', 'main.mid', '--force')
+    assert result.returncode == 0, result.stderr
+    # (a) every deleted node's removal is echoed, not only the root's
+    for branch in ('main.mid.leaf', 'main.mid'):
+        assert f'Deleted branch: {branch}' in result.stdout, result.stdout
+    # (b) the leaf's unmerged work warns against the SURVIVING ancestor (the
+    # semicolon pins the target: advice scoped to the dying parent would say
+    # 'main.mid;')
+    assert 'main.mid.leaf has commits not merged into main;' in result.stderr, (
+        result.stderr
+    )
+
+
 # ------ output, delegation, and name resolution
 
 
@@ -240,8 +332,8 @@ def test_node_list_pipe_status_has_no_brackets(repo: dict) -> None:
 def test_empty_list_emits_a_header(repo: dict) -> None:
     """An empty radio query should emit a header, not nothing.
 
-    ``node list`` passes ``columns=`` so an empty result still prints a header
-    row; radio commands do not, so an empty result is zero bytes and
+    ``node list`` and the radio listings alike pass ``columns=`` so an empty
+    result still prints a header row -- zero-byte output would be
     indistinguishable from a failure when piped.
     """
     result = _run(repo['task'], 'radio', 'messages', '--channel', 'public')
@@ -289,12 +381,11 @@ def test_child_without_base_branches_from_parent_tip(
 ) -> None:
     """A child spawned without ``--base`` branches from its parent's tip.
 
-    Regression for the spawn-base bug: ``node init`` created the child worktree
-    with no start ref, so the child branched from the main repo's HEAD rather
-    than the spawning node -- starting divergent (missing the parent's commits)
-    until the first parent merge. Uses its own repo (not the shared fixture) so
-    the parent can be advanced one commit past ``main``; the child must inherit
-    that commit at creation.
+    Creating the child worktree with no start ref would branch it from the
+    main repo's HEAD rather than the spawning node -- starting divergent
+    (missing the parent's commits) until the first parent merge. Uses its own
+    repo (not the shared fixture) so the parent can be advanced one commit
+    past ``main``; the child must inherit that commit at creation.
     """
     root = tmp_path / 'repo'
     root.mkdir()
@@ -325,7 +416,7 @@ def test_child_without_base_branches_from_parent_tip(
     assert spawn.returncode == 0, spawn.stderr
 
     # the child branched from the parent tip, so the parent's commit is present;
-    # it would be ABSENT had the child branched off main HEAD (the old bug)
+    # it would be ABSENT had the child branched off main HEAD
     child = root / '.worktrees' / 'main.task.c1'
     assert (child / 'parent_work.txt').exists(), spawn.stdout
     # main never saw that file -- proves the parent was genuinely ahead

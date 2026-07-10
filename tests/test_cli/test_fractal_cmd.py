@@ -12,6 +12,7 @@ throwaway tree, never the real one.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 
 import pytest
@@ -19,7 +20,7 @@ import pytest
 from fractal.core.node import Node
 from tests._helpers import _git
 
-from .conftest import _run
+from .conftest import _run, _worktree_root
 
 __all__ = [
     'test_install_project_copies_skills_into_both_agents',
@@ -29,6 +30,7 @@ __all__ = [
     'test_commit_check_fails_on_a_dirty_worker',
     'test_destroy_force_tears_the_fractal_down',
     'test_destroy_aborts_when_the_prompt_is_declined',
+    'test_open_without_textual_names_the_tui_extra',
     'test_pricing_check_reports_priced_models',
 ]
 
@@ -139,6 +141,34 @@ def test_destroy_aborts_when_the_prompt_is_declined(tmp_path: pathlib.Path) -> N
     # nothing was torn down: the worktree and registry are still present
     assert (repo / '.worktrees' / 'main.task').exists()
     assert (repo / '.fractal').exists()
+
+
+# ------ open (tui extra)
+
+
+def test_open_without_textual_names_the_tui_extra(tmp_path: pathlib.Path) -> None:
+    """``open`` without the tui extra says how to install it, not a bare error.
+
+    The TUI import is lazy (the extra stays off cold start), so a missing
+    textual must surface the extra's install command, not the raw
+    ``No module named 'textual'``. textual IS installed in the dev venv,
+    so absence is simulated: a shim module raising the extras-less
+    install's exact error shadows it on ``PYTHONPATH``.
+    """
+    shim = tmp_path / 'shim'
+    shim.mkdir()
+    (shim / 'textual.py').write_text(
+        'raise ModuleNotFoundError("No module named \'textual\'")\n',
+        encoding='utf-8',
+    )
+    # the conftest env overlay replaces PYTHONPATH wholesale, so compose
+    # shim + worktree (the worktree entry keeps the edited package importable)
+    pythonpath = os.pathsep.join((str(shim), str(_worktree_root())))
+    result = _run(tmp_path, 'open', PYTHONPATH=pythonpath)
+    assert result.returncode != 0
+    assert 'Error:' in result.stderr
+    assert "pip install 'plasma-fractal[tui]'" in result.stderr
+    assert 'Traceback' not in result.stdout + result.stderr
 
 
 # ------ pricing cache check

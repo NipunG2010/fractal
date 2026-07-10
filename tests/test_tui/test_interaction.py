@@ -49,10 +49,11 @@ async def test_ring_enter_and_rescope(
         await pilot.press('down', 'enter')  # select main.alpha, re-scope
         assert app.scope == 'main.alpha'
         assert app.snapshot.card['branch'] == 'main.alpha'
-        # the compose pane follows: leaf-named node field + default session
+        # the compose pane follows: leaf-named node field + the newest woven
+        # session (the open iteration's, live as soon as its stream opened)
         assert app.query_one('#m_node', Input).value == 'alpha'
         assert app.message_pane.node == 'main.alpha'
-        assert app.message_pane.session == session_for('main.alpha', 2, 1)
+        assert app.message_pane.session == session_for('main.alpha', 2, 2)
         await pilot.press('escape')
         assert app.mode == 'ring'
 

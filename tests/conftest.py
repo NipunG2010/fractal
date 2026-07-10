@@ -21,7 +21,19 @@ if any(arg == '--cov' or arg.startswith('--cov=') for arg in sys.argv):
 
 # env vars a running loop exports each iteration -- tests must not inherit them,
 # or in-process Node.init() adopts the live node as parent (see _isolate_loop_env)
-_LOOP_ENV_VARS = ['_NODE', 'NODE_DIR', 'MAX_DEPTH', 'MAX_CHILDREN', 'MAX_COST']
+# and _commit.sh logs commit events under the live RUN_ID/ITER_ID/STEP_ID lineage
+# missing from the test DB, silently losing them; ITER mislabels commit subjects
+_LOOP_ENV_VARS = [
+    '_NODE',
+    'NODE_DIR',
+    'MAX_DEPTH',
+    'MAX_CHILDREN',
+    'MAX_COST',
+    'RUN_ID',
+    'ITER_ID',
+    'STEP_ID',
+    'ITER',
+]
 
 
 @pytest.fixture(scope='session', autouse=True)

@@ -10,6 +10,7 @@ from fractal.cli.utils import (
     command,
     print_rows,
     require_non_negative,
+    resolve_node,
     resolve_target,
 )
 
@@ -28,7 +29,7 @@ def cost_remaining(app: typer.Typer) -> typer.Typer:
     node_help = 'Target node branch (default: this node).'
     node = typer.Argument(None, help=node_help)
     # run id option
-    run_id_help = 'Scope to a run ID (default: the current run).'
+    run_id_help = 'Scope to a run ID (default: the current run; per-run caps re-arm each new run).'
     run_id = typer.Option(None, '--run', help=run_id_help)
     # iteration id option
     iter_id_help = "Scope to an iteration ID's max-iter-cost headroom."
@@ -48,10 +49,27 @@ def cost_remaining(app: typer.Typer) -> typer.Typer:
         step_id: Optional[int] = step_id,
         path: str = path,
     ) -> None:
-        """Print remaining cost budget (per-run by default)."""
+        """Print remaining cost budget (current run by default; --run for one run).
+
+        Per-run caps re-arm on every launch, so a drained prior run never
+        shrinks the bare figure (scope to it via ``--run``). A deleted
+        target reports ``no budget``: its history persists, but every cap
+        store dies with the node.
+        """
         if sum(scope is not None for scope in (run_id, iter_id, step_id)) > 1:
             raise typer.BadParameter('use at most one of --run/--iter/--step.')
-        node = resolve_target(path, node)
+        # a deleted branch fails resolution: report the cap-less 'no budget'
+        # when it has a recorded run, keep the not-found error when it never ran
+        try:
+            node = resolve_target(path, node)
+        except typer.BadParameter:
+            if node is None:
+                raise
+            caller = resolve_node(path)
+            if caller.run_latest(branch=node) is None:
+                raise
+            typer.echo('no budget')
+            return
         remaining = node.cost_remaining(
             run_id=run_id,
             iter_id=iter_id,
@@ -72,7 +90,7 @@ def cost_spent(app: typer.Typer) -> typer.Typer:
     node_help = 'Target node branch (default: this node).'
     node = typer.Argument(None, help=node_help)
     # run id option
-    run_id_help = 'Scope to a run ID (default: the current run).'
+    run_id_help = 'Scope to a run ID (default: the current run; per-run caps re-arm each new run).'
     run_id = typer.Option(None, '--run', help=run_id_help)
     # iteration id option
     iter_id_help = 'Scope to a specific iteration ID.'
@@ -96,11 +114,31 @@ def cost_spent(app: typer.Typer) -> typer.Typer:
         max_depth: Optional[int] = max_depth,
         path: str = path,
     ) -> None:
-        """Print total cost (per-run by default). Includes children."""
+        """Print total cost (current run by default; --run for one run). Includes children.
+
+        Per-run caps re-arm on every launch, so the bare reading never
+        carries prior-run spend (scope to a prior run via ``--run``). A
+        deleted target answers from its persisted history -- its latest
+        recorded run by default.
+        """
         require_non_negative(max_depth=max_depth)
         if sum(scope is not None for scope in (run_id, iter_id, step_id)) > 1:
             raise typer.BadParameter('use at most one of --run/--iter/--step.')
-        node = resolve_target(path, node)
+        # a deleted branch fails resolution: answer through the caller (shared
+        # db), its latest recorded run standing in for the current one -- core
+        # gives run_id precedence over the caller's own scope
+        try:
+            node = resolve_target(path, node)
+        except typer.BadParameter:
+            if node is None:
+                raise
+            caller = resolve_node(path)
+            latest = caller.run_latest(branch=node)
+            if latest is None:
+                raise
+            if run_id is None and iter_id is None and step_id is None:
+                run_id = latest
+            node = caller
         kwargs = {
             'run_id': run_id,
             'iter_id': iter_id,
@@ -108,9 +146,14 @@ def cost_spent(app: typer.Typer) -> typer.Typer:
         }
         spent = node.cost_spent(**kwargs, max_depth=max_depth)
         if spent == 0.0 and node.cost_untracked(**kwargs, max_depth=max_depth):
-            typer.echo('null')
+            typer.echo('untracked')
         else:
             typer.echo(f'${spent:.{_DECIMAL_PRECISION}f}')
+            # disclose the SUM's silent gap (ended steps with NULL cost: kills
+            # before the first usage flush) on stderr; stdout stays parseable
+            unpriced = node.cost_unpriced(**kwargs, max_depth=max_depth)
+            if unpriced:
+                typer.echo(f'{unpriced} unpriced steps (NULL cost) excluded', err=True)
 
     return app
 
@@ -121,7 +164,7 @@ def cost_breakdown(app: typer.Typer) -> typer.Typer:
     node_help = 'Target node branch (default: this node).'
     node = typer.Argument(None, help=node_help)
     # run id option
-    run_id_help = 'Scope to a run ID (default: the current run).'
+    run_id_help = 'Scope to a run ID (default: the current run; per-run caps re-arm each new run).'
     run_id = typer.Option(None, '--run', help=run_id_help)
     # max-depth option
     max_depth_help = 'Maximum child depth to include (0 = this node only).'
@@ -141,31 +184,61 @@ def cost_breakdown(app: typer.Typer) -> typer.Typer:
         csv: bool = csv,
         path: str = path,
     ) -> None:
-        """Print per-node cost breakdown for a run (the current run by default).
+        """Print per-node cost breakdown (current run by default; --run for one run).
+
+        Per-run caps re-arm on every launch, so the bare table covers the
+        current run only (scope to a prior run via ``--run``).
 
         The target's own row leads (so a leaf node -- and ``--max-depth 0`` --
         attributes this node's own spend), followed by each in-subtree descendant.
         A descendant still registered shows its budget (idle children read 0.00);
         a descendant whose registry row is gone (deleted/reparented) but whose
-        spend still chains via ``parent_run_id`` is appended as a `` (deleted)``
-        row, so the rows always sum to ``cost spent``.
+        spend is still recorded (chained via ``parent_run_id``) is appended as a
+        `` (deleted)`` row, so the rows always sum to ``cost spent``. A deleted
+        *target* answers from its persisted history the same way: its own
+        `` (deleted)`` row leads (no cap survives the delete) over its latest
+        recorded run.
         """
         require_non_negative(max_depth=max_depth)
-        node = resolve_target(path, node)
-        children = node.child_list(max_depth=max_depth)
-        if children is None:
-            typer.echo('No database.', err=True)
-            raise SystemExit(1)
-        # per-descendant own spend in the run's subtree (chained by parent_run_id);
-        # this is the same lineage cost spent sums, so the rows below total to it
-        breakdown = node.cost_breakdown(run_id=run_id, max_depth=max_depth)
+        # a deleted branch fails resolution: drive the table through the caller
+        # (shared db), its latest recorded run standing in for the current one
+        # -- core gives run_id precedence over the caller's own scope
+        deleted = None
+        try:
+            node = resolve_target(path, node)
+        except typer.BadParameter:
+            if node is None:
+                raise
+            caller = resolve_node(path)
+            latest = caller.run_latest(branch=node)
+            if latest is None:
+                raise
+            if run_id is None:
+                run_id = latest
+            deleted, node = node, caller
+        # delete clears the whole subtree's registry rows, so a deleted target
+        # has no cap and no registered children -- the lineage carries the rest
+        if deleted:
+            branch, max_cost, children = f'{deleted} (deleted)', None, []
+        else:
+            branch, max_cost = node._branch, node.config_get('max_cost')
+            children = node.child_list(max_depth=max_depth)
+            if children is None:
+                typer.echo('No database.', err=True)
+                raise SystemExit(1)
+        # per-descendant own spend in the run lineage; this is the same set
+        # cost spent sums, so the rows below total to it
+        breakdown = node.cost_breakdown(
+            run_id=run_id,
+            max_depth=max_depth,
+        )
         # lead with the target's own depth-0 spend, which the descendant-only
         # breakdown drops -- the whole answer for a leaf, and makes --max-depth 0
         # yield exactly this node
         spent = node.cost_spent(run_id=run_id, max_depth=0)
         row = {
-            'node': node._branch,
-            'max_cost': node.config_get('max_cost'),
+            'node': branch,
+            'max_cost': max_cost,
             'spent': round(spent, _DECIMAL_PRECISION),
         }
         rows = [row]
@@ -191,5 +264,13 @@ def cost_breakdown(app: typer.Typer) -> typer.Typer:
                 }
                 rows.append(row)
         print_rows(rows, csv=csv, columns=['node', 'max_cost', 'spent'])
+        # disclose the SUM's silent gap across the same scope the table
+        # sums (ended NULL-cost steps) -- stderr keeps the table parseable
+        unpriced = node.cost_unpriced(
+            run_id=run_id,
+            max_depth=max_depth,
+        )
+        if unpriced:
+            typer.echo(f'{unpriced} unpriced steps (NULL cost) excluded', err=True)
 
     return app

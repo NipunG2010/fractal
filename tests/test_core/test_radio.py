@@ -24,15 +24,21 @@ __all__ = [
     'test_send_nonexistent_channel',
     'test_send_rejects_invalid_priority',
     'test_sent_lists_outbound_mail',
+    'test_sent_includes_own_replies',
     'test_messages_query',
     'test_messages_channel_filter',
     'test_messages_read_filter',
     'test_acting_marks_message_read',
     'test_read_returns_counts',
+    'test_read_multiple_uuids_dedupes_without_partial_receipts',
+    'test_read_channel_selector_reads_and_receipts',
+    'test_read_feed_selector_catches_up_subscriptions',
+    'test_read_receipts_attribute_to_reader_not_mailbox',
+    'test_read_channel_selector_respects_read_only',
     'test_feed_fans_out_with_sources',
-    'test_feed_limit_only_marks_returned_messages_read',
     'test_reply_inherits_subject_and_priority',
     'test_reply_lands_in_parents_channel_space',
+    'test_reply_to_inbox_message_reaches_the_sender',
     'test_thread_structure',
     'test_uuid_resolves_globally',
     'test_cross_node_read_respects_read_only',
@@ -116,7 +122,7 @@ def test_send_stamps_sender_session(radio: Radio) -> None:
     stamped = radio.send(channel='public', subject='s2', data='d2', priority=5)
     [row] = radio.node.db.read('messages', where={'message_uuid': stamped})
     assert row['session'] == 'sess-1'
-    reply_uuid = radio.reply(stamped, 'on it')
+    reply_uuid, _, _ = radio.reply(stamped, 'on it')
     [row] = radio.node.db.read('messages', where={'message_uuid': reply_uuid})
     assert row['session'] == 'sess-1'
 
@@ -225,6 +231,24 @@ def test_sent_lists_outbound_mail(radio_pair: tuple[Radio, Radio]) -> None:
     assert [r['message_uuid'] for r in recent] == [to_self, to_peer]
 
 
+def test_sent_includes_own_replies(radio_pair: tuple[Radio, Radio]) -> None:
+    """``sent`` lists authored replies too, wherever they thread.
+
+    The mailbox listings hide a reply that threads in place behind its
+    parent's reply count, but ``sent`` is the review surface for what this
+    node wrote -- replies must list beside the top-level posts.
+    """
+    root, peer = radio_pair
+    # an in-place reply into the peer's readable channel
+    post = peer.send(channel='public', subject='post', data='d', priority=3)
+    in_place, _, _ = root.reply(post, 'seen')
+    # a follow-up threaded onto the own outbox post
+    cast = root.send(channel='outbox', subject='cast', data='d', priority=3)
+    follow_up, _, _ = root.reply(cast, 'follow-up')
+    uuids = {r['message_uuid'] for r in root.sent()}
+    assert {in_place, cast, follow_up} <= uuids
+
+
 def test_messages_query(radio: Radio) -> None:
     """Messages are ordered by priority DESC, created_at ASC."""
     radio.send(subject='low', data='d', priority=1)
@@ -288,7 +312,7 @@ def test_read_returns_counts(radio: Radio) -> None:
     uuid = radio.messages()[0]['message_uuid']
     radio.reply(uuid, 'r1')
     radio.react(uuid, 1)
-    message = radio.read(uuid)
+    [message] = radio.read(uuid)
     assert message['subject'] == 's'
     assert message['data'] == 'd'
     assert message['replies'] == 1
@@ -299,11 +323,116 @@ def test_read_returns_counts(radio: Radio) -> None:
     assert radio.db.exists('reads', where=receipt)
 
 
+def test_read_multiple_uuids_dedupes_without_partial_receipts(
+    radio: Radio,
+) -> None:
+    """Read returns named UUIDs once, in order; a failed lookup receipts nothing.
+
+    Duplicate UUIDs collapse to their first occurrence, and receipts land
+    only after every lookup resolves -- a not-found UUID anywhere in the
+    call leaves even its resolvable companions unread.
+    """
+    first = radio.send(subject='one', data='d', priority=0)
+    second = radio.send(subject='two', data='d', priority=0)
+    messages = radio.read(first, second, first)
+    assert [m['message_uuid'] for m in messages] == [first, second]
+    assert len(radio.messages(read=True)) == 2
+    # a not-found UUID aborts the whole read before any receipt
+    third = radio.send(subject='three', data='d', priority=0)
+    with pytest.raises(ValueError, match='not found'):
+        radio.read(third, 'DEADBEEF')
+    assert len(radio.messages(read=False)) == 1
+
+
+def test_read_channel_selector_reads_and_receipts(radio: Radio) -> None:
+    """``read(channel=...)`` returns the channel's rows and receipts exactly them.
+
+    The ``unread`` narrowing follows this reader's receipts, so a second
+    unread read returns nothing new; rows outside the selection stay unread.
+    """
+    kept = radio.send(subject='kept', data='d', priority=2)
+    swept = radio.send(subject='swept', data='d', priority=5)
+    radio.send(channel='private', subject='note', data='d', priority=5)
+    # the selector reads the whole channel, priority first
+    messages = radio.read(channel='inbox', unread=True)
+    assert [m['message_uuid'] for m in messages] == [swept, kept]
+    # receipts landed for exactly the returned rows: nothing unread remains
+    assert radio.read(channel='inbox', unread=True) == []
+    assert len(radio.messages(channel='private', read=False)) == 1
+    # an explicit UUID returns regardless of its read state
+    [again] = radio.read(swept)
+    assert again['subject'] == 'swept'
+    # without ``unread`` the selector re-reads the full channel
+    assert len(radio.read(channel='private')) == 1
+    assert radio.messages(channel='private', read=False) == []
+
+
+def test_read_feed_selector_catches_up_subscriptions(
+    radio_pair: tuple[Radio, Radio],
+) -> None:
+    """``read(feed=True, unread=True)`` drains the unread feed, once.
+
+    The fan-out mirrors ``feed`` (readable subscribed channels, priority
+    order); receipts land for the returned rows, for this reader only.
+    """
+    root, peer = radio_pair
+    cast = peer.send(channel='outbox', subject='cast', data='d', priority=5)
+    post = peer.send(channel='public', subject='post', data='d', priority=3)
+    messages = root.read(feed=True, unread=True)
+    assert [m['message_uuid'] for m in messages] == [cast, post]
+    # the catch-up is complete: nothing unread remains for this reader
+    assert root.read(feed=True, unread=True) == []
+    # the peer's own unread state never moved
+    assert len(peer.messages(channel='outbox', read=False)) == 1
+
+
+def test_read_receipts_attribute_to_reader_not_mailbox(
+    radio_pair: tuple[Radio, Radio],
+) -> None:
+    """Selector reads of another mailbox receipt as the reader, never the owner.
+
+    ``node`` picks whose channel-space is viewed; the receipt names the
+    reading node, so an operator peek can never consume the owner's
+    unread state.
+    """
+    root, peer = radio_pair
+    peer_branch = peer.node._branch
+    cast = peer.send(channel='outbox', subject='cast', data='d', priority=5)
+    [message] = root.read(node=peer_branch, channel='outbox')
+    assert message['message_uuid'] == cast
+    # the receipt names the root, and only the root
+    [receipt] = root.db.read('reads', where={'message_id': message['message_id']})
+    assert receipt['node'] == root.node._branch
+    # the owner's unread state never moved
+    assert len(peer.messages(channel='outbox', read=False)) == 1
+    # the feed selector honors ``node`` too: the peer views the ROOT's feed
+    # (the root's subscriptions carry the peer's cast, not the root's own post)
+    note = root.send(channel='outbox', subject='note', data='d', priority=5)
+    viewed = peer.read(node=root.node._branch, feed=True)
+    read_uuids = {m['message_uuid'] for m in viewed}
+    assert cast in read_uuids
+    assert note not in read_uuids
+
+
+def test_read_channel_selector_respects_read_only(
+    radio_pair: tuple[Radio, Radio],
+) -> None:
+    """A read-only channel selector is owner-only, like the by-UUID rule."""
+    root, peer = radio_pair
+    root.send(peer.node._branch, subject='secret', data='d', priority=0)
+    with pytest.raises(PermissionError, match='read-only'):
+        root.read(node=peer.node._branch, channel='inbox')
+    # the owner reads its own read-only channel freely
+    [message] = peer.read(channel='inbox')
+    assert message['subject'] == 'secret'
+
+
 def test_feed_fans_out_with_sources(radio_pair: tuple[Radio, Radio]) -> None:
     """Feed merges subscribed channels, attributing each row to its source.
 
-    Reading the feed acks the returned rows (the reader's receipts), so the
-    unread feed converges to empty.
+    Listing is always passive: the unread view is stable across
+    calls -- and under ``limit`` -- until the reader consumes rows through
+    ``read``, and even then only for that reader.
     """
     root, peer = radio_pair
     peer_branch = peer.node._branch
@@ -312,36 +441,24 @@ def test_feed_fans_out_with_sources(radio_pair: tuple[Radio, Radio]) -> None:
     rows = root.feed(read=False)
     assert {r['message_uuid'] for r in rows} == {cast, post}
     assert {r['node'] for r in rows} == {peer_branch}
-    # the returned rows were acked for this reader only
+    # listing is passive: the unread view is unchanged, capped or not
+    assert len(root.feed(limit=1, read=False)) == 1
+    assert {r['message_uuid'] for r in root.feed(read=False)} == {cast, post}
+    # reading is the consuming act, and only for this reader
+    root.read(cast, post)
     assert root.feed(read=False) == []
     assert len(peer.messages(channel='outbox', read=False)) == 1
-
-
-def test_feed_limit_only_marks_returned_messages_read(radio: Radio) -> None:
-    """``feed(limit=N)`` acks only the N returned messages, not every match.
-
-    Regression: feed used to write a read receipt for every queried row before
-    truncating to ``limit``, so a capped feed silently buried the unshown rest.
-    """
-    # subscribe to own outbox (readable) and post five messages to it
-    radio.subscribe(radio.node._branch, channel='outbox')
-    for i in range(5):
-        radio.send(channel='outbox', subject=f's{i}', data='d', priority=i)
-    # feed only the top two unread
-    shown = radio.feed(limit=2, read=False)
-    assert len(shown) == 2
-    # the other three must remain unread -- only the two shown were acked
-    assert len(radio.feed(read=False)) == 3
 
 
 def test_reply_inherits_subject_and_priority(radio: Radio) -> None:
     """Reply inherits 'Re: subject' and priority from parent."""
     radio.send(subject='original', data='d', priority=4)
     uuid = radio.messages()[0]['message_uuid']
-    reply_uuid = radio.reply(uuid, 'reply data')
-    # find the reply by UUID
+    reply_uuid, node, channel = radio.reply(uuid, 'reply data')
+    # the return carries the resolved destination beside the UUID
     assert isinstance(reply_uuid, str)
     assert len(reply_uuid) == 8
+    assert (node, channel) == (radio.node._branch, 'inbox')
     [reply] = radio.db.read('messages', where={'message_uuid': reply_uuid})
     assert reply['subject'] == 'Re: original'
     assert reply['priority'] == 4
@@ -352,21 +469,55 @@ def test_reply_inherits_subject_and_priority(radio: Radio) -> None:
 def test_reply_lands_in_parents_channel_space(
     radio_pair: tuple[Radio, Radio],
 ) -> None:
-    """A reply is hosted where its parent is, so threads never straddle hosts.
+    """A reply to another node's readable channel stays in that channel-space.
 
-    Replying into another node's write-only channel stays owner-only.
+    Replying into another node's write-only channel never pierces it -- the
+    reply reroutes to the owner's inbox as a conversation turn.
     """
     root, peer = radio_pair
     peer_branch = peer.node._branch
     post = peer.send(channel='public', subject='post', data='d', priority=3)
-    reply_uuid = root.reply(post, 'seen')
+    reply_uuid, node, channel = root.reply(post, 'seen')
     [reply] = root.db.read('messages', where={'message_uuid': reply_uuid})
     assert reply['node'] == peer_branch
     assert reply['sender'] == root.node._branch
-    # a non-owner cannot reply into a write-only channel
+    assert (node, channel) == (peer_branch, 'public')
+    # a non-owner's reply into a write-only channel reaches the owner's
+    # inbox instead of the channel itself
     cast = peer.send(channel='outbox', subject='cast', data='d', priority=3)
-    with pytest.raises(PermissionError, match='write-only'):
-        root.reply(cast, 'denied')
+    cast_uuid, node, channel = root.reply(cast, 'ack')
+    [rerouted] = root.db.read('messages', where={'message_uuid': cast_uuid})
+    assert (rerouted['node'], rerouted['channel']) == (peer_branch, 'inbox')
+    assert (node, channel) == (peer_branch, 'inbox')
+
+
+def test_reply_to_inbox_message_reaches_the_sender(
+    radio_pair: tuple[Radio, Radio],
+) -> None:
+    """A reply to a message in my inbox lands in the original sender's inbox.
+
+    Conversation semantics: answering a message someone sent me must reach
+    the counterparty, threaded, not self-thread into my own inbox where the
+    sender never sees it.
+    """
+    root, peer = radio_pair
+    root_branch = root.node._branch
+    peer_branch = peer.node._branch
+    # peer asks in root's inbox; root's answer must land with the peer
+    ask = peer.send(node=root_branch, subject='ask', data='d', priority=3)
+    answer, _, _ = root.reply(ask, 'answer')
+    [reply] = root.db.read('messages', where={'message_uuid': answer})
+    assert reply['node'] == peer_branch
+    assert reply['channel'] == 'inbox'
+    assert reply['sender'] == root_branch
+    assert reply['subject'] == 'Re: ask'
+    assert reply['parent_message_uuid'] == ask
+    # a reply to my own outbox message stays self-threaded
+    cast = root.send(channel='outbox', subject='cast', data='d', priority=3)
+    note, _, _ = root.reply(cast, 'follow-up')
+    [reply] = root.db.read('messages', where={'message_uuid': note})
+    assert reply['node'] == root_branch
+    assert reply['channel'] == 'outbox'
 
 
 def test_thread_structure(radio: Radio) -> None:
@@ -374,7 +525,7 @@ def test_thread_structure(radio: Radio) -> None:
     radio.send(subject='root', data='d', priority=0)
     root_uuid = radio.messages()[0]['message_uuid']
     # reply to root, then reply to the reply
-    reply_uuid = radio.reply(root_uuid, 'reply 1')
+    reply_uuid, _, _ = radio.reply(root_uuid, 'reply 1')
     radio.reply(reply_uuid, 'reply 2')
     # the thread resolves from any message in it (walks up to the root)
     thread = radio.thread(reply_uuid)
@@ -393,7 +544,7 @@ def test_uuid_resolves_globally(radio_pair: tuple[Radio, Radio]) -> None:
     """
     root, peer = radio_pair
     cast = peer.send(channel='outbox', subject='cast', data='body', priority=5)
-    message = root.read(cast)
+    [message] = root.read(cast)
     assert message['node'] == peer.node._branch
     assert message['data'] == 'body'
 
@@ -409,7 +560,8 @@ def test_cross_node_read_respects_read_only(
     channel (``inbox``/``private``), so reaching a message there by UUID must
     be denied too -- otherwise the restriction leaks (a UUID holder could ack
     or archive a message they are not allowed to read). Readable channels
-    (``outbox``) stay reachable.
+    (``outbox``) stay reachable. ``thread`` exempts conversation
+    participants, so its denial needs a true bystander.
     """
     root, peer = radio_pair
     # a read-only message in the peer's inbox and a readable outbox cast
@@ -417,12 +569,20 @@ def test_cross_node_read_respects_read_only(
     public_uuid = peer.send(channel='outbox', subject='cast', data='d', priority=0)
     extra = (1,) if method == 'react' else ()
     call = getattr(root, method)
-    with pytest.raises(PermissionError, match='read-only'):
-        call(private_uuid, *extra)
+    if method == 'thread':
+        # root sent the inbox message, so it may thread that conversation;
+        # a peer-only private note keeps root a non-participant
+        secret = peer.send(channel='private', subject='note', data='d', priority=0)
+        with pytest.raises(PermissionError, match='read-only'):
+            call(secret)
+    else:
+        with pytest.raises(PermissionError, match='read-only'):
+            call(private_uuid, *extra)
     # the readable channel is still reachable cross-node
     call(public_uuid, *extra)
     # the peer reads its own inbox freely (owner only, not owner never)
-    assert peer.read(private_uuid)['subject'] == 'secret'
+    [note] = peer.read(private_uuid)
+    assert note['subject'] == 'secret'
 
 
 def test_write_only_permission(radio_pair: tuple[Radio, Radio]) -> None:
