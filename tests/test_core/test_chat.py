@@ -224,7 +224,7 @@ def test_chat_codex_fresh_and_resume(
     ('setup', 'kwargs', 'match'),
     [
         (None, {'resume': True}, '--resume requires --session'),
-        ('live', {'session': 'live-1', 'resume': True}, 'live loop session'),
+        ('live', {'session': 'live-1', 'resume': True}, 'loop session'),
         ('codex', {'session': 'x'}, 'codex cannot fork'),
         ('no-agent', {}, 'No agent configured'),
         (None, {'current': True, 'session': 'x'}, 'cannot be combined'),

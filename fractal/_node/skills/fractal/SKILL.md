@@ -50,12 +50,12 @@ CLI.
   wasted failed inits.
 - **Re-entry re-checks.** Width and descendant caps count children in
   play — active, or idle awaiting start — so a completed, stopped,
-  exited, killed, or retired child frees its slot. `node start --resume`
-  and a `node unretire` that lands `idle` put a node back in play and
-  re-check both caps exactly like a spawn (refused over cap, no
-  override); depth is structural, so only spawn checks it.
+  exited, killed, or retired child frees its slot.
+  `node start --continue` and a `node unretire` that lands `idle` put a
+  node back in play and re-check both caps exactly like a spawn (refused
+  over cap, no override); depth is structural, so only spawn checks it.
 - **Cost.** A `--max-cost` (per-run USD ceiling — every new `node start`
-  re-arms it; runs are isolated, so a resume opens a fresh budget) is
+  re-arms it; runs are isolated, so a continue opens a fresh budget) is
   strongly recommended for every child — without one the child launches
   uncapped, with a loud warning at start and bounded only by
   `--max-iters`/`--timeout`; a non-positive `--max-cost` is rejected.
@@ -79,7 +79,7 @@ CLI.
   caps bind at step boundaries, never mid-step — plan each iteration to
   end under the cap, and read a trip as disclosure that an iteration ran
   hot, not as a hard stop. If a done child strands anyway, prefer
-  raise-cap + resume + stop over a full re-finish — the re-finish
+  raise-cap + continue + stop over a full re-finish — the re-finish
   re-pays the whole close severalfold and can still near-miss — and
   treat `exited` with recorded DB finish signals as a defensible
   terminal once the work is merged and verified. Child-side corollary:
@@ -168,10 +168,10 @@ budget pool a cheaper token rate buys more steps, not a lower bill.
    COMMIT. Managers keep the full profile.
 
 3. **Commit the config** so the child starts from a committed baseline
-   (resume cleans uncommitted changes, so an unconfigured baseline would
-   otherwise be lost). Run the commit **from the child's worktree** — a
-   bare `commit` acts on the current directory's worktree (yours), not
-   the child's (or pass `--path=<child worktree>`):
+   (continue cleans uncommitted changes, so an unconfigured baseline
+   would otherwise be lost). Run the commit **from the child's
+   worktree** — a bare `commit` acts on the current directory's worktree
+   (yours), not the child's (or pass `--path=<child worktree>`):
 
    ```bash
    cd <child worktree>  # .worktrees/<branch>
@@ -197,7 +197,7 @@ budget pool a cheaper token rate buys more steps, not a lower bill.
    `fractal node config set <key>=<value>`, read one with
    `fractal node config get <key>`, or edit the file directly). A
    configured `max_cost` must be positive; a missing `max_cost` launches
-   uncapped with a loud warning. Add `--resume` only to continue a
+   uncapped with a loud warning. Add `--continue` only to continue a
    stopped/exited child. Starting is its own turn: when a spawn gate
    (child/descendant census, budget arithmetic) decides the launch, read
    it in one command and start in a separate one — a chained start
@@ -210,10 +210,10 @@ budget pool a cheaper token rate buys more steps, not a lower bill.
 Node configuration is the highest-leverage work you do — a
 well-configured node runs autonomously for hours; a poorly configured
 one burns budget and creates entropy. Invest real time here, and commit
-the baseline before launch — a resume wipes uncommitted changes. You can
-still steer a running child by editing its NODE.md, steps, or scripts
-(the loop re-reads them each iteration), but a strong baseline is
-fundamental.
+the baseline before launch — a continue wipes uncommitted changes. You
+can still steer a running child by editing its NODE.md, steps, or
+scripts (the loop re-reads them each iteration), but a strong baseline
+is fundamental.
 
 For complex tasks, configure nodes as a manager: provide sufficient
 resources for them to spawn their own children, and write detailed
@@ -287,6 +287,14 @@ writes a high-quality seed; once done, merge it and launch the target.
 - **Stop:** `fractal node finish <branch>` (after iteration),
   `fractal node stop <branch>` (after step),
   `fractal node kill <branch>` (immediately).
+- **Pause:** `fractal node pause <branch>` freezes the child's subtree
+  in place (aborts in-flight agent turns; loops park with their runs
+  open), `fractal node resume <branch>` relaunches it exactly there --
+  same budgets, same iteration count. A paused child still holds its
+  spawn slot and blocks your finish-drain, so resume or kill it before
+  finishing. Only `resume`, `kill`, and `chat` act on a paused node;
+  `start --continue` is for stopped/exited nodes (fresh run, full budget
+  re-arm, cleaned worktree), never for paused ones.
 - **Clean up:** `fractal node merge <branch>`. Deleting after the merge
   (`fractal node delete <branch>`) is OPTIONAL hygiene, never automatic
   -- a merged node's branch and records keep audit value, so keep them
@@ -295,13 +303,13 @@ writes a high-quality seed; once done, merge it and launch the target.
   subtree) regardless of merge state, discarding any unmerged work, so
   confirm the merge succeeded first.
 
-## Resume Mode
+## Continue Mode
 
-When `$RESUME_MODE` is `true`, decide per child whether to propagate by
-assessing its memory/plans:
+When `$CONTINUE_MODE` is `true`, decide per child whether to propagate
+by assessing its memory/plans:
 
-- **resume** (`fractal node start <branch> --resume`) if its work was in
-  progress and still relevant;
+- **continue** (`fractal node start <branch> --continue`) if its work
+  was in progress and still relevant;
 - **reset** (`fractal node init <name> --path="$PROJECT_DIR" --reset`,
   then start) if the direction was wrong but the task stands --
   `--reset` wipes the node to a **stock empty node** (memory, plans,

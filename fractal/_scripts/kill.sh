@@ -94,6 +94,22 @@ if [[ -z "$PGID" && -n "$PGID_FILE" && -f "$PGID_FILE" ]]; then
     fi
 fi
 
+# the in-flight agent invocation runs in its own group (.step_pgid, recorded by
+# _agent.sh) outside the pane's -- reap it too or the agent survives the kill,
+# headless and still spending
+STEP_PGID=""
+STEP_PGID_FILE=""
+if [[ -n "$PGID_FILE" ]]; then
+    STEP_PGID_FILE="${PGID_FILE%.pgid}.step_pgid"
+    if [[ -f "$STEP_PGID_FILE" ]]; then
+        RECORDED_STEP_PGID=$(tr -d '[:space:]' <"$STEP_PGID_FILE") || true
+        if [[ -n "$RECORDED_STEP_PGID" ]] \
+            && kill -0 -- "-$RECORDED_STEP_PGID" 2>/dev/null; then
+            STEP_PGID="$RECORDED_STEP_PGID"
+        fi
+    fi
+fi
+
 # grep -qxF (exact match), not tmux -t: -t resolves targets by
 # prefix/fnmatch, so a short name false-matches longer session names
 SESSION_EXISTS=
@@ -102,7 +118,7 @@ if tmux list-sessions -F '#{session_name}' 2>/dev/null \
     SESSION_EXISTS=1
 fi
 
-if [[ -z "$PANE_PID" && -z "$SESSION_EXISTS" && -z "$PGID" ]]; then
+if [[ -z "$PANE_PID" && -z "$SESSION_EXISTS" && -z "$PGID" && -z "$STEP_PGID" ]]; then
     if tmux list-sessions >/dev/null 2>&1; then
         echo "No running node found: $TMUX_SESSION_NAME"
     else
@@ -116,12 +132,14 @@ fi
 # signal the whole process group, not just the session -- killing only the
 # session orphans the agent (PPID 1, still spending budget)
 _reap() {
+    [[ -n "$STEP_PGID" ]] && kill "-$1" -- "-$STEP_PGID" 2>/dev/null || true
     [[ -n "$PGID" ]] && kill "-$1" -- "-$PGID" 2>/dev/null || true
     [[ -n "$PANE_PID" ]] && kill "-$1" "$PANE_PID" 2>/dev/null || true
 }
 
 _alive() {
-    { [[ -n "$PGID" ]] && kill -0 -- "-$PGID" 2>/dev/null; } \
+    { [[ -n "$STEP_PGID" ]] && kill -0 -- "-$STEP_PGID" 2>/dev/null; } \
+        || { [[ -n "$PGID" ]] && kill -0 -- "-$PGID" 2>/dev/null; } \
         || { [[ -n "$PANE_PID" ]] && kill -0 "$PANE_PID" 2>/dev/null; }
 }
 
@@ -141,6 +159,7 @@ if _alive; then
 fi
 
 tmux kill-session -t "$TMUX_SESSION_NAME" 2>/dev/null || true
-# drop the recorded pgid handle -- the group is dead either way
+# drop the recorded pgid handles -- the groups are dead either way
 [[ -n "$PGID_FILE" ]] && rm -f "$PGID_FILE" 2>/dev/null || true
+[[ -n "$STEP_PGID_FILE" ]] && rm -f "$STEP_PGID_FILE" 2>/dev/null || true
 echo "Killed node: $TMUX_SESSION_NAME"

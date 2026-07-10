@@ -28,6 +28,8 @@ __all__ = [
     'init',
     'commit',
     'open',
+    'pause',
+    'resume',
     'destroy',
     'stream',
     'pricing',
@@ -217,6 +219,52 @@ def open(app: typer.Typer) -> typer.Typer:
             FractalApp(root, branch=node._branch).run()
         else:
             raise RuntimeError(f'Directory is not a user node: {project_dir}')
+
+    return app
+
+
+def pause(app: typer.Typer) -> typer.Typer:
+    """Register the ``pause`` command."""
+    # path argument
+    path_help = 'Repository path.'
+    path = typer.Argument('.', help=path_help)
+    # reason option
+    reason_help = 'Optional reason for pausing.'
+    reason = typer.Option(None, '--reason', help=reason_help)
+
+    @command(app, 'pause')
+    def _pause(
+        path: str = path,
+        reason: Optional[str] = reason,
+    ) -> None:
+        """Pause the whole tree: abort in-flight agents, park every loop."""
+        # a tree-wide brake -- resolve to the repo root from any cwd inside it
+        # (mirrors destroy), so the fan-out is never scoped to one child's
+        # subtree during the exact emergency it exists for
+        repo_dir = Node(path)._repo_dir
+        node = resolve_node(repo_dir)
+        result = node.pause(reason)
+        typer.echo(result)
+
+    return app
+
+
+def resume(app: typer.Typer) -> typer.Typer:
+    """Register the ``resume`` command."""
+    # path argument
+    path_help = 'Repository path.'
+    path = typer.Argument('.', help=path_help)
+
+    @command(app, 'resume')
+    def _resume(
+        path: str = path,
+    ) -> None:
+        """Resume the paused tree where it left off (leaf-first)."""
+        # anchored at the repo root like pause, so the release matches the brake
+        repo_dir = Node(path)._repo_dir
+        node = resolve_node(repo_dir)
+        result = node.resume()
+        typer.echo(result)
 
     return app
 

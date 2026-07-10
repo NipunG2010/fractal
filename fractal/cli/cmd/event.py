@@ -37,7 +37,7 @@ def event_start(app: typer.Typer) -> typer.Typer:
     # event argument
     event_help = (
         'Event type (init, spawn, commit, approve, merge, delete,'
-        ' finish, stop, kill, retire, unretire).'
+        ' finish, stop, kill, pause, resume, retire, unretire).'
     )
     event = typer.Argument(..., help=event_help)
     # metadata option

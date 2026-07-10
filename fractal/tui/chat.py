@@ -83,12 +83,14 @@ def resolve_transport(
     Chat always reaches a real agent -- no node state diverts a turn
     anywhere else. An explicit ``session`` wins: the cockpit's own chat
     thread resumes in place, a claude session forks, a settled codex thread
-    resumes in place -- but a codex node's *live* thread cannot be forked
-    (and resuming it in place would perturb the running loop), so it falls
-    back to a fresh session with a warning. With no explicit session, an
-    active claude node's live session forks; every other active shape
-    (codex, detached, or no session woven yet) and anything settled or idle
-    gets a fresh seeded session.
+    resumes in place -- but a codex node's *live or paused* thread cannot be
+    forked (and resuming it in place would perturb the running loop, or the
+    session a paused run resumes with), so it falls back to a fresh session
+    with a warning. With no explicit session, an active or paused claude
+    node's woven session forks -- "pause it, then ask what it was doing" is
+    the flagship interrogation flow; every other active/paused shape (codex,
+    detached, or no session woven yet) and anything settled or idle gets a
+    fresh seeded session.
 
     Args:
         agent: The node's agent (``'claude'``/``'codex'``).
@@ -111,10 +113,11 @@ def resolve_transport(
                 resume=True,
             )
         if agent == 'codex':
-            if status == 'active' and session == live_session:
+            if status in ('active', 'paused') and session == live_session:
+                shape = 'live' if status == 'active' else 'paused'
                 return Transport(
                     kind='fresh',
-                    label="codex live thread can't fork -- fresh session",
+                    label=f"codex {shape} thread can't fork -- fresh session",
                     warn=True,
                 )
             return Transport(
@@ -128,11 +131,12 @@ def resolve_transport(
             label=f'forked session {session}',
             session=session,
         )
-    if status == 'active':
+    if status in ('active', 'paused'):
         if agent == 'claude' and live_session:
+            shape = 'live' if status == 'active' else 'paused'
             return Transport(
                 kind='fork',
-                label=f'forked live session {live_session}',
+                label=f'forked {shape} session {live_session}',
                 session=live_session,
             )
         if agent == 'codex':

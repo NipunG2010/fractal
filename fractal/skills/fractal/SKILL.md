@@ -1,7 +1,7 @@
 ---
 name: fractal
 description: Hierarchical agent loops with recursive self-organization.
-argument-hint: <name> [<path>] [--scope=<subdirs>] ... [--local] [--detached] [--resume]
+argument-hint: <name> [<path>] [--scope=<subdirs>] ... [--local] [--detached] [--continue]
 disable-model-invocation: true
 ---
 
@@ -23,8 +23,8 @@ behalf. See **Operator** below.
 ## Arguments
 
 Parse the following from `$ARGUMENTS`. The `/fractal` skill routes all
-the configuration to `fractal node init` and passes only `--resume` (if
-present) to `fractal node start`.
+the configuration to `fractal node init` and passes only `--continue`
+(if present) to `fractal node start`.
 
 **Init** — all configuration. Set by `fractal node init`, written to
 `config.json`, and editable there before launch:
@@ -58,7 +58,7 @@ present) to `fractal node start`.
   `1s`)
 - **`--max-cost`**: cost ceiling in USD per run — every new run re-arms
   the full cap (`node start` on a finished/killed node included); runs
-  are isolated, so a resume opens a fresh budget
+  are isolated, so a continue opens a fresh budget
 - **`--max-iter-cost`**: per-iteration cost ceiling in USD
 - **`--max-step-cost`**: per-step cost ceiling in USD (warn-only when
   unenforceable)
@@ -74,7 +74,7 @@ from `config.json`. A `max_cost` in `config.json` must be positive if
 set; a missing `max_cost` launches uncapped with a loud warning. Its
 only argument:
 
-- **`--resume`**: resume a stopped/exited node
+- **`--continue`**: continue a stopped/exited node
 
 After parsing, **list the options the user did not specify** (with each
 one's default) so they can see what else is configurable before defining
@@ -139,16 +139,16 @@ detail — read it for further context as needed.
 
 Determine the node's state and proceed accordingly:
 
-1. **`--resume` was specified** — the node already exists. Resolve its
+1. **`--continue` was specified** — the node already exists. Resolve its
    worktree and node directory from `fractal node list --path=<path>`,
    then skip the rest of this step (the repo and node are already set up
    — no init or commit).
 
-2. **No `--resume`, but a node already exists** for this path and name
+2. **No `--continue`, but a node already exists** for this path and name
    (check `fractal node list --path=<path>`) — **ask the user** what to
    do:
 
-   - **Resume** — treat as case 1 (keep state, continue).
+   - **Continue** — treat as case 1 (keep state, continue).
    - **Reset** — wipe and recreate: do case 3, adding `--reset` to
      `fractal node init`. `--reset` returns a **stock empty node** —
      memory, plans, steps, skills, and config are all wiped — so
@@ -212,7 +212,7 @@ user — installing the listed plugin(s) and running
 
 ### Step 2: Define the node
 
-If `--resume` was specified, the node is already defined from its
+If `--continue` was specified, the node is already defined from its
 previous run. Ask the user whether to keep that definition as-is
 (proceed to next step) or update it — revisit the relevant topics below
 to adjust goals, completion requirements, rules, budget, or steps before
@@ -341,7 +341,7 @@ fractal node start
 ```
 
 All run parameters were set at init (in `config.json`); `start` takes no
-config arguments — only `--resume` when continuing a stopped/exited
+config arguments — only `--continue` when continuing a stopped/exited
 node. If the user wants to tweak a setting first, edit
 `<node_dir>/config.json`, then start. The node launches in a detached
 tmux session.
@@ -376,6 +376,24 @@ Once the node is running, briefly explain how to interact with it:
   - `fractal node finish` — stop after current iteration
   - `fractal node stop` — stop after current step
   - `fractal node kill` — kill immediately
+- **Pausing:** `fractal node pause` freezes the subtree in place — it
+  aborts each in-flight agent turn and parks every loop with its run
+  open — and `fractal node resume` relaunches it exactly there (same
+  budgets, same iteration, the interrupted step's session continued when
+  possible). Tree-wide, `fractal pause` / `fractal resume` (from
+  anywhere in the repo) brake and release the whole tree; the brake also
+  latches every new `node init`/`start` — new top-level nodes included —
+  until `fractal resume` lifts it (a subtree `fractal node resume` under
+  a tree-wide brake only re-parks at boot — the brake holds until
+  `fractal resume`). Paused state is durable: it survives a reboot or a
+  filesystem copy of the repo to another machine. A paused node holds
+  its spawn slot and blocks its parent's finish-drain; only `resume`,
+  `kill`, and `chat` act on it (ask a paused node what it was doing —
+  `chat --current` forks the interrupted claude session, and the TUI's
+  chat does so by default; a codex node gets a fresh session). Note the
+  distinction: `resume` continues a *paused* run in place, while
+  `start --continue` opens a *fresh* run (full budget re-arm, worktree
+  cleaned) on a stopped/exited node.
 - **Worktree:** The node runs in a git worktree at
   `<repo>/.worktrees/<branch>/`. The user's repo is untouched. When
   done, from the repo root, merge with `fractal node merge <branch>`.

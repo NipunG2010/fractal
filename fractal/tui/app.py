@@ -290,7 +290,9 @@ class FractalApp(App):
         agent = card.get('agent') or ''
         explicit = pane.session if pane.session and pane.session != '-' else None
         own_chat = explicit is not None and explicit == self.chat.session(branch)
-        live = self._live_session(branch, agent) if status == 'active' else None
+        live = None
+        if status in ('active', 'paused'):
+            live = self._live_session(branch, agent)
         transport = resolve_transport(
             agent=agent,
             status=status,

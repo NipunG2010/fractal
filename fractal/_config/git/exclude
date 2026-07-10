@@ -11,8 +11,12 @@
 # Status file
 .status
 
-# Process group handle
+# Tree pause latch
+.paused
+
+# Process group handles
 .pgid
+.step_pgid
 
 # Obsidian config
 .obsidian/
@@ -40,6 +44,9 @@ tmp/
 
 # Budget exceeded marker
 .budget_exceeded
+
+# Pause abort marker
+.pause_abort
 
 # Bytecode
 __pycache__/

@@ -16,6 +16,7 @@ from fractal.cli.utils import (
 __all__ = [
     'run_start',
     'run_end',
+    'run_open',
     'run_list',
 ]
 
@@ -82,6 +83,37 @@ def run_end(app: typer.Typer) -> typer.Typer:
             exit_code=exit_code,
             metadata=metadata,
         )
+
+    return app
+
+
+def run_open(app: typer.Typer) -> typer.Typer:
+    """Register the ``_open`` command."""
+    # path option
+    path_help = 'Worktree directory.'
+    path = typer.Option('.', '--path', help=path_help)
+
+    @command(app, '_open')
+    def _open(
+        path: str = path,
+    ) -> None:
+        """Print the open run's adoption context. Exits 1 if none.
+
+        One ``run_id,iter,iter_id,resume_step`` line (empty fields where
+        the context has none) -- the resume boot's re-entry read.
+        """
+        node = resolve_node(path)
+        context = node.run_open()
+        if context is None:
+            raise SystemExit(1)
+        fields = (
+            context['run_id'],
+            context['iter'],
+            context['iter_id'],
+            context['resume_step'],
+        )
+        line = ','.join('' if field is None else f'{field}' for field in fields)
+        typer.echo(line)
 
     return app
 

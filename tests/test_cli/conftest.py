@@ -93,17 +93,45 @@ def _reap_group(proc: subprocess.Popen) -> None:
     """SIGKILL ``proc``'s whole process group and reap the direct child.
 
     Agent-loop launches use ``start_new_session=True``, so the group id is the
-    launch's own pid and spans the full chain (``_run.sh`` -> ``_agent.sh`` ->
-    stub agent) that a pid-only ``proc.kill()`` would leave reparented and
-    alive past the pytest session. Safe for teardowns to call unconditionally:
-    a clean exit's already-dead group is a no-op.
+    launch's own pid and spans the loop chain (``_run.sh`` -> ``_agent.sh``)
+    that a pid-only ``proc.kill()`` would leave reparented and alive past the
+    pytest session. The agent invocation itself runs in its *own* group
+    (recorded to ``.step_pgid`` for pause/kill), so the group kill alone would
+    orphan an in-flight stub -- sweep the surviving descendants too, the
+    harness twin of ``kill.sh``'s step-group reap. Safe for teardowns to call
+    unconditionally: a clean exit's already-dead chain is a no-op.
     """
+    descendants = _descendant_pids(proc.pid)
     with contextlib.suppress(ProcessLookupError):
         os.killpg(proc.pid, signal.SIGKILL)
+    for pid in descendants:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
     # drain and reap unless a completed communicate()/wait() already did (its
     # streams are closed then, and a second communicate() would blow up)
     if proc.returncode is None:
         proc.communicate()
+
+
+def _descendant_pids(pid: int) -> list[int]:
+    """The transitive descendants of ``pid``, from one ``ps`` snapshot."""
+    out = subprocess.run(
+        ['ps', '-axo', 'pid=,ppid='],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    children: dict[int, list[int]] = {}
+    for line in out.splitlines():
+        child, parent = line.split()
+        children.setdefault(int(parent), []).append(int(child))
+    chain: list[int] = []
+    frontier = [pid]
+    while frontier:
+        kids = [k for p in frontier for k in children.get(p, [])]
+        chain.extend(kids)
+        frontier = kids
+    return chain
 
 
 def _run_reaped(

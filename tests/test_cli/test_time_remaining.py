@@ -23,7 +23,7 @@ loop rather than import ``Node``: ``Node`` here is setup-only (it just writes DB
 rows the subprocess reads), so the schema-stable in-process copy is immaterial --
 only the subprocess, which runs the code under test, must resolve to this worktree
 (the ``_cli_env`` PYTHONPATH prepend guarantees it, mirroring
-``test_cost_resume.py``).
+``test_cost_continue.py``).
 """
 
 from __future__ import annotations

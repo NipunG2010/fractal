@@ -123,7 +123,7 @@ def test_force_commit_bypasses_a_failing_hook(tmp_path: pathlib.Path) -> None:
     """``--force`` commits past a hard-failing hook.
 
     The loop's force-commit backstops exist to save otherwise-lost work (a
-    later ``--resume`` discards uncommitted changes); a hook that can veto the
+    later ``--continue`` discards uncommitted changes); a hook that can veto the
     backstop defeats it, so force bypasses hooks like it bypasses scope and
     lint.
     """

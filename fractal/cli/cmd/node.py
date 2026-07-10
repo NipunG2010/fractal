@@ -25,6 +25,8 @@ __all__ = [
     'node_start',
     'node_finish',
     'node_stop',
+    'node_pause',
+    'node_resume',
     'node_kill',
     'node_merge',
     'node_delete',
@@ -40,6 +42,7 @@ __all__ = [
     'node_chat',
     'node_update',
     'node_reconcile_caps',
+    'node_latched',
     'node_render',
 ]
 
@@ -126,7 +129,7 @@ def node_init(app: typer.Typer) -> typer.Typer:
     max_cost_help = (
         'Maximum cost in USD per run: every new run RE-ARMS the full cap'
         ' (`node start` on a finished/killed node included) -- runs are'
-        ' isolated, so a resume opens a fresh budget.'
+        ' isolated, so a continue opens a fresh budget.'
     )
     max_cost = typer.Option(None, '--max-cost', help=max_cost_help)
     # max-iter-cost option
@@ -282,12 +285,12 @@ def node_start(app: typer.Typer) -> typer.Typer:
     # node argument
     node_help = 'Target node branch (default: this node).'
     node = typer.Argument(None, help=node_help)
-    # resume flag
-    resume_help = (
-        'Resume a stopped/exited node (continue iterations); the new run'
+    # continue flag
+    continue_help = (
+        'Continue a stopped/exited node (further iterations); the new run'
         ' RE-ARMS the full --max-cost.'
     )
-    resume = typer.Option(False, '--resume', help=resume_help)
+    continue_ = typer.Option(False, '--continue', help=continue_help)
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
@@ -295,18 +298,18 @@ def node_start(app: typer.Typer) -> typer.Typer:
     @command(app, 'start')
     def _start(
         node: Optional[str] = node,
-        resume: bool = resume,
+        continue_: bool = continue_,
         path: str = path,
     ) -> None:
         """Launch a node in a tmux session.
 
         Run parameters come from ``config.json`` (set at init or
-        edited before launch); only ``--resume`` is set here. Every
+        edited before launch); only ``--continue`` is set here. Every
         launch opens a fresh run with the full budget re-armed -- runs
-        are isolated, so budget a resume like a fresh launch.
+        are isolated, so budget a continue like a fresh launch.
         """
         node = resolve_target(path, node)
-        output = node.start(resume=resume)
+        output = node.start(continue_run=continue_)
         if output:
             typer.echo(output)
 
@@ -367,6 +370,54 @@ def node_stop(app: typer.Typer) -> typer.Typer:
         """Stop after the current step."""
         node = resolve_target(path, node)
         result = node.stop(reason)
+        typer.echo(result)
+
+    return app
+
+
+def node_pause(app: typer.Typer) -> typer.Typer:
+    """Register the ``pause`` command."""
+    # node argument
+    node_help = 'Target node branch (default: this node).'
+    node = typer.Argument(None, help=node_help)
+    # reason option
+    reason_help = 'Optional reason for pausing.'
+    reason = typer.Option(None, '--reason', help=reason_help)
+    # path option
+    path_help = 'Worktree directory.'
+    path = typer.Option('.', '--path', help=path_help)
+
+    @command(app, 'pause')
+    def _pause(
+        node: Optional[str] = node,
+        reason: Optional[str] = reason,
+        path: str = path,
+    ) -> None:
+        """Pause the subtree: abort in-flight agents, park the loops."""
+        node = resolve_target(path, node)
+        result = node.pause(reason)
+        typer.echo(result)
+
+    return app
+
+
+def node_resume(app: typer.Typer) -> typer.Typer:
+    """Register the ``resume`` command."""
+    # node argument
+    node_help = 'Target node branch (default: this node).'
+    node = typer.Argument(None, help=node_help)
+    # path option
+    path_help = 'Worktree directory.'
+    path = typer.Option('.', '--path', help=path_help)
+
+    @command(app, 'resume')
+    def _resume(
+        node: Optional[str] = node,
+        path: str = path,
+    ) -> None:
+        """Resume the paused subtree where it left off (leaf-first)."""
+        node = resolve_target(path, node)
+        result = node.resume()
         typer.echo(result)
 
     return app
@@ -628,7 +679,7 @@ def node_list(app: typer.Typer) -> typer.Typer:
     max_depth_help = 'Maximum child depth to include (1 = direct children only).'
     max_depth = typer.Option(None, '--max-depth', help=max_depth_help)
     # status option
-    status_help = 'Filter to a single status (e.g. active).'
+    status_help = 'Filter to a status, or several comma-separated (e.g. active,paused).'
     status = typer.Option(None, '--status', help=status_help)
     # live flag
     live_help = (
@@ -818,7 +869,7 @@ def node_chat(app: typer.Typer) -> typer.Typer:
     session_help = 'Session to fork (default: a fresh session).'
     session = typer.Option(None, '--session', help=session_help)
     # current flag
-    current_help = "Fork the node's live loop session (excludes --session/--resume)."
+    current_help = "Fork the node's loop session (excludes --session/--resume)."
     current = typer.Option(False, '--current', help=current_help)
     # resume flag
     resume_help = 'Continue --session in place instead of forking it.'
@@ -876,7 +927,7 @@ def node_update(app: typer.Typer) -> typer.Typer:
     max_cost_help = (
         'Child maximum cost in USD per run: every new run RE-ARMS the full'
         ' cap (`node start` on a finished/killed node included) -- runs are'
-        ' isolated, so a resume opens a fresh budget.'
+        ' isolated, so a continue opens a fresh budget.'
     )
     max_cost = typer.Option(None, '--max-cost', help=max_cost_help)
     # max-iter-cost option
@@ -1047,6 +1098,30 @@ def node_reconcile_caps(app: typer.Typer) -> typer.Typer:
                 f' {registry_value} -- registry updated to match config'
                 f" (retune with 'fractal node update')"
             )
+
+    return app
+
+
+def node_latched(app: typer.Typer) -> typer.Typer:
+    """Register the ``_latched`` command."""
+    # tree flag
+    tree_help = 'Check only the tree-wide latch (skip the ancestor walk).'
+    tree = typer.Option(False, '--tree', help=tree_help)
+    # path option
+    path_help = 'Worktree directory.'
+    path = typer.Option('.', '--path', help=path_help)
+
+    @command(app, '_latched')
+    def _latched(
+        tree: bool = tree,
+        path: str = path,
+    ) -> None:
+        """Print the pausing/paused node at-or-above. Exits 1 if clear."""
+        node = resolve_node(path)
+        latched = node.pause_latched(tree_only=tree)
+        if latched is None:
+            raise SystemExit(1)
+        typer.echo(latched)
 
     return app
 

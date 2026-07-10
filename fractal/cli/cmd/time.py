@@ -18,6 +18,9 @@ def time_remaining(app: typer.Typer) -> typer.Typer:
     # node argument
     node_help = 'Target node branch (default: this node).'
     node = typer.Argument(None, help=node_help)
+    # scope option
+    scope_help = "Timeout scope: 'run', 'iter', or 'step' (default: soonest)."
+    scope = typer.Option(None, '--scope', help=scope_help)
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
@@ -25,15 +28,18 @@ def time_remaining(app: typer.Typer) -> typer.Typer:
     @command(app, 'remaining')
     def _remaining(
         node: Optional[str] = node,
+        scope: Optional[str] = scope,
         path: str = path,
     ) -> None:
         """Print time left before the next timeout fires."""
         node = resolve_target(path, node)
-        remaining = node.time_remaining()
+        remaining = node.time_remaining(scope=scope)
         if remaining is None:
-            # None countdown means no deadline is active for any configured
-            # scope (run/iter/step all count down)
+            # None countdown means no deadline is active for the queried
+            # scope(s) -- all three by default, one under --scope
             timeouts = ('timeout', 'iter_timeout', 'step_timeout')
+            if scope is not None:
+                timeouts = ('timeout' if scope == 'run' else f'{scope}_timeout',)
             if not any(node.config_get(key) for key in timeouts):
                 typer.echo('no limit')
             else:

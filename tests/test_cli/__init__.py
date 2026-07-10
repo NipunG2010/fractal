@@ -2,7 +2,7 @@
 
 from .test_commit_hooks import *
 from .test_config_cli import *
-from .test_cost_resume import *
+from .test_cost_continue import *
 from .test_data_cli import *
 from .test_exit_notice import *
 from .test_fractal_cmd import *

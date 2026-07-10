@@ -767,7 +767,7 @@ def test_reconcile_records_orphan_event_once(repo: dict) -> None:
     [
         ('finish', 'Cannot finish: node is not active.'),
         ('stop', 'Cannot stop: node is not active.'),
-        ('kill', 'Cannot kill: node is not active (status: idle).'),
+        ('kill', 'Cannot kill: node is not active or paused (status: idle).'),
         ('attach', 'Cannot attach: node is not active.'),
         ('unretire', 'Cannot unretire: node is not retired.'),
     ],

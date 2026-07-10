@@ -44,6 +44,8 @@ NODE_VERB = {
     'finish': 'finished',
     'stop': 'stopped',
     'kill': 'killed',
+    'pause': 'paused',
+    'resume': 'resumed',
     'retire': 'retired',
     'unretire': 'unretired',
 }
@@ -71,12 +73,16 @@ def status_style(status: str, signal: str = '') -> tuple[str, str]:
         'finish': (theme.DOT_ON, theme.SUCCESS),
         'stop': (theme.DOT_ON, theme.WARNING),
         'kill': (theme.DOT_ON, theme.ERROR),
+        'pause': (theme.DOT_ON, theme.WARNING),
         'exit': (theme.DOT_ON, theme.ERROR),
     }
     if signal in override:
         return override[signal]
     return {
         'active': (theme.DOT_ON, theme.SUCCESS),
+        # paused is live-shaped (frozen mid-work, holding its slot), not
+        # settled -- filled, unlike stopped
+        'paused': (theme.DOT_ON, theme.WARNING),
         'idle': (theme.DOT_OFF, theme.DIM),
         'retired': (theme.DOT_OFF, theme.DIM),
         'completed': (theme.DOT_OFF, theme.SUCCESS),

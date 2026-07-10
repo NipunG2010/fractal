@@ -132,7 +132,7 @@ class NodeSpec:
 
     name: str  # leaf name; nesting via `children`
     status: str = 'idle'  # the node's final lifecycle status
-    signal: str = ''  # ''|'stop'|'finish' pending while active
+    signal: str = ''  # ''|'stop'|'finish'|'pause' pending while active
     agent: str = 'claude'
     detached: bool = False
     runs: str = 'auto'  # 'auto' shapes history from status; 'none'

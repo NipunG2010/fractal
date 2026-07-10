@@ -19,8 +19,8 @@ Covered (contract pinned from the ``--detached``/``--sync`` help + ``modes/``):
   session per iteration: the first agent call uses ``--session-id`` and every
   later call ``--resume`` (same id); detached passes no session flag at all (each
   step a fresh invocation). The detached mode doc rides along only in detached.
-- **resume mode** -- ``--resume`` appends ``modes/RESUME.md`` to every prompt;
-  a normal launch does not.
+- **continue mode** -- ``--continue`` appends ``modes/CONTINUE.md`` to every
+  prompt; a normal launch does not.
 - **per-step ``agent:`` frontmatter** -- a step's ``agent:`` override switches just
   that step's agent (others keep the base); in a continuous node each agent keeps its
   own woven session across the steps it runs, so the override does not require
@@ -41,9 +41,13 @@ Covered (contract pinned from the ``--detached``/``--sync`` help + ``modes/``):
 - **timeout force-commit bypasses hooks** -- the timeout backstop's ``--force``
   commit lands dirty work past a hard-failing host pre-commit hook (every call
   site is ``|| true``, so a hook veto would silently lose the work).
-- **resume preserves operator seed edits** -- ``--resume``'s working-tree
+- **continue preserves operator seed edits** -- ``--continue``'s working-tree
   restore commits dirty node-dir paths (operator-attributed, ``--no-verify``)
-  before its checkout/clean, so between-run steering edits survive a resume.
+  before its checkout/clean, so between-run steering edits survive a continue.
+- **pause / resume** -- a pause parks the run in place (paused step, open
+  run/iter rows, no force-commit) and ``--resume`` adopts it exactly
+  there: mid-step, at a between-steps checkpoint, or at an iteration
+  boundary (numbering continues; ``max_iters`` never re-arms).
 
 The finish-wait scenarios drive the wait deterministically with a **gate**: the
 stub blocks a designated step on a marker file until the driver releases it,
@@ -76,9 +80,15 @@ from .conftest import _cli_env, _reap_group, _run, _run_reaped, _worktree_root
 __all__ = [
     'test_sync_runs_before_every_step',
     'test_session_wiring_continuous_vs_detached',
-    'test_resume_mode_injects_resume_doc',
-    'test_max_iters_is_per_run_budget_across_resumes',
-    'test_resume_commits_operator_seed_edits_instead_of_discarding',
+    'test_continue_mode_injects_continue_doc',
+    'test_max_iters_is_per_run_budget_across_continues',
+    'test_continue_commits_operator_seed_edits_instead_of_discarding',
+    'test_pause_mid_step_parks_and_resume_adopts_run',
+    'test_checkpoint_pause_resumes_at_next_step',
+    'test_boundary_pause_resume_continues_iteration_count',
+    'test_pause_with_pending_finish_still_finishes_the_iteration',
+    'test_tree_latch_parks_a_booting_loop',
+    'test_finish_drain_blocks_on_paused_child',
     'test_per_step_agent_override_runs_in_detached',
     'test_per_step_agent_override_weaves_sessions',
     'test_codex_continuous_session_weaving',
@@ -123,7 +133,8 @@ __all__ = [
 # when the loop injected that mode (the seed NODE.md carries none of them)
 _SYNC_MARKER = 'Check radio and act on anything'  # modes/SYNC.md
 _DETACHED_MARKER = 'Each step is a separate session'  # modes/DETACHED.md
-_RESUME_MARKER = 'This node was resumed'  # modes/RESUME.md
+_CONTINUE_MARKER = 'This node was continued'  # modes/CONTINUE.md
+_RESUME_MARKER = 'This node was paused mid-run'  # modes/RESUME.md
 _RESERVE_MARKER = 'Reserve Mode'  # modes/RESERVE.md
 
 # the loop machinery runs from the package, not a per-node copy -- invoke the dev
@@ -433,37 +444,42 @@ def test_session_wiring_continuous_vs_detached(repo: dict, detached: bool) -> No
         assert all(_DETACHED_MARKER not in c['prompt'] for c in calls.values())
 
 
-# ------ resume mode
+# ------ continue mode
 
 
-def test_resume_mode_injects_resume_doc(repo: dict) -> None:
-    """``--resume`` appends the resume mode doc to prompts; a normal launch does not.
+def test_continue_mode_injects_continue_doc(repo: dict) -> None:
+    """``--continue`` appends the continue mode doc to prompts; a normal launch does not.
 
-    The worker is committed so the resume clean/checkout preserves its seed,
-    edited ``_run.sh``, and steps. A normal launch carries no resume doc; the
-    resumed launch (the loop continuing iterations) appends ``modes/RESUME.md`` to
-    every prompt -- the observable signal that ``$RESUME_MODE`` reached the
-    prompt builder.
+    The worker is committed so the continue clean/checkout preserves its seed,
+    edited ``_run.sh``, and steps. A normal launch carries no continue doc; the
+    continued launch (the loop running further iterations) appends
+    ``modes/CONTINUE.md`` to every prompt -- the observable signal that
+    ``$CONTINUE_MODE`` reached the prompt builder.
     """
-    node = _make_node(repo, 'resumed', detached=False, sync=False, commit=True)
-    # control: a normal launch never injects the resume doc
-    base, _ = _run_loop(repo, node, capture_name='resume_off', resume=False)
+    node = _make_node(repo, 'continued', detached=False, sync=False, commit=True)
+    # control: a normal launch never injects the continue doc
+    base, _ = _run_loop(repo, node, capture_name='continue_off', continue_=False)
     assert base
-    assert all(_RESUME_MARKER not in c['prompt'] for c in base.values())
+    assert all(_CONTINUE_MARKER not in c['prompt'] for c in base.values())
     # max-iters is a total budget, so the fresh run spent the cap of 1; raise it
-    # before resuming or there would be nothing to run
+    # before continuing or there would be nothing to run
     _run(node['worktree'], 'config', '_set', 'max_iters=2')
-    # resumed launch: the resume doc rides into every prompt
-    resumed, result = _run_loop(repo, node, capture_name='resume_on', resume=True)
-    assert resumed, result.stderr
-    assert all(_RESUME_MARKER in c['prompt'] for c in resumed.values())
+    # continued launch: the continue doc rides into every prompt
+    continued, result = _run_loop(
+        repo,
+        node,
+        capture_name='continue_on',
+        continue_=True,
+    )
+    assert continued, result.stderr
+    assert all(_CONTINUE_MARKER in c['prompt'] for c in continued.values())
 
 
-def test_max_iters_is_per_run_budget_across_resumes(repo: dict) -> None:
-    """``--max-iters`` caps iterations per run, not a lifetime total across resumes.
+def test_max_iters_is_per_run_budget_across_continues(repo: dict) -> None:
+    """``--max-iters`` caps iterations per run, not a lifetime total across continues.
 
     The iteration counter restarts at 1 each run and the cap applies per run -- so a
-    resume gets a fresh "1 of M" budget (here another full iteration) rather than
+    continue gets a fresh "1 of M" budget (here another full iteration) rather than
     continuing the count or refusing once a lifetime total is hit.
     """
     node = _make_node(
@@ -478,9 +494,9 @@ def test_max_iters_is_per_run_budget_across_resumes(repo: dict) -> None:
     _, first = _run_loop(repo, node, capture_name='relabel_1')
     assert first.returncode == 0, first.stderr
     assert 'Iteration 1 of 1' in first.stdout
-    # resume without touching the cap: the count restarts at 1 of 1 and the run
+    # continue without touching the cap: the count restarts at 1 of 1 and the run
     # gets a fresh per-run budget -- no carried-over "2 of ...", no third iteration
-    _, second = _run_loop(repo, node, capture_name='relabel_2', resume=True)
+    _, second = _run_loop(repo, node, capture_name='relabel_2', continue_=True)
     assert second.returncode == 0, second.stderr
     assert 'Iteration 1 of 1' in second.stdout
     assert 'Iteration 2' not in second.stdout
@@ -499,16 +515,16 @@ def test_max_iters_is_per_run_budget_across_resumes(repo: dict) -> None:
     assert recorded == ['1', '1'], recorded
 
 
-def test_resume_commits_operator_seed_edits_instead_of_discarding(repo: dict) -> None:
-    """Uncommitted seed edits made between runs survive a ``--resume``.
+def test_continue_commits_operator_seed_edits_instead_of_discarding(repo: dict) -> None:
+    """Uncommitted seed edits made between runs survive a ``--continue``.
 
     The seed's documented steering flow edits ``NODE.md`` in the stopped node's
-    worktree between runs, uncommitted; resume's working-tree restore
-    (``checkout -- .`` + ``clean -fd``) must not silently revert it. The resume
-    block commits dirty node-dir paths (operator-attributed) before its clean,
-    so the edit both survives in the tree and is reachable from ``HEAD`` --
-    the committed-baseline invariant and the edit-to-steer contract hold at
-    once.
+    worktree between runs, uncommitted; continue's working-tree restore
+    (``checkout -- .`` + ``clean -fd``) must not silently revert it. The
+    continue block commits dirty node-dir paths (operator-attributed) before
+    its clean, so the edit both survives in the tree and is reachable from
+    ``HEAD`` -- the committed-baseline invariant and the edit-to-steer contract
+    hold at once.
     """
     node = _make_node(repo, 'seededit', detached=False, sync=False, commit=True)
     # first run completes normally
@@ -521,8 +537,8 @@ def test_resume_commits_operator_seed_edits_instead_of_discarding(repo: dict) ->
         original + '\nOPERATOR-STEERING-EDIT: current phase is 2.\n',
         encoding='utf-8',
     )
-    # resumed launch: the restore must preserve the edit, not discard it
-    _, second = _run_loop(repo, node, capture_name='seededit_2', resume=True)
+    # continued launch: the restore must preserve the edit, not discard it
+    _, second = _run_loop(repo, node, capture_name='seededit_2', continue_=True)
     assert second.returncode == 0, second.stderr
     survived = node_md.read_text(encoding='utf-8')
     assert 'OPERATOR-STEERING-EDIT' in survived
@@ -533,6 +549,466 @@ def test_resume_commits_operator_seed_edits_instead_of_discarding(repo: dict) ->
         'HEAD:.fractal/main.seededit/NODE.md',
     ).stdout
     assert 'OPERATOR-STEERING-EDIT' in committed
+
+
+# ------ pause / resume
+
+
+def test_pause_mid_step_parks_and_resume_adopts_run(repo: dict) -> None:
+    """A mid-step pause parks the run in place; resume continues it there.
+
+    The full round trip through the real loop. Pause: the signal lands
+    while the gated step blocks mid-invocation, the real ``pause.sh``
+    aborts the recorded step process group, and the loop reclassifies the
+    abort -- step recorded ``paused`` (never ``failed``), no force-commit
+    (the dirty worktree is the frozen state), run and iteration rows left
+    open, node parked ``paused``. Resume (``--resume``): the boot
+    adopts the same run and iteration, withdraws the pause signal,
+    re-enters at the interrupted step with the woven session resumed
+    (``--resume`` of the pre-pause id), rides ``modes/RESUME.md`` into
+    every prompt, and finishes the iteration normally.
+    """
+    node = _make_node(repo, 'pauser', detached=False, sync=False, steps=_GATE_STEPS)
+    worktree = node['worktree']
+    node_dir = node['node_dir']
+
+    proc, capture, log = _launch_finish_wait(repo, node, capture_name='pause_mid')
+    try:
+        # park at the gate step, mid-invocation, and leave uncommitted work
+        assert _await_gate(capture, deadline=time.monotonic() + 60), log.read_text()
+        (worktree / 'wip.txt').write_text('frozen mid-step\n', encoding='utf-8')
+        # the launch recorded the invocation's own process group -- the handle
+        # the abort targets without touching the loop
+        step_pgid = node_dir / '.step_pgid'
+        assert step_pgid.exists(), 'agent launch must record .step_pgid'
+        # pause: signal first (the loop reclassifies the abort by it), then
+        # the real pause.sh reaps the gated agent's group
+        assert _run(worktree, 'signal', '_set', 'pause', 'take five').returncode == 0
+        pause_sh = _worktree_root() / 'fractal' / '_scripts' / 'pause.sh'
+        abort = subprocess.run(
+            ['bash', f'{pause_sh}', f'{worktree}'],
+            capture_output=True,
+            text=True,
+        )
+        assert abort.returncode == 0, abort.stderr
+        assert 'Aborted in-flight agent' in abort.stdout, abort.stdout
+        proc.wait(timeout=60)
+    finally:
+        _, result = _finish_wait_result(proc, capture, log)
+
+    # parked: the loop exited clean with the node paused, the interrupted
+    # step recorded paused, and the rows left open for adoption
+    assert result.returncode == 0, result.stdout
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'paused', result.stdout
+    rows = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT status, ended_at FROM runs WHERE node = 'main.pauser'",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert rows == ['active,'], rows
+    steps = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT step, status FROM steps WHERE node = 'main.pauser'"
+            ' ORDER BY step_id',
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert steps == ['1,paused'], steps
+    # no force-commit buried the frozen state: the work is still uncommitted
+    assert 'wip.txt' in _git(worktree, 'status', '--porcelain').stdout
+    assert 'failed on' not in _git(worktree, 'log', '--oneline', '-3').stdout
+
+    # resume: relaunch with --resume, pre-releasing the gate so the
+    # re-entered step runs straight through
+    (capture / 'gate_release').touch()
+    calls, resumed = _resume_loop(repo, node, capture_name='pause_mid')
+    assert resumed.returncode == 0, resumed.stderr
+    assert 'Resuming run' in resumed.stdout, resumed.stdout
+
+    # the same run and iteration were adopted (never a second row), the
+    # interrupted step re-ran on a fresh row, and the run closed normally
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'completed', (
+        resumed.stdout
+    )
+    runs = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT run_id, status FROM runs WHERE node = 'main.pauser'",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert len(runs) == 1, runs
+    run_id, run_status = runs[0].split(',')
+    assert run_status == 'completed', runs
+    iters = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT iter, status FROM iters WHERE node = 'main.pauser'",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert iters == ['1,completed'], iters
+    steps = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT step, status FROM steps WHERE node = 'main.pauser'"
+            ' ORDER BY step_id',
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert steps == ['1,paused', '1,completed', '2,completed'], steps
+    # the pause signal was withdrawn at adoption (it would re-park the run)
+    assert _run(worktree, 'signal', '_get', 'pause', '--run', run_id).returncode == 1
+    # the re-entered step resumed the pre-pause session; the resume doc rode
+    # into both resumed prompts and only them
+    assert calls[1]['session'].startswith('--session-id '), calls[1]['session']
+    assert calls[2]['session'].startswith('--resume '), calls[2]['session']
+    assert calls[1]['session'].split()[1] == calls[2]['session'].split()[1]
+    assert _RESUME_MARKER not in calls[1]['prompt']
+    assert _RESUME_MARKER in calls[2]['prompt']
+    assert _RESUME_MARKER in calls[3]['prompt']
+    # the invocation handle never outlives its step
+    assert not step_pgid.exists()
+
+
+def test_checkpoint_pause_resumes_at_next_step(repo: dict) -> None:
+    """A between-steps park re-enters at the first unrun step, not step 1.
+
+    A pause that lands while no agent is in flight writes no paused step
+    row -- the loop parks at its next checkpoint with only completed rows
+    in the open iteration. Resume must derive the re-entry from those
+    completed rows: step 1 never re-runs (no duplicate spend), step 2 is
+    what runs next.
+    """
+    node = _make_node(repo, 'ckpt', detached=False, sync=False, steps=_GATE_STEPS)
+    worktree = node['worktree']
+
+    proc, capture, log = _launch_finish_wait(repo, node, capture_name='ckpt_pause')
+    try:
+        assert _await_gate(capture, deadline=time.monotonic() + 60), log.read_text()
+        # the signal lands while step 1 is mid-flight; releasing the gate
+        # lets step 1 COMPLETE, so the loop parks at the pre-step-2
+        # checkpoint with no paused step row
+        assert _run(worktree, 'signal', '_set', 'pause', 'checkpoint').returncode == 0
+        (capture / 'gate_release').touch()
+        proc.wait(timeout=60)
+    finally:
+        _, result = _finish_wait_result(proc, capture, log)
+
+    # parked at the checkpoint: step 1 closed completed, nothing paused
+    assert result.returncode == 0, result.stdout
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'paused', result.stdout
+    steps = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT step, status FROM steps WHERE node = 'main.ckpt' ORDER BY step_id",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert steps == ['1,completed'], steps
+
+    # resume: the adopted iteration re-enters at step 2, never re-running 1
+    calls, resumed = _resume_loop(repo, node, capture_name='ckpt_pause')
+    assert resumed.returncode == 0, resumed.stderr
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'completed', (
+        resumed.stdout
+    )
+    steps = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT step, status FROM steps WHERE node = 'main.ckpt' ORDER BY step_id",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert steps == ['1,completed', '2,completed'], steps
+    assert len(calls) == 2, sorted(calls)
+    assert 'Commit step' in calls[2]['prompt']
+    assert _RESUME_MARKER in calls[2]['prompt']
+
+
+def test_boundary_pause_resume_continues_iteration_count(repo: dict) -> None:
+    """A pause between iterations resumes at the next iteration, not at 1.
+
+    The park lands after ``iter _end`` closed the row (during the
+    inter-iteration sleep), so no open iteration exists to adopt. Resume
+    must continue the run's numbering from the newest closed row -- never
+    restart at 1, which would duplicate ``(run, iter)`` pairs and re-arm
+    ``max_iters``.
+    """
+    node = _make_node(repo, 'boundary', detached=False, sync=False, max_iters=2)
+    worktree = node['worktree']
+    # a long inter-iteration sleep gives the boundary park a wide window
+    # (its pause poll runs every 30s chunk)
+    assert _run(worktree, 'config', '_set', 'sleep=120s').returncode == 0
+
+    proc, capture, log = _launch_finish_wait(repo, node, capture_name='boundary_pause')
+    try:
+        # wait for iteration 1 to close (the loop is then inside the sleep)
+        def _iter_closed() -> bool:
+            rows = (
+                _run(
+                    worktree,
+                    'db',
+                    '_query',
+                    "SELECT COUNT(*) FROM iters WHERE node = 'main.boundary'"
+                    ' AND ended_at IS NOT NULL',
+                    '--csv',
+                )
+                .stdout.strip()
+                .splitlines()[1:]
+            )
+            return rows == ['1']
+
+        closed = _await_progress(
+            _iter_closed,
+            lambda: _capture_activity(capture),
+            deadline=time.monotonic() + 90,
+        )
+        assert closed, log.read_text()
+        assert _run(worktree, 'signal', '_set', 'pause', 'boundary').returncode == 0
+        proc.wait(timeout=60)
+    finally:
+        _, result = _finish_wait_result(proc, capture, log)
+
+    # parked at the boundary: iteration 1 closed, the run open, none paused
+    assert result.returncode == 0, result.stdout
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'paused', result.stdout
+
+    # resume: the run continues at iteration 2 and max_iters never re-arms
+    _, resumed = _resume_loop(repo, node, capture_name='boundary_pause')
+    assert resumed.returncode == 0, resumed.stderr
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'completed', (
+        resumed.stdout
+    )
+    iters = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT iter, status FROM iters WHERE node = 'main.boundary'"
+            ' ORDER BY iter_id',
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert iters == ['1,completed', '2,completed'], iters
+    runs = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT COUNT(*) FROM runs WHERE node = 'main.boundary'",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert runs == ['1'], runs
+
+
+def test_pause_with_pending_finish_still_finishes_the_iteration(repo: dict) -> None:
+    """A finish pending across a park lets the adopted iteration run out.
+
+    Finish means "after the current iteration" -- and the adopted iteration
+    IS the current one, so a resume must re-enter it and run its remaining
+    steps (the last one included) before the finish closes the run. Jumping
+    straight to the run end would skip the final step and strand the
+    iteration row open.
+    """
+    node = _make_node(repo, 'fwadopt', detached=False, sync=False, steps=_GATE_STEPS)
+    worktree = node['worktree']
+
+    proc, capture, log = _launch_finish_wait(repo, node, capture_name='fw_adopt')
+    try:
+        assert _await_gate(capture, deadline=time.monotonic() + 60), log.read_text()
+        # finish lands first, then the pause aborts the gated step mid-flight
+        assert _run(worktree, 'signal', '_set', 'finish', 'wrap up').returncode == 0
+        assert _run(worktree, 'signal', '_set', 'pause', 'brake').returncode == 0
+        pause_sh = _worktree_root() / 'fractal' / '_scripts' / 'pause.sh'
+        abort = subprocess.run(
+            ['bash', f'{pause_sh}', f'{worktree}'],
+            capture_output=True,
+            text=True,
+        )
+        assert abort.returncode == 0, abort.stderr
+        proc.wait(timeout=60)
+    finally:
+        _, result = _finish_wait_result(proc, capture, log)
+    assert result.returncode == 0, result.stdout
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'paused', result.stdout
+
+    # resume: the adopted iteration re-enters and runs BOTH steps before the
+    # surviving finish closes the run completed
+    (capture / 'gate_release').touch()
+    _, resumed = _resume_loop(repo, node, capture_name='fw_adopt')
+    assert resumed.returncode == 0, resumed.stderr
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'completed', (
+        resumed.stdout
+    )
+    steps = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT step, status FROM steps WHERE node = 'main.fwadopt'"
+            ' ORDER BY step_id',
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert steps == ['1,paused', '1,completed', '2,completed'], steps
+    # the adopted iteration closed -- never stranded open
+    iters = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            'SELECT iter, status, ended_at IS NULL FROM iters'
+            " WHERE node = 'main.fwadopt'",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert iters == ['1,completed,0'], iters
+
+
+def test_tree_latch_parks_a_booting_loop(repo: dict) -> None:
+    """A loop that boots under the tree latch parks itself at boot.
+
+    The latch guards ``init``/``start``, but a start already in flight when
+    the tree-wide brake lands reaches the loop anyway -- the boot check is
+    the backstop: the loop parks ``paused`` before running any step, with
+    its open run adoptable by a later resume.
+    """
+    node = _make_node(repo, 'bootpark', detached=False, sync=False)
+    worktree = node['worktree']
+    # the tree-wide brake's marker, as a user-node pause writes it
+    latch = repo['root'] / '.fractal' / 'main' / '.paused'
+    latch.write_text('paused\n', encoding='utf-8')
+    try:
+        calls, result = _run_loop(repo, node, capture_name='bootpark_on')
+        assert result.returncode == 0, result.stderr
+        assert 'Parked at boot' in result.stdout, result.stdout
+        assert _run(worktree, 'node', 'status').stdout.strip() == 'paused', (
+            result.stdout
+        )
+        # no step ran, and the run row is open for adoption
+        assert not calls, calls
+        rows = (
+            _run(
+                worktree,
+                'db',
+                '_query',
+                "SELECT status, ended_at FROM runs WHERE node = 'main.bootpark'",
+                '--csv',
+            )
+            .stdout.strip()
+            .splitlines()[1:]
+        )
+        assert rows == ['active,'], rows
+    finally:
+        latch.unlink(missing_ok=True)
+
+    # released: the resume relaunch adopts the empty open run and runs it
+    _, resumed = _resume_loop(repo, node, capture_name='bootpark_on')
+    assert resumed.returncode == 0, resumed.stderr
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'completed', (
+        resumed.stdout
+    )
+    runs = (
+        _run(
+            worktree,
+            'db',
+            '_query',
+            "SELECT COUNT(*) FROM runs WHERE node = 'main.bootpark'",
+            '--csv',
+        )
+        .stdout.strip()
+        .splitlines()[1:]
+    )
+    assert runs == ['1'], runs
+
+
+def test_finish_drain_blocks_on_paused_child(repo: dict) -> None:
+    """A finishing parent's drain treats a paused child as still draining.
+
+    A paused child stops counting as ``active``, but it is frozen mid-work
+    and will return -- the parent's commit (last) step must not run over
+    it. The drain clears only once the child settles for real.
+    """
+    node = _make_node(repo, 'fwpause', detached=False, sync=False, steps=_GATE_STEPS)
+    worktree = node['worktree']
+    child = _register_active_child(repo, node, 'kid')
+    # park the child: paused with its loop gone -- exactly how a paused
+    # node looks (the registration's placeholder session is dropped)
+    assert _run(child, '_status', 'paused').returncode == 0
+    session = f'{repo["root"].name} ({child.name.replace(".", "-")})'
+    subprocess.run(['tmux', 'kill-session', '-t', f'={session}'], capture_output=True)
+
+    proc, capture, log = _launch_finish_wait(repo, node, capture_name='fw_paused')
+    try:
+        # park at the gate step, then finish (the run now exists)
+        assert _await_gate(capture, deadline=time.monotonic() + 60), log.read_text()
+        assert _run(worktree, 'signal', '_set', 'finish', 'done now').returncode == 0
+        (capture / 'gate_release').touch()
+
+        # the drain holds on the paused child: the banner appears and the
+        # commit step's prompt stays uncaptured for the whole hold
+        assert _await_log(log, _WAIT_BANNER, deadline=time.monotonic() + 30), (
+            log.read_text()
+        )
+        time.sleep(8)
+        commit_calls = [
+            f
+            for f in capture.glob('prompt_*.txt')
+            if 'Commit step' in f.read_text(encoding='utf-8')
+        ]
+        assert not commit_calls, [f.name for f in commit_calls]
+
+        # the child settles for real -> the drain clears
+        assert _run(child, '_status', 'completed').returncode == 0
+    finally:
+        calls, result = _finish_wait_result(proc, capture, log)
+
+    # the wait ran and cleared, and the commit step ran only after the settle
+    assert _WAIT_BANNER in result.stdout, result.stdout
+    assert _DRAINED_BANNER in result.stdout, result.stdout
+    commit_calls = [n for n, c in calls.items() if 'Commit step' in c['prompt']]
+    assert commit_calls, (calls, result.stdout)
 
 
 # ------ per-step agent: frontmatter
@@ -1697,7 +2173,7 @@ def test_codex_preflight_failure_is_loud_and_recoverable(repo: dict) -> None:
     model, surfaced by ``node status``/``activity``), (2) stamp the honest
     terminal ``exited`` so the wedge is visible, and (3) leave a forward path:
     a plain ``node start`` refuses with a restart hint (no silent re-fail) while
-    ``--resume`` is now accepted (``exited`` is resume-eligible).
+    ``--continue`` is now accepted (``exited`` is continue-eligible).
     """
     node = _make_node(
         repo,
@@ -1720,24 +2196,24 @@ def test_codex_preflight_failure_is_loud_and_recoverable(repo: dict) -> None:
     assert _run(worktree, 'node', 'status').stdout.strip() == 'exited'
 
     # (3a) a plain start does not silently re-run the doomed preflight: it
-    # refuses from the terminal status and points at --resume
+    # refuses from the terminal status and points at --continue
     plain = _run(worktree, 'node', 'start')
     assert plain.returncode != 0, plain.stdout
     assert 'exited' in plain.stderr, plain.stderr
-    assert 'resume' in plain.stderr, plain.stderr
-    # (3b) --resume is accepted by the status guard -- plant a non-positive
+    assert 'continue' in plain.stderr, plain.stderr
+    # (3b) --continue is accepted by the status guard -- plant a non-positive
     # max_cost straight in config.json (bypassing the _set guard; an unset cap
     # is a valid uncapped start, so the halt needs an explicitly non-positive
     # value) so the launch halts at the next node-level guard not tmux, proving
-    # resume passed the status check rather than dead-ending at the 'Cannot
-    # resume from status: idle' an un-stamped wedge would produce
+    # continue passed the status check rather than dead-ending at the 'Cannot
+    # continue from status: idle' an un-stamped wedge would produce
     config_path = node_dir / 'config.json'
     config = json.loads(config_path.read_text(encoding='utf-8'))
     config['max_cost'] = -1
     config_path.write_text(json.dumps(config), encoding='utf-8')
-    resume = _run(worktree, 'node', 'start', '--resume')
-    assert 'Cannot resume from status' not in resume.stderr, resume.stderr
-    assert 'positive max_cost' in resume.stderr, resume.stderr
+    continued = _run(worktree, 'node', 'start', '--continue')
+    assert 'Cannot continue from status' not in continued.stderr, continued.stderr
+    assert 'positive max_cost' in continued.stderr, continued.stderr
 
 
 def test_codex_preflight_runs_without_timeout_binary(repo: dict) -> None:
@@ -1987,7 +2463,7 @@ def test_timeout_force_commit_bypasses_a_failing_hook(repo: dict) -> None:
     """The timeout backstop's force-commit saves work past a failing hook.
 
     Every backstop call site is ``|| true``, so a hook that can veto the force
-    commit loses the work silently -- and a later ``--resume`` cleans it away
+    commit loses the work silently -- and a later ``--continue`` cleans it away
     (bypassing hooks here is deliberate). ``--force`` passes
     ``--no-verify``, so the last-resort save cannot be rejected: the gate step
     blocks past the timeout with dirty work in the tree and a hook rejecting
@@ -2287,7 +2763,7 @@ def _make_node(
     mode and replaces the seed steps with ``steps`` (default two trivial steps)
     -- the launch runs this worktree's ``_run.sh`` directly (see ``_LOOP``), so
     the node's own copy is irrelevant. When ``commit`` is set, commits the
-    worktree so a ``--resume`` clean/checkout preserves it.
+    worktree so a ``--continue`` clean/checkout preserves it.
     """
     root = repo['root']
     args = [
@@ -2367,7 +2843,7 @@ def _run_loop(
     node: dict,
     *,
     capture_name: str,
-    resume: bool = False,
+    continue_: bool = False,
     stub_cost: str = '0.001',
     home: Optional[pathlib.Path] = None,
     cwd: Optional[pathlib.Path] = None,
@@ -2393,10 +2869,33 @@ def _run_loop(
     if home is not None:
         env['HOME'] = f'{home}'
     cmd = ['bash', f'{_LOOP}', f'{worktree}']
-    if resume:
-        cmd.append('--resume')
+    if continue_:
+        cmd.append('--continue')
     # cwd overrides the launch directory (real launches inherit an ambient CWD)
     result = _run_reaped(cmd, cwd=f'{cwd or worktree}', env=env, timeout=180)
+    return _collect_calls(capture), result
+
+
+def _resume_loop(
+    repo: dict,
+    node: dict,
+    *,
+    capture_name: str,
+) -> tuple[dict, subprocess.CompletedProcess]:
+    """Relaunch ``_run.sh --resume``; return ``({call_num: {...}}, process)``.
+
+    The resume relaunch of a paused launch (the ``resume.sh`` path minus
+    tmux, like every launch in this suite): the existing capture dir --
+    and its call counter -- carries over, so the adopted run's calls
+    continue the paused launch's numbering.
+    """
+    root = repo['root']
+    worktree = node['worktree']
+    capture = root / f'capture_{capture_name}'
+    env = _cli_env(CAPTURE_DIR=f'{capture}', STUB_COST='0.001')
+    env['PATH'] = f'{repo["bindir"]}{os.pathsep}{env["PATH"]}'
+    cmd = ['bash', f'{_LOOP}', f'{worktree}', '--resume']
+    result = _run_reaped(cmd, cwd=f'{worktree}', env=env, timeout=180)
     return _collect_calls(capture), result
 
 

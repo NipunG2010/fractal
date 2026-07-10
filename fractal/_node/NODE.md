@@ -31,6 +31,7 @@ State:
 - Max child depth: $MAX_DEPTH
 - Max children: $MAX_CHILDREN
 - Max descendants: $MAX_DESCENDANTS
+- Continue mode: $CONTINUE_MODE
 - Resume mode: $RESUME_MODE
 
 Explore the CLI with `fractal --help`, `fractal <command> --help`, and

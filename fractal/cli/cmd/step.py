@@ -16,6 +16,7 @@ from fractal.cli.utils import (
 __all__ = [
     'step_start',
     'step_end',
+    'step_session',
     'step_list',
     'step_pending',
     'step_approved',
@@ -113,6 +114,39 @@ def step_end(app: typer.Typer) -> typer.Typer:
             exit_code=exit_code,
             metadata=metadata,
         )
+
+    return app
+
+
+def step_session(app: typer.Typer) -> typer.Typer:
+    """Register the ``_session`` command."""
+    # step id argument
+    step_id_help = 'Step ID.'
+    step_id = typer.Argument(..., help=step_id_help)
+    # session argument
+    session_help = 'Real, agent-specific session id.'
+    session = typer.Argument(..., help=session_help)
+    # agent option
+    agent_help = 'Agent that runs the step.'
+    agent = typer.Option(..., '--agent', help=agent_help)
+    # model option
+    model_help = 'Model recorded with the session.'
+    model = typer.Option(None, '--model', help=model_help)
+    # path option
+    path_help = 'Worktree directory.'
+    path = typer.Option('.', '--path', help=path_help)
+
+    @command(app, '_session')
+    def _session(
+        step_id: int = step_id,
+        session: str = session,
+        agent: str = agent,
+        model: Optional[str] = model,
+        path: str = path,
+    ) -> None:
+        """Record a step's agent session at launch (re-stamped from the stream)."""
+        node = resolve_node(path)
+        node.step_session(agent, step_id=step_id, model=model, session=session)
 
     return app
 

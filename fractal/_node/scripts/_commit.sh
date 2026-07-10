@@ -113,7 +113,7 @@ fi
 if [[ "$CHECK" == true ]]; then
     # porcelain, not "diff HEAD": diff lists only tracked changes, so a step that
     # left only untracked files reads as clean -- the force-commit safety net skips
-    # it and a later --resume (git clean -fd) then discards the work
+    # it and a later --continue (git clean -fd) then discards the work
     UNCOMMITTED=$(git -C "$WORKTREE_DIR" status --porcelain || true)
     if [[ -n "$UNCOMMITTED" ]]; then
         echo "Error: uncommitted changes remain (agent should have committed)" >&2
@@ -198,11 +198,11 @@ stage_changes() {
             && STAGE_PATHS+=("$WORKTREE_DIR/.gitattributes")
         if [[ ${#STAGE_PATHS[@]} -gt 0 ]]; then
             git -C "$WORKTREE_DIR" add "${STAGE_PATHS[@]}" \
-                ':!**/.venv' ':!**/.db' ':!**/.db-*' ':!**/.status'
+                ':!**/.venv' ':!**/.db' ':!**/.db-*' ':!**/.status' ':!**/.paused'
         fi
     else
         git -C "$WORKTREE_DIR" add "$WORKTREE_DIR" \
-            ':!**/.venv' ':!**/.db' ':!**/.db-*' ':!**/.status'
+            ':!**/.venv' ':!**/.db' ':!**/.db-*' ':!**/.status' ':!**/.paused'
     fi
 }
 
@@ -216,7 +216,7 @@ stage_changes
 # .cache/, manages itself -- its collapsed dir line and the content lines
 # it also emits are one managed entity, not eaten files)
 SKIPPED=$(git -C "$WORKTREE_DIR" ls-files --others -i --exclude-standard --directory \
-    -- ':!**/.venv' ':!**/.db' ':!**/.db-*' ':!**/.status' \
+    -- ':!**/.venv' ':!**/.db' ':!**/.db-*' ':!**/.status' ':!**/.paused' \
     | git -C "$WORKTREE_DIR" check-ignore -v --stdin 2>/dev/null \
     | awk -F'\t' '
         $1 ~ /(^|\/)\.git\/info\/exclude:/ { next }

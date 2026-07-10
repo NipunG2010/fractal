@@ -338,16 +338,24 @@ logic uncommented.
 - **Public CLI commands:** normal names (`init`, `start`, `finish`)
 - **Private CLI commands:** underscore prefix (`_get`, `_set`,
   `_status`) — hidden from `--help`, used only by internal scripts
-- **Signal names:** `finish`, `stop`, `kill`, `exit`
+- **Signal names:** `finish`, `stop`, `kill`, `pause`, `exit`
 - **Lifecycle status:** one status set (`Node._statuses` is the source
   of truth) shared by the node `.status` file and the DB row tables. Not
   every status applies at every level: `failed` is entity-row only (a
   run uses `exited`, never `failed`); `idle`/`retired` are node-only; a
-  user (root) node is marked by config, not a status. Exit codes are
-  binary, derived from status; rows carry start/end instants (duration
-  is derived, not stored) and events are point-in-time. Read
-  `Node._statuses` and the DB schema in `core/` before touching
-  lifecycle or DB code.
+  user (root) node is marked by config, not a status. `paused` is
+  active-like everywhere but execution: the loop exits (no tmux session
+  is the normal parked state — never crash-healed), the run row (and any
+  still-open iteration) stays open for `resume` to adopt, the node holds
+  its spawn slot and blocks ancestor finish-drains, and only
+  `resume`/`kill`/`chat` are legal on it; a user-node (tree-wide) pause
+  also latches the root (a `.paused` marker beside the central DB), so
+  even depth-1 spawns and starts refuse until the tree-wide resume. Exit
+  codes are binary, derived from status; rows carry start/end instants
+  (duration is derived, not stored) and events are point-in-time —
+  `pause`/`resume` event instants credit paused spans back to run/iter
+  deadlines. Read `Node._statuses` and the DB schema in `core/` before
+  touching lifecycle or DB code.
 - **Database scoping:** one central SQLite DB per tree, in the root
   (user) node's data directory, resolved through the `root` config key
   every node carries. Every row table has a `node` column naming the

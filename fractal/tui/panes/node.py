@@ -34,6 +34,7 @@ _SIGNAL_ING = {
     'finish': 'finishing',
     'stop': 'stopping',
     'kill': 'killing',
+    'pause': 'pausing',
     'exit': 'exiting',
 }
 

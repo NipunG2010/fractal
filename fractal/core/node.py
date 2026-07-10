@@ -85,6 +85,7 @@ _CHAT_RUNTIME = {
     'ITER_REF': 'N/A (chat)',
     'TIME_BUDGET': 'N/A (chat)',
     'COST_BUDGET': 'N/A (chat)',
+    'CONTINUE_MODE': 'false',
     'RESUME_MODE': 'false',
     'RESERVE_MODE': 'false',
 }
@@ -100,6 +101,7 @@ class Node:
 
     _statuses = (
         'active',
+        'paused',
         'idle',
         'completed',
         'stopped',
@@ -120,6 +122,8 @@ class Node:
         'finish_cancel',
         'stop',
         'kill',
+        'pause',
+        'resume',
         'retire',
         'unretire',
     )
@@ -203,6 +207,19 @@ class Node:
         return self._root / project / '.fractal' / branch
 
     @property
+    def _tree_latch_file(self: Node) -> pathlib.Path:
+        """The tree-wide pause latch marker, beside the central database.
+
+        Written by a user-node :meth:`pause` and removed by its
+        :meth:`resume`: a depth-1 node's only ancestor is the statusless
+        user root, so without the marker a start racing a tree-wide pause
+        fan-out would slip in unfrozen. Lives in the root node's data
+        directory, so it rides a filesystem transplant with the rest of
+        the paused state.
+        """
+        return self.db._path.parent / '.paused'
+
+    @property
     def _status_file(self: Node) -> pathlib.Path:
         """Path to the node's ``.status`` file (lifecycle state)."""
         return self._node_dir / '.status'
@@ -261,7 +278,10 @@ class Node:
         (:meth:`caps_reconcile`): a loop that died before its next iteration
         boundary never ran the boundary reconcile, and the dead row would
         otherwise carry the drift forever. A no-op unless the status is
-        ``active``, so a settled node never pays the tmux probe.
+        ``active``, so a settled node never pays the tmux probe -- and a
+        ``paused`` node is never healed: no session is its *normal* parked
+        state (the loop exits at pause; ``resume`` relaunches it), on this
+        host or after a filesystem transplant to another.
 
         Never reconciles the node from inside its own running loop: the loop
         self-finishes (``send_budget_finish`` calls ``node finish``), and a
@@ -277,38 +297,41 @@ class Node:
             self.caps_reconcile()
 
     def _reap_orphan(self: Node) -> None:
-        """Kill a surviving agent group recorded by a dead loop.
+        """Kill surviving process groups recorded by a dead loop.
 
-        ``_run.sh`` records its process group at run start (``.pgid``, removed
-        on any in-band exit), so a file that outlives the tmux session marks
-        an out-of-band pane death (tmux kill/crash, host OOM) whose agent may
-        still be running -- and spending -- headless. The reap follows
-        ``kill.sh``'s TERM-grace-KILL cadence and logs an ``orphan`` event
-        naming the reaped pgid. Best-effort: a dead, recycled, or foreign
-        group reads as already gone.
+        ``_run.sh`` records its process group at run start (``.pgid``) and
+        ``_agent.sh`` records each agent invocation's own group
+        (``.step_pgid``); both are removed on any in-band exit, so a file
+        that outlives the tmux session marks an out-of-band pane death (tmux
+        kill/crash, host OOM) whose agent may still be running -- and
+        spending -- headless. The reap follows ``kill.sh``'s TERM-grace-KILL
+        cadence and logs an ``orphan`` event naming each reaped pgid.
+        Best-effort: a dead, recycled, or foreign group reads as already
+        gone.
         """
-        pgid_file = self._node_dir / '.pgid'
-        if not pgid_file.exists():
-            return
-        # trust the record only while its group is still alive
-        try:
-            pgid = int(pgid_file.read_text(encoding='utf-8').strip())
-            os.killpg(pgid, 0)
-        except (ValueError, ProcessLookupError, PermissionError):
-            pgid = 0
-        # reap the group and audit the reap
-        if pgid > 0:
+        for name in ('.pgid', '.step_pgid'):
+            pgid_file = self._node_dir / name
+            if not pgid_file.exists():
+                continue
+            # trust the record only while its group is still alive
             try:
-                os.killpg(pgid, signal.SIGTERM)
-                for _ in range(10):
-                    time.sleep(0.2)
-                    os.killpg(pgid, 0)
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            event_id = self.event_start('orphan', metadata=f'reaped pgid {pgid}')
-            self.event_end(event_id=event_id, status='completed')
-        pgid_file.unlink(missing_ok=True)
+                pgid = int(pgid_file.read_text(encoding='utf-8').strip())
+                os.killpg(pgid, 0)
+            except (ValueError, ProcessLookupError, PermissionError):
+                pgid = 0
+            # reap the group and audit the reap
+            if pgid > 0:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                    for _ in range(10):
+                        time.sleep(0.2)
+                        os.killpg(pgid, 0)
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                event_id = self.event_start('orphan', metadata=f'reaped pgid {pgid}')
+                self.event_end(event_id=event_id, status='completed')
+            pgid_file.unlink(missing_ok=True)
 
     def _is_own_loop(self: Node) -> bool:
         """Whether this process is running inside this node's own loop.
@@ -666,6 +689,12 @@ class Node:
         lock_dir.mkdir(parents=True, exist_ok=True)
         with open(lock_dir / '.lock', 'a', encoding='utf-8') as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
+            # refuse to spawn into a paused subtree -- the pause latch admits
+            # no new work until resume
+            if latched := parent.pause_latched():
+                raise RuntimeError(
+                    f'Cannot spawn under a paused node ({latched}). Resume it first.'
+                )
             # enforce the live subtree/budget caps under the lock, off a fresh
             # re-read of live descendants -- only now (serialized) is the count
             # authoritative, so concurrent fan-out can't each pass before any of
@@ -681,7 +710,7 @@ class Node:
                 if self.__class__(child_worktree_dir).exists():
                     raise ValueError(
                         f'Node {child_branch!r} already exists; start it with'
-                        ' `fractal node start --resume`, remove it with'
+                        ' `fractal node start --continue`, remove it with'
                         ' `fractal node delete`, or pass --reset to'
                         ' reinitialize it.'
                     )
@@ -1052,22 +1081,22 @@ class Node:
     def start(
         self: Node,
         *,
-        resume: bool = False,
+        continue_run: bool = False,
     ) -> str:
         """Launch the node in a tmux session.
 
         Creates a tmux session (or window if already inside
         tmux) that runs the iteration loop. All run parameters
         are read from ``config.json`` (set at init or edited
-        before launch); ``resume`` is the only launch-time action.
+        before launch); ``continue_run`` is the only launch-time action.
 
-        A resume re-enters the unsettled pool, so it re-checks the
+        A continue re-enters the unsettled pool, so it re-checks the
         width/descendant gates (:meth:`_enforce_rearm_limits`) and re-arms to
         ``idle`` under the ``.worktrees`` flock; the loop stamps ``active`` at
         boot just as a fresh start does.
 
         Args:
-            resume: Resume a stopped/exited node.
+            continue_run: Continue a stopped/exited node.
 
         Returns:
             Script output.
@@ -1076,23 +1105,31 @@ class Node:
         # reject user nodes
         if self.is_user:
             raise RuntimeError('Cannot start a user node.')
-        # reconcile a crashed-but-active node so --resume isn't wedged
+        # reconcile a crashed-but-active node so --continue isn't wedged
         self._reconcile_status()
         # validate status
         current_status = self.status()
         if current_status == 'retired':
             raise RuntimeError('Cannot start a retired node. Unretire it first.')
-        # statuses a resume may re-arm from
-        resumable = ('completed', 'stopped', 'exited', 'killed')
-        if resume:
-            if current_status not in resumable:
-                raise RuntimeError(f'Cannot resume from status: {current_status!r}')
+        if current_status == 'paused':
+            raise RuntimeError('Cannot start a paused node. Resume it first.')
+        # statuses a continue may re-arm from
+        continuable = ('completed', 'stopped', 'exited', 'killed')
+        if continue_run:
+            if current_status not in continuable:
+                raise RuntimeError(f'Cannot continue from status: {current_status!r}')
         else:
             if current_status != 'idle':
                 raise RuntimeError(
                     f'Cannot start from status: {current_status}.'
-                    f' Use --resume to restart.'
+                    f' Use --continue to restart.'
                 )
+        # refuse to launch into a paused subtree -- the pause latch admits no
+        # new work until resume
+        if latched := self.pause_latched():
+            raise RuntimeError(
+                f'Cannot start under a paused node ({latched}). Resume it first.'
+            )
         # a non-positive ceiling launches straight into a degenerate $0 finish, so
         # reject it; a missing ceiling means uncapped -- allowed but warned loudly
         # since spend is then untracked, bounded only by --max-iters/--timeout (a
@@ -1119,11 +1156,11 @@ class Node:
         self._validate_launch_config()
         # build arguments
         args = [f'{self._root}']
-        if resume:
-            args.append('--resume')
+        if continue_run:
+            args.append('--continue')
         # ensure git excludes
         self._git_exclude()
-        if resume:
+        if continue_run:
             # gate re-check and idle re-arm stay atomic under the .worktrees
             # flock (init's check+register atomicity) -- the loop stamps active
             # only at boot, so a post-lock re-arm would let a concurrent gate
@@ -1132,16 +1169,18 @@ class Node:
             lock_dir.mkdir(parents=True, exist_ok=True)
             with open(lock_dir / '.lock', 'a', encoding='utf-8') as lock_file:
                 fcntl.flock(lock_file, fcntl.LOCK_EX)
-                # re-read under the lock -- a concurrent resume that won the
+                # re-read under the lock -- a concurrent continue that won the
                 # race has already re-armed this node out of a settled status
                 current_status = self.status()
-                if current_status not in resumable:
-                    raise RuntimeError(f'Cannot resume from status: {current_status!r}')
+                if current_status not in continuable:
+                    raise RuntimeError(
+                        f'Cannot continue from status: {current_status!r}'
+                    )
                 self._enforce_rearm_limits()
                 self.status_set('idle')
             # launch outside the lock -- the idle re-arm above already holds
             # the slot; roll a failed launch back to the settled status so
-            # --resume stays the retry path (idle reads as never-started)
+            # --continue stays the retry path (idle reads as never-started)
             try:
                 result = self._run_script('start.sh', *args)
             except Exception:
@@ -1235,8 +1274,8 @@ class Node:
             raise RuntimeError('Cannot cancel finish: node has no run.')
         if self.signal_get('finish', run_id=run_id) is None:
             raise RuntimeError('Cannot cancel finish: no finish signal is set.')
-        # delete the pending rows, bracketed by an audit event -- signals are
-        # append-only everywhere else; this is the one deliberate withdrawal
+        # delete the pending rows, bracketed by an audit event -- one of the
+        # deliberate withdrawals catalogued on signal_clear
         event_id = self.event_start('finish_cancel', metadata=reason or '')
         self.db.delete(
             'signals',
@@ -1296,9 +1335,12 @@ class Node:
         self.event_end(event_id=event_id, status='completed')
 
     def kill(self: Node, reason: Optional[str] = None) -> str:
-        """Kill the node and its active descendants immediately (children first).
+        """Kill the node and its active or paused descendants (children first).
 
-        Reaps each tmux session and marks its active rows ``killed``.
+        Reaps each tmux session and marks its active rows ``killed``. Paused
+        nodes are killable -- the escape hatch for a parked subtree; with no
+        loop alive the kill is pure bookkeeping (``kill.sh`` no-ops and the
+        open rows close ``killed``).
 
         Args:
             reason: Optional reason for killing.
@@ -1309,8 +1351,10 @@ class Node:
         """
         # validate status
         current = self.status()
-        if current != 'active':
-            raise RuntimeError(f'Cannot kill: node is not active (status: {current}).')
+        if current not in ('active', 'paused'):
+            raise RuntimeError(
+                f'Cannot kill: node is not active or paused (status: {current}).'
+            )
         # attribute the propagated reason so a descendant's signal row names
         # this node as the source (mirrors finish)
         propagated = (
@@ -1319,7 +1363,9 @@ class Node:
             else f'via kill of {self._branch}'
         )
         # reap descendants first (best-effort), then self
-        for _, descendant in self._live_descendants(status='active'):
+        for row, descendant in self._live_descendants():
+            if row['status'] not in ('active', 'paused'):
+                continue
             try:
                 descendant._kill(propagated)
             except Exception:
@@ -1354,6 +1400,239 @@ class Node:
             self.event_end(event_id=event_id, status='completed')
         return result.stdout.strip()
 
+    def pause(self: Node, reason: Optional[str] = None) -> str:
+        """Pause the node and its active descendants (parent-first).
+
+        Signals ``pause`` then aborts each node's in-flight agent invocation
+        (``pause.sh`` reaps the recorded step process group), so every loop
+        reclassifies the abort and parks: it exits with status ``paused``,
+        leaving its run and iteration rows open for :meth:`resume` to adopt.
+        Fans out parent-first -- the inverse of every other signal -- so a
+        parent parked before its children can never drain-complete over
+        them, and re-enumerates until the subtree is fully signaled,
+        catching children spawned mid-fan-out (``init``/``start`` refuse
+        new work under the pause latch). On the user (root) node, which has
+        no loop of its own, the fan-out covers the whole tree with no self
+        signal -- the tree-wide brake -- and latches the root first, so
+        even a depth-1 start racing the sweep refuses until resume.
+
+        Args:
+            reason: Optional reason for pausing.
+
+        Returns:
+            Confirmation message.
+
+        """
+        # a tree-wide pause latches the root before fanning out, so a start
+        # or spawn racing the sweep (even at depth 1, where no pausable
+        # ancestor exists) refuses instead of slipping in unfrozen
+        if self.is_user:
+            self._tree_latch_file.write_text('paused\n', encoding='utf-8')
+        # a non-user node pauses itself first; the user node only fans out
+        if not self.is_user:
+            # reconcile a crashed-but-active node so it hits the clear
+            # not-active guard below, not the misleading no-run error
+            self._reconcile_status()
+            # validate status
+            if self.status() != 'active':
+                raise RuntimeError('Cannot pause: node is not active.')
+            # an active node with no run cannot be signaled
+            _, _, run_id = self._resolve_context()
+            if run_id is None:
+                raise RuntimeError('Cannot pause: node has no run.')
+        # attribute the propagated reason so a descendant's signal row names
+        # this node as the source (mirrors finish)
+        propagated = (
+            f'{reason} (via pause of {self._branch})'
+            if reason
+            else f'via pause of {self._branch}'
+        )
+        # pause self first, then sweep descendants shallowest first until
+        # every active one carries a pause signal -- the re-enumeration
+        # catches children spawned mid-fan-out; best-effort per node
+        # (mirrors kill), each attempted exactly once
+        paused_count = 0
+        if not self.is_user:
+            self._pause(reason)
+            paused_count += 1
+        attempted = set()
+        while True:
+            pending = [
+                (row['node'], descendant)
+                for row, descendant in self._live_descendants(status='active')
+                if row['node'] not in attempted
+                and descendant.signal_get('pause') is None
+            ]
+            if not pending:
+                break
+            pending.sort(key=lambda entry: entry[0].count('.'))
+            for branch, descendant in pending:
+                attempted.add(branch)
+                try:
+                    descendant._pause(propagated)
+                    paused_count += 1
+                except Exception:
+                    print(
+                        f'Warning: failed to pause {descendant._root}',
+                        file=sys.stderr,
+                    )
+        # build confirmation
+        if paused_count == 0:
+            return 'No active nodes to pause (tree latched until resume).'
+        s = 's' if paused_count != 1 else ''
+        result = (
+            f'Pause signal sent to {paused_count} node{s}'
+            ' (in-flight agents aborted; loops park paused)'
+        )
+        if reason:
+            result += f': {reason}'
+        return result
+
+    def _pause(self: Node, reason: Optional[str] = None) -> None:
+        """Signal ``pause`` and abort this node's in-flight agent invocation."""
+        # the signal lands before the abort so the loop reclassifies the
+        # killed step as paused, never as a failed step (a failure would
+        # force-commit and open a fresh session)
+        event_id = self.event_start('pause', metadata=reason or '')
+        self.signal_set('pause', reason or '')
+        try:
+            self._run_script('pause.sh', f'{self._root}')
+        except Exception:
+            # the signal is durable -- the loop still parks at its next
+            # checkpoint -- but the failed abort must surface
+            self.event_end(event_id=event_id, status='failed')
+            raise
+        self.event_end(event_id=event_id, status='completed')
+
+    def resume(self: Node) -> str:
+        """Resume the node and its paused descendants (leaf-first).
+
+        Relaunches each paused loop, which adopts its open run where the
+        pause left it: same budgets and iteration count, the interrupted
+        step re-entered (resuming the recorded agent session when one
+        exists, re-orienting fresh otherwise), and run/iteration deadlines
+        credited for the paused span. Leaf-first so every child reads
+        ``active`` again before its parent's drain-waits can look. A node
+        still parking (``active`` with a pending pause signal) gets its
+        pause withdrawn instead -- the live loop then never parks. On the
+        user (root) node the fan-out covers the whole tree with no self
+        relaunch -- the tree-wide release, which also lifts the root latch.
+
+        Returns:
+            Confirmation message.
+
+        """
+        # a tree-wide resume releases the latch first -- new starts and
+        # spawns are legal again the moment the release begins, even when
+        # nothing is left parked to relaunch
+        if self.is_user:
+            self._tree_latch_file.unlink(missing_ok=True)
+        # a non-user node must itself be paused or still pausing; the user
+        # node only fans out
+        self_pausing = False
+        if not self.is_user:
+            current = self.status()
+            if current == 'active':
+                self_pausing = self.signal_get('pause') is not None
+            if current != 'paused' and not self_pausing:
+                raise RuntimeError(
+                    f'Cannot resume: node is not paused (status: {current}).'
+                )
+        # a node still parking (active with a pending pause signal) has a live
+        # loop that cannot be relaunched -- withdraw its pause instead, so the
+        # loop never parks; the resume event closes the span for the credit
+        # walk, and a loop that already read the signal parks anyway (honest:
+        # it lands paused for the next resume to relaunch)
+        resumed_count = 0
+        withdrawn = [
+            descendant
+            for _, descendant in self._live_descendants(status='active')
+            if descendant.signal_get('pause') is not None
+        ]
+        if self_pausing:
+            withdrawn.append(self)
+        for node in withdrawn:
+            event_id = node.event_start('resume')
+            node.signal_clear('pause')
+            node.event_end(event_id=event_id, status='completed')
+            resumed_count += 1
+        # resume parked descendants leaf-first (deepest first), then self --
+        # children must be running again before a parent's drain-wait can
+        # conclude anything about them; best-effort per node (mirrors kill)
+        pending = self._live_descendants(status='paused')
+        pending.sort(key=lambda entry: entry[0]['node'].count('.'), reverse=True)
+        for _, descendant in pending:
+            try:
+                descendant._resume()
+                resumed_count += 1
+            except Exception:
+                print(
+                    f'Warning: failed to resume {descendant._root}',
+                    file=sys.stderr,
+                )
+        if not self.is_user and not self_pausing:
+            self._resume()
+            resumed_count += 1
+        # build confirmation
+        if resumed_count == 0:
+            return 'No paused nodes to resume.'
+        s = 's' if resumed_count != 1 else ''
+        return (
+            f'Resumed {resumed_count} node{s}'
+            ' (parked loops relaunched leaf-first; live pauses withdrawn)'
+        )
+
+    def _resume(self: Node) -> None:
+        """Relaunch this node's loop to adopt its paused run.
+
+        The relaunched loop itself withdraws the run's pause signals
+        (:meth:`signal_clear` at adoption), so a bare ``--resume``
+        launch -- e.g. after a filesystem transplant -- self-clears too.
+        """
+        # the resume event lands before the relaunch so the booting loop's
+        # deadline credit sees the pause..resume span closed
+        event_id = self.event_start('resume')
+        try:
+            self._run_script('resume.sh', f'{self._root}')
+        except Exception:
+            self.event_end(event_id=event_id, status='failed')
+            raise
+        self.event_end(event_id=event_id, status='completed')
+
+    def pause_latched(self: Node, *, tree_only: bool = False) -> Optional[str]:
+        """The branch of the nearest paused or pausing node at-or-above, if any.
+
+        The pause latch: a paused subtree admits no new work, so ``init``
+        (spawn) and ``start`` refuse -- and a booting loop parks -- while
+        any ancestor (or the node itself) is ``paused`` or still ``active``
+        with a pending ``pause`` signal, or while the tree-wide latch (a
+        user-node pause) is set. Walks by name so a pruned intermediate
+        never hides a paused ancestor.
+
+        Args:
+            tree_only: Check only the tree-wide latch, skipping the
+                ancestor walk -- the resume-boot variant, where paused
+                ancestors are the leaf-first fan-out's normal state but a
+                NEW tree-wide brake must still park the boot.
+
+        Returns:
+            The latching node's branch (the root branch for the tree-wide
+            latch), or ``None`` when the path is clear.
+
+        """
+        if not tree_only:
+            for node in self._self_and_ancestors():
+                if node.is_user:
+                    continue
+                status = node.status()
+                if status == 'paused':
+                    return node._branch
+                if status == 'active' and node.signal_get('pause') is not None:
+                    return node._branch
+        if self._tree_latch_file.exists():
+            return self.config_get('root')
+        return None
+
     def merge(self: Node) -> str:
         """Squash-merge the node's branch into its merge target.
 
@@ -1379,6 +1658,8 @@ class Node:
         current = self.status()
         if current == 'active':
             raise RuntimeError('Cannot merge an active node. Stop or kill it first.')
+        if current == 'paused':
+            raise RuntimeError('Cannot merge a paused node. Resume or kill it first.')
         # run merge script -- merge.sh resolves the target and logs the
         # merge event on it (it's the single source of truth for the target)
         result = self._run_script('merge.sh', f'{self._root}')
@@ -1391,8 +1672,8 @@ class Node:
         each live worktree via ``delete.sh`` (worktree + branch + remote), and
         the subtree's registry rows and subscriptions are cleared from the
         central database -- its history rows (runs, steps, messages, ...)
-        persist. Refuses if the node or any descendant is active -- stop or
-        kill the subtree first.
+        persist. Refuses if the node or any descendant is active or paused --
+        stop, resume, or kill the subtree first.
 
         Returns:
             Tuple of per-node script output (deletion order) and collected
@@ -1413,6 +1694,8 @@ class Node:
         # validate status -- the node itself must not be running
         if self.status() == 'active':
             raise RuntimeError('Cannot delete an active node. Stop or kill it first.')
+        if self.status() == 'paused':
+            raise RuntimeError('Cannot delete a paused node. Resume or kill it first.')
         # collect the subtree: self + every descendant (flat registry); capture
         # branch + repo dir + central db up front -- they resolve through
         # self._root, which is torn down below, so they must be read before
@@ -1442,13 +1725,15 @@ class Node:
         # reconcile crashed descendants so a dead child doesn't wedge the delete
         for _, descendant in self._live_descendants(status='active'):
             descendant._reconcile_status()
-        # refuse if any descendant is still active -- recursive teardown must not
-        # yank a running node's worktree out from under it
-        if self._live_descendants(status='active'):
-            raise RuntimeError(
-                'Cannot delete a node with an active descendant.'
-                ' Stop or kill the subtree first.'
-            )
+        # refuse if any descendant is still active or paused -- recursive
+        # teardown must not yank a running node's worktree out from under it,
+        # nor discard a paused one's frozen mid-step work
+        for row, _ in self._live_descendants():
+            if row['status'] in ('active', 'paused'):
+                raise RuntimeError(
+                    'Cannot delete a node with an active or paused descendant.'
+                    ' Stop, resume, or kill the subtree first.'
+                )
         # pre-flight every subtree worktree for the lock delete.sh rejects (a
         # locked worktree can't be removed): recursive teardown is non-atomic, so
         # a lock found mid-tear would strand a half-deleted subtree -- check the
@@ -1621,6 +1906,8 @@ class Node:
         # validate status
         if self.status() == 'active':
             raise RuntimeError('Cannot retire an active node. Stop or kill it first.')
+        if self.status() == 'paused':
+            raise RuntimeError('Cannot retire a paused node. Resume or kill it first.')
         # set status and log event -- the pre-retire status rides the event
         # metadata so unretire can restore it instead of dropping it
         prior = self.status()
@@ -1693,7 +1980,9 @@ class Node:
         ``.worktrees/``, deletes the user node's data directory, and strips
         fractal's block from the repo's ``info/exclude``. Committed artifacts
         (the project wiki, baseline commits) and remote branches are left in
-        place. Refuses while any node's tmux session is alive.
+        place. Refuses while any node's tmux session is alive -- and while
+        any node is paused: a parked worktree holds frozen uncommitted
+        mid-step work that no session-liveness check can see.
 
         Args:
             path: Git repository root.
@@ -1702,11 +1991,21 @@ class Node:
             Script output.
 
         """
+        node = Node(path)
+        # refuse over frozen work -- a paused node has no session for
+        # destroy.sh's liveness refusal to catch
+        if node.exists():
+            paused = [row['node'] for row, _ in node._live_descendants(status='paused')]
+            if paused:
+                names = ', '.join(paused)
+                raise RuntimeError(
+                    f'Cannot destroy: paused node(s) hold frozen work'
+                    f' ({names}). Resume or kill them first.'
+                )
         # run destroy.sh under the .worktrees flock so its worktree remove/prune
         # does not race a concurrent init/delete (the same lock child_add takes) --
         # but only when .worktrees exists; creating it would defeat destroy.sh's
         # nothing-to-destroy check, which keys off that directory
-        node = Node(path)
         worktrees = node._repo_dir / '.worktrees'
         if worktrees.is_dir():
             with open(worktrees / '.lock', 'a', encoding='utf-8') as lock_file:
@@ -1754,12 +2053,12 @@ class Node:
         return 'idle'
 
     def status_display(self: Node) -> str:
-        """Return the status decorated with any pending graceful-stop signal.
+        """Return the status decorated with any pending graceful signal.
 
-        ``active (stopping)`` / ``active (finishing)`` when a stop/finish signal
-        is pending on an active node, else the bare status. Display-only -- the
-        stored status (and the value status filters match on, via the first
-        space-delimited chunk) stays bare.
+        ``active (pausing)`` / ``active (stopping)`` / ``active (finishing)``
+        when a pause/stop/finish signal is pending on an active node, else the
+        bare status. Display-only -- the stored status (and the value status
+        filters match on, via the first space-delimited chunk) stays bare.
 
         Returns:
             Status string, possibly with a pending-signal suffix.
@@ -1767,6 +2066,8 @@ class Node:
         """
         status = self.status()
         if status == 'active':
+            if self.signal_get('pause') is not None:
+                return 'active (pausing)'
             if self.signal_get('stop') is not None:
                 return 'active (stopping)'
             if self.signal_get('finish') is not None:
@@ -1816,8 +2117,8 @@ class Node:
             all_nodes: Include retired nodes in output.
             retired_only: Show only retired nodes.
             max_depth: Maximum depth relative to this node.
-            status: Filter to a single status (overrides the
-                retired/all default).
+            status: Filter to a status, or several comma-separated
+                (overrides the retired/all default).
             live: Reconcile each row against the child's real
                 ``.status()``, dropping descendants whose worktree is gone and
                 relabeling a crashed ``active`` node (no live tmux session) to
@@ -1910,9 +2211,11 @@ class Node:
         if decorated:
             worktrees = _worktree_map(self._repo_dir)
             rows = [self._decorate_status(row, worktrees) for row in rows]
-        # filter by an explicit status, else apply the retired/all default
+        # filter by an explicit status (one or comma-several), else apply
+        # the retired/all default
         if status is not None:
-            rows = [row for row in rows if _base_status(row.get('status')) == status]
+            wanted = {chunk.strip() for chunk in status.split(',') if chunk.strip()}
+            rows = [row for row in rows if _base_status(row.get('status')) in wanted]
         elif retired_only:
             rows = [row for row in rows if _base_status(row.get('status')) == 'retired']
         elif not all_nodes:
@@ -1920,16 +2223,17 @@ class Node:
         return rows
 
     def _decorate_status(self: Node, row: dict, worktrees: dict[str, str]) -> dict:
-        """Append a live descendant's pending stop/finish signal to its status.
+        """Append a live descendant's pending graceful signal to its status.
 
         Display helper for ``list``: for a descendant whose live status is
         still ``active``, replaces the row's status with its
-        :meth:`status_display` (``active (stopping)`` / ``active (finishing)``).
-        Decoration only -- a stale registry row (live status no longer active)
-        keeps its cached value, so ``live`` stays the reconciliation opt-in.
-        ``worktrees`` is a branch->path map (one ``git worktree list``) so the
-        listing resolves worktrees without a subprocess per row. Best-effort --
-        a row whose worktree is gone keeps its cached status.
+        :meth:`status_display` (``active (pausing)`` / ``active (stopping)``
+        / ``active (finishing)``). Decoration only -- a stale registry row
+        (live status no longer active) keeps its cached value, so ``live``
+        stays the reconciliation opt-in. ``worktrees`` is a branch->path map
+        (one ``git worktree list``) so the listing resolves worktrees without
+        a subprocess per row. Best-effort -- a row whose worktree is gone
+        keeps its cached status.
         """
         if _base_status(row.get('status')) != 'active':
             return row
@@ -2155,8 +2459,9 @@ class Node:
                         row = {**row, 'status': node.status()}
                 healed.append((row, node))
             live = healed
-        # statuses that hold a spawn slot: active, or idle awaiting start
-        unsettled = ('active', 'idle')
+        # statuses that hold a spawn slot: active, paused mid-work (it will
+        # return), or idle awaiting start
+        unsettled = ('active', 'paused', 'idle')
         return sum(1 for row, _ in live if row['status'] in unsettled)
 
     def _enforce_spawn_limits(
@@ -2255,7 +2560,7 @@ class Node:
         land the subtree over cap. ``max_depth`` is structural (the node
         already sits at its spawn-time depth) and the budget bound is
         spawn-time only (every run re-arms the node's own ``max_cost``), so
-        neither re-runs here. Called by :meth:`start` (resume) and
+        neither re-runs here. Called by :meth:`start` (continue) and
         :meth:`unretire` (idle restore) under the ``.worktrees`` flock just
         before the re-arm, mirroring ``init``'s check+register atomicity;
         like the spawn gate, there is no override flag.
@@ -2623,10 +2928,69 @@ class Node:
             )
         if not rows:
             return None
-        # subtract elapsed time from the budget
+        # subtract elapsed time from the budget, crediting paused spans -- a
+        # pause parks the loop with the run/iter rows left open, so the raw
+        # wall clock would charge the frozen time against the deadline (a
+        # step never spans a pause: the interrupted step row closes ``paused``
+        # and resume opens a fresh one)
         elapsed = _compute_duration(rows[0]['started_at'])
+        if scope in ('run', 'iter'):
+            elapsed -= self._pause_credit(run_id=run_id, since=rows[0]['started_at'])
         remaining = seconds - elapsed
         return remaining if remaining > 0 else 0.0
+
+    def _pause_credit(
+        self: Node,
+        *,
+        run_id: int,
+        since: Optional[str] = None,
+    ) -> float:
+        """Seconds the run spent paused, from its pause/resume event instants.
+
+        Sums the pause->resume spans recorded on the run's events, clipping
+        each to ``since`` (an iteration deadline credits only the span inside
+        the iteration); an unmatched trailing pause accrues to now (the node
+        is still parked). The instants are the substrate for pause-aware cost
+        attribution as well.
+
+        Args:
+            run_id: Run whose events are scanned.
+            since: ISO instant spans are clipped to (the scope's anchor).
+
+        Returns:
+            Credited seconds (``0.0`` when the run never paused).
+
+        """
+        rows = self.db.read('events', where={'node': self._branch, 'run_id': run_id})
+        # a failed resume never relaunched the loop (the node is still
+        # parked), so only a completed one closes a span; a failed pause
+        # still opens one -- its signal is durable and the loop parks anyway
+        spans = [
+            row
+            for row in rows
+            if row['event'] == 'pause'
+            or (row['event'] == 'resume' and row['status'] == 'completed')
+        ]
+        spans.sort(key=lambda row: row['created_at'])
+        # walk the interleaved instants; duplicate pauses collapse onto the
+        # first, duplicate resumes are inert, and the fixed-width UTC format
+        # makes string comparison safe
+        credit = 0.0
+        pause_at = None
+        for row in spans:
+            if row['event'] == 'pause':
+                if pause_at is None:
+                    pause_at = row['created_at']
+            elif pause_at is not None:
+                start = max(pause_at, since) if since else pause_at
+                end = row['created_at']
+                if end > start:
+                    credit += _compute_duration(start) - _compute_duration(end)
+                pause_at = None
+        if pause_at is not None:
+            start = max(pause_at, since) if since else pause_at
+            credit += max(_compute_duration(start), 0.0)
+        return credit
 
     def cost_remaining(
         self: Node,
@@ -3252,8 +3616,12 @@ class Node:
         parts = self.config_get('agent').split()
         if model is None:
             model = self.config_get('model')
-        # the live loop session (only while running) -- never continued in place
-        live = self.session_get(agent) if self.status() == 'active' else None
+        # the loop's woven session (while running or parked) -- never continued
+        # in place: that would perturb the running loop's turn, or the session
+        # a paused run resumes with
+        live = None
+        if self.status() in ('active', 'paused'):
+            live = self.session_get(agent)
         # validate the request: --current forks the live session and is mutually
         # exclusive with --session/--resume; nothing else is inferred
         if current and (session is not None or resume):
@@ -3274,8 +3642,9 @@ class Node:
             raise ValueError('--resume requires --session (the session to continue).')
         if resume and session == live:
             raise ValueError(
-                'Refusing to resume the live loop session in place (it would'
-                ' perturb the running loop); use --current to fork it instead.'
+                'Refusing to resume the loop session in place (it would'
+                ' perturb the running loop, or the session a paused run'
+                ' resumes with); use --current to fork it instead.'
             )
         # a given/current session is forked by default; --resume continues it
         fork = session is not None and not resume
@@ -3398,10 +3767,10 @@ class Node:
         """The node's static template variables (paths, git, config, modes).
 
         Mirrors the loop's bash derivation (``_run.sh``) so both render the same
-        values. Run-scoped variables (step/iteration/budget/resume/reserve) are
-        not derived here -- a caller supplies them via ``render_template``'s
-        ``overrides`` (the loop with live state, a chat with ``N/A (chat)``); any
-        placeholder left unsupplied stays verbatim.
+        values. Run-scoped variables (step/iteration/budget and the
+        continue/resume/reserve modes) are not derived here -- a caller supplies
+        them via ``render_template``'s ``overrides`` (the loop with live state,
+        a chat with ``N/A (chat)``); any placeholder left unsupplied stays verbatim.
 
         Returns:
             A ``name -> value`` map of the static template variables.
@@ -3564,6 +3933,84 @@ class Node:
         if metadata is not None:
             data['metadata'] = metadata
         self.db.update(data, 'runs', where={'run_id': run_id, 'ended_at': None})
+
+    def run_open(self: Node) -> Optional[dict]:
+        """Resolve the open run and re-entry context a resume boot adopts.
+
+        Pause parks with the run row open; the resume boot reuses it
+        instead of opening a fresh one (which would re-arm the budget).
+        The run's newest iteration decides the re-entry: an open one is
+        adopted, re-entering at the first step that never completed --
+        derived from the completed step rows, since a checkpoint or drain
+        park writes no paused row and rows from an earlier pause cycle are
+        stale -- while a closed one (a boundary pause) only anchors the
+        numbering. A step paused awaiting approval that was approved while
+        parked is skipped past instead of re-run (``'; unpriced'`` may
+        have been appended, so the marker matches as a prefix).
+
+        Returns:
+            ``{'run_id', 'iter', 'iter_id', 'resume_step'}`` -- ``iter_id``
+            and ``resume_step`` are ``None`` at a boundary, ``iter`` is
+            ``None`` when the run has no iterations -- or ``None`` when no
+            run is open.
+
+        """
+        runs = self.db.read(
+            'runs',
+            where={'node': self._branch, 'ended_at': None},
+            limit=1,
+        )
+        if not runs:
+            return None
+        run_id = runs[0]['run_id']
+        result = {
+            'run_id': run_id,
+            'iter': None,
+            'iter_id': None,
+            'resume_step': None,
+        }
+        iters = self.db.read('iters', where={'run_id': run_id}, limit=1)
+        if not iters:
+            return result
+        newest = iters[0]
+        result['iter'] = newest['iter']
+        if newest['ended_at'] is not None:
+            return result
+        result['iter_id'] = newest['iter_id']
+        # re-enter at the first step that never completed (SYNC rows carry
+        # the number of the step they precede, not their own work)
+        steps = self.db.read(
+            'steps',
+            where={'iter_id': newest['iter_id'], 'status': 'completed'},
+        )
+        completed_max = max(
+            (row['step'] for row in steps if row['step_name'] != 'SYNC'),
+            default=0,
+        )
+        resume_step = completed_max + 1
+        # skip past approved awaiting-approval steps: they close paused,
+        # never completed, so each holds the re-entry until its approval
+        # lands -- and the lookup is scoped per step, so a newer paused row
+        # from a later pause cycle can never shadow an earlier approval
+        while True:
+            paused = self.db.read(
+                'steps',
+                where={
+                    'iter_id': newest['iter_id'],
+                    'status': 'paused',
+                    'step': resume_step,
+                },
+                limit=1,
+            )
+            if not paused:
+                break
+            if not paused[0]['metadata'].startswith('awaiting approval'):
+                break
+            if not self.step_approved(step_id=paused[0]['step_id']):
+                break
+            resume_step += 1
+        result['resume_step'] = resume_step
+        return result
 
     def run_latest(
         self: Node,
@@ -3843,12 +4290,34 @@ class Node:
         and an ISO 8601 timestamp (approved). This method
         transitions from NULL to ``''``.
 
+        The fresh row supersedes any earlier still-pending row of the same
+        iteration step (a re-run after an unapproved pause): the stale row
+        would otherwise sit in ``pending`` forever, silently swallowing
+        approvals aimed at it.
+
         Args:
             step_id: Step to mark.
 
         """
         data = {'approved': ''}
         self.db.update(data, 'steps', where={'step_id': step_id})
+        # void superseded pending twins -- only this row's approval counts now
+        if rows := self.db.read('steps', where={'step_id': step_id}):
+            twins = self.db.read(
+                'steps',
+                where={
+                    'iter_id': rows[0]['iter_id'],
+                    'step': rows[0]['step'],
+                    'approved': '',
+                },
+            )
+            for twin in twins:
+                if twin['step_id'] != step_id:
+                    self.db.update(
+                        {'approved': None},
+                        'steps',
+                        where={'step_id': twin['step_id']},
+                    )
 
     def step_approve(
         self: Node,
@@ -4093,8 +4562,8 @@ class Node:
         status. No-op if no runs exist.
 
         Args:
-            signal: Signal identifier (``finish``,
-                ``stop``, ``kill``, ``exit``).
+            signal: Signal identifier (``finish``, ``stop``,
+                ``kill``, ``pause``, ``exit``).
             metadata: Text payload.
 
         """
@@ -4112,6 +4581,33 @@ class Node:
             'metadata': metadata,
         }
         self.db.write(data, 'signals')
+
+    def signal_clear(
+        self: Node,
+        signal: str,
+        *,
+        run_id: Optional[int] = None,
+    ) -> None:
+        """Delete a run's rows for one signal.
+
+        Signals are append-only except the deliberate withdrawals:
+        ``finish_cancel``, and the resume boot clearing the ``pause``
+        rows that parked the run it adopts (it would otherwise re-park
+        on them at its first checkpoint).
+
+        Args:
+            signal: Signal identifier.
+            run_id: Run to clear. Auto-resolved if omitted.
+
+        """
+        if run_id is None:
+            _, _, run_id = self._resolve_context()
+        if run_id is None:
+            return
+        self.db.delete(
+            'signals',
+            where={'node': self._branch, 'run_id': run_id, 'signal': signal},
+        )
 
     def session_get(self: Node, agent: str) -> Optional[str]:
         """Read an agent's session for the current iteration.

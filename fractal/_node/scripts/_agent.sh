@@ -24,6 +24,20 @@ AGENT_BASE_COMMAND="${PARTS[0]}"
 # clear any stale budget-exceeded marker; _stream re-creates it if this invocation
 # reaches its --max-budget-usd cap (a clean stop, handled in the outcome below)
 rm -f "$NODE_DIR/.budget_exceeded"
+# clear any stale step group handle and abort marker; the launch wrapper
+# below re-records the group, pause.sh the marker
+rm -f "$NODE_DIR/.step_pgid" "$NODE_DIR/.pause_abort"
+
+# run the launch as the leader of its own process group, recorded to
+# .step_pgid -- the handle pause.sh/kill.sh use to abort the agent subtree
+# without touching this script or the downstream fractal _stream; the exec
+# keeps the pid, so the recorded group stays live for the whole invocation
+# (timeout(1), when present, re-groups onto its own pid -- the same value)
+GROUPED='import os, sys
+os.setpgid(0, 0)
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    handle.write(f"{os.getpid()}\n")
+os.execvp(sys.argv[2], sys.argv[2:])'
 
 LAUNCH=()
 
@@ -117,7 +131,17 @@ if [[ "$AGENT_BASE_COMMAND" == "claude" ]]; then
         if [[ -n "$SESSION_ID" ]]; then
             LAUNCH+=(--resume "$SESSION_ID")
         else
-            LAUNCH+=(--session-id "$(uuidgen | tr '[:upper:]' '[:lower:]')")
+            NEW_SESSION_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+            LAUNCH+=(--session-id "$NEW_SESSION_ID")
+            # stamp the caller-generated id before launch -- _stream re-stamps
+            # it from the stream, but a boot-window abort (a pause landing
+            # before the first frame) must still leave a resumable session
+            if [[ -n "${STEP_ID:-}" ]]; then
+                STAMP_ARGS=(--agent=claude)
+                [[ -n "$RECORD_MODEL" ]] && STAMP_ARGS+=(--model="$RECORD_MODEL")
+                fractal step _session "$STEP_ID" "$NEW_SESSION_ID" \
+                    "${STAMP_ARGS[@]}" --path="$WORKTREE_DIR" 2>/dev/null || true
+            fi
         fi
     fi
     ERR_FILE="$NODE_DIR/claude.err"
@@ -129,7 +153,7 @@ if [[ "$AGENT_BASE_COMMAND" == "claude" ]]; then
     # each pipe stage's status from PIPESTATUS instead of aborting on failure
     cd "$WORKTREE_DIR"
     set +e
-    "${LAUNCH[@]}" 2>"$ERR_FILE" \
+    python3 -c "$GROUPED" "$NODE_DIR/.step_pgid" "${LAUNCH[@]}" 2>"$ERR_FILE" \
         | fractal _stream ${STREAM_STEP[@]+"${STREAM_STEP[@]}"} \
             --path="$WORKTREE_DIR" "${STREAM_ARGS[@]}"
     # copy PIPESTATUS in one shot -- a simple assignment resets it, so reading
@@ -160,7 +184,8 @@ elif [[ "$AGENT_BASE_COMMAND" == "codex" ]]; then
     # can't truncate the log
     cd "$WORKTREE_DIR"
     set +e
-    CODEX_HOME="$NODE_DIR/.codex" "${LAUNCH[@]}" 2>"$ERR_FILE" \
+    CODEX_HOME="$NODE_DIR/.codex" python3 -c "$GROUPED" \
+        "$NODE_DIR/.step_pgid" "${LAUNCH[@]}" 2>"$ERR_FILE" \
         | fractal _stream ${STREAM_STEP[@]+"${STREAM_STEP[@]}"} \
             --path="$WORKTREE_DIR" "${STREAM_ARGS[@]}"
     # copy PIPESTATUS in one shot -- a simple assignment resets it, so reading
@@ -173,6 +198,9 @@ fi
 
 # ------ attribute the outcome
 
+# the invocation is over -- drop the group handle so a later pause/kill can
+# never signal a recycled pgid
+rm -f "$NODE_DIR/.step_pgid"
 # clear any stale marker; _run.sh reads it to label a failed step/iter honestly
 rm -f "$NODE_DIR/.fail_reason"
 STATUS=0

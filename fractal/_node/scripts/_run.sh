@@ -23,10 +23,12 @@ WAIT=""
 MAX_COST=""
 MAX_ITER_COST=""
 RESERVE_BUDGET=""
+CONTINUE=false
 RESUME=false
 
 ITER=0
 TIMED_OUT=false
+PAUSED=false
 RUN_TIMEOUT_SECONDS=-1
 ITER_TIMEOUT_SECONDS=-1
 STEP_TIMEOUT_SECONDS=-1
@@ -45,8 +47,9 @@ The command is the agent invocation (e.g. "claude" or "codex").
 If omitted, it is read from the node's config.json (set by --agent at init).
 
 Options:
-    --resume     Resume a stopped/exited node (clean worktree, continue iterations)
-    --help|-h    Show this help message
+    --continue    Continue a stopped/exited node (clean worktree, further iterations)
+    --resume      Resume a paused node (adopt its open run where the pause left it)
+    --help|-h     Show this help message
 
 Run parameters (max-iters, timeout, iter-timeout, step-timeout, interval,
 sleep, wait, max-cost, max-iter-cost, max-step-cost) are read from the
@@ -112,6 +115,9 @@ for arg in "$@"; do
     case "$arg" in
         --help | -h)
             usage
+            ;;
+        --continue)
+            CONTINUE=true
             ;;
         --resume)
             RESUME=true
@@ -261,8 +267,8 @@ if [[ "$INTERVAL_SECONDS" -gt 0 ]]; then
 fi
 
 # SYNC_MODE gates the SYNC step run before each step; unlike the prompt-injection modes
-# (DETACHED_MODE/RESUME_MODE/RESERVE_MODE/META_MODE) SYNC.md is run as its own step,
-# not appended to step prompts (the mode-append loop skips it)
+# (DETACHED_MODE/CONTINUE_MODE/RESUME_MODE/RESERVE_MODE/META_MODE) SYNC.md is run as
+# its own step, not appended to step prompts (the mode-append loop skips it)
 SYNC_MODE=$(fractal config _get sync --path="$WORKTREE_DIR" 2>/dev/null || echo "true")
 [[ -z "$SYNC_MODE" ]] && SYNC_MODE=true
 
@@ -353,6 +359,7 @@ export INTERVAL_SECONDS
 export ITER
 
 export DETACHED_MODE="$DETACHED"
+export CONTINUE_MODE="$CONTINUE"
 export RESUME_MODE="$RESUME"
 export META_MODE
 export META_TARGET
@@ -392,19 +399,33 @@ check_finish() {
     return 0
 }
 
+check_pause() {
+    if fractal signal _get pause --path="$WORKTREE_DIR" --run="$RUN_ID" 2>/dev/null; then
+        echo ""
+        echo "=== Pause requested ==="
+        echo ""
+        return 1
+    fi
+    return 0
+}
+
 descendants_active() {
-    # check via --live (not cached registry)
+    # check via --live (not cached registry); a paused descendant still
+    # counts -- it is frozen mid-work and drains only after resume, so a
+    # finishing parent must wait for it, never complete over it; one query
+    # for both statuses, so a child flipping between them mid-poll is never
+    # missed by two separate snapshots
     local N
-    N=$(fractal node list --status=active --live --count \
+    N=$(fractal node list --status=active,paused --live --count \
         --path="$WORKTREE_DIR" 2>/dev/null || echo 0)
     [[ "$N" -gt 0 ]]
 }
 
 wait_for_children() {
     # wait for descendants to drain; SYNC between polls if enabled
-    # returns 1 if interrupted (stop/timeout), 0 otherwise -- the
-    # interrupts are mandatory: a crashed-but-active child would
-    # otherwise hang the wait forever
+    # returns 1 if interrupted (pause/stop/timeout, with PAUSED set on a
+    # pause), 0 otherwise -- the interrupts are mandatory: a
+    # crashed-but-active child would otherwise hang the wait forever
     local WAIT_CONTEXT="$1"
     local SYNC_FILE="$MODES_DIR/SYNC.md"
     local SAVED_LABEL="${STEP_LABEL:-}"
@@ -422,6 +443,11 @@ wait_for_children() {
         while [[ "$WAITED" -lt "$WAIT_SECONDS" ]]; do
             sleep "$POLL_INTERVAL"
             WAITED=$((WAITED + POLL_INTERVAL))
+            if ! check_pause 2>/dev/null; then
+                PAUSED=true
+                export STEP_LABEL="$SAVED_LABEL"
+                return 1
+            fi
             if ! check_stop 2>/dev/null; then
                 export STEP_LABEL="$SAVED_LABEL"
                 return 1
@@ -454,11 +480,21 @@ wait_for_children() {
                 --path="$WORKTREE_DIR")
             [[ "$STEP_ID" =~ ^[0-9]+$ ]] || STEP_ID=""
 
-            run_step "$SYNC_FILE" 0 || true
+            local SYNC_RC=0
+            run_step "$SYNC_FILE" 0 || SYNC_RC=$?
 
+            # a pause abort landing on this SYNC is a park, not a completion;
+            # the wait's next poll parks the loop
+            local SYNC_STATUS="completed"
+            if [[ "$SYNC_RC" -ne 0 ]] && { [[ -f "$NODE_DIR/.pause_abort" ]] \
+                || fractal signal _get pause \
+                    --path="$WORKTREE_DIR" --run="$RUN_ID" 2>/dev/null; }; then
+                rm -f "$NODE_DIR/.pause_abort"
+                SYNC_STATUS="paused"
+            fi
             if [[ -n "$STEP_ID" ]]; then
                 fractal step _end "$STEP_ID" --path="$WORKTREE_DIR" \
-                    --status=completed --exit-code=0 2>/dev/null || true
+                    --status="$SYNC_STATUS" --exit-code=0 2>/dev/null || true
             fi
 
             echo "--- SYNC (waiting for children): done ---"
@@ -735,6 +771,7 @@ build_step_prompt() {
         --var "ITER_REF=$ITER_REF" \
         --var "TIME_BUDGET=$TIME_BUDGET" \
         --var "COST_BUDGET=$COST_BUDGET" \
+        --var "CONTINUE_MODE=$CONTINUE_MODE" \
         --var "RESUME_MODE=$RESUME_MODE" \
         --var "RESERVE_MODE=$RESERVE_MODE"
 }
@@ -944,6 +981,21 @@ run_iter() {
         REQUIRES_APPROVAL=$(parse_step_requires_approval "$STEP_FILE")
         export STEP_LABEL="step $STEP_NUM of $STEP_COUNT ($STEP_NAME)"
 
+        # re-enter an adopted iteration at its interrupted step -- the steps
+        # before it already ran before the pause; a re-entry past the last
+        # step (an approved final step) means the iteration's work is done,
+        # so run none of it and let the iteration close normally
+        if [[ -n "$RESUME_STEP_NUM" ]]; then
+            if [[ "$RESUME_STEP_NUM" -gt "$STEP_COUNT" ]]; then
+                RESUME_STEP_NUM=""
+                return 0
+            fi
+            if [[ "$STEP_NUM" -lt "$RESUME_STEP_NUM" ]]; then
+                continue
+            fi
+            RESUME_STEP_NUM=""
+        fi
+
         if [[ "$RESERVE" != true ]] && [[ -n "$MAX_ITER_COST" ]]; then
             local ITER_SPENT
             ITER_SPENT=$(fractal node cost spent --iter="$ITER_ID" \
@@ -967,6 +1019,13 @@ run_iter() {
             fi
         fi
 
+        # park before the step (step 1 included -- a pause landing during
+        # setup must not buy a whole agent turn); no commit: the dirty
+        # worktree is the frozen mid-iteration state resume continues from
+        if ! check_pause; then
+            PAUSED=true
+            return 0
+        fi
         if [[ "$STEP_NUM" -gt 1 ]]; then
             check_stop || break
             # hard subtree ceiling: a spawn-heavy iteration can blow the budget
@@ -1005,6 +1064,16 @@ run_iter() {
                 local SYNC_STATUS="exited"
                 local SYNC_EXIT_CODE=1
                 echo "--- SYNC (before $STEP_NAME): timed out ---"
+            elif [[ "$EXIT_CODE" -ne 0 ]] && { [[ -f "$NODE_DIR/.pause_abort" ]] \
+                || fractal signal _get pause \
+                    --path="$WORKTREE_DIR" --run="$RUN_ID" 2>/dev/null; }; then
+                # the abort was pause's kill landing on the SYNC invocation --
+                # park before launching the step's own agent
+                rm -f "$NODE_DIR/.pause_abort"
+                SYNC_STATUS="paused"
+                SYNC_EXIT_CODE=0
+                PAUSED=true
+                echo "--- SYNC (before $STEP_NAME): paused ---"
             elif [[ "$EXIT_CODE" -ne 0 ]]; then
                 SYNC_STATUS="failed"
                 SYNC_EXIT_CODE=1
@@ -1020,6 +1089,9 @@ run_iter() {
                     --status="$SYNC_STATUS" --exit-code="$SYNC_EXIT_CODE" 2>/dev/null || true
             fi
 
+            if [[ "$PAUSED" == true ]]; then
+                return 0
+            fi
             # SYNC failure is non-fatal; timeout is fatal
             if [[ "$EXIT_CODE" -eq 124 ]]; then
                 echo "--- Committing directly (SYNC timed out) ---"
@@ -1040,6 +1112,11 @@ run_iter() {
             && fractal signal _get finish --path="$WORKTREE_DIR" \
                 --run="$RUN_ID" 2>/dev/null; then
             if ! wait_for_children "before $STEP_NAME"; then
+                # a pause parks the drain as-is (no commit); the finish signal
+                # survives on the adopted run and re-arms the wait after resume
+                if [[ "$PAUSED" == true ]]; then
+                    return 0
+                fi
                 if [[ "$STARTED" == true ]]; then
                     echo "--- Committing directly (wait-for-children interrupted) ---"
                     bash "$PACKAGE_DIR/_node/scripts/_commit.sh" --path="$WORKTREE_DIR" \
@@ -1089,6 +1166,21 @@ run_iter() {
             EXIT_CODE=0
             STEP_BUDGET_SKIP=true
             echo "--- Step $STEP_NUM/$STEP_COUNT ($STEP_NAME): skipped (over budget) ---"
+        elif [[ "$EXIT_CODE" -ne 0 ]] && { [[ -f "$NODE_DIR/.pause_abort" ]] \
+            || fractal signal _get pause \
+                --path="$WORKTREE_DIR" --run="$RUN_ID" 2>/dev/null; }; then
+            # the abort was pause's kill, not an agent failure: record the step
+            # paused (resume re-enters here on a fresh row) and reset EXIT_CODE
+            # so the failure return below -- whose force-commit would bury the
+            # frozen mid-step worktree -- never fires; the durable abort marker
+            # backs the signal, which a racing resume may already have withdrawn
+            rm -f "$NODE_DIR/.pause_abort"
+            STEP_STATUS="paused"
+            STEP_EXIT_CODE=0
+            EXIT_CODE=0
+            PAUSED=true
+            echo "--- Step $STEP_NUM/$STEP_COUNT ($STEP_NAME):" \
+                "paused (${STEP_DURATION}s) ---"
         elif [[ "$EXIT_CODE" -ne 0 ]]; then
             STEP_STATUS="failed"
             STEP_EXIT_CODE=1
@@ -1101,7 +1193,8 @@ run_iter() {
         fi
 
         # --- approval wait loop ---
-        if [[ "$EXIT_CODE" -eq 0 ]] && [[ "$REQUIRES_APPROVAL" == "true" ]] \
+        if [[ "$EXIT_CODE" -eq 0 ]] && [[ "$PAUSED" != true ]] \
+            && [[ "$REQUIRES_APPROVAL" == "true" ]] \
             && [[ -n "$STEP_ID" ]] && [[ "$RESERVE" != true ]]; then
             echo "--- Step $STEP_NUM/$STEP_COUNT ($STEP_NAME):" \
                 "awaiting approval (step_id=$STEP_ID) ---"
@@ -1115,6 +1208,11 @@ run_iter() {
                 while [[ "$WAITED" -lt "$WAIT_SECONDS" ]]; do
                     sleep "$POLL_INTERVAL"
                     WAITED=$((WAITED + POLL_INTERVAL))
+                    if ! check_pause 2>/dev/null; then
+                        PAUSED=true
+                        APPROVAL_INTERRUPTED=true
+                        break
+                    fi
                     if ! check_stop 2>/dev/null || ! check_finish 2>/dev/null; then
                         APPROVAL_INTERRUPTED=true
                         break
@@ -1153,11 +1251,23 @@ run_iter() {
                         --path="$WORKTREE_DIR")
                     [[ "$STEP_ID" =~ ^[0-9]+$ ]] || STEP_ID=""
 
-                    run_step "$SYNC_FILE" 0 || true
+                    local SYNC_RC=0
+                    run_step "$SYNC_FILE" 0 || SYNC_RC=$?
 
+                    # a pause abort landing on this SYNC is a park, not a
+                    # completion; the wait's next poll parks the loop
+                    local SYNC_STATUS="completed"
+                    if [[ "$SYNC_RC" -ne 0 ]] \
+                        && { [[ -f "$NODE_DIR/.pause_abort" ]] \
+                            || fractal signal _get pause \
+                                --path="$WORKTREE_DIR" --run="$RUN_ID" \
+                                2>/dev/null; }; then
+                        rm -f "$NODE_DIR/.pause_abort"
+                        SYNC_STATUS="paused"
+                    fi
                     if [[ -n "$STEP_ID" ]]; then
                         fractal step _end "$STEP_ID" --path="$WORKTREE_DIR" \
-                            --status=completed --exit-code=0 2>/dev/null || true
+                            --status="$SYNC_STATUS" --exit-code=0 2>/dev/null || true
                     fi
                     STEP_ID="$AWAIT_STEP_ID"
 
@@ -1167,7 +1277,15 @@ run_iter() {
             done
 
             if [[ "$APPROVAL_INTERRUPTED" == true ]]; then
-                if [[ "$TIMED_OUT" == true ]]; then
+                if [[ "$PAUSED" == true ]]; then
+                    # a pause parks the wait as-is: the step's work is done but
+                    # unapproved -- resume reads the recorded approval and either
+                    # skips past this step or re-runs it (re-arming the wait)
+                    STEP_STATUS="paused"
+                    STEP_EXIT_CODE=0
+                    echo "--- Step $STEP_NUM/$STEP_COUNT ($STEP_NAME):" \
+                        "paused awaiting approval ---"
+                elif [[ "$TIMED_OUT" == true ]]; then
                     STEP_STATUS="exited"
                     STEP_EXIT_CODE=1
                     echo "--- Step $STEP_NUM/$STEP_COUNT ($STEP_NAME):" \
@@ -1202,6 +1320,12 @@ run_iter() {
             case "$STEP_STATUS" in
                 exited) STEP_REASON="timed out" ;;
                 stopped) [[ "${STEP_BUDGET_SKIP:-false}" == true ]] && STEP_REASON="over budget" ;;
+                paused)
+                    # the awaiting-approval marker drives resume's re-entry: an
+                    # approved step is skipped past, not re-run
+                    [[ "${APPROVAL_INTERRUPTED:-false}" == true ]] \
+                        && STEP_REASON="awaiting approval"
+                    ;;
                 failed)
                     if [[ -f "$NODE_DIR/.fail_reason" ]]; then
                         STEP_REASON=$(cat "$NODE_DIR/.fail_reason")
@@ -1229,6 +1353,12 @@ run_iter() {
             fi
         fi
 
+        # park after recording the paused step -- no commit; the dirty
+        # worktree is the frozen mid-step state resume continues from
+        if [[ "$PAUSED" == true ]]; then
+            return 0
+        fi
+
         if [[ "$EXIT_CODE" -ne 0 ]]; then
             if [[ "$STARTED" == true ]]; then
                 echo "--- Committing directly (step failed/timed out) ---"
@@ -1240,22 +1370,22 @@ run_iter() {
     done
 }
 
-# ------ resume mode
+# ------ continue mode
 
-if [[ "$RESUME" == true ]]; then
+if [[ "$CONTINUE" == true ]]; then
     # preserve operator edits: the documented steering flow edits node-dir files
     # between runs without committing, and the checkout/clean below would revert
     # them -- commit them first; --no-verify like every backstop save (a host
     # hook must not veto it); no || true: failing loud beats destroying the edits
     if [[ -n "$(git -C "$WORKTREE_DIR" status --porcelain -- "$NODE_DIR")" ]]; then
-        echo "Resuming: committing operator edits under .fractal/$CURRENT_BRANCH..."
+        echo "Continuing: committing operator edits under .fractal/$CURRENT_BRANCH..."
         git -C "$WORKTREE_DIR" add -A -- "$NODE_DIR"
         git -C "$WORKTREE_DIR" commit --no-verify \
-            -m "$CURRENT_BRANCH: operator edits (committed at resume)"
+            -m "$CURRENT_BRANCH: operator edits (committed at continue)"
     fi
-    echo "Resuming: cleaning uncommitted changes..."
+    echo "Continuing: cleaning uncommitted changes..."
     # preserve config.json across the clean -- the documented way to re-tune before
-    # resuming (e.g. adjust max_iters), and the agent never owns it; ITER is
+    # continuing (e.g. adjust max_iters), and the agent never owns it; ITER is
     # not reseeded, so each run counts from 1 (max_iters caps iterations per run)
     CONFIG_BACKUP=$(mktemp)
     cp "$NODE_DIR/config.json" "$CONFIG_BACKUP" 2>/dev/null || true
@@ -1317,10 +1447,10 @@ if [[ "$DETACHED" == true ]]; then
 else
     RUN_MODE_LABEL="continuous"
 fi
-if [[ "$RESUME" == true ]]; then
-    RESUME_LABEL="yes"
+if [[ "$CONTINUE" == true ]]; then
+    CONTINUE_LABEL="yes"
 else
-    RESUME_LABEL="no"
+    CONTINUE_LABEL="no"
 fi
 if [[ "$SYNC_MODE" == true ]]; then
     SYNC_LABEL="yes"
@@ -1338,7 +1468,7 @@ echo "  iterations: $MAX_LABEL | timeout: $TIMEOUT_LABEL" \
     "| interval: $INTERVAL_LABEL | sleep: $SLEEP_LABEL" \
     "| max-cost: $COST_LABEL | max-iter-cost: $ITER_COST_LABEL" \
     "| max-step-cost: $STEP_COST_LABEL" \
-    "| mode: $RUN_MODE_LABEL | resume: $RESUME_LABEL | sync: $SYNC_LABEL | wait: $WAIT_LABEL"
+    "| mode: $RUN_MODE_LABEL | continue: $CONTINUE_LABEL | sync: $SYNC_LABEL | wait: $WAIT_LABEL"
 
 # pricing.json is needed when a step will run an agent that needs pricing with a
 # model to price -- the step's own model, or the node default; an agent that
@@ -1374,7 +1504,7 @@ fi
 # 'idle' (indistinguishable from a never-started node) and loses the diagnosis in
 # the dying tmux pane -- instead persist a short reason to .fail_reason (surfaced
 # by `node status`/`activity`) and stamp the honest terminal 'exited', which both
-# names the failure and unwedges recovery (--resume accepts 'exited'; a plain
+# names the failure and unwedges recovery (--continue accepts 'exited'; a plain
 # start refuses with a restart hint rather than silently re-failing)
 abort_preflight() {
     local REASON="$1"
@@ -1428,10 +1558,57 @@ if needs_pricing "$AGENT_BASE_COMMAND" && [[ -n "$NODE_MODEL" ]]; then
     fi
 fi
 
-RUN_ID=$(fractal run _start --path="$WORKTREE_DIR")
-if [[ -z "$RUN_ID" || ! "$RUN_ID" =~ ^[0-9]+$ ]]; then
-    echo "Error: failed to start run" >&2
-    exit 1
+# adopt the paused run on a resume relaunch: pause parks with the run and
+# iteration rows open, and `run _start` would close them as orphaned and
+# re-arm the full budget -- the resume boot must reuse them instead; the
+# adoption context (open run, newest iteration, re-entry step) is resolved
+# in core by `run _open`
+ADOPT_ITER_ID=""
+RESUME_STEP_NUM=""
+if [[ "$RESUME" == true ]]; then
+    ADOPT=$(fractal run _open --path="$WORKTREE_DIR" 2>/dev/null || true)
+    if [[ -z "$ADOPT" ]]; then
+        # one retry insulates a transient read failure (a contended DB) from
+        # the honest no-open-run abort below
+        sleep 2
+        ADOPT=$(fractal run _open --path="$WORKTREE_DIR" 2>/dev/null || true)
+    fi
+    IFS=',' read -r RUN_ID ADOPT_ITER ADOPT_ITER_ID RESUME_STEP_NUM <<<"$ADOPT"
+    if [[ -z "$RUN_ID" || ! "$RUN_ID" =~ ^[0-9]+$ ]]; then
+        echo "Error: no open run to adopt -- was the node paused?" >&2
+        abort_preflight "no open run to adopt"
+    fi
+    if [[ -n "$ADOPT_ITER_ID" ]]; then
+        # the pause landed inside this iteration: reuse its open row (the
+        # loop's increment lands back on its number)
+        ITER=$((ADOPT_ITER - 1))
+    elif [[ "$ADOPT_ITER" =~ ^[0-9]+$ ]]; then
+        # boundary pause: the iteration closed before the park -- continue
+        # the count from it (the increment opens the next one)
+        ITER="$ADOPT_ITER"
+    fi
+    # withdraw the pause signals that parked this run (the finish_cancel
+    # precedent) -- the first checkpoint would otherwise re-park on them;
+    # done here, not by the resume CLI, so a bare --resume launch
+    # (e.g. after a filesystem transplant) self-clears too
+    fractal signal _clear pause --path="$WORKTREE_DIR" --run="$RUN_ID" \
+        2>/dev/null || true
+    # close the pause span for the deadline credit even when no resume CLI
+    # ran (a bare --resume launch) -- a resume event with no open pause
+    # is inert to the credit walk, so the CLI-then-boot double write is safe
+    RESUME_EVENT_ID=$(fractal event _start resume --run="$RUN_ID" \
+        --path="$WORKTREE_DIR" 2>/dev/null || true)
+    if [[ "$RESUME_EVENT_ID" =~ ^[0-9]+$ ]]; then
+        fractal event _end "$RESUME_EVENT_ID" --status=completed \
+            --path="$WORKTREE_DIR" 2>/dev/null || true
+    fi
+    echo "Resuming run $RUN_ID where the pause left it"
+else
+    RUN_ID=$(fractal run _start --path="$WORKTREE_DIR")
+    if [[ -z "$RUN_ID" || ! "$RUN_ID" =~ ^[0-9]+$ ]]; then
+        echo "Error: failed to start run" >&2
+        exit 1
+    fi
 fi
 # the agent subprocess (and `fractal commit` under it)
 # records events against this lineage explicitly
@@ -1477,10 +1654,51 @@ _on_exit() {
 }
 trap _on_exit EXIT
 
+# a loop that boots into a pausing/paused subtree parks immediately: the pause
+# fan-out cannot have signaled a node whose start was still in flight when it
+# swept; a resume relaunch is exempt from the ancestor walk (its fan-out is
+# leaf-first, so ancestors legitimately still read paused while a child boots)
+# but not from a NEW tree-wide brake landing during the relaunch window; left
+# unset (not =()) on a fresh boot so the +-expansion is safe under set -u on
+# bash 3.2, where expanding an empty array errors
+if [[ "$RESUME" == true ]]; then
+    LATCH_ARGS=(--tree)
+fi
+if LATCHED=$(fractal node _latched ${LATCH_ARGS[@]+"${LATCH_ARGS[@]}"} \
+    --path="$WORKTREE_DIR" 2>/dev/null); then
+    echo "=== Parked at boot: $LATCHED is paused ==="
+    fractal signal _set pause "via pause latch ($LATCHED)" \
+        --path="$WORKTREE_DIR" 2>/dev/null || true
+    # open the pause span -- without the instant, the parked time would
+    # burn against this run's deadline at resume
+    PAUSE_EVENT_ID=$(fractal event _start pause \
+        --metadata="via pause latch ($LATCHED)" --run="$RUN_ID" \
+        --path="$WORKTREE_DIR" 2>/dev/null || true)
+    if [[ "$PAUSE_EVENT_ID" =~ ^[0-9]+$ ]]; then
+        fractal event _end "$PAUSE_EVENT_ID" --status=completed \
+            --path="$WORKTREE_DIR" 2>/dev/null || true
+    fi
+    fractal _status paused --path="$WORKTREE_DIR" || true
+    exit 0
+fi
+
 # compute the whole-run deadline once -- the per-iteration deadline (below)
-# resets each pass, but the run wall clock is fixed for this invocation
+# resets each pass, but the run wall clock is fixed for this invocation; an
+# adopted run anchors on the Python reading, which credits the paused spans
+# (wall clock alone would charge the frozen time against the deadline)
 if [[ "$RUN_TIMEOUT_SECONDS" -gt 0 ]]; then
-    RUN_END_EPOCH=$(($(date +%s) + RUN_TIMEOUT_SECONDS))
+    if [[ "$RESUME" == true ]]; then
+        RUN_REMAINING=$(fractal node time remaining --scope=run \
+            --path="$WORKTREE_DIR" 2>/dev/null || echo "")
+        RUN_REMAINING="${RUN_REMAINING%s}"
+        if [[ "$RUN_REMAINING" =~ ^[0-9]+$ ]]; then
+            RUN_END_EPOCH=$(($(date +%s) + RUN_REMAINING))
+        else
+            RUN_END_EPOCH=$(($(date +%s) + RUN_TIMEOUT_SECONDS))
+        fi
+    else
+        RUN_END_EPOCH=$(($(date +%s) + RUN_TIMEOUT_SECONDS))
+    fi
 else
     RUN_END_EPOCH=0
 fi
@@ -1528,9 +1746,21 @@ while true; do
     ITER_LABEL=$(iter_label)
     export ITER_LABEL
 
-    # reset the per-iteration deadline (the run deadline is fixed for the run)
+    # reset the per-iteration deadline (the run deadline is fixed for the run);
+    # an adopted iteration anchors on the credited Python reading, like the run
     if [[ "$ITER_TIMEOUT_SECONDS" -gt 0 ]]; then
-        ITER_END_EPOCH=$(($(date +%s) + ITER_TIMEOUT_SECONDS))
+        if [[ -n "$ADOPT_ITER_ID" ]]; then
+            ITER_REMAINING=$(fractal node time remaining --scope=iter \
+                --path="$WORKTREE_DIR" 2>/dev/null || echo "")
+            ITER_REMAINING="${ITER_REMAINING%s}"
+            if [[ "$ITER_REMAINING" =~ ^[0-9]+$ ]]; then
+                ITER_END_EPOCH=$(($(date +%s) + ITER_REMAINING))
+            else
+                ITER_END_EPOCH=$(($(date +%s) + ITER_TIMEOUT_SECONDS))
+            fi
+        else
+            ITER_END_EPOCH=$(($(date +%s) + ITER_TIMEOUT_SECONDS))
+        fi
     else
         ITER_END_EPOCH=0
     fi
@@ -1577,15 +1807,27 @@ while true; do
     echo ""
     echo "=== Iteration $ITER_LABEL at $ITER_TIMESTAMP ==="
 
-    # check signals before starting
-    if ! check_finish; then
-        wait_for_children "run end" || true
+    # check signals before starting (pause outranks stop/finish: it parks the
+    # run with the other signals intact, to fire after resume) -- except on
+    # an adopted iteration: it IS the current iteration a pending finish or
+    # stop lets run out, so only pause can pre-empt its re-entry (the
+    # post-iteration checks below still fire once it closes)
+    if ! check_pause; then
+        PAUSED=true
         break
     fi
-    check_stop || break
+    if [[ -z "$ADOPT_ITER_ID" ]]; then
+        if ! check_finish; then
+            wait_for_children "run end" || true
+            break
+        fi
+        check_stop || break
+    fi
 
-    # reset the per-iteration session map (sessions are per-agent, per-iteration)
-    if [[ "$DETACHED" == false ]]; then
+    # reset the per-iteration session map (sessions are per-agent,
+    # per-iteration) -- except when adopting a paused iteration, whose map
+    # holds the interrupted step's resumable session
+    if [[ "$DETACHED" == false ]] && [[ -z "$ADOPT_ITER_ID" ]]; then
         fractal session _clear --path="$WORKTREE_DIR" 2>/dev/null || true
     fi
 
@@ -1594,11 +1836,17 @@ while true; do
         fractal _pricing --max-age=24h
     fi
 
-    ITER_ID=$(fractal iter _start \
-        "$RUN_ID" --iter="$ITER" --path="$WORKTREE_DIR")
-    if [[ -z "$ITER_ID" || ! "$ITER_ID" =~ ^[0-9]+$ ]]; then
-        echo "Error: failed to start iteration $ITER" >&2
-        break
+    # reuse the adopted iteration's open row; a fresh iteration opens its own
+    if [[ -n "$ADOPT_ITER_ID" ]]; then
+        ITER_ID="$ADOPT_ITER_ID"
+        ADOPT_ITER_ID=""
+    else
+        ITER_ID=$(fractal iter _start \
+            "$RUN_ID" --iter="$ITER" --path="$WORKTREE_DIR")
+        if [[ -z "$ITER_ID" || ! "$ITER_ID" =~ ^[0-9]+$ ]]; then
+            echo "Error: failed to start iteration $ITER" >&2
+            break
+        fi
     fi
     export ITER_ID
 
@@ -1623,6 +1871,18 @@ while true; do
         run_iter && ITER_FAILED=false || ITER_FAILED=true
     fi
     ITER_DURATION=$((SECONDS - ITER_START))
+
+    # park mid-iteration: skip the commit backstop (the dirty worktree is the
+    # frozen mid-step state resume continues from) and leave the iteration row
+    # open for resume to adopt
+    if [[ "$PAUSED" == true ]]; then
+        break
+    fi
+
+    # the re-entry marker and resume framing apply to the adopted pass only;
+    # later iterations run normally, with normal prompts
+    RESUME_STEP_NUM=""
+    export RESUME_MODE=false
 
     # ensure iteration committed
     if ! bash "$PACKAGE_DIR/_node/scripts/_commit.sh" --path="$WORKTREE_DIR" \
@@ -1689,7 +1949,12 @@ while true; do
     # by check_finish just below, which drains children and breaks the loop
     check_reserve_boundary || true
 
-    # check signals after iteration
+    # check signals after iteration (pause first, mirroring the pre-iteration
+    # order)
+    if ! check_pause; then
+        PAUSED=true
+        break
+    fi
     if ! check_finish; then
         wait_for_children "run end" || true
         break
@@ -1721,14 +1986,57 @@ while true; do
         fi
         if [[ "$SLEEP_AMOUNT" -gt 0 ]]; then
             echo "Sleeping ${SLEEP_LABEL_TEXT}..."
-            sleep "$SLEEP_AMOUNT"
+            # sleep in chunks, polling for pause -- an interval node would
+            # otherwise not park until its next wake, hours away
+            SLEPT=0
+            while [[ "$SLEPT" -lt "$SLEEP_AMOUNT" ]]; do
+                SLEEP_CHUNK=$((SLEEP_AMOUNT - SLEPT))
+                [[ "$SLEEP_CHUNK" -gt 30 ]] && SLEEP_CHUNK=30
+                sleep "$SLEEP_CHUNK"
+                SLEPT=$((SLEPT + SLEEP_CHUNK))
+                if ! check_pause 2>/dev/null; then
+                    PAUSED=true
+                    break 2
+                fi
+            done
         fi
     fi
 done
 
+# drain backstop: a resume can re-enter at the loop's max-iters or timeout
+# gate without reaching an in-loop drain -- a pending finish must still wait
+# for the subtree before the cascade below stamps completed; idempotent for
+# normal exits (a drained finish returns immediately), and a pause landing
+# here parks like any other
+if [[ "$PAUSED" != true ]] \
+    && fractal signal _get finish --path="$WORKTREE_DIR" --run="$RUN_ID" 2>/dev/null; then
+    wait_for_children "run end" || true
+fi
+
+# park: the pause terminal -- stamp paused and leave the run and iteration rows
+# open for resume to adopt; no run _end, no exit signal, and no commit sweep
+# (the dirty worktree is the frozen mid-step state resume continues from); the
+# EXIT trap reads the paused stamp and leaves it alone
+if [[ "$PAUSED" == true ]]; then
+    # (re)open the pause span at the park instant -- a duplicate pause event
+    # collapses in the credit walk, and a park after a withdrawn pause
+    # (whose resume event closed the span) would otherwise burn its parked
+    # wall-clock against the adopted deadlines
+    PAUSE_EVENT_ID=$(fractal event _start pause --metadata="parked" \
+        --run="$RUN_ID" --path="$WORKTREE_DIR" 2>/dev/null || true)
+    if [[ "$PAUSE_EVENT_ID" =~ ^[0-9]+$ ]]; then
+        fractal event _end "$PAUSE_EVENT_ID" --status=completed \
+            --path="$WORKTREE_DIR" 2>/dev/null || true
+    fi
+    fractal _status paused --path="$WORKTREE_DIR" || true
+    echo ""
+    echo "=== Paused (resume with: fractal node resume) ==="
+    exit 0
+fi
+
 # final safety sweep: a trailing step (e.g. a wind-down after a finish/ceiling
 # signal) can write to the worktree after the last per-iteration commit -- commit
-# it so the node never exits unclean, which a later --resume (`git clean -fd`)
+# it so the node never exits unclean, which a later --continue (`git clean -fd`)
 # would otherwise discard; mirrors the in-loop backstop: check (porcelain) then
 # --force; `kill` bypasses this by design (abrupt stop)
 if ! bash "$PACKAGE_DIR/_node/scripts/_commit.sh" --path="$WORKTREE_DIR" \

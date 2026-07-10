@@ -7,8 +7,10 @@ the parts of the signal/boundary surface the existing suite leaves uncovered.
 
 - the guards from every *non-active* lifecycle status (terminal states and
   ``retired``), proving a finished/killed/retired node cannot be re-signalled;
-- the ``active`` allow-path -- ``finish``/``stop`` record a signal but leave the
-  node ``active`` for the loop to act on;
+- the ``active`` allow-path -- ``finish``/``stop``/``pause`` record a signal but
+  leave the node ``active`` for the loop to act on;
+- the tree-wide brake -- ``fractal pause`` latches the root against new work,
+  and ``fractal resume`` withdraws the pending pause and lifts the latch;
 - ``kill``'s node/row status agreement -- the node and every active run/iteration/
   step row all land on ``killed`` together;
 - the double-signal sequencing (``stop`` after ``finish`` is allowed; ``kill`` is
@@ -52,7 +54,8 @@ from .conftest import _run
 
 __all__ = [
     'test_signal_rejected_from_non_active_status',
-    'test_active_node_accepts_finish_and_stop',
+    'test_active_node_accepts_graceful_signals',
+    'test_tree_pause_latches_and_resume_releases',
     'test_finish_cancel_withdraws_the_pending_signal',
     'test_list_surfaces_pending_signal_and_filters_on_base',
     'test_kill_marks_node_and_active_rows_killed',
@@ -66,11 +69,13 @@ __all__ = [
 ]
 
 
-# (finish, stop, kill) all require ``active``; the kill message names the status
+# (finish, stop, pause, kill) all require ``active`` (kill also accepts
+# ``paused``, covered separately); the kill message names the status
 _REJECT_MESSAGES = {
     'finish': 'Cannot finish: node is not active.',
     'stop': 'Cannot stop: node is not active.',
-    'kill': 'Cannot kill: node is not active (status: {status}).',
+    'pause': 'Cannot pause: node is not active.',
+    'kill': 'Cannot kill: node is not active or paused (status: {status}).',
 }
 
 
@@ -138,13 +143,13 @@ def live_loop() -> Iterator[Callable[[pathlib.Path], None]]:
     'status',
     ['completed', 'stopped', 'exited', 'killed', 'retired'],
 )
-@pytest.mark.parametrize('command', ['finish', 'stop', 'kill'])
+@pytest.mark.parametrize('command', ['finish', 'stop', 'pause', 'kill'])
 def test_signal_rejected_from_non_active_status(
     repo: dict,
     command: str,
     status: str,
 ) -> None:
-    """``finish``/``stop``/``kill`` are rejected from every non-active status.
+    """``finish``/``stop``/``pause``/``kill`` are rejected from settled statuses.
 
     A finished, stopped, exited, killed, or retired node is not running, so
     each signal must fail with a clear ``RuntimeError`` (exit 1, message on
@@ -163,18 +168,19 @@ def test_signal_rejected_from_non_active_status(
 # ------ active allow-path
 
 
-@pytest.mark.parametrize('signal', ['finish', 'stop'])
-def test_active_node_accepts_finish_and_stop(
+@pytest.mark.parametrize('signal', ['finish', 'stop', 'pause'])
+def test_active_node_accepts_graceful_signals(
     repo: dict,
     signal: str,
     live_loop: Callable[[pathlib.Path], None],
 ) -> None:
-    """``finish``/``stop`` record a signal but leave the node ``active``.
+    """``finish``/``stop``/``pause`` record a signal, leaving the node ``active``.
 
-    The signal is the loop's cue to wind down after the current iteration/step;
-    the node stays ``active`` until the loop itself writes the terminal status,
-    so the command must not flip the status on its own. The live session models
-    the running loop (without it, finish/stop reconcile the node to ``exited``).
+    The signal is the loop's cue to wind down (or park) after the current
+    iteration/step; the node stays ``active`` until the loop itself writes
+    the terminal status, so the command must not flip the status on its own.
+    The live session models the running loop (without it, the commands
+    reconcile the node to ``exited``).
     """
     wt, _ = _arm(repo['root'], f'arm_{signal}')
     live_loop(wt)
@@ -184,8 +190,69 @@ def test_active_node_accepts_finish_and_stop(
     count = f"SELECT COUNT(*) FROM signals WHERE node='{wt.name}' AND signal='{signal}'"
     assert _cell(wt, count) == '1'
     # the node stays active, now with the pending signal surfaced
-    suffix = 'stopping' if signal == 'stop' else 'finishing'
+    suffix = {'finish': 'finishing', 'stop': 'stopping', 'pause': 'pausing'}[signal]
     assert _run(wt, 'node', 'status').stdout.strip() == f'active ({suffix})'
+
+
+def test_tree_pause_latches_and_resume_releases(
+    tmp_path_factory: pytest.TempPathFactory,
+    live_loop: Callable[[pathlib.Path], None],
+) -> None:
+    """Tree-wide pause brakes the whole tree; tree-wide resume releases it.
+
+    ``fractal pause`` at the repo root fans out from the user node and
+    latches the root, so even a depth-1 init -- whose only ancestor is the
+    statusless user root -- refuses while the tree is braked, and a second
+    brake is a clean no-op. ``fractal resume`` withdraws a still-parking
+    node's pause (its live loop then never parks) and lifts the latch. A
+    private repo: tree-wide commands sweep every node, so the shared
+    module repo's leftovers would bleed into the counts. The live session
+    models the running loop (status reads reconcile an active node with no
+    session to ``exited``).
+    """
+    root = tmp_path_factory.mktemp(f'fractal_brake_{uuid.uuid4().hex[:8]}')
+    _git(root, 'init', '-b', 'main')
+    _git(root, 'config', 'user.email', 'brake@test.local')
+    _git(root, 'config', 'user.name', 'brake')
+    (root / 'README.md').write_text('# brake\n', encoding='utf-8')
+    wiki = root / 'wiki'
+    wiki.mkdir()
+    (wiki / '_index.md').write_text(
+        '---\nname: wiki\n---\n# wiki\n\n***\n',
+        encoding='utf-8',
+    )
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-m', 'init')
+    assert _run(root, 'init').returncode == 0
+    wt, _ = _arm(root, 'brakeme')
+    live_loop(wt)
+
+    # the brake: fans out from the user node and latches the root
+    result = _run(root, 'pause', '--reason', 'drill')
+    assert result.returncode == 0
+    assert 'Pause signal sent to 1 node' in result.stdout
+    assert _run(wt, 'node', 'status').stdout.strip() == 'active (pausing)'
+    # the latch refuses new work, even at depth 1
+    refused = _run(root, 'node', 'init', 'latched_out', '--agent', 'claude')
+    assert refused.returncode == 1
+    assert 'Cannot spawn under a paused node' in refused.stderr
+    # re-braking an already-signaled tree is a clean no-op
+    again = _run(root, 'pause')
+    assert again.returncode == 0
+    assert 'No active nodes to pause' in again.stdout
+
+    # the release: withdraws the pending pause (the live loop never parks)
+    # and lifts the latch
+    released = _run(root, 'resume')
+    assert released.returncode == 0
+    assert 'Resumed 1 node' in released.stdout
+    assert _run(wt, 'node', 'status').stdout.strip() == 'active'
+    allowed = _run(root, 'node', 'init', 'latched_out', '--agent', 'claude')
+    assert allowed.returncode == 0, allowed.stderr
+    # releasing a tree with nothing parked reports the no-op
+    idle = _run(root, 'resume')
+    assert idle.returncode == 0
+    assert 'No paused nodes to resume.' in idle.stdout
 
 
 def test_finish_cancel_withdraws_the_pending_signal(
@@ -528,12 +595,13 @@ def test_step_approve_is_parent_only_and_validates_the_step(repo: dict) -> None:
 def test_exit_signal_round_trips_through_the_crud(repo: dict) -> None:
     """``exit`` is a loop-only signal -- CRUD round-trip, but no ``node`` command.
 
-    Of the four signal names (``finish``/``stop``/``kill``/``exit``), only ``exit``
-    has no ``node`` sub-command: the loop sets it itself via ``signal _set exit`` at
-    the end of a run that wound down without an explicit finish/stop (``_run.sh``).
-    So ``exit`` must round-trip through the low-level signal CRUD like the others --
-    ``_get`` is exit-coded (1 unset, 0 set) and echoes the reason, and ``_list
-    --signal`` narrows to it -- while ``node exit`` is not a command at all.
+    Of the five signal names (``finish``/``stop``/``kill``/``pause``/``exit``),
+    only ``exit`` has no ``node`` sub-command: the loop sets it itself via
+    ``signal _set exit`` at the end of a run that wound down without an explicit
+    finish/stop (``_run.sh``). So ``exit`` must round-trip through the low-level
+    signal CRUD like the others -- ``_get`` is exit-coded (1 unset, 0 set) and
+    echoes the reason, and ``_list --signal`` narrows to it -- while ``node exit``
+    is not a command at all.
     """
     wt, _ = _arm(repo['root'], 'exitsig')
     # unset -> exit 1, nothing on stdout

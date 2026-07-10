@@ -38,7 +38,7 @@ __all__ = [
 _READ_TIMEOUT_S = 0.25
 
 # the pending-signal precedence (the most severe set this run wins the display)
-_SIGNAL_PRECEDENCE = ('kill', 'stop', 'finish', 'exit')
+_SIGNAL_PRECEDENCE = ('kill', 'pause', 'stop', 'finish', 'exit')
 
 
 def leaf_of(branch: str) -> str:

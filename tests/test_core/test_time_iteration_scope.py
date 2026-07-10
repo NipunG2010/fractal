@@ -13,8 +13,8 @@ scenarios:
 
 - a run that has already cycled through a long completed iteration before the
   active one (a "sum the run's iterations" bug would zero the budget); and
-- a sequence of nearly-exhausted-then-ended runs followed by a fresh resume (a
-  "sum across runs" rollup would clamp the resume to ``0``).
+- a sequence of nearly-exhausted-then-ended runs followed by a fresh continue
+  (a "sum across runs" rollup would clamp the continue to ``0``).
 
 Uses the in-process ``node_with_db`` fixture and back-dates ``started_at`` to
 simulate elapsed time deterministically (no sleeps), mirroring
@@ -28,7 +28,7 @@ from tests._helpers import _age_iter
 
 __all__ = [
     'test_remaining_scopes_to_active_iteration_within_run',
-    'test_remaining_does_not_accumulate_across_resumes',
+    'test_remaining_does_not_accumulate_across_continues',
 ]
 
 # a 10-minute per-iteration budget, in the suffix form the loop validates
@@ -65,15 +65,15 @@ def test_remaining_scopes_to_active_iteration_within_run(node_with_db: Node) -> 
     assert 578.0 < remaining <= ITER_TIMEOUT_SECONDS - 20.0
 
 
-def test_remaining_does_not_accumulate_across_resumes(node_with_db: Node) -> None:
-    """Repeated resumes never accumulate elapsed; each gets the full budget.
+def test_remaining_does_not_accumulate_across_continues(node_with_db: Node) -> None:
+    """Repeated continues never accumulate elapsed; each gets the full budget.
 
     The cost budget is an accumulating quantity; the per-iteration time budget is not.
     Two runs each nearly exhaust the per-iteration budget and end, then a third
-    run (the resume) starts a fresh iteration. ``--iter-timeout`` auto-resolves to
-    that live run and reports ~585s left -- the full budget minus only its own
+    run (the continue) starts a fresh iteration. ``--iter-timeout`` auto-resolves
+    to that live run and reports ~585s left -- the full budget minus only its own
     ~15s. A rollup that summed elapsed across runs would sum ``590 + 590 + 15``
-    and clamp the resume to ``0``.
+    and clamp the continue to ``0``.
     """
     node = node_with_db
     node.config_set(iter_timeout=ITER_TIMEOUT)
@@ -84,11 +84,11 @@ def test_remaining_does_not_accumulate_across_resumes(node_with_db: Node) -> Non
         _age_iter(node, iter_id, 590.0)
         node.iter_end(iter_id=iter_id, status='completed', exit_code=0)
         node.run_end(run_id=run_id, status='completed', exit_code=0)
-    # resume: a fresh run + iteration, only ~15s elapsed
-    resume = node.run_start()
-    iter3 = node.iter_start(run_id=resume, iter=3)
+    # continue: a fresh run + iteration, only ~15s elapsed
+    continued = node.run_start()
+    iter3 = node.iter_start(run_id=continued, iter=3)
     _age_iter(node, iter3, 15.0)
     remaining = node.time_remaining(scope='iter')
-    # the resume gets the full budget back, not the across-run-summed 0
+    # the continue gets the full budget back, not the across-run-summed 0
     assert remaining is not None
     assert 583.0 < remaining <= ITER_TIMEOUT_SECONDS - 15.0

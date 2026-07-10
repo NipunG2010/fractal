@@ -11,8 +11,9 @@ Usage: start.sh <path> [options]
 Launch a node in a tmux session.
 
 Options:
-    --resume     Resume a stopped/exited node (clean worktree, continue iterations)
-    --help|-h    Show this help message
+    --continue    Continue a stopped/exited node (clean worktree, further iterations)
+    --resume      Resume a paused node (adopt its open run where the pause left it)
+    --help|-h     Show this help message
 
 Run parameters come from the node's config.json (set at init, editable before start).
 USAGE

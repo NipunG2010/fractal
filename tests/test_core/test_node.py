@@ -16,6 +16,7 @@ import pytest
 import fractal.core
 from fractal.cli.utils import init_node, resolve_init_target, resolve_node
 from fractal.core.node import Node, _find_worktree
+from tests._helpers import _age_iter, _age_run, _past_timestamp
 
 from .conftest import _make_git_repo, _parse_project_dir, _resolve_branch
 
@@ -82,10 +83,10 @@ __all__ = [
     'test_start_rejects_user',
     'test_start_rejects_non_positive_max_cost',
     'test_start_only_from_idle',
-    'test_start_resume_from_terminal',
-    'test_start_resume_re_arms_after_drained_run',
+    'test_start_continue_from_terminal',
+    'test_start_continue_re_arms_after_drained_run',
     'test_start_without_max_cost_warns_and_runs',
-    'test_start_resume_reconciles_crashed_active',
+    'test_start_continue_reconciles_crashed_active',
     'test_reject_active_op_reconciles_crashed_node',
     'test_reconcile_closes_crashed_runs_open_rows',
     'test_tmux_probe_treats_missing_binary_as_no_session',
@@ -126,6 +127,20 @@ __all__ = [
     'test_kill_recurses_to_descendants',
     'test_signals_reach_deep_through_inactive_intermediate',
     'test_kill_propagates_deep_status_and_keeps_worktrees',
+    'test_pause_rejects_non_active',
+    'test_pause_signals_and_decorates',
+    'test_paused_rejects_all_but_resume_and_kill',
+    'test_kill_reaps_a_paused_node',
+    'test_reconcile_leaves_paused_untouched',
+    'test_resume_requires_paused',
+    'test_resume_withdraws_a_pausing_node',
+    'test_pause_fans_out_top_down_and_resume_leaf_first',
+    'test_pause_latch_blocks_spawn_and_start',
+    'test_tree_pause_latches_depth_one',
+    'test_time_remaining_credits_paused_spans',
+    'test_run_open_resolves_re_entry',
+    'test_step_pending_supersedes_stale_twin',
+    'test_destroy_refuses_paused_nodes',
     'test_list_returns_nodes',
     'test_list_hides_retired',
     'test_list_all_shows_retired',
@@ -147,7 +162,7 @@ __all__ = [
     'test_init_on_existing_node_refuses_loudly',
     'test_cost_remaining',
     'test_cost_remaining_scopes_to_per_level_caps',
-    'test_cost_spent_reads_current_run_after_resume',
+    'test_cost_spent_reads_current_run_after_continue',
     'test_cost_untracked_distinguishes_null_from_zero',
     'test_cost_untracked_subtree_flags_untracked_child',
     'test_kill_marks_all_active',
@@ -156,10 +171,10 @@ __all__ = [
     'test_max_depth_ancestor_enforcement',
     'test_max_descendants_counts_only_unsettled',
     'test_spawn_limit_enforced_inside_lock',
-    'test_resume_re_checks_width_gate',
-    'test_resume_re_checks_descendant_gate',
+    'test_continue_re_checks_width_gate',
+    'test_continue_re_checks_descendant_gate',
     'test_spawn_gate_reconciles_crashed_active',
-    'test_resume_gate_reconciles_crashed_active',
+    'test_continue_gate_reconciles_crashed_active',
     'test_unretire_re_checks_width_gate',
     'test_unretire_re_checks_descendant_gate',
     'test_unretire_settled_restore_passes_at_cap',
@@ -1864,7 +1879,7 @@ def test_status_returns_stored_value(node_with_db: Node) -> None:
     assert node.status() == 'completed'
 
 
-@pytest.mark.parametrize('invalid_status', ['running', 'paused', 'unknown', ''])
+@pytest.mark.parametrize('invalid_status', ['running', 'suspended', 'unknown', ''])
 def test_status_set_validates(
     node_with_db: Node,
     invalid_status: str,
@@ -1983,44 +1998,44 @@ def test_start_rejects_non_positive_max_cost(
 
 
 def test_start_only_from_idle(node_with_db: Node) -> None:
-    """Start without resume raises from non-idle status."""
+    """Start without continue raises from non-idle status."""
     node = node_with_db
     # set status to a terminal state
     node.status_set('completed')
-    # verify start rejects without resume
+    # verify start rejects without continue
     with pytest.raises(RuntimeError):
         node.start()
 
 
 @pytest.mark.parametrize('status', ['completed', 'stopped', 'exited', 'killed'])
-def test_start_resume_from_terminal(node_with_db: Node, status: str) -> None:
-    """Start with resume succeeds from every resumable terminal status."""
+def test_start_continue_from_terminal(node_with_db: Node, status: str) -> None:
+    """Start with continue succeeds from every continuable terminal status."""
     node = node_with_db
     # configure a cost budget (required to start)
     node.config_set(max_cost=1.0)
     # set the node to a terminal status
     node.status_set(status)
-    # verify resume works (mock shell script)
+    # verify continue works (mock shell script)
     with patch.object(node, '_run_script'):
-        node.start(resume=True)
+        node.start(continue_run=True)
 
 
-def test_start_resume_re_arms_after_drained_run(node_with_db: Node) -> None:
-    """A resume re-arms the full cap: prior-run spend never blocks a launch.
+def test_start_continue_re_arms_after_drained_run(node_with_db: Node) -> None:
+    """A continue re-arms the full cap: prior-run spend never blocks a launch.
 
     Runs are isolated by design: a launch after a drained run proceeds with the
     full ``max_cost`` re-armed -- there is no lifetime gate reading prior spend.
     """
     node = node_with_db
     node.config_set(max_cost=0.15)
-    # run 1 drains past the cap, then exits (the resume-re-arm setup)
+    # run 1 drains past the cap, then exits (the continue-re-arm setup)
     run_1 = node.run_start()
     _record_step_cost(node, run_id=run_1, cost=0.20)
     node.run_end(run_id=run_1, status='exited', exit_code=1)
     node.status_set('exited')
     # the launch re-arms the full cap and proceeds
     with patch.object(node, '_run_script') as run_script:
-        node.start(resume=True)
+        node.start(continue_run=True)
     assert run_script.called
 
 
@@ -2043,24 +2058,24 @@ def test_start_without_max_cost_warns_and_runs(
     assert 'without a cost cap' in capsys.readouterr().err
 
 
-def test_start_resume_reconciles_crashed_active(node_with_db: Node) -> None:
-    """``--resume`` recovers a crashed-but-active node whose session is gone.
+def test_start_continue_reconciles_crashed_active(node_with_db: Node) -> None:
+    """``--continue`` recovers a crashed-but-active node whose session is gone.
 
     A loop that dies without ending leaves the status ``active`` with no tmux
-    session, which would wedge ``--resume`` (it rejects an active status). With
-    the session provably gone (one-loop-per-node), start reconciles the status
-    to the honest ``exited`` terminal and proceeds -- re-arming to ``idle``
-    under the resume gate.
+    session, which would wedge ``--continue`` (it rejects an active status).
+    With the session provably gone (one-loop-per-node), start reconciles the
+    status to the honest ``exited`` terminal and proceeds -- re-arming to
+    ``idle`` under the continue gate.
     """
     node = node_with_db
     # configure a cost budget (required to start)
     node.config_set(max_cost=1.0)
     # crashed loop: status active but no tmux session
     node.status_set('active')
-    # verify resume reconciles to exited and launches (mock session + shell)
+    # verify continue reconciles to exited and launches (mock session + shell)
     with patch.object(node, '_tmux_session_exists', return_value=False):
         with patch.object(node, '_run_script') as run_script:
-            node.start(resume=True)
+            node.start(continue_run=True)
     assert run_script.called
     # healed to exited mid-flight, then re-armed idle by the gate
     assert node.status() == 'idle'
@@ -2386,7 +2401,7 @@ def test_delete_rejects_active_descendant(
     # the kid is genuinely running (live session), so delete
     # must refuse rather than reconcile it away
     monkeypatch.setattr(Node, '_tmux_session_exists', lambda self: True)
-    with pytest.raises(RuntimeError, match='active descendant'):
+    with pytest.raises(RuntimeError, match='active or paused descendant'):
         Node(parent_wt).delete()
 
     # nothing was torn down
@@ -3033,7 +3048,7 @@ def test_list_renders_config_caps_over_stale_registry(
     """
     parent, child = _spawn_parent_child(git_repo, monkeypatch)
     # seed the registry cap via the blessed path, then top up config only --
-    # the rescue move (config edit + resume, no node update)
+    # the rescue move (config edit + continue, no node update)
     parent.child_update('kid', max_cost=12.0)
     child.config_set(max_cost=15.0)
     # both listing flavors render the config cap
@@ -3115,6 +3130,413 @@ def test_kill_propagates_deep_status_and_keeps_worktrees(
     # kill never removes worktrees -- the whole chain stays on disk
     for node in (p, c, g):
         assert node.exists()
+
+
+# ------ pause / resume
+
+
+def test_pause_rejects_non_active(node_with_db: Node) -> None:
+    """Pause raises when node is not active."""
+    node = node_with_db
+    # set status to idle
+    node.status_set('idle')
+    # verify pause rejects
+    with pytest.raises(RuntimeError, match='not active'):
+        node.pause()
+
+
+def test_pause_signals_and_decorates(node_with_db: Node) -> None:
+    """Pause sets the pause signal, logs its event, and decorates the display."""
+    node = node_with_db
+    node.status_set('active')
+    node.run_start()
+    # pause (mock shell script: the abort is pause.sh's job)
+    with patch.object(node, '_run_script'):
+        result = node.pause(reason='cooling off')
+    assert 'Pause signal sent to 1 node' in result
+    # the signal carries the reason and the display shows the pending park
+    assert node.signal_get('pause') == 'cooling off'
+    assert node.status_display() == 'active (pausing)'
+    # the pause event is bracketed completed
+    events = node.db.read('events', where={'node': node._branch, 'event': 'pause'})
+    assert [event['status'] for event in events] == ['completed']
+
+
+def test_paused_rejects_all_but_resume_and_kill(node_with_db: Node) -> None:
+    """A paused node admits only resume, kill, and (fork-only) chat.
+
+    Merge/delete/retire would act on the frozen mid-step worktree, and
+    start (fresh or ``--continue``) would git-clean it and re-arm the
+    budget -- every other path must refuse and name the way out.
+    """
+    node = node_with_db
+    node.status_set('paused')
+    with pytest.raises(RuntimeError, match='Resume or kill it first'):
+        node.merge()
+    with pytest.raises(RuntimeError, match='Resume or kill it first'):
+        node.delete()
+    with pytest.raises(RuntimeError, match='Resume or kill it first'):
+        node.retire()
+    with pytest.raises(RuntimeError, match='Resume it first'):
+        node.start()
+    with pytest.raises(RuntimeError, match='Resume it first'):
+        node.start(continue_run=True)
+
+
+def test_kill_reaps_a_paused_node(node_with_db: Node) -> None:
+    """Kill accepts a paused node and closes its open rows ``killed``.
+
+    The escape hatch: a parked subtree has no loop to signal, so kill is
+    pure bookkeeping -- rows close, the status lands ``killed``, and the
+    node becomes continue-eligible.
+    """
+    node = node_with_db
+    node.status_set('active')
+    run_id = node.run_start()
+    node.status_set('paused')
+    # kill the parked node (mock shell script: nothing is alive to reap)
+    with patch.object(node, '_run_script'):
+        node.kill(reason='abandoning the experiment')
+    assert node.status() == 'killed'
+    # the open run row closed killed
+    run = node.db.read('runs', where={'run_id': run_id})[0]
+    assert run['status'] == 'killed'
+    assert run['ended_at'] is not None
+
+
+def test_reconcile_leaves_paused_untouched(node_with_db: Node) -> None:
+    """A paused node with no tmux session is parked, not crashed.
+
+    No session is paused's *normal* state (the loop exits at pause; resume
+    relaunches it, on this host or after a transplant) -- the crashed-active
+    heal must never relabel it ``exited`` or close its open rows.
+    """
+    node = node_with_db
+    node.status_set('active')
+    run_id = node.run_start()
+    node.status_set('paused')
+    # the loop is gone -- exactly how a paused node looks
+    with patch.object(node, '_tmux_session_exists', return_value=False):
+        # a reject-active op runs the reconcile first; it must land on the
+        # paused guard, not relabel the node exited and merge it
+        with pytest.raises(RuntimeError, match='paused'):
+            node.merge()
+    assert node.status() == 'paused'
+    # the open run row survived for resume to adopt
+    run = node.db.read('runs', where={'run_id': run_id})[0]
+    assert run['ended_at'] is None
+
+
+def test_resume_requires_paused(node_with_db: Node) -> None:
+    """Resume raises unless the node is paused, then relaunches it."""
+    node = node_with_db
+    node.status_set('idle')
+    # verify resume rejects
+    with pytest.raises(RuntimeError, match='not paused'):
+        node.resume()
+    # a paused node resumes (mock shell script: the relaunch is resume.sh's job)
+    node.status_set('paused')
+    with patch.object(node, '_run_script'):
+        result = node.resume()
+    assert 'Resumed 1 node' in result
+    # the resume event is bracketed completed
+    events = node.db.read('events', where={'node': node._branch, 'event': 'resume'})
+    assert [event['status'] for event in events] == ['completed']
+
+
+def test_resume_withdraws_a_pausing_node(node_with_db: Node) -> None:
+    """Resume on a still-parking node withdraws its pause instead of failing.
+
+    Between the pause command and the loop's park the node is ``active``
+    with a pending pause signal; a resume in that window cannot relaunch a
+    live loop, so it clears the signal -- the loop then never parks -- and
+    closes the pause span for the deadline credit.
+    """
+    node = node_with_db
+    node.status_set('active')
+    node.run_start()
+    with patch.object(node, '_run_script'):
+        node.pause(reason='hold')
+    assert node.signal_get('pause') is not None
+    # resume in the parking window: withdrawal, never a relaunch
+    with patch.object(node, '_run_script') as run_script:
+        result = node.resume()
+    assert 'Resumed 1 node' in result
+    assert node.signal_get('pause') is None
+    assert not run_script.called
+    # the pause span is closed for the credit walk
+    events = node.db.read('events', where={'node': node._branch, 'event': 'resume'})
+    assert [event['status'] for event in events] == ['completed']
+
+
+def test_pause_fans_out_top_down_and_resume_leaf_first(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pause reaches the parent before the child; resume inverts the order.
+
+    Top-down pause means a parent parks before its children and can never
+    drain-complete over them mid-fan-out; leaf-first resume means every
+    child is running again before its parent's drain-waits can look. The
+    event rows record the actual order.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # pause the parent -- the active child is signaled too, with attribution
+    with patch.object(Node, '_run_script'):
+        result = parent.pause(reason='hold')
+    assert 'Pause signal sent to 2 nodes' in result
+    assert parent.signal_get('pause') == 'hold'
+    assert child.signal_get('pause') == 'hold (via pause of main.parent)'
+    # the fan-out ran parent first (shallowest first)
+    pause_events = parent.db.read('events', where={'event': 'pause'})
+    pause_events.sort(key=lambda event: event['event_id'])
+    assert [event['node'] for event in pause_events] == [
+        'main.parent',
+        'main.parent.kid',
+    ]
+    # both loops park (simulated -- the loops are mocked here)
+    parent.status_set('paused')
+    child.status_set('paused')
+    # resume the parent -- the child relaunches first (deepest first)
+    with patch.object(Node, '_run_script'):
+        result = parent.resume()
+    assert 'Resumed 2 nodes' in result
+    resume_events = parent.db.read('events', where={'event': 'resume'})
+    resume_events.sort(key=lambda event: event['event_id'])
+    assert [event['node'] for event in resume_events] == [
+        'main.parent.kid',
+        'main.parent',
+    ]
+
+
+def test_pause_latch_blocks_spawn_and_start(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A paused (or pausing) ancestor refuses new spawns and starts.
+
+    The latch closes the fan-out race: a node born or started into a
+    pausing subtree would run unfrozen inside a "paused" tree, so
+    ``init``/``start`` refuse until resume.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    parent_dir = parent._root / '.fractal' / 'main.parent'
+    # a parked parent latches its subtree
+    parent.status_set('paused')
+    child.status_set('stopped')
+    with pytest.raises(RuntimeError, match='under a paused node'):
+        child.start(continue_run=True)
+    monkeypatch.setenv('_NODE', f'{parent_dir}')
+    with pytest.raises(RuntimeError, match='Cannot spawn under a paused node'):
+        Node(git_repo).init(name='kid2')
+    monkeypatch.delenv('_NODE')
+    # a still-active parent with a pending pause signal latches too
+    parent.status_set('active')
+    parent.signal_set('pause', 'incoming')
+    with pytest.raises(RuntimeError, match='under a paused node'):
+        child.start(continue_run=True)
+
+
+def test_tree_pause_latches_depth_one(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user-node pause brakes the whole tree, depth-1 included.
+
+    A depth-1 node's only ancestor is the statusless user root, so the
+    ancestor walk alone cannot latch it -- the tree-wide brake writes the
+    root marker that init/start consult, and the tree-wide release lifts
+    it again.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # an idle depth-1 sibling, initialized before the brake
+    Node(git_repo).init(name='newtop')
+    newtop = Node(git_repo / '.worktrees' / 'main.newtop')
+    user = Node(git_repo)
+    with patch.object(Node, '_run_script'):
+        result = user.pause(reason='brake')
+    assert 'Pause signal sent to 2 nodes' in result
+    # the latch refuses a depth-1 spawn and a depth-1 start
+    with pytest.raises(RuntimeError, match='Cannot spawn under a paused node'):
+        Node(git_repo).init(name='another')
+    with pytest.raises(RuntimeError, match='Cannot start under a paused node'):
+        newtop.start()
+    # both loops park (simulated), then the tree-wide release lifts the latch
+    parent.status_set('paused')
+    child.status_set('paused')
+    with patch.object(Node, '_run_script'):
+        result = user.resume()
+    assert 'Resumed 2 nodes' in result
+    with patch.object(newtop, '_run_script'):
+        newtop.start()
+    Node(git_repo).init(name='another')
+
+
+def test_time_remaining_credits_paused_spans(node_with_db: Node) -> None:
+    """Run and iteration deadlines credit the time spent paused.
+
+    The rows stay open across a pause, so the raw wall clock would charge
+    the frozen span against ``--timeout``/``--iter-timeout`` and a long
+    pause would end the run the moment it resumed. The pause/resume event
+    instants give the span back; an iteration credits only the part inside
+    it.
+    """
+    node = node_with_db
+    node.config_set(timeout='10m', iter_timeout='5m')
+    node.status_set('active')
+    run_id = node.run_start()
+    _age_run(node, run_id, 300.0)
+    iter_id = node.iter_start(run_id=run_id, iter=1)
+    _age_iter(node, iter_id, 150.0)
+    # a pause span from 240s ago to 60s ago (180s parked; 90s inside the iter)
+    for event, seconds_ago in (('pause', 240.0), ('resume', 60.0)):
+        event_id = node.event_start(event)
+        node.event_end(event_id=event_id, status='completed')
+        node.db.update(
+            {'created_at': _past_timestamp(seconds_ago)},
+            'events',
+            where={'event_id': event_id},
+        )
+    # run: 600 - (300 elapsed - 180 credit) = 480
+    run_remaining = node.time_remaining(scope='run', run_id=run_id)
+    assert run_remaining is not None
+    assert 470.0 < run_remaining <= 481.0
+    # iter: 300 - (150 elapsed - 90 credit clipped to the iter) = 240
+    iter_remaining = node.time_remaining(scope='iter', run_id=run_id)
+    assert iter_remaining is not None
+    assert 230.0 < iter_remaining <= 241.0
+    # a failed resume never relaunched the loop: the span it would have
+    # closed stays open and keeps accruing (pause 30s ago -> ~30s more)
+    for event, status, seconds_ago in (
+        ('pause', 'completed', 30.0),
+        ('resume', 'failed', 10.0),
+    ):
+        event_id = node.event_start(event)
+        node.event_end(event_id=event_id, status=status)
+        node.db.update(
+            {'created_at': _past_timestamp(seconds_ago)},
+            'events',
+            where={'event_id': event_id},
+        )
+    # run: 600 - (300 elapsed - (180 + ~30) credit) = ~510
+    run_remaining = node.time_remaining(scope='run', run_id=run_id)
+    assert run_remaining is not None
+    assert 500.0 < run_remaining <= 511.0
+
+
+def test_run_open_resolves_re_entry(node_with_db: Node) -> None:
+    """``run_open`` derives the re-entry from completed rows and approvals.
+
+    The completed rows say where the pause left the iteration (a checkpoint
+    or drain park writes no paused row); an approved awaiting-approval step
+    is skipped past even when a later pause cycle wrote a newer paused row
+    at the next step -- the lookup is scoped per step, so nothing shadows
+    an earlier approval.
+    """
+    node = node_with_db
+    node.status_set('active')
+    run_id = node.run_start()
+    # no iterations yet: only the run is adoptable
+    context = node.run_open()
+    assert context == {
+        'run_id': run_id,
+        'iter': None,
+        'iter_id': None,
+        'resume_step': None,
+    }
+    iter_id = node.iter_start(run_id=run_id, iter=1)
+    # steps 1-2 completed, step 3 paused awaiting approval (then approved),
+    # step 4 paused by a later cycle (a plain mid-step abort)
+    for number in (1, 2):
+        step_id = node.step_start(
+            iter_id=iter_id,
+            run_id=run_id,
+            step=number,
+            step_name='WORK',
+        )
+        node.step_end(step_id=step_id, status='completed', exit_code=0)
+    awaiting = node.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=3,
+        step_name='GATE',
+    )
+    node.step_pending(step_id=awaiting)
+    node.step_end(
+        step_id=awaiting,
+        status='paused',
+        exit_code=0,
+        metadata='awaiting approval',
+    )
+    shadowing = node.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=4,
+        step_name='WORK',
+    )
+    node.step_end(step_id=shadowing, status='paused', exit_code=0)
+    # unapproved: re-entry holds at the awaiting step
+    context = node.run_open()
+    assert context is not None
+    assert context['iter_id'] == iter_id
+    assert context['resume_step'] == 3
+    # approved while parked: re-entry skips past it, undeterred by the
+    # newer paused row at step 4
+    node.step_approve(step_id=awaiting)
+    context = node.run_open()
+    assert context is not None
+    assert context['resume_step'] == 4
+    # a closed newest iteration anchors only the numbering (boundary pause)
+    node.iter_end(iter_id=iter_id, status='completed', exit_code=0)
+    context = node.run_open()
+    assert context is not None
+    assert context['iter'] == 1
+    assert context['iter_id'] is None
+    assert context['resume_step'] is None
+
+
+def test_step_pending_supersedes_stale_twin(node_with_db: Node) -> None:
+    """A re-run step's fresh pending row voids its superseded twin.
+
+    An unapproved pause/resume re-runs the step on a fresh row; the old
+    paused row's pending state would otherwise sit in ``pending`` forever,
+    silently swallowing approvals aimed at it.
+    """
+    node = node_with_db
+    node.status_set('active')
+    run_id = node.run_start()
+    iter_id = node.iter_start(run_id=run_id, iter=1)
+    stale = node.step_start(iter_id=iter_id, run_id=run_id, step=1, step_name='GATE')
+    node.step_pending(step_id=stale)
+    node.step_end(
+        step_id=stale,
+        status='paused',
+        exit_code=0,
+        metadata='awaiting approval',
+    )
+    # the re-run opens a fresh row and re-arms the gate on it alone
+    fresh = node.step_start(iter_id=iter_id, run_id=run_id, step=1, step_name='GATE')
+    node.step_pending(step_id=fresh)
+    rows = {row['step_id']: row['approved'] for row in node.db.read('steps')}
+    assert rows[fresh] == ''
+    assert rows[stale] is None
+
+
+def test_destroy_refuses_paused_nodes(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Destroy refuses over a paused node's frozen work.
+
+    A paused node has no tmux session for ``destroy.sh``'s liveness
+    refusal to catch, yet its worktree holds frozen uncommitted mid-step
+    work -- the teardown must name it and stop.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    child.status_set('paused')
+    parent.status_set('completed')
+    with pytest.raises(RuntimeError, match='paused node'):
+        Node.destroy(git_repo)
 
 
 # ------ list
@@ -3509,7 +3931,7 @@ def test_commit_check_detects_untracked_work(tmp_path: pathlib.Path) -> None:
     force-commits when it reports the tree dirty (``_run.sh``). The tracked-only
     query ``git diff --name-only HEAD`` never lists untracked files, so a step
     that leaves only new untracked work would be reported clean -- the
-    force-commit skipped, and a later ``--resume`` (``git clean -fd``) would
+    force-commit skipped, and a later ``--continue`` (``git clean -fd``) would
     discard the work. ``--check`` must use a query that sees untracked files.
     """
     repo = _make_git_repo(tmp_path / 'repo')
@@ -3544,7 +3966,7 @@ def test_commit_surfaces_hook_aborted_commit(tmp_path: pathlib.Path) -> None:
     pre-commit hook (black/isort reformatting and aborting, or a check-only
     hook failing): the script would report success and push while ``HEAD``
     never advanced, leaving the iteration's work uncommitted and exposed to a
-    later ``--resume`` (``git clean -fd``). The genuine no-op must still
+    later ``--continue`` (``git clean -fd``). The genuine no-op must still
     exit 0; a real hook/commit failure must propagate (non-zero -> RuntimeError).
     """
     repo = _make_git_repo(tmp_path / 'repo')
@@ -3595,7 +4017,7 @@ def test_commit_surfaces_hook_aborted_commit(tmp_path: pathlib.Path) -> None:
     with pytest.raises(RuntimeError):
         node.commit('work', init=True)
     # HEAD did not advance -- the work is genuinely uncommitted, so a masked
-    # "success" would have been a lie that a later --resume could discard
+    # "success" would have been a lie that a later --continue could discard
     assert _head() == head_before
 
 
@@ -3833,7 +4255,7 @@ def test_init_on_existing_node_refuses_loudly(
     Were ``node init`` against an already-initialized node to exit 0 with
     the old node fully in place, the requested caps would silently never
     land while the operator believed they applied. Reuse is explicit in
-    this CLI (``node start --resume``, ``--reset``), so an implicit adopt
+    this CLI (``node start --continue``, ``--reset``), so an implicit adopt
     is refused by name.
     """
     Node(git_repo).init(agent='claude', user=True)
@@ -3914,22 +4336,22 @@ def test_cost_remaining_scopes_to_per_level_caps(node_with_db: Node) -> None:
     assert node.cost_remaining(step_id=step_id) == pytest.approx(0.5)
 
 
-def test_cost_spent_reads_current_run_after_resume(node_with_db: Node) -> None:
+def test_cost_spent_reads_current_run_after_continue(node_with_db: Node) -> None:
     """Bare cost views read the current run only; a prior run needs ``--run``.
 
-    Runs are isolated by design: a resume opens a fresh run, so the bare
+    Runs are isolated by design: a continue opens a fresh run, so the bare
     reading forgets prior spend and ``cost_remaining`` charges ``max_cost``
     with the current run alone. A prior run stays readable via its id.
     """
     node = node_with_db
     node.config_set(max_cost=10.0)
 
-    # run 1 spends, then exits (a resume never reuses a run)
+    # run 1 spends, then exits (a continue never reuses a run)
     run_1 = node.run_start()
     _record_step_cost(node, run_id=run_1, cost=1.75)
     node.run_end(run_id=run_1, status='exited', exit_code=1)
 
-    # run 2 (the resume) spends against a fresh per-run budget
+    # run 2 (the continue) spends against a fresh per-run budget
     run_2 = node.run_start()
     _record_step_cost(node, run_id=run_2, cost=2.25)
 
@@ -4216,16 +4638,16 @@ def test_spawn_limit_enforced_inside_lock(
     assert 'main.parent.kid2' not in branches
 
 
-def test_resume_re_checks_width_gate(
+def test_continue_re_checks_width_gate(
     git_repo: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A resume needs a free width slot: respawn-to-cap refuses the re-arm.
+    """A continue needs a free width slot: respawn-to-cap refuses the re-arm.
 
     Spawn-to-cap -> settle -> respawn hands the settled node's slot to its
-    replacement, so ``--resume`` re-checks the parent's ``max_children`` with
-    the spawn gate's unsettled counting and refuses -- the spawn refusal, no
-    override flag -- while the replacement holds the slot.
+    replacement, so ``--continue`` re-checks the parent's ``max_children``
+    with the spawn gate's unsettled counting and refuses -- the spawn
+    refusal, no override flag -- while the replacement holds the slot.
     """
     parent, child = _spawn_parent_child(git_repo, monkeypatch)
     parent.config_set(max_children=1)
@@ -4235,30 +4657,31 @@ def test_resume_re_checks_width_gate(
     monkeypatch.setenv('_NODE', f'{parent_wt / ".fractal" / "main.parent"}')
     Node(git_repo).init(name='kid2')
     monkeypatch.delenv('_NODE')
-    # the idle replacement holds the only slot -- the resume must refuse
+    # the idle replacement holds the only slot -- the continue must refuse
     with patch.object(child, '_run_script') as run_script:
         with pytest.raises(ValueError, match='Max children reached'):
-            child.start(resume=True)
+            child.start(continue_run=True)
     assert not run_script.called
     # the refused node stays settled -- no half-armed state holds a slot
     assert child.status() == 'exited'
-    # settling the replacement frees the slot; the resume re-arms to idle
+    # settling the replacement frees the slot; the continue re-arms to idle
     kid2 = Node(git_repo / '.worktrees' / 'main.parent.kid2')
     kid2.status_set('completed')
     with patch.object(child, '_run_script'):
-        child.start(resume=True)
+        child.start(continue_run=True)
     assert child.status() == 'idle'
 
 
-def test_resume_re_checks_descendant_gate(
+def test_continue_re_checks_descendant_gate(
     git_repo: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A resume binds on every ancestor's ``max_descendants``, like a spawn.
+    """A continue binds on every ancestor's ``max_descendants``, like a spawn.
 
     With the grandchild ``g`` settled, its slot in ``p``'s subtree goes to
     the re-armed intermediate ``c``; a cap of 1 on ``p`` refuses ``g``'s
-    resume naming the ancestor, and raising it to 2 admits the same resume.
+    continue naming the ancestor, and raising it to 2 admits the same
+    continue.
     """
     p, c, g = _spawn_chain(git_repo, monkeypatch)
     # settle the grandchild; the intermediate holds p's only subtree slot
@@ -4267,13 +4690,13 @@ def test_resume_re_checks_descendant_gate(
     p.config_set(max_descendants=1)
     with patch.object(g, '_run_script') as run_script:
         with pytest.raises(ValueError, match='Max descendants reached') as excinfo:
-            g.start(resume=True)
+            g.start(continue_run=True)
     assert p._branch in str(excinfo.value)
     assert not run_script.called
     # a cap of 2 has a free slot for the re-arm
     p.config_set(max_descendants=2)
     with patch.object(g, '_run_script'):
-        g.start(resume=True)
+        g.start(continue_run=True)
     assert g.status() == 'idle'
 
 
@@ -4302,18 +4725,18 @@ def test_spawn_gate_reconciles_crashed_active(
     assert child.status() == 'exited'
 
 
-def test_resume_gate_reconciles_crashed_active(
+def test_continue_gate_reconciles_crashed_active(
     git_repo: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A crashed sibling's phantom slot never blocks a resume.
+    """A crashed sibling's phantom slot never blocks a continue.
 
     The re-arm counts its crashed-but-active sibling the same way a spawn
     does: healed first (persisted), so the dead loop frees the only width
-    slot and the resume proceeds.
+    slot and the continue proceeds.
     """
     parent, child = _spawn_parent_child(git_repo, monkeypatch)
-    # spawn a sibling and settle it (the node the resume re-arms)
+    # spawn a sibling and settle it (the node the continue re-arms)
     parent_wt = parent._root
     monkeypatch.setenv('_NODE', f'{parent_wt / ".fractal" / "main.parent"}')
     Node(git_repo).init(name='kid2')
@@ -4325,8 +4748,8 @@ def test_resume_gate_reconciles_crashed_active(
     sessions = frozenset({parent._tmux_session_name})
     monkeypatch.setattr('fractal.core.node._live_tmux_sessions', lambda: sessions)
     with patch.object(kid2, '_run_script'):
-        kid2.start(resume=True)
-    # the resume landed and the heal persisted the honest terminal
+        kid2.start(continue_run=True)
+    # the continue landed and the heal persisted the honest terminal
     assert kid2.status() == 'idle'
     assert child.status() == 'exited'
 
@@ -4335,7 +4758,7 @@ def test_unretire_re_checks_width_gate(
     git_repo: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An idle-restoring unretire needs a free width slot, like a resume.
+    """An idle-restoring unretire needs a free width slot, like a continue.
 
     Retire-to-cap -> respawn hands the retired node's slot to its
     replacement, so an unretire that would land ``idle`` re-checks the
@@ -4406,7 +4829,7 @@ def test_unretire_settled_restore_passes_at_cap(
 
     Unretiring a node whose pre-retire status was settled changes nothing
     the width/descendant gates count, so a full tree does not block it:
-    the node lands back on its settled status (a later resume still pays
+    the node lands back on its settled status (a later continue still pays
     the gate).
     """
     parent, child = _spawn_parent_child(git_repo, monkeypatch)
