@@ -3822,6 +3822,79 @@ class Node:
             'META_TARGET': meta,
         }
 
+    def build_prompt(
+        self: Node,
+        step_file: str,
+        *,
+        overrides: Optional[dict[str, str]] = None,
+    ) -> str:
+        """Assemble and render a step's full prompt.
+
+        The prompt is the ``NODE.md`` charter, the step body (frontmatter
+        stripped), and every active mode doc, joined by blank lines and
+        substituted in one pass -- one merged variable map (the
+        :meth:`render_template` merge: ``_render_vars`` under
+        ``overrides``) both selects the active modes and renders the
+        text. A mode doc ``<NAME>.md`` activates when ``<NAME>_MODE`` is
+        ``true`` in that map: static modes (``DETACHED``/``META``) derive
+        from config, run-scoped modes (``CONTINUE``/``RESUME``/
+        ``RESERVE``) ride in as overrides. ``SYNC.md`` never joins --
+        sync runs as its own step.
+
+        Args:
+            step_file: The step markdown file.
+            overrides: Run-scoped variable values (see
+                :meth:`render_template`).
+
+        Returns:
+            The rendered prompt.
+
+        """
+        # merge the variable map once -- it both selects the active modes
+        # and substitutes the assembled text (overrides win)
+        variables = {**self._render_vars(), **(overrides or {})}
+        # assemble: charter, step body (frontmatter stripped), active modes
+        charter = (self._node_dir / 'NODE.md').read_text(encoding='utf-8')
+        step_text = pathlib.Path(step_file).read_text(encoding='utf-8')
+        parts = [charter, '\n', _strip_frontmatter(step_text)]
+        modes_dir = self._package_dir / '_node' / 'modes'
+        for mode_file in sorted(modes_dir.glob('*.md')):
+            if mode_file.name == 'SYNC.md':
+                continue
+            if variables.get(f'{mode_file.stem}_MODE') == 'true':
+                parts += ['\n', mode_file.read_text(encoding='utf-8')]
+        return _VarTemplate(''.join(parts)).safe_substitute(variables)
+
+    def _fenced_update(
+        self: Node,
+        data: dict[str, Any],
+        table: str,
+        *,
+        where: dict[str, Any],
+    ) -> int:
+        """The single write path for lifecycle row transitions.
+
+        Every ``runs``/``iters``/``steps`` transition write (status
+        terminals, the approval gate) routes through here, keeping the
+        transition guards uniform and greppable: a guard in ``where``
+        (e.g. ``ended_at IS NULL``) makes the transition
+        first-writer-wins, and the returned count is the observable
+        verdict -- 0 means another writer already won. The step recorder
+        columns (``session``/``model``/``cost`` and the ``unpriced``
+        marker) deliberately write raw: additive audit figures, safe on
+        closed rows.
+
+        Args:
+            data: Column values to set.
+            table: Lifecycle table (``runs``/``iters``/``steps``).
+            where: Column filters, including the transition guard.
+
+        Returns:
+            Number of rows transitioned.
+
+        """
+        return self.db.update(data, table, where=where)
+
     def _close_open_rows(self: Node, *, status: str, exit_code: int) -> None:
         """Close every still-open run/iteration/step row with a terminal.
 
@@ -3856,7 +3929,7 @@ class Node:
                 'exit_code': exit_code,
                 'ended_at': now,
             }
-            self.db.update(data, table, where={'node': branch, 'ended_at': None})
+            self._fenced_update(data, table, where={'node': branch, 'ended_at': None})
         # stamp the marker on the closed streamed rows (a flush that raced
         # the close strips it again via step_cost)
         for row in unpriced:
@@ -3901,7 +3974,7 @@ class Node:
         status: str,
         exit_code: int,
         metadata: Optional[str] = None,
-    ) -> None:
+    ) -> int:
         """End a run.
 
         First-writer-wins: stamps ``status``, ``exit_code``, and
@@ -3918,6 +3991,9 @@ class Node:
                 iterations``) for visibility in ``node activity``; the metadata
                 column is left untouched when ``None``.
 
+        Returns:
+            Rows transitioned -- 0 when another writer already closed it.
+
         """
         # validate the row status against the known set
         if status not in self._statuses:
@@ -3932,7 +4008,11 @@ class Node:
         # record a reason only when given (don't clobber existing metadata)
         if metadata is not None:
             data['metadata'] = metadata
-        self.db.update(data, 'runs', where={'run_id': run_id, 'ended_at': None})
+        return self._fenced_update(
+            data,
+            'runs',
+            where={'run_id': run_id, 'ended_at': None},
+        )
 
     def run_open(self: Node) -> Optional[dict]:
         """Resolve the open run and re-entry context a resume boot adopts.
@@ -4079,7 +4159,7 @@ class Node:
         status: str,
         exit_code: int,
         metadata: Optional[str] = None,
-    ) -> None:
+    ) -> int:
         """End an iteration.
 
         First-writer-wins via the ``ended_at IS NULL`` guard. Duration is
@@ -4097,6 +4177,9 @@ class Node:
             metadata: Optional short failure reason (e.g. ``timed out``) for
                 visibility in ``node activity``; the metadata column is left
                 untouched when ``None``.
+
+        Returns:
+            Rows transitioned -- 0 when another writer already closed it.
 
         """
         # validate the row status against the known set
@@ -4128,7 +4211,7 @@ class Node:
             models = {row['model'] for row in steps if row['model']}
             if len(models) == 1:
                 data['model'] = models.pop()
-        self.db.update(
+        return self._fenced_update(
             data,
             'iters',
             where={'iter_id': iter_id, 'ended_at': None},
@@ -4231,7 +4314,7 @@ class Node:
         status: str,
         exit_code: int,
         metadata: Optional[str] = None,
-    ) -> None:
+    ) -> int:
         """End a step.
 
         First-writer-wins via the ``ended_at IS NULL`` guard, so a kill
@@ -4255,6 +4338,9 @@ class Node:
                 ``timed out``/``agent error``) for visibility in ``node
                 activity``; the metadata column is left untouched when ``None``.
 
+        Returns:
+            Rows transitioned -- 0 when another writer already closed it.
+
         """
         # validate the row status against the known set
         if status not in self._statuses:
@@ -4276,7 +4362,11 @@ class Node:
             if rows and rows[0]['cost'] is None and rows[0]['session'] is not None:
                 reason = metadata if metadata is not None else rows[0]['metadata']
                 data['metadata'] = f'{reason}; unpriced' if reason else 'unpriced'
-        self.db.update(data, 'steps', where={'step_id': step_id, 'ended_at': None})
+        return self._fenced_update(
+            data,
+            'steps',
+            where={'step_id': step_id, 'ended_at': None},
+        )
 
     def step_pending(
         self: Node,
@@ -4288,19 +4378,30 @@ class Node:
         The ``approved`` column has three states: NULL (does
         not require approval), ``''`` (pending approval),
         and an ISO 8601 timestamp (approved). This method
-        transitions from NULL to ``''``.
+        transitions from NULL to ``''`` -- the guard admits no other
+        starting state, so a stray re-pend can never demote an
+        approval back to pending.
 
         The fresh row supersedes any earlier still-pending row of the same
         iteration step (a re-run after an unapproved pause): the stale row
         would otherwise sit in ``pending`` forever, silently swallowing
-        approvals aimed at it.
+        approvals aimed at it. Superseding is gated on this row winning
+        the mark, and voiding guards on the twin still being pending --
+        a stray re-pend can never void another row's live gate, and an
+        approval landing between the read and the void survives.
 
         Args:
             step_id: Step to mark.
 
         """
         data = {'approved': ''}
-        self.db.update(data, 'steps', where={'step_id': step_id})
+        marked = self._fenced_update(
+            data,
+            'steps',
+            where={'step_id': step_id, 'approved': None},
+        )
+        if not marked:
+            return
         # void superseded pending twins -- only this row's approval counts now
         if rows := self.db.read('steps', where={'step_id': step_id}):
             twins = self.db.read(
@@ -4313,30 +4414,40 @@ class Node:
             )
             for twin in twins:
                 if twin['step_id'] != step_id:
-                    self.db.update(
+                    self._fenced_update(
                         {'approved': None},
                         'steps',
-                        where={'step_id': twin['step_id']},
+                        where={'step_id': twin['step_id'], 'approved': ''},
                     )
 
     def step_approve(
         self: Node,
         *,
         step_id: int,
-    ) -> None:
+    ) -> int:
         """Approve a step (set ``approved`` to the current UTC timestamp).
 
         The low-level write; the step is validated (exists and requires
         approval) by the sole caller ``child_approve`` before the approve
-        event is logged, so this just stamps the timestamp.
+        event is logged. The stamp is a compare-and-swap on the live gate
+        (``approved = ''``): first-approval-wins, so a re-approve keeps
+        the original instant and an approval aimed at a superseded
+        (voided) gate writes nothing instead of resurrecting it.
 
         Args:
             step_id: Step to approve.
 
+        Returns:
+            Rows transitioned -- 0 when the gate was not pending.
+
         """
         now = _utc_now()
         data = {'approved': now}
-        self.db.update(data, 'steps', where={'step_id': step_id})
+        return self._fenced_update(
+            data,
+            'steps',
+            where={'step_id': step_id, 'approved': ''},
+        )
 
     def step_approved(
         self: Node,
@@ -4923,6 +5034,37 @@ class ChatCommand:
 
 
 # ------ helper functions
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Return ``text`` with a leading ``---`` frontmatter block removed.
+
+    Byte-conservative line handling: lines split on the newline byte
+    alone (a CRLF file keeps its carriage returns, so a CRLF fence line
+    is not a fence), the fence check trims leading whitespace only, and
+    a block that never closes swallows the rest of the text; every
+    surviving line comes back newline-terminated, so a file without a
+    trailing newline gains one.
+
+    Args:
+        text: The markdown text.
+
+    Returns:
+        The body below the frontmatter.
+
+    """
+    lines = text.split('\n')
+    # a trailing newline yields a final empty element, not an extra line
+    if lines and lines[-1] == '':
+        lines.pop()
+    if lines and lines[0].lstrip() == '---':
+        for index, line in enumerate(lines[1:], start=1):
+            if line.lstrip() == '---':
+                lines = lines[index + 1 :]
+                break
+        else:
+            lines = []
+    return ''.join(f'{line}\n' for line in lines)
 
 
 @typing.overload

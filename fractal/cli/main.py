@@ -68,7 +68,7 @@ def cli(**kwargs: Any) -> None:
     cmd.node_update(node_app)
     cmd.node_reconcile_caps(node_app)
     cmd.node_latched(node_app)
-    cmd.node_render(node_app)
+    cmd.node_prompt(node_app)
     cmd.time_remaining(time_app)
     cmd.cost_remaining(cost_app)
     cmd.cost_spent(cost_app)

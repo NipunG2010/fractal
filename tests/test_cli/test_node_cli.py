@@ -70,7 +70,7 @@ __all__ = [
     'test_chat_requires_a_prompt',
     'test_chat_rejects_codex_fork',
     'test_chat_current_requires_a_live_session',
-    'test_render_bridge_substitutes_and_overrides',
+    'test_prompt_bridge_assembles_and_renders',
 ]
 
 
@@ -1283,27 +1283,37 @@ def test_chat_current_requires_a_live_session(repo: dict) -> None:
     assert 'live session' in result.stderr.lower()
 
 
-# ------ render
+# ------ prompt
 
 
-def test_render_bridge_substitutes_and_overrides(repo: dict) -> None:
-    """``node _render`` substitutes node vars, applies ``--var``, keeps unknowns."""
-    template = 'wt=$WORKTREE_DIR step=$STEP_LABEL desc=$MAX_DESCENDANTS none=$NOPE'
+def test_prompt_bridge_assembles_and_renders(repo: dict) -> None:
+    """``node _prompt`` joins charter + step + modes, substituted with ``--var``."""
+    step = repo['task'] / '.fractal' / 'main.task' / 'steps' / '01-PLAN.md'
     result = _run(
         repo['task'],
         'node',
-        '_render',
+        '_prompt',
+        f'{step}',
         '--var',
         'STEP_LABEL=step 1 of 3',
-        stdin=template,
+        '--var',
+        'CONTINUE_MODE=true',
     )
     assert result.returncode == 0, result.stderr
     out = result.stdout
-    assert '$WORKTREE_DIR' not in out  # static var substituted...
-    assert 'main.task' in out  # ...to the real worktree
-    assert 'step=step 1 of 3' in out  # --var override (value with spaces)
-    assert '$MAX_DESCENDANTS' not in out  # run-config caps substitute on the loop path
-    assert 'none=$NOPE' in out  # unknown placeholder passes through
+    # the charter leads; the step body follows, frontmatter stripped
+    assert out.startswith('You are an autonomous node')
+    assert '## Plan' in out
+    assert 'requires_approval' not in out
+    # the --var-activated mode doc joins; an inactive one stays out
+    assert 'This node was continued' in out
+    assert 'This node was paused mid-run' not in out
+    # static vars substitute, --var overrides win (value with spaces),
+    # unsupplied run-scoped placeholders pass through for the caller
+    assert '$WORKTREE_DIR' not in out
+    assert 'main.task' in out
+    assert 'step 1 of 3' in out
+    assert '$TIME_BUDGET' in out
 
 
 # ------ helpers

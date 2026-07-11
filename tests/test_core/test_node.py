@@ -140,6 +140,8 @@ __all__ = [
     'test_time_remaining_credits_paused_spans',
     'test_run_open_resolves_re_entry',
     'test_step_pending_supersedes_stale_twin',
+    'test_approval_gate_is_first_approval_wins',
+    'test_row_closers_transition_once_and_report_it',
     'test_destroy_refuses_paused_nodes',
     'test_list_returns_nodes',
     'test_list_hides_retired',
@@ -3520,6 +3522,62 @@ def test_step_pending_supersedes_stale_twin(node_with_db: Node) -> None:
     rows = {row['step_id']: row['approved'] for row in node.db.read('steps')}
     assert rows[fresh] == ''
     assert rows[stale] is None
+    # an approval aimed at the voided gate writes nothing -- the stale row
+    # stays voided instead of resurrecting with a timestamp
+    assert node.step_approve(step_id=stale) == 0
+    assert node.db.read('steps', where={'step_id': stale})[0]['approved'] is None
+
+
+def test_approval_gate_is_first_approval_wins(node_with_db: Node) -> None:
+    """The approval gate is a compare-and-swap on the pending state.
+
+    A re-approve keeps the original instant, and a stray re-pend cannot
+    demote an approval back to pending -- the gate only ever moves
+    NULL -> pending -> approved.
+    """
+    node = node_with_db
+    node.status_set('active')
+    run_id = node.run_start()
+    iter_id = node.iter_start(run_id=run_id, iter=1)
+    step_id = node.step_start(iter_id=iter_id, run_id=run_id, step=1, step_name='GATE')
+    node.step_pending(step_id=step_id)
+    # the first approval wins the gate and stamps the instant
+    assert node.step_approve(step_id=step_id) == 1
+    stamped = node.db.read('steps', where={'step_id': step_id})[0]['approved']
+    assert stamped
+    # a re-approve observes the loss and the original instant survives
+    assert node.step_approve(step_id=step_id) == 0
+    assert node.db.read('steps', where={'step_id': step_id})[0]['approved'] == stamped
+    # a stray re-pend cannot demote the approval
+    node.step_pending(step_id=step_id)
+    assert node.db.read('steps', where={'step_id': step_id})[0]['approved'] == stamped
+
+
+def test_row_closers_transition_once_and_report_it(node_with_db: Node) -> None:
+    """The run/iter/step closers are first-writer-wins and say who won.
+
+    Every closer guards on ``ended_at IS NULL``: the first terminal
+    sticks, and a competing closer writes nothing and observes 0 -- the
+    substrate a kill racing the loop's own clean end stands on.
+    """
+    node = node_with_db
+    node.status_set('active')
+    run_id = node.run_start()
+    iter_id = node.iter_start(run_id=run_id, iter=1)
+    step_id = node.step_start(iter_id=iter_id, run_id=run_id, step=1, step_name='WORK')
+    # the first close wins each row; the loser observes 0 and changes nothing
+    assert node.step_end(step_id=step_id, status='completed', exit_code=0) == 1
+    assert node.step_end(step_id=step_id, status='killed', exit_code=1) == 0
+    assert node.iter_end(iter_id=iter_id, status='completed', exit_code=0) == 1
+    assert node.iter_end(iter_id=iter_id, status='killed', exit_code=1) == 0
+    assert node.run_end(run_id=run_id, status='completed', exit_code=0) == 1
+    assert node.run_end(run_id=run_id, status='killed', exit_code=1) == 0
+    statuses = [
+        node.db.read('steps', where={'step_id': step_id})[0]['status'],
+        node.db.read('iters', where={'iter_id': iter_id})[0]['status'],
+        node.db.read('runs', where={'run_id': run_id})[0]['status'],
+    ]
+    assert statuses == ['completed', 'completed', 'completed']
 
 
 def test_destroy_refuses_paused_nodes(

@@ -1,4 +1,4 @@
-"""Tests for ``Database`` CRUD operations and schema."""
+"""Tests for ``Database`` CRUD operations, transactions, and schema."""
 
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ __all__ = [
     'test_where_none_filters_match_null_columns',
     'test_connect_sets_generous_busy_timeout',
     'test_concurrent_writers_serialize',
+    'test_transaction_commits_and_rolls_back',
+    'test_update_reports_rowcount_for_compare_and_swap',
 ]
 
 # runs.started_at is NOT NULL with no SQL default (the Python writers supply it)
@@ -270,3 +272,82 @@ def test_concurrent_writers_serialize(database: Database) -> None:
     # every write lands: no lock errors, exactly N*M rows
     assert errors == [], errors
     assert database.count('runs') == writers * per_writer
+
+
+def test_transaction_commits_and_rolls_back(database: Database) -> None:
+    """A transaction's writes land together on exit and vanish on error.
+
+    ``transaction()`` yields the connection every table operation joins via
+    ``connection=``: reads inside the block see the block's uncommitted
+    writes, a clean exit commits them all at once, and an exception rolls
+    the whole block back -- the atomicity a multi-statement lifecycle
+    transition (read, decide, write) is built on.
+    """
+    # a clean block commits, and in-transaction reads see uncommitted
+    # writes -- every table operation joins through connection=
+    with database.transaction() as connection:
+        run_id = database.write(_run(), 'runs', connection=connection)
+        database.update(
+            {'status': 'completed'},
+            'runs',
+            where={'run_id': run_id},
+            connection=connection,
+        )
+        inside = database.read(
+            'runs',
+            where={'run_id': run_id},
+            connection=connection,
+        )
+        assert inside[0]['status'] == 'completed'
+        assert database.exists('runs', where={'run_id': run_id}, connection=connection)
+        assert database.count('runs', connection=connection) == 1
+        node_id = database.merge(
+            {'node': 'task.a', 'status': 'idle'},
+            'nodes',
+            conflict=['node'],
+            connection=connection,
+        )
+        assert node_id
+        database.delete('nodes', where={'node': 'task.a'}, connection=connection)
+        assert not database.exists(
+            'nodes',
+            where={'node': 'task.a'},
+            connection=connection,
+        )
+    assert database.read('runs', where={'run_id': run_id})[0]['status'] == 'completed'
+
+    # an exception rolls the whole block back and re-raises
+    def fail_mid_transaction() -> None:
+        with database.transaction() as connection:
+            database.write(_run(node='rollback'), 'runs', connection=connection)
+            raise RuntimeError('boom')
+
+    with pytest.raises(RuntimeError, match='boom'):
+        fail_mid_transaction()
+    assert not database.exists('runs', where={'node': 'rollback'})
+
+
+def test_update_reports_rowcount_for_compare_and_swap(database: Database) -> None:
+    """``update`` returns the matched-row count -- the observable CAS verdict.
+
+    A fenced transition writes through a guarded ``where`` (the run closers
+    guard on ``ended_at IS NULL``): rowcount 1 means this writer won the
+    swap, 0 means another writer got there first and the loser observes
+    instead of overwriting.
+    """
+    run_id = database.write(_run(), 'runs')
+    # the first closer wins the swap
+    won = database.update(
+        {'status': 'completed', 'ended_at': _STARTED},
+        'runs',
+        where={'run_id': run_id, 'ended_at': None},
+    )
+    assert won == 1
+    # a competing closer on the same guard observes the loss
+    lost = database.update(
+        {'status': 'killed', 'ended_at': _STARTED},
+        'runs',
+        where={'run_id': run_id, 'ended_at': None},
+    )
+    assert lost == 0
+    assert database.read('runs', where={'run_id': run_id})[0]['status'] == 'completed'

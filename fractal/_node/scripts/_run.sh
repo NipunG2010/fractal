@@ -268,7 +268,7 @@ fi
 
 # SYNC_MODE gates the SYNC step run before each step; unlike the prompt-injection modes
 # (DETACHED_MODE/CONTINUE_MODE/RESUME_MODE/RESERVE_MODE/META_MODE) SYNC.md is run as
-# its own step, not appended to step prompts (the mode-append loop skips it)
+# its own step, not appended to step prompts (the prompt builder skips it)
 SYNC_MODE=$(fractal config _get sync --path="$WORKTREE_DIR" 2>/dev/null || echo "true")
 [[ -z "$SYNC_MODE" ]] && SYNC_MODE=true
 
@@ -595,33 +595,6 @@ needs_pricing() {
     [[ "$1" == "codex" ]]
 }
 
-strip_frontmatter() {
-    local FILE="$1"
-    local LINE
-    local LINE_NUM=0
-    local IN_FRONTMATTER=false
-
-    while IFS= read -r LINE || [[ -n "$LINE" ]]; do
-        LINE_NUM=$((LINE_NUM + 1))
-        local TRIMMED="${LINE#"${LINE%%[![:space:]]*}"}"
-
-        if [[ "$LINE_NUM" -eq 1 ]] && [[ "$TRIMMED" == "---" ]]; then
-            IN_FRONTMATTER=true
-            continue
-        fi
-
-        if [[ "$IN_FRONTMATTER" == true ]]; then
-            if [[ "$TRIMMED" == "---" ]]; then
-                IN_FRONTMATTER=false
-                continue
-            fi
-            continue
-        fi
-
-        echo "$LINE"
-    done <"$FILE"
-}
-
 # resolve the guard's cost figures pinned to this run (budgets are per-run;
 # runs are isolated) -- every budget check below keys on these two
 run_cost_spent() {
@@ -745,26 +718,13 @@ build_step_prompt() {
     # refresh the cost budget so each step's context reflects spend so far
     build_cost_budget
 
-    # assemble the raw prompt -- the NODE.md charter, the step (frontmatter
-    # stripped), and any active modes (SYNC.md runs as its own step, so it is
-    # skipped here) -- then render its $VARs in one pass through the shared Python
-    # substitutor: static vars (paths, limits, modes) come from the node's
-    # config/git, and the run-scoped vars are passed through as overrides
-    {
-        cat "$NODE_DIR/NODE.md"
-        echo ""
-        strip_frontmatter "$STEP_FILE"
-        for MODE_FILE in "$MODES_DIR"/*.md; do
-            [[ -f "$MODE_FILE" ]] || continue
-            [[ "$MODE_FILE" == */SYNC.md ]] && continue
-            MODE_FLAG="${MODE_FILE##*/}"
-            MODE_FLAG="${MODE_FLAG%.md}_MODE"
-            if [[ "${!MODE_FLAG:-}" == true ]]; then
-                echo ""
-                cat "$MODE_FILE"
-            fi
-        done
-    } | fractal node _render --path="$WORKTREE_DIR" \
+    # assemble + render in one pass through the shared Python builder -- the
+    # NODE.md charter, the step (frontmatter stripped), and any active modes
+    # (SYNC.md runs as its own step, so it is skipped there): static vars
+    # (paths, limits) come from the node's config/git, and the run-scoped
+    # vars pass through as overrides -- the boot-pinned DETACHED/META flags
+    # included, so a mid-run config edit cannot flip a run's mode composition
+    fractal node _prompt "$STEP_FILE" --path="$WORKTREE_DIR" \
         --var "STEP_LABEL=$STEP_LABEL" \
         --var "ITER_LABEL=$ITER_LABEL" \
         --var "ITER_TIMESTAMP=$ITER_TIMESTAMP" \
@@ -773,7 +733,9 @@ build_step_prompt() {
         --var "COST_BUDGET=$COST_BUDGET" \
         --var "CONTINUE_MODE=$CONTINUE_MODE" \
         --var "RESUME_MODE=$RESUME_MODE" \
-        --var "RESERVE_MODE=$RESERVE_MODE"
+        --var "RESERVE_MODE=$RESERVE_MODE" \
+        --var "DETACHED_MODE=$DETACHED_MODE" \
+        --var "META_MODE=$META_MODE"
 }
 
 run_step() {
@@ -812,7 +774,9 @@ run_step() {
     fi
 
     local PROMPT
-    PROMPT=$(build_step_prompt "$STEP_FILE")
+    # a failed build (builder error, missing charter/step file) must fail the
+    # step -- launching the agent on an empty prompt would burn a full turn
+    PROMPT=$(build_step_prompt "$STEP_FILE") || return 1
 
     # compute step time limit: min(run remaining, iteration remaining, step_timeout)
     export STEP_LIMIT_SECONDS=0

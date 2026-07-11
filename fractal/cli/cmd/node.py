@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pathlib
 import sys
 from typing import Optional
 
@@ -43,7 +42,7 @@ __all__ = [
     'node_update',
     'node_reconcile_caps',
     'node_latched',
-    'node_render',
+    'node_prompt',
 ]
 
 _ACTIVITY_COLUMNS = [
@@ -1126,11 +1125,11 @@ def node_latched(app: typer.Typer) -> typer.Typer:
     return app
 
 
-def node_render(app: typer.Typer) -> typer.Typer:
-    """Register the ``_render`` command."""
-    # template argument
-    template_help = 'Template file to render (default: read from stdin).'
-    template = typer.Argument(None, help=template_help)
+def node_prompt(app: typer.Typer) -> typer.Typer:
+    """Register the ``_prompt`` command."""
+    # step argument
+    step_help = 'Step markdown file to assemble the prompt for.'
+    step = typer.Argument(..., help=step_help)
     # var option
     vars_help = 'Override a template variable as KEY=VALUE (repeatable).'
     vars = typer.Option([], '--var', help=vars_help)
@@ -1138,23 +1137,18 @@ def node_render(app: typer.Typer) -> typer.Typer:
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
 
-    @command(app, '_render')
-    def _render(
-        template: Optional[str] = template,
+    @command(app, '_prompt')
+    def _prompt(
+        step: str = step,
         vars: list[str] = vars,
         path: str = path,
     ) -> None:
-        """Render a node's ``$VAR`` template variables (the loop's substitutor).
+        """Assemble and render a step's full prompt (the loop's builder).
 
-        Reads the template from the file argument or stdin, substitutes the
-        node's variables (overridden by any ``--var KEY=VALUE``), and prints the
-        result verbatim. ``_run.sh`` pipes the assembled step prompt through this.
+        The ``NODE.md`` charter, the step body (frontmatter stripped), and
+        the active mode docs, joined and substituted in one pass;
+        ``_run.sh`` builds every step prompt through this.
         """
-        # read the template from the file argument, else stdin
-        if template is not None:
-            text = pathlib.Path(template).read_text(encoding='utf-8')
-        else:
-            text = sys.stdin.read()
         # parse KEY=VALUE overrides (split on the first '=' so a value may hold '=')
         overrides = {}
         for item in vars:
@@ -1162,7 +1156,7 @@ def node_render(app: typer.Typer) -> typer.Typer:
             overrides[key] = value
         # render and print verbatim (no added newline -- byte-faithful like envsubst)
         node = resolve_node(path)
-        rendered = node.render_template(text, overrides=overrides)
+        rendered = node.build_prompt(step, overrides=overrides)
         typer.echo(rendered, nl=False)
 
     return app

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import pathlib
 import sqlite3
+from collections.abc import Iterator
 from typing import Any, Optional
 
 __all__ = ['Database']
@@ -14,7 +16,9 @@ class Database:
 
     Provides generic table operations -- ``init``, ``read``,
     ``write``, ``update``, ``merge``, ``delete``, ``exists``,
-    and ``count`` -- with no domain-specific logic.
+    and ``count`` -- with no domain-specific logic. Multi-statement
+    transitions run inside :meth:`transaction`, passing its connection
+    to the table operations via ``connection=``.
     """
 
     _timeout = 30
@@ -93,6 +97,75 @@ class Database:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextlib.contextmanager
+    def transaction(self: Database) -> Iterator[sqlite3.Connection]:
+        """One ``BEGIN IMMEDIATE`` transaction over a dedicated connection.
+
+        Yields a connection holding the database write lock for the whole
+        block, so a read-decide-write transition commits or rolls back as
+        one atomic unit; the table operations join it via ``connection=``.
+        Every operation inside the block must pass it: a write without
+        ``connection=`` deadlocks against the block's own lock until the
+        busy timeout, and a read without it silently sees the
+        pre-transaction snapshot. ``BEGIN IMMEDIATE`` takes the lock up
+        front -- two concurrent transactions serialize (bounded by the
+        busy timeout) instead of failing mid-block. Commits on clean
+        exit; rolls back on any exception (re-raised).
+
+        Yields:
+            The transaction's connection.
+
+        """
+        connection = self._connect()
+        # explicit BEGIN/COMMIT -- disable the sqlite3 module's implicit
+        # transaction management for this handle
+        connection.isolation_level = None
+        try:
+            connection.execute('BEGIN IMMEDIATE')
+            yield connection
+            connection.commit()
+        except BaseException:
+            # BEGIN itself may be what failed (busy timeout), leaving no
+            # transaction to roll back
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @contextlib.contextmanager
+    def _handle(
+        self: Database,
+        connection: Optional[sqlite3.Connection],
+        *,
+        read_only: bool = False,
+    ) -> Iterator[sqlite3.Connection]:
+        """Yield ``connection`` if given, else an owned one-shot handle.
+
+        An owned handle commits on clean exit and always closes; a caller's
+        connection is yielded untouched -- its transaction owns commit and
+        close, and reads on it see the transaction's uncommitted writes.
+
+        Args:
+            connection: Transaction to run inside (from
+                :meth:`transaction`), or ``None`` for an owned handle.
+            read_only: Open an owned handle read-only (no commit).
+
+        Yields:
+            The connection the operation runs on.
+
+        """
+        if connection is not None:
+            yield connection
+            return
+        owned = self._connect(read_only=read_only)
+        try:
+            yield owned
+            if not read_only:
+                owned.commit()
+        finally:
+            owned.close()
+
     def read(
         self: Database,
         table: Optional[str] = None,
@@ -101,6 +174,7 @@ class Database:
         params: tuple[Any, ...] = (),
         where: Optional[dict[str, Any]] = None,
         limit: Optional[int] = None,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> list[dict[str, Any]]:
         """Read rows from a table.
 
@@ -128,6 +202,8 @@ class Database:
                 placeholders.
             where: Column filters (AND-joined equality).
             limit: Maximum rows to return.
+            connection: Transaction to run inside (from
+                :meth:`transaction`).
 
         Returns:
             List of row dicts.
@@ -153,24 +229,25 @@ class Database:
             if limit is not None:
                 query += f' LIMIT {limit}'
         # execute query
-        connection = self._connect(read_only=True)
-        try:
-            cursor = connection.execute(query, params)
+        with self._handle(connection, read_only=True) as handle:
+            cursor = handle.execute(query, params)
             result = [dict(row) for row in cursor.fetchall()]
-        finally:
-            connection.close()
         return result
 
     def write(
         self: Database,
         data: dict[str, Any],
         table: str,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> int:
         """Insert a row into a table.
 
         Args:
             data: Column values.
             table: Table name.
+            connection: Transaction to run inside (from
+                :meth:`transaction`).
 
         Returns:
             Row ID of the inserted row.
@@ -181,13 +258,9 @@ class Database:
         placeholders = ', '.join('?' for _ in data)
         statement = f'INSERT INTO {table} ({columns}) VALUES ({placeholders})'
         # execute statement
-        connection = self._connect()
-        try:
-            cursor = connection.execute(statement, tuple(data.values()))
+        with self._handle(connection) as handle:
+            cursor = handle.execute(statement, tuple(data.values()))
             row_id = cursor.lastrowid
-            connection.commit()
-        finally:
-            connection.close()
         return row_id
 
     def update(
@@ -196,13 +269,20 @@ class Database:
         table: str,
         *,
         where: dict[str, Any],
-    ) -> None:
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> int:
         """Update rows in a table.
 
         Args:
             data: Column values to set.
             table: Table name.
             where: Column filters (AND-joined equality).
+            connection: Transaction to run inside (from
+                :meth:`transaction`).
+
+        Returns:
+            Number of rows updated -- the observable outcome of a
+            compare-and-swap ``where`` (0 means another writer won).
 
         """
         # build statement
@@ -211,12 +291,10 @@ class Database:
         statement = f'UPDATE {table} SET {set_clause} WHERE {where_clause}'
         params = tuple(data.values()) + params
         # execute statement
-        connection = self._connect()
-        try:
-            connection.execute(statement, params)
-            connection.commit()
-        finally:
-            connection.close()
+        with self._handle(connection) as handle:
+            cursor = handle.execute(statement, params)
+            count = cursor.rowcount
+        return count
 
     def merge(
         self: Database,
@@ -224,6 +302,7 @@ class Database:
         table: str,
         *,
         conflict: Optional[list[str]] = None,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> int:
         """Insert a row, or upsert it on a unique conflict.
 
@@ -243,6 +322,8 @@ class Database:
             table: Table name.
             conflict: Unique column(s) to upsert on. ``None`` does
                 a whole-row insert-or-replace.
+            connection: Transaction to run inside (from
+                :meth:`transaction`).
 
         Returns:
             Row ID of the inserted, updated, or (on a no-op) existing row.
@@ -278,9 +359,8 @@ class Database:
                 f'INSERT OR REPLACE INTO {table} ({columns}) VALUES ({placeholders})'
             )
         # execute statement
-        connection = self._connect()
-        try:
-            cursor = connection.execute(statement, tuple(data.values()))
+        with self._handle(connection) as handle:
+            cursor = handle.execute(statement, tuple(data.values()))
             if conflict:
                 # RETURNING yields the affected row on insert/update, but nothing
                 # on a no-op (the row already exists and was left alone) -- so fall
@@ -290,16 +370,13 @@ class Database:
                     row_id = returned[0]
                 else:
                     where = ' AND '.join(f'{key} = ?' for key in conflict)
-                    found = connection.execute(
+                    found = handle.execute(
                         f'SELECT rowid FROM {table} WHERE {where}',
                         tuple(data[key] for key in conflict),
                     ).fetchone()
                     row_id = found[0] if found else 0
             else:
                 row_id = cursor.lastrowid
-            connection.commit()
-        finally:
-            connection.close()
         return row_id
 
     def delete(
@@ -307,36 +384,38 @@ class Database:
         table: str,
         *,
         where: dict[str, Any],
+        connection: Optional[sqlite3.Connection] = None,
     ) -> None:
         """Delete rows from a table.
 
         Args:
             table: Table name.
             where: Column filters (AND-joined equality).
+            connection: Transaction to run inside (from
+                :meth:`transaction`).
 
         """
         # build statement
         where_clause, params = self._where_clause(where)
         statement = f'DELETE FROM {table} WHERE {where_clause}'
         # execute statement
-        connection = self._connect()
-        try:
-            connection.execute(statement, params)
-            connection.commit()
-        finally:
-            connection.close()
+        with self._handle(connection) as handle:
+            handle.execute(statement, params)
 
     def exists(
         self: Database,
         table: str,
         *,
         where: dict[str, Any],
+        connection: Optional[sqlite3.Connection] = None,
     ) -> bool:
         """Check whether a matching row exists.
 
         Args:
             table: Table name.
             where: Column filters (AND-joined equality).
+            connection: Transaction to run inside (from
+                :meth:`transaction`).
 
         Returns:
             Whether a matching row exists.
@@ -346,12 +425,9 @@ class Database:
         where_clause, params = self._where_clause(where)
         query = f'SELECT 1 FROM {table} WHERE {where_clause} LIMIT 1'
         # execute query
-        connection = self._connect(read_only=True)
-        try:
-            cursor = connection.execute(query, params)
+        with self._handle(connection, read_only=True) as handle:
+            cursor = handle.execute(query, params)
             result = cursor.fetchone() is not None
-        finally:
-            connection.close()
         return result
 
     def count(
@@ -359,12 +435,15 @@ class Database:
         table: str,
         *,
         where: Optional[dict[str, Any]] = None,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> int:
         """Count rows in a table.
 
         Args:
             table: Table name.
             where: Column filters (AND-joined equality).
+            connection: Transaction to run inside (from
+                :meth:`transaction`).
 
         Returns:
             Row count.
@@ -378,12 +457,9 @@ class Database:
             query += ' WHERE ' + where_clause
             params += where_params
         # execute query
-        connection = self._connect(read_only=True)
-        try:
-            cursor = connection.execute(query, params)
+        with self._handle(connection, read_only=True) as handle:
+            cursor = handle.execute(query, params)
             result, *_ = cursor.fetchone()
-        finally:
-            connection.close()
         return result
 
     @staticmethod
