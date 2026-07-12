@@ -90,15 +90,11 @@ def install(app: typer.Typer) -> typer.Typer:
             root / '.claude' / 'skills',
             root / '.agents' / 'skills',
         ]
-        # collect fractal's and the wiki dependency's skills up front, so a
-        # missing source is skipped before anything is copied (no partial install)
+        # collect skills
         skills = []
         for package in ('fractal', 'wiki'):
             skills_dir = importlib.resources.files(package).joinpath('skills')
-            if skills_dir.is_dir():
-                skills.extend(path for path in skills_dir.iterdir() if path.is_dir())
-            else:
-                typer.echo(f'No bundled skills for {package}; skipping.', err=True)
+            skills.extend(path for path in skills_dir.iterdir() if path.is_dir())
         # copy each skill into every target (replaces any prior copy)
         for skill in sorted(skills, key=lambda path: path.name):
             for target in targets:
