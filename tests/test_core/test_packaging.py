@@ -33,8 +33,8 @@ def test_exclude_template_ships_as_package_data() -> None:
     the package lives in ``site-packages`` with no repo root above it, still
     finds it.
     """
-    config = pathlib.Path(fractal.core.__file__).parent.parent / '_config'
-    template = config / 'git' / 'exclude'
+    assets = pathlib.Path(fractal.core.__file__).parent.parent / '_assets'
+    template = assets / 'git' / 'exclude'
     assert template.is_file(), (
         'git-excludes template missing from the fractal package; under a '
         'non-editable install _git_exclude would raise FileNotFoundError'

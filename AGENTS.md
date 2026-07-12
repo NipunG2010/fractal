@@ -11,7 +11,7 @@ already reads parent directories), also check the parent directory for
 
 The `fractal/` package is organized into `cli/` (typer app), `core/`
 (business logic), `tui/` (Textual app), `skills/` (the plugin skill),
-`util/` (shared utilities), and the node machinery seeds — `_config/`,
+`util/` (shared utilities), and the node machinery seeds — `_assets/`,
 `_node/`, and `_scripts/` — with the pytest suite in `tests/`.
 
 `Node` delegates lifecycle operations to the `_scripts/` shell scripts

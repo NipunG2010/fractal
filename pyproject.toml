@@ -36,7 +36,7 @@ fractal = "fractal.cli.main:cli"
 [tool.poetry]
 packages = [{include = "fractal"}]
 include = [
-    { path = "fractal/_config/git/exclude", format = ["sdist", "wheel"] },
+    { path = "fractal/_assets/git/exclude", format = ["sdist", "wheel"] },
     { path = "fractal/_node/**/*", format = ["sdist", "wheel"] },
     { path = "fractal/_scripts/*.sh", format = ["sdist", "wheel"] },
     { path = "fractal/core/schema.sql", format = ["sdist", "wheel"] },

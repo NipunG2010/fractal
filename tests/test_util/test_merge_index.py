@@ -440,13 +440,13 @@ def _driver() -> pathlib.Path:
     wiki owns this script -- ``wiki config``/``wiki init`` register the stable
     ``wiki _merge`` entry point as the ``merge.wiki`` driver, and ``_merge``
     dispatches ``_index.md`` pathnames to wiki's own copy of the script (wiki
-    is a hard dependency that ships ``_config/**`` as package data). The
+    is a hard dependency that ships ``_assets/**`` as package data). The
     direct invocations exercise exactly that script.
     """
     import wiki
 
     package = pathlib.Path(wiki.__file__).resolve().parent
-    return package / '_config' / 'git' / 'merge_index.sh'
+    return package / '_assets' / 'git' / 'merge_index.sh'
 
 
 def _index(links: tuple[str, ...], below: str) -> str:

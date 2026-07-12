@@ -1020,8 +1020,8 @@ class Node:
         common_dir = _git(['rev-parse', '--git-common-dir'], cwd=self._root)
         exclude = (self._root / common_dir).resolve() / 'info' / 'exclude'
         # build the managed block from the shipped template
-        config = self._package_dir / '_config'
-        template = config / 'git' / 'exclude'
+        assets = self._package_dir / '_assets'
+        template = assets / 'git' / 'exclude'
         patterns = template.read_text(encoding='utf-8')
         # prepend the user node's own seed dir so the top-level branch ignores it;
         # child seeds (.fractal/<branch>.<child>) stay tracked so meta and merge-up
