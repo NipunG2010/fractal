@@ -15,9 +15,9 @@ wiki and memory merge.
 
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 import subprocess
-from typing import NamedTuple
 
 import pytest
 
@@ -425,7 +425,8 @@ def test_take_ours_above_link_drop_is_restored_by_wiki_update(
 # ------ helpers
 
 
-class MergeResult(NamedTuple):
+@dataclasses.dataclass(frozen=True)
+class MergeResult:
     """Outcome of a three-way ``_index.md`` merge."""
 
     returncode: int

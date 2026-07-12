@@ -262,7 +262,7 @@ def test_git_exclude_concurrent_writers_preserve_custom(tmp_path: pathlib.Path) 
     barrier = threading.Barrier(workers)
 
     def hammer() -> None:
-        barrier.wait()
+        barrier.wait(timeout=30)
         for _ in range(15):
             node._git_exclude()
 

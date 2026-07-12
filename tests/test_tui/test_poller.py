@@ -1,4 +1,4 @@
-"""Tests for change detection: ``NodePoller`` tokens and snapshot identity.
+"""Test the ``fractal.tui.poller`` module.
 
 Both halves of the perf contract: the poller reports a branch exactly when its
 on-disk token moved, and the builder hands back the identical ``Snapshot``

@@ -92,7 +92,7 @@ class TreePane:
         self.app._apply()
 
     def key(self: TreePane, event: Key) -> None:
-        """Handle tree mode: ↑↓ move, →/← fold, ⏎ re-scope/fold, esc leaves."""
+        """Handle tree mode: up/down move, right/left fold, enter re-scope/fold, esc."""
         key = event.key
         branches = self._branches
         sel = branches[self.sel] if 0 <= self.sel < len(branches) else None
@@ -115,7 +115,7 @@ class TreePane:
             self.rebuild(self.app.snapshot)
         elif key == 'enter' and sel:
             if sel == self.app.scope and kids:
-                # ⏎ on the already-focused branch folds/unfolds its subtree
+                # enter on the already-focused branch folds/unfolds its subtree
                 self.collapsed.symmetric_difference_update({sel})
                 self._last = None
                 self.rebuild(self.app.snapshot)

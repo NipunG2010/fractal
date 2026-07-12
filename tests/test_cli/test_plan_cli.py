@@ -17,9 +17,7 @@ from tests._helpers import _git
 
 from .conftest import _run
 
-__all__ = [
-    'test_plan_init_seeds_heading_and_list_finds_it',
-]
+__all__ = ['test_plan_init_seeds_heading_and_list_finds_it']
 
 
 @pytest.fixture(scope='module')

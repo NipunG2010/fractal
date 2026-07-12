@@ -273,7 +273,7 @@ def render_stream(
             input=input,
         )
     else:
-        raise NotImplementedError(f'Unsupported agent: {agent}')
+        raise typer.BadParameter(f'--agent must be claude or codex, got {agent!r}.')
 
 
 def update_pricing(max_age: Optional[str] = None) -> str:
@@ -622,7 +622,7 @@ def resolve_target(path: Union[str, pathlib.Path], node: Optional[str] = None) -
     # require an initialized node at the resolved target
     if target.exists():
         return target
-    raise typer.BadParameter(f'No fractal node at {target._root}')
+    raise typer.BadParameter(f'No fractal node at {target._root}.')
 
 
 # ------ helper functions

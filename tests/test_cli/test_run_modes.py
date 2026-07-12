@@ -57,7 +57,6 @@ set the loop's-own-run finish signal before the commit-step gate is reached.
 
 from __future__ import annotations
 
-import contextlib
 import csv
 import io
 import json
@@ -75,7 +74,14 @@ import pytest
 
 from tests._helpers import _git
 
-from .conftest import _cli_env, _reap_group, _run, _run_reaped, _worktree_root
+from .conftest import (
+    _cli_env,
+    _reap_group,
+    _require_tmux,
+    _run,
+    _run_reaped,
+    _worktree_root,
+)
 
 __all__ = [
     'test_sync_runs_before_every_step',
@@ -2077,7 +2083,11 @@ def test_self_finish_over_cap_records_exited(repo: dict) -> None:
     ids=['budget-cascade', 'plain-cascade'],
 )
 def test_cascaded_budget_finish_records_exited(
-    repo: dict, name: str, reason: str, node_status: str, run_row: str
+    repo: dict,
+    name: str,
+    reason: str,
+    node_status: str,
+    run_row: str,
 ) -> None:
     """A budget-reason finish cascaded from an ancestor ends ``exited``/1.
 
@@ -3056,8 +3066,7 @@ def _register_active_child(repo: dict, parent: dict, name: str) -> pathlib.Path:
     Skips the test when tmux is unavailable (the live drain check needs it).
     Returns the child worktree.
     """
-    if shutil.which('tmux') is None:
-        pytest.skip('tmux unavailable')
+    _require_tmux()
     root = repo['root']
     node_dir = parent['node_dir']
     init = _run(
@@ -3084,7 +3093,7 @@ def _register_active_child(repo: dict, parent: dict, name: str) -> pathlib.Path:
     session = f'{root.name} ({child.name.replace(".", "-")})'
     # a killed suite run leaves this session behind (the teardown never ran)
     # and tmux refuses the duplicate name -- reap any stale twin first
-    subprocess.run(['tmux', 'kill-session', '-t', session], capture_output=True)
+    subprocess.run(['tmux', 'kill-session', '-t', f'={session}'], capture_output=True)
     subprocess.run(['tmux', 'new-session', '-d', '-s', session], check=True)
     repo.setdefault('sessions', []).append(session)
     return child
@@ -3258,7 +3267,9 @@ def test_gate_teardown_reaps_full_process_group(repo: dict) -> None:
     # reap survivors and release the gate before asserting -- a red run must
     # not itself leak the chain it just proved leaked
     for pid in survivors:
-        with contextlib.suppress(ProcessLookupError):
+        try:
             os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     (capture / 'gate_release').touch()
     assert survivors == [], (survivors, chain)

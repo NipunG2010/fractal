@@ -1,9 +1,9 @@
 """Tests for ``Node`` template-variable rendering (``$VAR`` substitution).
 
-The engine is pinned against GNU ``envsubst`` -- the loop's substitutor -- so a
-template renders identically whether the loop or ``Node.render_template`` does
-it. The remaining tests cover what the static map substitutes and how a chat
-sees it (real paths, ``N/A (chat)`` run-state).
+The engine is pinned against GNU ``envsubst`` -- the grammar the renderer is
+matched to -- so a template renders byte-identically to what ``envsubst``
+would produce. The remaining tests cover what the static map substitutes and
+how a chat sees it (real paths, ``N/A (chat)`` run-state).
 """
 
 from __future__ import annotations

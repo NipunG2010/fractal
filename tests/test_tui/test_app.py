@@ -1,10 +1,10 @@
-"""App-shell tests: the cockpit's orchestration driven through a real ``Pilot``.
+"""Test the ``fractal.tui.app`` module.
 
 These pin the shell's own responsibilities -- the focus ring, the chat-worker
 lifecycle (the silent-turn watchdog, turn cancellation, tool/error events,
-shutdown cleanup) -- as observable behavior. The chat-worker flows run on the
-writable pair tree with an injected ``FakeTurn``; ring navigation runs on the
-canonical read-only tree.
+shutdown cleanup) -- as observable behavior, driven through a real ``Pilot``.
+The chat-worker flows run on the writable pair tree with an injected
+``FakeTurn``; ring navigation runs on the canonical read-only tree.
 """
 
 from __future__ import annotations
@@ -149,12 +149,12 @@ async def test_cancelling_an_in_flight_turn_notes_it_and_drops_the_spinner(
         turn = app._turn
         assert turn is not None
         await pilot.pause()
-        assert app.query('#chatpending')  # the spinner is pinned
+        assert app.query('#m_chatpending')  # the spinner is pinned
         app._cancel_turn()  # the lever a re-send pulls
         await pilot.pause()
         assert turn.cancelled  # the subprocess was killed
         assert app._turn is None
-        assert not app.query('#chatpending')  # the spinner left with the turn
+        assert not app.query('#m_chatpending')  # the spinner left with the turn
         convo = app.chat.convo('main.alpha')
         assert any(who == 'meta' and text == 'cancelled' for who, text in convo)
 

@@ -1,4 +1,4 @@
-"""Tests for the TUI read stack: ``TuiData`` shaped through ``SnapshotBuilder``.
+"""Test the ``fractal.tui.data`` module.
 
 Every test reads the canonical deterministic tree through the surface the
 cockpit renders from -- ``builder.build(scope)`` -- and asserts the shaped
@@ -381,7 +381,7 @@ def test_subtree_log_merges_descendants(builder: SnapshotBuilder) -> None:
 
 
 def _query(data: TuiData, branch: Any, reader: Callable) -> Any:
-    # run one connection-scoped reader the way a refresh pass does
+    """Run one connection-scoped reader the way a refresh pass does."""
     connection = data.connect()
     try:
         return reader(connection, branch)
@@ -416,7 +416,7 @@ _READ_SURFACE: dict[str, Callable[[TuiData, SnapshotBuilder], Any]] = {
 
 
 def _read_state(data: TuiData) -> tuple:
-    # every read marker in the central DB: the receipts table, byte for byte
+    """Every read marker in the central DB: the receipts table, byte for byte."""
     connection = data.connect()
     try:
         reads = data.rows(

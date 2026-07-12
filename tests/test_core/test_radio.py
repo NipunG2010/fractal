@@ -1,4 +1,4 @@
-"""Tests for ``Radio`` messaging, channels, and subscriptions.
+"""Test the ``fractal.core.radio`` module.
 
 Cross-node behavior runs against two real node identities sharing the one
 central database (the ``radio_pair`` fixture) -- no resolver mocks.

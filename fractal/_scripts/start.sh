@@ -26,7 +26,7 @@ for arg in "$@"; do
     esac
 done
 
-PACKAGE_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
+PACKAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SCRIPT_DIR="$PACKAGE_DIR/_scripts"
 
 if [[ -z "${1:-}" ]]; then
@@ -66,7 +66,7 @@ fi
 # ------ launch in tmux
 
 if ! command -v tmux &>/dev/null; then
-    echo "Error: tmux is required" >&2
+    echo "Error: tmux is required (brew install tmux)" >&2
     exit 1
 fi
 

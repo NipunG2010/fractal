@@ -7,7 +7,12 @@ from typing import Optional
 
 import typer
 
-from fractal.cli.utils import command, print_rows, resolve_node
+from fractal.cli.utils import (
+    command,
+    print_rows,
+    require_non_negative,
+    resolve_node,
+)
 from fractal.core.node import Node
 from fractal.core.radio import Radio
 
@@ -294,6 +299,7 @@ def radio_messages(app: typer.Typer) -> typer.Typer:
         path: str = path,
     ) -> None:
         """List a channel's metadata, inbox by default (bodies via 'read')."""
+        require_non_negative(limit=limit)
         # resolve node
         radio = Radio(resolve_node(path))
         # --saved: show archived messages
@@ -364,6 +370,7 @@ def radio_sent(app: typer.Typer) -> typer.Typer:
         path: str = path,
     ) -> None:
         """List messages this node sent (the node column is the recipient)."""
+        require_non_negative(limit=limit)
         radio = Radio(resolve_node(path))
         rows = radio.sent(
             channel=channel,
@@ -423,6 +430,7 @@ def radio_feed(app: typer.Typer) -> typer.Typer:
         path: str = path,
     ) -> None:
         """List subscribed nodes' metadata (bodies via 'read --feed')."""
+        require_non_negative(limit=limit)
         # resolve node
         radio = Radio(resolve_node(path))
         # --saved: show archived messages

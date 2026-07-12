@@ -22,6 +22,7 @@ from collections.abc import Iterator
 from typing import IO, Optional
 
 from fractal.core.node import ChatCommand
+from fractal.tui import theme
 
 __all__ = [
     'ChatEvent',
@@ -205,7 +206,10 @@ class ClaudeStreamParser:
             duration = 0.001 * (message.get('duration_ms') or 0.0)
             cost = message.get('total_cost_usd')
             cost_str = f'${cost:.2f}' if cost is not None else '$?'
-            summary = f'done · {turns} turns · {duration:.1f}s · {cost_str}'
+            summary = (
+                f'done {theme.SEP} {turns} turns {theme.SEP} {duration:.1f}s'
+                f' {theme.SEP} {cost_str}'
+            )
             if message.get('is_error') or message.get('subtype') != 'success':
                 detail = message.get('result') or message.get('subtype') or 'error'
                 result.append(ChatEvent(kind='error', text=str(detail)))
@@ -255,7 +259,7 @@ class CodexStreamParser:
             # codex reports no per-turn cost on the stream; close on wall time
             self._closed = True
             wall = time.monotonic() - self._started
-            return [ChatEvent(kind='meta', text=f'done · {wall:.1f}s')]
+            return [ChatEvent(kind='meta', text=f'done {theme.SEP} {wall:.1f}s')]
         elif event_type in ('error', 'turn.failed'):
             error = event.get('error')
             detail = (
@@ -324,7 +328,7 @@ class ChatTurn:
                 kind='error',
                 text=f'{self._command.agent} failed to launch: {error}',
             )
-            yield ChatEvent(kind='meta', text='done · 0.0s')
+            yield ChatEvent(kind='meta', text=f'done {theme.SEP} 0.0s')
             return
         self._process = process
         if self._cancelled:
@@ -362,14 +366,17 @@ class ChatTurn:
         # carried no summary -- e.g. a kill or a truncated stream)
         if not parser.closed:
             wall = time.monotonic() - started
-            yield ChatEvent(kind='meta', text=f'done · {wall:.1f}s')
+            yield ChatEvent(kind='meta', text=f'done {theme.SEP} {wall:.1f}s')
 
 
 class FakeTurn:
     """A ``ChatTurn``-shaped canned event stream (tests and demos)."""
 
     def __init__(
-        self: FakeTurn, events: list[ChatEvent], *, pause: float = 0.0
+        self: FakeTurn,
+        events: list[ChatEvent],
+        *,
+        pause: float = 0.0,
     ) -> None:
         """Initialize ``FakeTurn``.
 

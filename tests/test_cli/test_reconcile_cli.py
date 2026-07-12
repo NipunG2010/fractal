@@ -10,7 +10,6 @@ row instead of echoing it, because reads are the fleet's steering surface.
 
 from __future__ import annotations
 
-import contextlib
 import os
 import pathlib
 import signal
@@ -181,8 +180,10 @@ def test_status_read_reaps_an_orphaned_agent(root: pathlib.Path) -> None:
         assert len(reaped) == 1, activity
     finally:
         # a red must not leak the sleep (orphan stubs accumulate)
-        with contextlib.suppress(ProcessLookupError, PermissionError):
+        try:
             os.killpg(orphan.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
         orphan.wait()
 
 
@@ -203,6 +204,8 @@ def test_kill_reaps_recorded_pgid_after_pane_death(root: pathlib.Path) -> None:
         assert _run(worktree, 'node', 'status').stdout.strip() == 'killed'
     finally:
         # a red must not leak the sleep (orphan stubs accumulate)
-        with contextlib.suppress(ProcessLookupError, PermissionError):
+        try:
             os.killpg(orphan.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
         orphan.wait()

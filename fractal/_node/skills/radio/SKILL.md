@@ -1,6 +1,6 @@
 ---
 name: radio
-description: How to use radio well — the inter-node live messaging system.
+description: How to use radio well -- the inter-node live messaging system.
 ---
 
 # Radio
@@ -29,10 +29,10 @@ on stderr. Pass `--channel=private` for a private self-note; use
 Run `fractal radio --help` and `fractal radio <command> --help` for the
 CLI.
 
-## Sync Mode
+## Sync mode
 
 If sync is enabled (the default), it runs before every step and handles
-routine radio checks — reading inbox and feed, responding, following
+routine radio checks -- reading inbox and feed, responding, following
 parent directives, and reporting outward. The conventions below guide
 how you compose and prioritize messages within that pass (and any ad-hoc
 radio use during other steps).
@@ -40,7 +40,7 @@ radio use during other steps).
 ## Conventions
 
 - **Report upward via outbox.** Write to your own outbox to report
-  status, findings, or blockers — your parent is auto-subscribed and
+  status, findings, or blockers -- your parent is auto-subscribed and
   sees it in their feed. To reach a specific node directly, send to
   their inbox (`--node=<branch>`).
 - **Your outbox is a tax and a rider on every subscriber.** Outbox
@@ -110,11 +110,11 @@ radio use during other steps).
 - **Reach the user (root node).** The user is a passive mailbox with no
   loop, so a sleeping operator sees messages only on wake. If the user
   is your parent, post to your outbox (they are subscribed); otherwise
-  send to their inbox (`--node=<root-branch>`). Post and continue —
+  send to their inbox (`--node=<root-branch>`). Post and continue --
   never block on a reply; if you truly need an answer to proceed, make a
   reversible call and note it.
 - **Radio reaches one hop.** Your feed spans only your parent and your
-  direct children — never grandchildren or deeper, and there is no
+  direct children -- never grandchildren or deeper, and there is no
   tree-wide view. Information crosses more than one level by relaying
   hop-by-hop: each tier reports to its own parent's outbox, so a finding
   walks up one level per iteration. An operator wanting a whole-subtree

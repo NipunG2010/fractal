@@ -1,4 +1,4 @@
-"""Tests for ``TuiActions`` -- the cockpit's only write surface.
+"""Test the ``fractal.tui.actions`` module.
 
 Writes run against the small writable pair tree (the canonical tree stays
 read-only) and are verified the way the cockpit sees them: through a fresh

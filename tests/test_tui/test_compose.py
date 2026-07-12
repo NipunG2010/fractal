@@ -58,16 +58,16 @@ async def test_kind_toggle_flips_visible_fields(
         await pilot.press('escape')  # back to field mode on the body
         # body -> the middle (convo/subject) -> the kind toggle (rows[0])
         await pilot.press('up', 'up')
-        assert pane.cur == 'm_kind'
+        assert pane.cursor == 'm_kind'
         await pilot.press('enter')  # flip the kind
         flipped = 'radio' if start_kind == 'chat' else 'chat'
         assert pane.kind == flipped
         # radio reveals channel/thread/priority/subject; chat reveals the convo
         radio = flipped == 'radio'
         assert app.query_one('#cell_m_channel').display is radio
-        assert app.query_one('#subjectrow').display is radio
+        assert app.query_one('#m_subjectrow').display is radio
         assert app.query_one('#cell_m_session').display is not radio
-        assert app.query_one('#convo').display is not radio
+        assert app.query_one('#m_convo').display is not radio
 
 
 async def test_field_grid_navigation_walks_rows_and_body(
@@ -81,21 +81,21 @@ async def test_field_grid_navigation_walks_rows_and_body(
         pane.refresh_visibility()
         await pilot.press('down', 'enter', 'escape')  # into field mode, on the body
         await pilot.press('up', 'up')  # body -> subject (middle) -> m_kind (rows[0])
-        assert pane.cur == 'm_kind'
+        assert pane.cursor == 'm_kind'
         await pilot.press('right', 'right')  # kind -> node -> channel
-        assert pane.cur == 'm_channel'
+        assert pane.cursor == 'm_channel'
         await pilot.press('right')  # -> thread
-        assert pane.cur == 'm_thread'
+        assert pane.cursor == 'm_thread'
         await pilot.press('left')  # back to channel
-        assert pane.cur == 'm_channel'
+        assert pane.cursor == 'm_channel'
         await pilot.press('down')  # the row -> the middle (subject) for radio
-        assert pane.cur == 'm_subject'
+        assert pane.cursor == 'm_subject'
         await pilot.press('down')  # subject -> body
-        assert pane.cur == 'm_body'
+        assert pane.cursor == 'm_body'
         await pilot.press('up')  # body -> subject (the middle)
-        assert pane.cur == 'm_subject'
+        assert pane.cursor == 'm_subject'
         await pilot.press('up')  # subject -> the row (rows[0] = m_kind)
-        assert pane.cur == 'm_kind'
+        assert pane.cursor == 'm_kind'
         await pilot.press('up')  # ↑ at the top row leaves to the ring
         assert app.mode == 'ring'
 
@@ -113,13 +113,13 @@ async def test_field_cursor_cycles_through_the_visible_fields(
         pane = app.message_pane
         await pilot.press('down', 'enter', 'escape')  # field mode on the body
         visible = pane._visible_fields()
-        start = pane.cur
+        start = pane.cursor
         app.action_field_next()
         await pilot.pause()
-        assert pane.cur == visible[(visible.index(start) + 1) % len(visible)]
+        assert pane.cursor == visible[(visible.index(start) + 1) % len(visible)]
         app.action_field_prev()
         await pilot.pause()
-        assert pane.cur == start
+        assert pane.cursor == start
 
 
 async def test_type_to_edit_a_free_text_field(
@@ -136,7 +136,7 @@ async def test_type_to_edit_a_free_text_field(
         await pilot.press(
             'right', 'right', 'right'
         )  # kind -> node -> channel -> thread
-        assert pane.cur == 'm_thread'  # a free-text field (no combo)
+        assert pane.cursor == 'm_thread'  # a free-text field (no combo)
         await pilot.press('x')  # type-to-edit: enters edit and inserts the char
         assert app.mode == 'edit'
         assert 'x' in app.query_one('#m_thread', Input).value
@@ -153,14 +153,14 @@ async def test_combo_pick_sets_the_node_field(
         pane = app.message_pane
         await pilot.press('down', 'enter', 'escape')  # field mode on the body
         await pilot.press('up', 'up', 'right')  # body -> middle -> m_kind -> m_node
-        assert pane.cur == 'm_node'
+        assert pane.cursor == 'm_node'
         await pilot.press('enter')  # drop the node combo
         assert app.mode == 'combo'
-        assert app.query('#combodrop')
+        assert app.query('#m_combodrop')
         await pilot.press('down')  # move the highlight off the current node
         await pilot.press('enter')  # commit the pick
         assert app.mode == 'field'
-        assert not app.query('#combodrop')
+        assert not app.query('#m_combodrop')
         # the node retargeted to a tree branch; the field shows that leaf
         branches = [row['branch'] for row in app.snapshot.tree]
         assert pane.node in branches
@@ -177,13 +177,13 @@ async def test_combo_cancel_restores_the_prior_value(
         before = pane.node
         # field mode -> m_node, drop the combo
         await pilot.press('down', 'enter', 'escape', 'up', 'up', 'right')
-        assert pane.cur == 'm_node'
+        assert pane.cursor == 'm_node'
         await pilot.press('enter')  # drop the combo
         assert app.mode == 'combo'
         await pilot.press('down', 'down')  # move the highlight around
         await pilot.press('escape')  # cancel: nothing commits
         assert app.mode == 'field'
-        assert not app.query('#combodrop')
+        assert not app.query('#m_combodrop')
         assert pane.node == before
         assert app.query_one('#m_node', Input).value == leaf_of(before)
 
@@ -197,11 +197,11 @@ async def test_combo_filters_by_typed_text(
         pane = app.message_pane
         # field mode -> m_node, then type-to-open the combo seeded with 'g'
         await pilot.press('down', 'enter', 'escape', 'up', 'up', 'right')
-        assert pane.cur == 'm_node'
+        assert pane.cursor == 'm_node'
         await pilot.press('g')
         assert app.mode == 'combo'
         await pilot.pause()
-        drop = app.query_one('#combodrop', OptionList)
+        drop = app.query_one('#m_combodrop', OptionList)
         # only branches containing 'g' survive the filter (gamma)
         branches = [row['branch'] for row in app.snapshot.tree]
         expected = [branch for branch in branches if 'g' in branch.lower()]
@@ -221,12 +221,12 @@ async def test_chatscroll_mode_scrolls_the_transcript(
             app.chat.append('main.alpha', 'meta', f'line {index}')
         app.message_pane.rescope_convo()
         await pilot.pause()
-        convo = app.query_one('#convo')
+        convo = app.query_one('#m_convo')
         convo.scroll_home(animate=False)
         await pilot.pause()
         # field mode -> the convo zone (chat's middle), then activate chat-scroll
         await pilot.press('down', 'enter', 'escape', 'up')
-        assert app.message_pane.cur == 'convo'
+        assert app.message_pane.cursor == 'm_convo'
         await pilot.press('enter')
         assert app.mode == 'chatscroll'
         await pilot.press('down', 'down', 'down')

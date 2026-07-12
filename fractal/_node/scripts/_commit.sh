@@ -261,7 +261,10 @@ MSG_SUBJECT="$CURRENT_BRANCH: $LABEL ($MSG)"
 # so pre-commit-hook retry never double-logs; returns git's commit status
 commit() {
     # force bypasses hooks too: the loop's backstops must be able to save work
-    # past a failing hook, and mutating hooks must never rewrite the save
+    # past a failing hook, and mutating hooks must never rewrite the save;
+    # declared =() so the += below builds a clean array -- bash 3.2 prepends
+    # an empty element to a bare-declared scalar on first +=, and the
+    # +-expansion stays set-u-safe
     local VERIFY=()
     [[ "$FORCE" == true ]] && VERIFY+=(--no-verify)
     git -C "$WORKTREE_DIR" commit ${VERIFY[@]+"${VERIFY[@]}"} -m "$MSG_SUBJECT" || return 1

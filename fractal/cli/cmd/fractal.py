@@ -364,11 +364,9 @@ def pricing(app: typer.Typer) -> typer.Typer:
         # refresh mode: fetch atomically, tolerating an offline fallback to cache
         status = update_pricing(max_age=max_age)
         if status == 'missing':
-            typer.echo(
-                'Error: could not fetch pricing and no cached pricing.json exists.',
-                err=True,
+            raise RuntimeError(
+                'Could not fetch pricing and no cached pricing.json exists.'
             )
-            raise SystemExit(1)
         if status == 'stale':
             typer.echo(
                 'Warning: could not refresh pricing; using cached pricing.json.',

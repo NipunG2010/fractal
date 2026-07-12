@@ -14,21 +14,22 @@ Screen { background: $background; color: $foreground; layers: base overlay; }
 /* hkey hugs the cell top, halving the visual gap to the panes above */
 #message { height: 21; border-top: hkey $border-dim; }
 #message.focused { border-top: hkey $primary; }
-#fields { height: 1; }
+#m_fields { height: 1; }
 .cell { width: auto; height: 1; margin: 0 $gap 0 0; }
 .cell Label { color: $chrome; padding: 0 1 0 0; }
-#convo { height: 1fr; }
+#m_convo { height: 1fr; }
 .msg { width: 1fr; height: auto; }
 .you { background: $panel; }
-#subjectrow { height: 1; }
-#subjectrow Label { color: $chrome; padding: 0 1 0 0; }
-#composer { height: auto; margin-top: 1; background: $panel; }
-#composer.bodylit { background: $lit; }
-#composer Label { color: $primary; padding: 0 1 0 0; background: $panel; }
+#m_subjectrow { height: 1; }
+#m_subjectrow Label { color: $chrome; padding: 0 1 0 0; }
+#m_composer { height: auto; margin-top: 1; background: $panel; }
+#m_composer.bodylit { background: $lit; }
+#m_composer Label { color: $primary; padding: 0 1 0 0; background: $panel; }
 Input { height: 1; border: none; padding: 0 1; background: $surface; color: $foreground; }
 Input:focus { background: $sel; }
+/* !important: the field-cursor light must beat Input:focus, which outranks a bare class */
 .fsel { background: $lit !important; }
-#combodrop { layer: overlay; background: $overlay; border: round $primary; padding: 0 1; }
+#m_combodrop { layer: overlay; background: $overlay; border: round $primary; padding: 0 1; }
 #rdrop { layer: overlay; background: $overlay; border: round $primary; padding: 0 1; }
 .zonefocus { background: $zone; }
 .litdiv { color: $primary; }

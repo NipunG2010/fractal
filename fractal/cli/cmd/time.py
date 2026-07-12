@@ -8,9 +8,7 @@ import typer
 
 from fractal.cli.utils import command, resolve_target
 
-__all__ = [
-    'time_remaining',
-]
+__all__ = ['time_remaining']
 
 
 def time_remaining(app: typer.Typer) -> typer.Typer:

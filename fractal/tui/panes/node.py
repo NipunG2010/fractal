@@ -308,15 +308,15 @@ class NodePane:
         """
         if not card:
             return f'[{theme.DIM}]no node[/]'
-        agent = card['agent'] or '—'
+        agent = card['agent'] or theme.EMPTY
         if card['detached']:
             agent += f' [{theme.DIM}](detached)[/]'
-        model = card['model'] or '—'
-        session = card['session'] or '—'
+        model = card['model'] or theme.EMPTY
+        session = card['session'] or theme.EMPTY
         return (
-            f'[{theme.DIM}]agent[/]        {agent}\n'
-            f'[{theme.DIM}]model[/]        {model}\n'
-            f'[{theme.DIM}]session[/]      {session}'
+            f'[{theme.DIM}]{fmt.col("agent", theme.IDENT_W)}[/]{agent}\n'
+            f'[{theme.DIM}]{fmt.col("model", theme.IDENT_W)}[/]{model}\n'
+            f'[{theme.DIM}]{fmt.col("session", theme.IDENT_W)}[/]{session}'
         )
 
     def _measures(self: NodePane, m: Optional[dict]) -> Union[Text, str]:
@@ -362,7 +362,7 @@ class NodePane:
             )
         # both gauges share one fixed width and trail their text (the row
         # ends ragged-right rather than stretching to the pane edge)
-        gap = 3
+        gap = theme.GAUGE_GAP
         avail = self._content_w() - theme.MEAS_W - 2 * theme.GAP
         el_fig = max(len(fig[1][1]) for fig in figs)
         co_fig = max(len(fig[3][1]) for fig in figs)
@@ -459,17 +459,20 @@ class NodePane:
         """Render the foot hints for the active zone."""
         if self.app.mode == 'node' and self.zone == 'top':
             return (
-                f'[{theme.DIM}]{theme.RET} chat this session {theme.SEP} ↓ runs'
-                f' {theme.SEP} esc back[/]'
+                f'[{theme.DIM}]{theme.RET} chat this session {theme.SEP}'
+                f' {theme.DOWN} runs {theme.SEP} esc back[/]'
             )
         if self.app.mode == 'node' and self.zone == 'rows':
             return (
-                f'[{theme.DIM}]↑↓ select {theme.SEP} {theme.RET} open in runs'
+                f'[{theme.DIM}]{theme.UP}{theme.DOWN} select {theme.SEP}'
+                f' {theme.RET} open in runs'
                 f' {theme.SEP} t subtree {theme.SEP} esc back[/]'
             )
         return (
-            f'[{theme.DIM}]↑↓ select {theme.SEP} →/{theme.RET} expand'
-            f' {theme.SEP} ← collapse {theme.SEP} ↓ event log {theme.SEP} esc[/]'
+            f'[{theme.DIM}]{theme.UP}{theme.DOWN} select {theme.SEP}'
+            f' {theme.RIGHT}/{theme.RET} expand'
+            f' {theme.SEP} {theme.LEFT} collapse {theme.SEP} {theme.DOWN} event log'
+            f' {theme.SEP} esc[/]'
         )
 
     def _ex_rows(self: NodePane, snap: Snapshot) -> list[tuple]:
@@ -755,7 +758,7 @@ class NodePane:
         """Handle node mode: card chat, explorer selection, log scroll/rows."""
         key = event.key
         snap = self.app.snapshot
-        # top zone: the card; ⏎ opens a chat against its session
+        # top zone: the card; enter opens a chat against its session
         if self.zone == 'top':
             if key in ('escape', 'up'):
                 self.leave()
@@ -772,7 +775,7 @@ class NodePane:
             event.stop()
             return
         # log rows: a selection cursor over the activity timeline (the view
-        # scrolls only when the cursor crosses the viewport edge); ⏎ jumps the
+        # scrolls only when the cursor crosses the viewport edge); enter jumps the
         # explorer (and the card) to the row's run/iter/step
         if self.zone == 'rows':
             if key == 'escape':
@@ -839,7 +842,7 @@ class NodePane:
                 self.ex_expanded.symmetric_difference_update({ref})
                 self._ex_rebuild(snap)
             else:
-                # ⏎ on a step: fork-chat its session in the compose pane
+                # enter on a step: fork-chat its session in the compose pane
                 self.app.fork_session(self._ex_entry(snap, ref))
                 self._ex_paint()
         else:

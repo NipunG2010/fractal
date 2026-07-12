@@ -4,7 +4,7 @@ set -euo pipefail
 # Run linters on the node's worktree
 # ----------------------------------
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 NODE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKTREE_DIR="$(git -C "$(dirname "$NODE_DIR")" rev-parse --show-toplevel)"
 

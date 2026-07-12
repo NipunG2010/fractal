@@ -41,7 +41,6 @@ from __future__ import annotations
 import csv
 import io
 import pathlib
-import shutil
 import subprocess
 import uuid
 from collections.abc import Callable, Iterator
@@ -50,7 +49,7 @@ import pytest
 
 from tests._helpers import _git
 
-from .conftest import _run
+from .conftest import _require_tmux, _run
 
 __all__ = [
     'test_signal_rejected_from_non_active_status',
@@ -117,8 +116,7 @@ def live_loop() -> Iterator[Callable[[pathlib.Path], None]]:
     callable that spawns the session ``start.sh`` would (skipping the test when
     tmux is unavailable); every spawned session is killed on teardown.
     """
-    if shutil.which('tmux') is None:
-        pytest.skip('tmux unavailable')
+    _require_tmux()
     spawned: list[str] = []
 
     def _spawn(wt: pathlib.Path) -> None:

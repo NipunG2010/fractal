@@ -204,7 +204,7 @@ def _parse_project_dir(output: str) -> pathlib.Path:
     for line in reversed(output.strip().split('\n')):
         if line.startswith('Initialized /'):
             return pathlib.Path(line.removeprefix('Initialized '))
-    raise ValueError('no "Initialized /" line found in output')
+    raise ValueError('No "Initialized /" line found in output.')
 
 
 def _resolve_branch(project_dir: pathlib.Path) -> str:

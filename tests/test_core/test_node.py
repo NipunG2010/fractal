@@ -1,4 +1,4 @@
-"""Tests for ``Node``."""
+"""Test the ``fractal.core.node`` module."""
 
 from __future__ import annotations
 
@@ -2169,7 +2169,9 @@ def test_tmux_probe_treats_missing_binary_as_no_session(node_with_db: Node) -> N
     real_run = subprocess.run
 
     def fake_run(
-        cmd: list, *args: object, **kwargs: object
+        cmd: list,
+        *args: object,
+        **kwargs: object,
     ) -> subprocess.CompletedProcess:
         if cmd and cmd[0] == 'tmux':
             raise FileNotFoundError(2, 'No such file or directory', 'tmux')
@@ -2509,7 +2511,7 @@ def test_run_script_resolves_invoking_installation_cli(
     decoy_dir.mkdir()
     marker = decoy_dir / 'consulted'
     decoy = decoy_dir / 'fractal'
-    decoy.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
+    decoy.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n', encoding='utf-8')
     decoy.chmod(0o755)
     monkeypatch.setenv('PATH', f'{decoy_dir}{os.pathsep}{os.environ["PATH"]}')
     # drive a script that shells back into fractal (delete.sh reads config)
@@ -2538,7 +2540,7 @@ def test_commit_resolves_invoking_installation_cli(
     decoy_dir.mkdir()
     marker = decoy_dir / 'consulted'
     decoy = decoy_dir / 'fractal'
-    decoy.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
+    decoy.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n', encoding='utf-8')
     decoy.chmod(0o755)
     monkeypatch.setenv('PATH', f'{decoy_dir}{os.pathsep}{os.environ["PATH"]}')
     # drive a real commit -- _commit.sh shells back into fractal for its

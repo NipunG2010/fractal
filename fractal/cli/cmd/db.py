@@ -8,9 +8,7 @@ import typer
 
 from fractal.cli.utils import command, print_rows, resolve_node
 
-__all__ = [
-    'db_query',
-]
+__all__ = ['db_query']
 
 
 def db_query(app: typer.Typer) -> typer.Typer:

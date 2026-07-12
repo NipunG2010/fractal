@@ -55,9 +55,9 @@ _SLASH_COMMANDS = ('node', 'channel', 'thread', 'priority', 'subject')
 class Composer(TextArea):
     """The MESSAGE body, with a terminal-aware send key.
 
-    On a kitty-protocol terminal ``⏎``/``⌃S`` send and ``⇧⏎`` inserts the
-    newline; elsewhere ``⏎`` is the newline and ``⌃S`` the only send (``⇧⏎``
-    arrives as plain ``enter`` there).
+    On a kitty-protocol terminal ``enter``/``ctrl+s`` send and ``shift+enter``
+    inserts the newline; elsewhere ``enter`` is the newline and ``ctrl+s`` the
+    only send (``shift+enter`` arrives as plain ``enter`` there).
     """
 
     def on_mount(self: Composer) -> None:
@@ -83,8 +83,8 @@ class Composer(TextArea):
             self.insert('\n')
             self.scroll_cursor_visible()
         elif key in ('up', 'down'):
-            # move between lines within the message; only ↑ at the very top
-            # bubbles out to the field above (↓ stays -- the body is last)
+            # move between lines within the message; only up at the very top
+            # bubbles out to the field above (down stays -- the body is last)
             before = self.cursor_location
             if key == 'up':
                 self.action_cursor_up()
@@ -122,7 +122,7 @@ class MessagePane:
         self.app = app
         self.kind = 'chat'
         self.kind_hover = False
-        self.cur = 'm_kind'
+        self.cursor = 'm_kind'
         self.node = app.scope
         self.session = (list(app.snapshot.sessions) or ['-'])[0]
         self._streaming = False
@@ -134,7 +134,7 @@ class MessagePane:
 
     def compose(self: MessagePane) -> ComposeResult:
         """Compose the pane interior."""
-        with Horizontal(id='fields'):
+        with Horizontal(id='m_fields'):
             for fid, label, area in _MFIELDS:
                 if area != 'row':
                     continue
@@ -144,14 +144,14 @@ class MessagePane:
                 with Horizontal(classes='cell', id=f'cell_{fid}'):
                     yield Label(label)
                     yield Input(self._default(fid), id=fid)
-        yield Divider(id='chattop')
-        yield PaneScroll(id='convo')
-        yield Divider(id='chatline')
-        with Horizontal(id='subjectrow'):
+        yield Divider(id='m_chattop')
+        yield PaneScroll(id='m_convo')
+        yield Divider(id='m_chatline')
+        with Horizontal(id='m_subjectrow'):
             yield Label('subject')
-            yield Input(placeholder='—', id='m_subject')
-        with Horizontal(id='composer'):
-            yield Label(theme.PROMPT, id='prompt')
+            yield Input(placeholder=theme.EMPTY, id='m_subject')
+        with Horizontal(id='m_composer'):
+            yield Label(theme.PROMPT, id='m_prompt')
             yield Composer(id='m_body', show_line_numbers=False)
         if _ENTER_SENDS:
             hint = (
@@ -170,7 +170,7 @@ class MessagePane:
         return {
             'm_node': leaf_of(self.node),
             'm_channel': 'public',
-            'm_thread': '—',
+            'm_thread': theme.EMPTY,
             'm_priority': '10',
             'm_session': fmt.trunc(self.session, theme.SESS_W),
         }.get(fid, '')
@@ -179,7 +179,7 @@ class MessagePane:
         """Show the node's leaf name; ``self.node`` keeps the full branch."""
         field = self.app.query_one('#m_node', Input)
         field.value = leaf_of(self.node)
-        field.styles.width = len(field.value) + 3
+        field.styles.width = len(field.value) + theme.HUG_PAD
 
     def show_session(self: MessagePane) -> None:
         """Show the (truncated) session id; ``self.session`` keeps the full value."""
@@ -193,7 +193,7 @@ class MessagePane:
         (resting AND lit/hover), so selection reads from the chip.
         """
         lit = (
-            self.app.mode in ('field', 'edit', 'combo') and self.cur == 'm_kind'
+            self.app.mode in ('field', 'edit', 'combo') and self.cursor == 'm_kind'
         ) or self.kind_hover
         result = []
         for kind in ('chat', 'radio'):
@@ -239,7 +239,7 @@ class MessagePane:
 
     def _area(self: MessagePane, fid: str) -> str:
         """Return the field's grid area (row / subject / chat / body)."""
-        if fid == 'convo':
+        if fid == 'm_convo':
             return 'chat'
         return next((area for f, label, area in _MFIELDS if f == fid), 'row')
 
@@ -248,7 +248,7 @@ class MessagePane:
         if self.kind == 'radio':
             return [f[0] for f in _MFIELDS if f[0] not in _CHAT_ONLY]
         fields = [f[0] for f in _MFIELDS if f[0] not in _RADIO_ONLY]
-        fields.insert(fields.index('m_body'), 'convo')
+        fields.insert(fields.index('m_body'), 'm_convo')
         return fields
 
     def refresh_visibility(self: MessagePane) -> None:
@@ -257,16 +257,16 @@ class MessagePane:
         # mutation path funnels through here
         for fid in ('m_node', 'm_channel'):
             field = self.app.query_one(f'#{fid}', Input)
-            field.styles.width = len(field.value) + 3
+            field.styles.width = len(field.value) + theme.HUG_PAD
         radio = self.kind == 'radio'
         self.app.query_one('#message').set_class(radio, 'radiokind')
         self.app.query_one('#cell_m_session').display = not radio
         self.app.query_one('#cell_m_channel').display = radio
         self.app.query_one('#cell_m_thread').display = radio
         self.app.query_one('#cell_m_priority').display = radio
-        self.app.query_one('#subjectrow').display = radio
-        self.app.query_one('#convo').display = not radio
-        self.app.query_one('#chatline').display = not radio
+        self.app.query_one('#m_subjectrow').display = radio
+        self.app.query_one('#m_convo').display = not radio
+        self.app.query_one('#m_chatline').display = not radio
 
     def paint_fields(self: MessagePane) -> None:
         """Paint the field cursor, composer light, and chat-scroll dividers."""
@@ -275,22 +275,24 @@ class MessagePane:
             if fid == 'm_kind':
                 self.paint_kind()
             else:
-                selected = active and fid == self.cur
+                selected = active and fid == self.cursor
                 self.app.query_one(f'#{fid}').set_class(selected, 'fsel')
-        body = active and self.cur == 'm_body'
-        self.app.query_one('#prompt').set_class(body, 'fsel')
+        body = active and self.cursor == 'm_body'
+        self.app.query_one('#m_prompt').set_class(body, 'fsel')
         # light the whole composer so the body highlight is a full rectangle
-        self.app.query_one('#composer').set_class(body, 'bodylit')
-        convo = self.app.query_one('#convo')
-        convo.set_class(self.app.mode == 'field' and self.cur == 'convo', 'zonefocus')
+        self.app.query_one('#m_composer').set_class(body, 'bodylit')
+        convo = self.app.query_one('#m_convo')
+        convo.set_class(
+            self.app.mode == 'field' and self.cursor == 'm_convo', 'zonefocus'
+        )
         lit = self.app.mode == 'chatscroll'
-        self.app.query_one('#chattop').set_class(lit, 'litdiv')
-        self.app.query_one('#chatline').set_class(lit, 'litdiv')
+        self.app.query_one('#m_chattop').set_class(lit, 'litdiv')
+        self.app.query_one('#m_chatline').set_class(lit, 'litdiv')
 
     def enter(self: MessagePane) -> None:
         """Enter the pane straight into the body, ready to type."""
         self.app.mode = 'edit'
-        self.cur = 'm_body'
+        self.cursor = 'm_body'
         self.paint_fields()
         self.app.query_one('#m_body').focus()
 
@@ -319,13 +321,13 @@ class MessagePane:
             self._move_field(key)
         elif key == 'enter':
             self._activate()
-        elif self.cur in ('convo', 'm_kind'):
+        elif self.cursor in ('m_convo', 'm_kind'):
             return
         elif event.is_printable:
-            if self._opts(self.cur) is not None:
-                self._open_combo(self.cur, seed=event.character or '')
+            if self._opts(self.cursor) is not None:
+                self._open_combo(self.cursor, seed=event.character or '')
             else:
-                widget = self.app.query_one(f'#{self.cur}')
+                widget = self.app.query_one(f'#{self.cursor}')
                 self.app.mode = 'edit'
                 widget.focus()
                 if isinstance(widget, TextArea):
@@ -342,55 +344,55 @@ class MessagePane:
         rows = [fid for fid in visible if self._area(fid) == 'row']
         if 'm_subject' in visible:
             middle = 'm_subject'
-        elif 'convo' in visible:
-            middle = 'convo'
+        elif 'm_convo' in visible:
+            middle = 'm_convo'
         else:
             middle = None
-        area = self._area(self.cur)
+        area = self._area(self.cursor)
         if area == 'row':
-            index = rows.index(self.cur)
+            index = rows.index(self.cursor)
             if direction == 'left':
-                self.cur = rows[max(0, index - 1)]
+                self.cursor = rows[max(0, index - 1)]
             elif direction == 'right':
-                self.cur = rows[min(len(rows) - 1, index + 1)]
+                self.cursor = rows[min(len(rows) - 1, index + 1)]
             elif direction == 'down':
-                self.cur = middle or 'm_body'
+                self.cursor = middle or 'm_body'
             elif direction == 'up':
                 self.leave()
                 return
         elif area in ('subject', 'chat'):
             if direction == 'up':
-                self.cur = rows[0]
+                self.cursor = rows[0]
             elif direction == 'down':
-                self.cur = 'm_body'
+                self.cursor = 'm_body'
         else:
             if direction == 'up':
-                self.cur = middle or rows[0]
+                self.cursor = middle or rows[0]
         self.paint_fields()
 
     def _activate(self: MessagePane) -> None:
         """Activate the cursor's field (toggle, scroll, combo, or edit)."""
-        if self.cur == 'm_kind':
+        if self.cursor == 'm_kind':
             self._flip_kind()
-        elif self.cur == 'convo':
+        elif self.cursor == 'm_convo':
             self.app.mode = 'chatscroll'
             self.paint_fields()
-        elif self._opts(self.cur) is not None:
-            self._open_combo(self.cur)
+        elif self._opts(self.cursor) is not None:
+            self._open_combo(self.cursor)
         else:
             self.app.mode = 'edit'
-            self.app.query_one(f'#{self.cur}').focus()
+            self.app.query_one(f'#{self.cursor}').focus()
 
     def _flip_kind(self: MessagePane) -> None:
         """Toggle chat <-> radio, re-show the fields, keep the cursor valid."""
         self.kind = 'radio' if self.kind == 'chat' else 'chat'
         self.refresh_visibility()
-        if self.cur not in self._visible_fields():
-            self.cur = 'm_kind'
+        if self.cursor not in self._visible_fields():
+            self.cursor = 'm_kind'
         self.paint_fields()
 
     def key_edit(self: MessagePane, event: Key) -> None:
-        """Handle edit mode: esc ends, ↑↓ end + move."""
+        """Handle edit mode: esc ends, up/down end + move."""
         key = event.key
         if key == 'escape':
             self._end_edit()
@@ -407,15 +409,15 @@ class MessagePane:
         self.paint_fields()
 
     def key_chatscroll(self: MessagePane, event: Key) -> None:
-        """Handle chat-scroll mode: ↑↓ scroll the transcript, esc back."""
+        """Handle chat-scroll mode: up/down scroll the transcript, esc back."""
         key = event.key
         if key == 'escape':
             self.app.mode = 'field'
             self.paint_fields()
         elif key == 'up':
-            self.app.query_one('#convo').scroll_up(animate=False)
+            self.app.query_one('#m_convo').scroll_up(animate=False)
         elif key == 'down':
-            self.app.query_one('#convo').scroll_down(animate=False)
+            self.app.query_one('#m_convo').scroll_down(animate=False)
         else:
             return
         event.stop()
@@ -429,8 +431,8 @@ class MessagePane:
         elif self.app.mode == 'combo':
             self._close_combo(commit=True)
         visible = self._visible_fields()
-        index = visible.index(self.cur) if self.cur in visible else 0
-        self.cur = visible[(index + step) % len(visible)]
+        index = visible.index(self.cursor) if self.cursor in visible else 0
+        self.cursor = visible[(index + step) % len(visible)]
         self.paint_fields()
 
     def _open_combo(self: MessagePane, fid: str, seed: str = '') -> None:
@@ -442,14 +444,14 @@ class MessagePane:
         fields = {'m_node': self.node, 'm_session': self.session}
         self._ccurrent = fields.get(fid, field.value)
         self.app.mode = 'combo'
-        self.app.mount(OptionList(id='combodrop'))
+        self.app.mount(OptionList(id='m_combodrop'))
         field.value = seed
         field.focus()
         self.app.call_after_refresh(self.filter_combo)
 
     def filter_combo(self: MessagePane) -> None:
         """Re-filter the combo options from the field's typed value."""
-        drops = self.app.query('#combodrop')
+        drops = self.app.query('#m_combodrop')
         if not drops:
             return
         drop = drops.first(OptionList)
@@ -472,11 +474,11 @@ class MessagePane:
         drop.styles.offset = (region.x, region.y + 1)
 
     def key_combo(self: MessagePane, event: Key) -> None:
-        """Handle combo mode: ↑↓ move the highlight, esc cancels."""
+        """Handle combo mode: up/down move the highlight, esc cancels."""
         key = event.key
         if key in ('up', 'down'):
             if self._cfiltered:
-                drop = self.app.query_one('#combodrop', OptionList)
+                drop = self.app.query_one('#m_combodrop', OptionList)
                 highlighted = drop.highlighted or 0
                 step = 1 if key == 'down' else -1
                 drop.highlighted = (highlighted + step) % len(self._cfiltered)
@@ -489,7 +491,7 @@ class MessagePane:
         """Commit the highlighted combo option into the field."""
         field = self.app.query_one(f'#{self._cfid}', Input)
         if self._cfiltered:
-            drop = self.app.query_one('#combodrop', OptionList)
+            drop = self.app.query_one('#m_combodrop', OptionList)
             field.value = self._cfiltered[drop.highlighted or 0]
         self._close_combo(commit=True)
 
@@ -497,7 +499,7 @@ class MessagePane:
         """Close the combo drop, committing or restoring the field value."""
         if not commit:
             self.app.query_one(f'#{self._cfid}', Input).value = self._cprev
-        for drop in self.app.query('#combodrop'):
+        for drop in self.app.query('#m_combodrop'):
             drop.remove()
         self.app.set_focus(None)
         self.app.mode = 'field'
@@ -511,13 +513,13 @@ class MessagePane:
                 self.node = picked or self.node
             self.show_node()
         self.refresh_visibility()
-        if self.cur not in self._visible_fields():
-            self.cur = 'm_node'
+        if self.cursor not in self._visible_fields():
+            self.cursor = 'm_node'
         self.paint_fields()
 
     def rescope_convo(self: MessagePane) -> None:
         """Swap the transcript to the scoped branch's buffer."""
-        convo = self.app.query_one('#convo')
+        convo = self.app.query_one('#m_convo')
         convo.remove_children()
         for who, text in self.app.chat.convo(self.app.scope):
             convo.mount(self._msg(who, text))
@@ -545,7 +547,7 @@ class MessagePane:
         self.app.chat.append(branch, who, text)
         self._streaming = False
         if branch == self.app.scope:
-            convo = self.app.query_one('#convo')
+            convo = self.app.query_one('#m_convo')
             convo.mount(self._msg(who, text), before=self._pending())
             self.app.call_after_refresh(convo.scroll_end, animate=False)
 
@@ -554,10 +556,10 @@ class MessagePane:
         self.app.chat.append_delta(branch, text)
         if branch != self.app.scope:
             return
-        convo = self.app.query_one('#convo')
+        convo = self.app.query_one('#m_convo')
         buffered = self.app.chat.convo(branch)[-1][1]
         # the trailing agent bubble sits just above the spinner, when present
-        bubbles = [child for child in convo.children if child.id != 'chatpending']
+        bubbles = [child for child in convo.children if child.id != 'm_chatpending']
         if self._streaming and bubbles:
             bubbles[-1].update(buffered)
         else:
@@ -567,14 +569,14 @@ class MessagePane:
 
     def _pending(self: MessagePane) -> Optional[Static]:
         """Find the in-flight spinner line (the transcript's last child)."""
-        pending = self.app.query('#chatpending')
+        pending = self.app.query('#m_chatpending')
         return pending.first(Static) if pending else None
 
     def show_pending(self: MessagePane) -> None:
         """Pin the in-flight spinner line at the transcript tail."""
         self.clear_pending()
-        convo = self.app.query_one('#convo')
-        convo.mount(Static('', classes='msg', id='chatpending'))
+        convo = self.app.query_one('#m_convo')
+        convo.mount(Static('', classes='msg', id='m_chatpending'))
         self.update_pending()
         self.app.call_after_refresh(convo.scroll_end, animate=False)
 
@@ -589,7 +591,7 @@ class MessagePane:
 
     def clear_pending(self: MessagePane) -> None:
         """Drop the spinner line (the turn finished or was cancelled)."""
-        for widget in self.app.query('#chatpending'):
+        for widget in self.app.query('#m_chatpending'):
             widget.remove()
 
     def send_body(self: MessagePane) -> None:
@@ -621,7 +623,7 @@ class MessagePane:
         priority_value = self.app.query_one('#m_priority', Input).value.strip()
         priority = int(priority_value) if priority_value.isdigit() else 10
         try:
-            if thread and thread != '—':
+            if thread and thread != theme.EMPTY:
                 self.app.actions.reply(
                     message_uuid=thread,
                     data=text,
@@ -640,7 +642,9 @@ class MessagePane:
         except (ValueError, PermissionError, sqlite3.Error) as error:
             self.app.notify(str(error), severity='warning')
             return
-        self.app.notify(f'radio {kind} → {leaf_of(target)} {theme.SEP} {channel}')
+        self.app.notify(
+            f'radio {kind} {theme.RIGHT} {leaf_of(target)} {theme.SEP} {channel}'
+        )
         if self.app.mode not in ('radio', 'rdrop', 'rdetail'):
             self.app.refresh_radio()
 
@@ -683,6 +687,8 @@ class MessagePane:
         parts = text[1:].split(maxsplit=1) if text.startswith('/') else []
         command = parts[0].lower() if parts else ''
         body = self.app.query_one('#m_body', Composer)
+        # TextArea has no public span API: style by writing its private
+        # per-line highlight map
         body._highlights.clear()
         if command in _SLASH_COMMANDS:
             body._highlights[0].append((0, 1 + len(command), 'slash'))
@@ -698,7 +704,7 @@ class MessagePane:
             self.show_session()
         self.kind = 'chat'
         self.app.mode = 'field'
-        self.cur = 'm_body'
+        self.cursor = 'm_body'
         self.app.focus_id = 'message'
         self.refresh_visibility()
         self.app._apply()
@@ -718,7 +724,7 @@ class MessagePane:
         self.app.query_one('#m_subject', Input).value = subject
         self.refresh_visibility()
         self.app.focus_id = 'message'
-        self.cur = 'm_body'
+        self.cursor = 'm_body'
         self.app.mode = 'edit'
         self.app._apply()
         self.app.query_one('#m_body').focus()
@@ -736,7 +742,7 @@ class MessagePane:
             self.show_session()
         self.refresh_visibility()
         self.app.focus_id = 'message'
-        self.cur = 'm_body'
+        self.cursor = 'm_body'
         self.app.mode = 'edit'
         self.app._apply()
         self.app.query_one('#m_body').focus()
@@ -747,13 +753,13 @@ class MessagePane:
 
 
 def _enter_sends() -> bool:
-    """Return whether ``⏎`` sends (the terminal delivers ``⇧⏎`` distinctly).
+    """Return whether ``enter`` sends (the terminal delivers ``shift+enter`` distinctly).
 
     Textual pushes the kitty keyboard protocol at startup but never learns
     whether the terminal honored it, so capability comes from the terminal's
     identity: kitty, ghostty, WezTerm, and iTerm2 (3.5+) all deliver
     ``shift+enter`` as its own key. Anywhere else both keys arrive as plain
-    ``enter``, so ``⏎`` stays the newline and ``⌃S`` is the only send.
+    ``enter``, so ``enter`` stays the newline and ``ctrl+s`` is the only send.
     """
     term = os.environ.get('TERM', '')
     if 'kitty' in term or 'ghostty' in term:

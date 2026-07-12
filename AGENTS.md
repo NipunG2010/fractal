@@ -288,6 +288,44 @@ never commits red.
   helpers)
 - Tests where the assertion is essentially restating the implementation
 
+## Wiki Maintenance
+
+The project wiki at `wiki/` is the authoritative reference for fractal's
+concepts, modules, and architecture. **Think of the wiki as a nested,
+dynamic-access AGENTS.md** — the structure mirrors the `fractal/` source
+tree, so when working in a module you read the corresponding wiki branch
+for context.
+
+- **Wiki paths mirror source paths.** Working on a module? Read the
+  corresponding wiki branch (e.g., `fractal/core/radio.py` →
+  `wiki/core/radio/`). Cross-cutting topics live in folders like
+  `wiki/project/`.
+- **Read the wiki first.** When the user asks about a fractal concept or
+  module, check `wiki/` before answering. The descriptive reference
+  lives there, not in this file.
+- **Update the wiki when code changes.** When you add, rename, remove,
+  or significantly modify a class or module, update the corresponding
+  wiki page in the same task. Treat wiki maintenance as part of the
+  change, not an afterthought.
+- **Update the wiki when you learn.** When you discover non-obvious
+  design rationale while exploring code, write it into the relevant wiki
+  page.
+- **Use the CLI.** Run `wiki search <pattern>` to find content. Run
+  `wiki map` for the navigation tree. Run `wiki update` to refresh
+  frontmatter and links. Run `wiki lint` to surface stale content.
+- **Description style.** Frontmatter `desc` fields and link descriptions
+  are human-readable prose — complete sentences ending in a period, with
+  class/method names rephrased into plain language (backticks only if
+  code must appear; detailed code references belong in the content
+  section below `***`). When a `desc` value exceeds ~100 characters, use
+  a YAML block scalar (`|`) with indented continuation lines.
+- **Leaf pages vs. folders.** Use a standalone `.md` page (e.g.,
+  `project/releasing.md`) when the topic doesn't correspond to a code
+  module and doesn't need child pages. Use a folder with `_index.md`
+  when the topic mirrors a Python module or needs sub-pages. If a leaf
+  page grows too large, consider converting it to a folder with child
+  pages.
+
 ## Code Style
 
 No implementation-phase comments and no development-history references

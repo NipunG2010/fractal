@@ -25,7 +25,7 @@ import pytest
 from fractal.core.node import Node
 from tests._helpers import _git
 
-from .conftest import _run
+from .conftest import _require_tmux, _run
 
 __all__ = [
     'test_init_persists_run_config',
@@ -188,7 +188,10 @@ def test_init_persists_run_config(repo: dict, key: str, expected: str) -> None:
     ],
 )
 def test_scope_flags_flatten_to_recorded_roots(
-    repo: dict, name: str, scope_flags: list[str], expected: list[str]
+    repo: dict,
+    name: str,
+    scope_flags: list[str],
+    expected: list[str],
 ) -> None:
     """Comma, repeated, and mixed ``--scope`` forms flatten to one root list.
 
@@ -592,8 +595,7 @@ def test_list_status_count_and_live(repo: dict) -> None:
     status. Activates ``task`` then restores it to ``idle`` so the shared
     fixture is left as other tests expect.
     """
-    if shutil.which('tmux') is None:
-        pytest.skip('tmux unavailable')
+    _require_tmux()
     root, task = repo['root'], repo['task']
     # --count matches the csv cardinality; the fixture's two workers are a
     # floor, not a total (shared-fixture tests may have added nodes)
@@ -1055,7 +1057,9 @@ def test_update_retunes_iter_and_step_cost(repo: dict) -> None:
     [('--max-iter-cost', 'max_iter_cost'), ('--max-step-cost', 'max_step_cost')],
 )
 def test_update_rejects_iter_cost_on_uncapped_child(
-    repo: dict, flag: str, key: str
+    repo: dict,
+    flag: str,
+    key: str,
 ) -> None:
     """A per-iteration/step cap on an uncapped child is rejected at update.
 

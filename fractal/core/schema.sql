@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE TABLE IF NOT EXISTS messages (
     message_id          INTEGER PRIMARY KEY,
     node                TEXT    NOT NULL,
-    message_uuid        TEXT    NOT NULL,
+    message_uuid        TEXT    NOT NULL UNIQUE,
     parent_message_id   INTEGER,
     parent_message_uuid TEXT,
     channel             TEXT    NOT NULL,
@@ -91,8 +91,7 @@ CREATE TABLE IF NOT EXISTS messages (
     subject             TEXT    NOT NULL,
     data                TEXT    NOT NULL,
     metadata            TEXT    NOT NULL DEFAULT '',
-    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE(message_uuid)
+    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS archive (

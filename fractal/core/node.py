@@ -56,13 +56,13 @@ _CODEX_NO_FORK = (
 
 
 class _VarTemplate(string.Template):
-    """``$VAR`` substitution matched to GNU ``envsubst`` (the loop's substitutor).
+    """``$VAR`` substitution matched to GNU ``envsubst`` (the pinned grammar).
 
     Only ``$NAME`` and ``${NAME}`` are references; everything else -- notably
     ``$$`` -- is passed through verbatim (the ``escaped`` group is made
-    unreachable, so ``$$`` is not collapsed to ``$``). This keeps a template's
-    rendering identical whether the loop (``envsubst``) or ``Node.render_template``
-    substitutes it.
+    unreachable, so ``$$`` is not collapsed to ``$``). Rendering is pinned
+    byte-for-byte against ``envsubst``, so a template means exactly what that
+    grammar says regardless of what substitutes it.
     """
 
     pattern = r"""
@@ -2265,8 +2265,8 @@ class Node:
         """
         try:
             return json.loads(config_path.read_text(encoding='utf-8'))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f'{config_path} is not valid JSON: {exc}') from exc
+        except json.JSONDecodeError as e:
+            raise ValueError(f'{config_path} is not valid JSON: {e}') from e
 
     def config_get(self: Node, key: str, default: Any = None) -> Any:
         """Read a config value.
@@ -3478,7 +3478,7 @@ class Node:
         cmd = ['commit', '-m', msg, '--', *paths]
         try:
             _git(cmd, cwd=self._root)
-        except RuntimeError as exc:
+        except RuntimeError as e:
             # a formatting hook may have rewritten the staged pages in the
             # working tree (mdformat escapes wikilinks); the index still holds
             # the authored bytes, so restore them -- leaving the rewrite in
@@ -3498,7 +3498,7 @@ class Node:
                 ' if present -- both register a frontmatter renderer and'
                 ' whichever is discovered first wins), or keep formatters off'
                 ' the wiki paths.'
-            ) from exc
+            ) from e
         return f'Committed user node baseline on {self._branch}.'
 
     def chat(
@@ -3747,8 +3747,8 @@ class Node:
 
         The variable map is ``_render_vars`` merged with ``overrides`` (which
         win). Substitution matches GNU ``envsubst`` (``$NAME``/``${NAME}`` only;
-        unknown placeholders and ``$$`` pass through verbatim), so a template
-        renders identically whether the loop or this code substitutes it.
+        unknown placeholders and ``$$`` pass through verbatim) -- the grammar
+        the renderer is pinned against.
 
         Args:
             template: The text to render.
@@ -5107,11 +5107,19 @@ def _git(
     if cwd:
         full_cmd.extend(['-C', f'{cwd}'])
     full_cmd.extend(cmd)
-    result = subprocess.run(
-        full_cmd,
-        capture_output=True,
-        text=True,
-    )
+    # a missing git binary is treated like a failed command, so callers that
+    # pass check=False (e.g. the leading rev-parse) degrade to a clean no-op
+    try:
+        result = subprocess.run(
+            full_cmd,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:
+        if check:
+            cmd_string = ' '.join(cmd)
+            raise RuntimeError(f'git {cmd_string} failed: {e}') from e
+        return None
     if result.returncode != 0:
         if check:
             cmd_string = ' '.join(cmd)

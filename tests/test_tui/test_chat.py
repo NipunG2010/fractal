@@ -1,4 +1,4 @@
-"""Tests for the cockpit chat surface: transports, parsers, turns, invariants.
+"""Test the ``fractal.tui.chat`` module.
 
 The transport decision table and both stream parsers are pure and run on
 canned input; ``ChatTurn`` is exercised against real tiny subprocesses (python
@@ -308,7 +308,7 @@ def test_claude_parser_null_duration() -> None:
 
 
 def _command(code: str) -> ChatCommand:
-    # a python one-liner standing in for the agent binary
+    """A python one-liner standing in for the agent binary."""
     return ChatCommand(
         agent='claude',
         argv=(sys.executable, '-c', code),
@@ -502,21 +502,21 @@ async def test_stale_done_does_not_clear_the_new_turn(
         # the prior turn's queued done arrives late
         app.on_chat_done(ChatDone(stale_id))
         assert app._turn is live_turn  # the live turn is untouched
-        assert app.query('#chatpending')  # its spinner is still pinned
+        assert app.query('#m_chatpending')  # its spinner is still pinned
         # the live turn finishes on its own and clears cleanly
         for _ in range(100):
             await pilot.pause(0.05)
             if app._turn is None:
                 break
         assert app._turn is None
-        assert not app.query('#chatpending')
+        assert not app.query('#m_chatpending')
 
 
-# ------ helper functions
+# ------ helpers
 
 
 def _dump(data: TuiData) -> tuple[str, ...]:
-    # a full logical dump of the central database (read-only connection)
+    """A full logical dump of the central database (read-only connection)."""
     connection = data.connect()
     try:
         return tuple(connection.iterdump())

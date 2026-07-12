@@ -1,14 +1,16 @@
 """Implements ``TuiData`` -- read-only primitives over the central database.
 
 The cockpit's only database surface: branch-keyed path resolution plus raw
-read-only SQL readers, each scoped by node to a caller-held connection so one
-refresh pass opens one connection. ``Node`` objects are deliberately absent
-from the read path -- their path properties shell out to git on every access,
-which at tree scale would dominate a poll tick; paths resolve once here (one
-batched ``git worktree list``) and cache per branch. Nothing in this module
-ever writes -- in particular no ``Radio.feed``/``read``/``reply``/``react``,
-which all stamp read state. Shaping into pane contracts lives in
-``fractal.tui.snapshot``; writes live in ``fractal.tui.actions``.
+read-only SQL readers, each scoped by node to a caller-held connection --
+every section loader opens one, runs its reads, and closes it, so a refresh
+pass costs one short-lived connection per uncached section. ``Node`` objects
+are deliberately absent from the read path -- their path properties shell out
+to git on every access, which at tree scale would dominate a poll tick; paths
+resolve once here (one batched ``git worktree list``) and cache per branch.
+Nothing in this module ever writes -- in particular no
+``Radio.feed``/``read``/``reply``/``react``, which all stamp read state.
+Shaping into pane contracts lives in ``fractal.tui.snapshot``; writes live in
+``fractal.tui.actions``.
 """
 
 from __future__ import annotations
@@ -183,7 +185,7 @@ class TuiData:
     def connect(self: TuiData) -> sqlite3.Connection:
         """Open one short-timeout read-only connection to the central database.
 
-        The caller holds it for a whole refresh pass and closes it; a
+        The caller holds it for one section's reads and closes it; a
         contending writer blocks a read for at most the short busy timeout.
 
         Raises:

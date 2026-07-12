@@ -262,7 +262,7 @@ reject_subsecond "$WAIT" "--wait"
 
 # ------ resolve source directories
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 NODE_SEED_DIR="$(cd "$SCRIPT_DIR/../_node" && pwd -P)"
 
 # ------ validate repo root
@@ -362,7 +362,7 @@ if [[ -d "$WORKTREE_DIR" ]]; then
     echo "Reusing existing worktree at $WORKTREE_DIR"
     if [[ "$RESET" != true ]]; then
         echo "Warning: $BRANCH already initialized; pass --reset to refresh" \
-            "seed files and config."
+            "seed files and config." >&2
     fi
 else
     # clear any stale registration first: a worktree dir removed out-of-band

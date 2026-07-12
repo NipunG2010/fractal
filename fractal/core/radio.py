@@ -533,11 +533,7 @@ class Radio:
         # every participant, and the read filter applies only afterwards so a
         # matching descendant under a filtered-out ancestor is not pruned
         result = []
-        self._collect_thread(
-            message=root,
-            depth=0,
-            result=result,
-        )
+        self._collect_thread(root, 0, result)
         # reject a non-owner reaching a read-only channel -- thread participants
         # are exempt, so a rerouted conversation reads whole for both parties
         branch = self.node._branch
@@ -1114,7 +1110,6 @@ class Radio:
 
     def _collect_thread(
         self: Radio,
-        *,
         message: dict,
         depth: int,
         result: list[dict],
@@ -1137,11 +1132,7 @@ class Radio:
         # re-sort by created_at ASC (db.read defaults to DESC)
         children.sort(key=lambda m: m['created_at'])
         for child in children:
-            self._collect_thread(
-                message=child,
-                depth=depth + 1,
-                result=result,
-            )
+            self._collect_thread(child, depth + 1, result)
 
     def _collect_message_ids(
         self: Radio,

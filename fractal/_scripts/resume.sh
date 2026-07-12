@@ -38,7 +38,7 @@ if [[ ! "$WORKTREE_DIR" = /* ]]; then
     WORKTREE_DIR="$(cd "$WORKTREE_DIR" && pwd)"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # derive the session name (mirrors start.sh) to catch a resume racing a loop
 # that is still parking -- start.sh's own session-exists refusal suggests

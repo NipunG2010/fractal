@@ -18,13 +18,14 @@ The teardown is destructive, so every test builds its own fresh repo under
 from __future__ import annotations
 
 import pathlib
-import shutil
 import subprocess
 
 import pytest
 
 import fractal
 from tests._helpers import _git
+
+from .conftest import _require_tmux
 
 __all__ = [
     'test_destroy_noop_without_fractal',
@@ -135,8 +136,7 @@ def test_destroy_does_not_orphan_a_locked_worktree(
 
 def test_destroy_refuses_a_running_tmux_session(tmp_path: pathlib.Path) -> None:
     """A node with a live tmux session blocks the destroy before any removal."""
-    if shutil.which('tmux') is None:
-        pytest.skip('tmux unavailable')
+    _require_tmux()
     repo = _make_repo(tmp_path / 'tmuxguard')
     worktree = _add_worktree(repo, 'main.foo')
     # the session name destroy.sh derives: <repo dirname> (<branch, dots dashed>)

@@ -1,4 +1,4 @@
-"""Tests for ``Database`` CRUD operations, transactions, and schema."""
+"""Test the ``fractal.core.db`` module."""
 
 from __future__ import annotations
 
@@ -259,8 +259,8 @@ def test_concurrent_writers_serialize(database: Database) -> None:
         try:
             for index in range(per_writer):
                 database.write(_run(metadata=f'{tag}:{index}'), 'runs')
-        except Exception as exc:
-            errors.append(exc)
+        except Exception as e:
+            errors.append(e)
 
     # run the writers concurrently against the shared DB
     threads = [threading.Thread(target=writer, args=(tag,)) for tag in range(writers)]

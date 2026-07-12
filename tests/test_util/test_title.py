@@ -1,4 +1,4 @@
-"""Tests for title derivation (``name_to_title``)."""
+"""Test the ``fractal.util.title`` module."""
 
 from __future__ import annotations
 
@@ -6,9 +6,7 @@ import pytest
 
 from fractal.util import name_to_title
 
-__all__ = [
-    'test_name_to_title',
-]
+__all__ = ['test_name_to_title']
 
 
 @pytest.mark.parametrize(

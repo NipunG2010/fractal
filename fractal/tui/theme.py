@@ -1,7 +1,9 @@
 """Design tokens: the single source of colors, dimensions, and glyphs.
 
-This is the only module in ``fractal.tui`` that may contain a hex color, a
-dimension literal, or a glyph character. Colors flow to the stylesheet as
+This is the only module in ``fractal.tui`` that may contain a hex color or a
+glyph character, and the only home for a dimension literal that is shared
+across render sites or consumed by the stylesheet (one-off local layout math
+may stay inline). Colors flow to the stylesheet as
 ``$variables`` on the ``THEME`` (every slot is pinned there with its exact
 hex, bypassing the HSL round-trip Textual's ``ColorSystem.generate`` applies to
 the semantic slots) and to the Rich content markup by direct import
@@ -72,12 +74,16 @@ NODE_FIT_MIN = 23  # explorer label-area floor (columns)
 SESS_W, DUR_W, COST_W = 9, 6, 10  # explorer/event-log value cluster columns
 TIME_W = 8  # event log: HH:MM:SS time column
 META_MIN = 4  # event log: min metadata before the ellipsis
+IDENT_W = 13  # node card: ident label column (agent/model/session)
 MEAS_W, BAR_W = 4, 12  # measures matrix: scope label, gauge width
 EL_FIG_W, CO_FIG_W = 8, 20  # measures matrix: elapsed / cost figures
+GAUGE_GAP = 3  # measures matrix: figure-to-gauge gap
 SENDER_W, CHANNEL_W = 14, 8  # radio list columns (buffers use the GAP unit)
+RD_LABEL_W = 11  # radio detail: label column
 # compose-field box widths (TCSS via $m-*-w; m_session also caps the shown
 # value; node/channel size to their content at runtime)
 M_SESSION_W, M_THREAD_W, M_PRIORITY_W = 12, 11, 5
+HUG_PAD = 3  # content-hugging inputs: box padding + one column of air
 REFRESH_S = 0.6  # poll cadence (seconds)
 SPIN_S = 0.1  # chat spinner frame cadence (seconds)
 
@@ -92,7 +98,9 @@ TEE, ELBOW, PIPE, INDENT = '├─ ', '└─ ', '│  ', '   '
 BAR = '━'  # gauge fill
 LINE = '─'  # date-separator rule
 ELLIPSIS = '…'
+EMPTY = '—'  # empty-value placeholder
 RET, SHIFT, CTRL = '⏎', '⇧', '⌃'  # key hints
+UP, DOWN, LEFT, RIGHT = '↑', '↓', '←', '→'  # arrow key hints
 TOOL, WARN = '⚙', '⚠'  # chat tool-use / degraded-send markers
 SPINNER = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')  # chat in-flight
 

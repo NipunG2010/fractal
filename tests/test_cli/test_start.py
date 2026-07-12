@@ -12,9 +12,7 @@ import subprocess
 
 from .conftest import _worktree_root
 
-__all__ = [
-    'test_start_resolves_dirs_before_arg_check',
-]
+__all__ = ['test_start_resolves_dirs_before_arg_check']
 
 
 def test_start_resolves_dirs_before_arg_check() -> None:

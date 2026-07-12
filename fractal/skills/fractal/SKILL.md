@@ -302,8 +302,10 @@ agent invocations and a budget sized by counting `steps/` undercounts
 `--no-sync` for lightweight leaf nodes. A step may carry YAML
 frontmatter: `agent: <command>` runs that step on a different agent
 (each agent keeps its own woven session across the steps that use it),
-`model: <name>` overrides the model for that step, and `detached: true`
-isolates a single step in its own session within a continuous node.
+`model: <name>` overrides the model for that step, `detached: true`
+isolates a single step in its own session within a continuous node, and
+`requires_approval: true` holds the loop after the step completes until
+the operator approves it (`fractal node pending`/`approve`).
 
 **f) Environment setup.** Ask if the project needs environment
 preparation (virtual environments, dependencies, containers, build
@@ -454,7 +456,7 @@ spawns. Ask the user for input and feedback freely, but never let a
 question block you unless it is absolutely critical — proceed on your
 best judgment, make reversible calls, and note them.
 
-## CLI Reference
+## CLI reference
 
 Run `fractal --help` and `fractal <command> --help` for all commands and
 options. Commands act on the node in the current directory by default,

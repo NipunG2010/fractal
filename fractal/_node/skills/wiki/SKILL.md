@@ -1,6 +1,6 @@
 ---
 name: wiki
-description: The wiki CLI and the node's two knowledge bases (project wiki + memory).
+description: The wiki CLI and the node's two knowledge bases -- project wiki and memory.
 ---
 
 # Wiki

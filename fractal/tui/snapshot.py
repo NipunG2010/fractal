@@ -534,7 +534,9 @@ class SnapshotBuilder:
         }
 
     def _elapsed(
-        self: SnapshotBuilder, row: Optional[dict], is_live: bool
+        self: SnapshotBuilder,
+        row: Optional[dict],
+        is_live: bool,
     ) -> Optional[float]:
         """Compute a row's elapsed seconds.
 
@@ -674,13 +676,17 @@ class SnapshotBuilder:
         """
         cluster = theme.SESS_W + theme.GAP + theme.DUR_W + theme.GAP + theme.COST_W
         if card is not None:
-            agent = card['agent'] or '—'
+            agent = card['agent'] or theme.EMPTY
             if card['detached']:
                 agent += ' (detached)'
-            values = [agent, card['model'] or '—', card['session'] or '—']
-            ident_w = 13 + max(len(value) for value in values)
+            values = [
+                agent,
+                card['model'] or theme.EMPTY,
+                card['session'] or theme.EMPTY,
+            ]
+            ident_w = theme.IDENT_W + max(len(value) for value in values)
         else:
-            ident_w = 13
+            ident_w = theme.IDENT_W
         label_w = 0
         for run in history:
             label_w = max(label_w, 2 + len(run['label']))
@@ -747,9 +753,9 @@ class SnapshotBuilder:
         measures_inner = (
             theme.MEAS_W
             + theme.GAP
-            + (theme.EL_FIG_W + 3 + theme.BAR_W)
+            + (theme.EL_FIG_W + theme.GAUGE_GAP + theme.BAR_W)
             + theme.GAP
-            + (theme.CO_FIG_W + 3 + theme.BAR_W)
+            + (theme.CO_FIG_W + theme.GAUGE_GAP + theme.BAR_W)
         )
         node_width = max(node_width, measures_inner + theme.NODE_CHROME)
         inner = node_width - theme.NODE_CHROME

@@ -50,7 +50,8 @@ def test_init_prefers_the_environments_wiki_over_a_broken_shim(
 
 
 def test_init_names_the_missing_wiki_dependency(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With no ``wiki`` anywhere, ``init`` names plasma-wiki and the remedy.
 

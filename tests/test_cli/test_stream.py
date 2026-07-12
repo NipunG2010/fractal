@@ -6,7 +6,6 @@ import io
 import json
 import pathlib
 from typing import Optional
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -107,7 +106,7 @@ def test_renders_text_and_tools(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_records_cost_on_result() -> None:
     """Records cost via ``node.step_cost()`` on result event."""
-    mock_node = MagicMock()
+    node = _FakeNode()
     input_stream = _stream_lines(
         {
             'type': 'result',
@@ -117,9 +116,9 @@ def test_records_cost_on_result() -> None:
         },
     )
 
-    render_stream(mock_node, agent='claude', step_id=42, input=input_stream)
+    render_stream(node, agent='claude', step_id=42, input=input_stream)
 
-    mock_node.step_cost.assert_called_once_with(step_id=42, cost=0.5678)
+    assert node.recorded == {42: 0.5678}
 
 
 def test_handles_malformed_input(capsys: pytest.CaptureFixture[str]) -> None:
@@ -167,7 +166,7 @@ def test_claude_stream_renders_records_and_captures() -> None:
     The session id from the init event is stamped on the step row and
     persisted to ``.session`` when tracking.
     """
-    node = MagicMock()
+    node = _FakeNode()
     input_stream = _stream_lines(
         {'type': 'system', 'subtype': 'init', 'session_id': 'sess_abc'},
         {
@@ -187,14 +186,9 @@ def test_claude_stream_renders_records_and_captures() -> None:
         input=input_stream,
     )
 
-    node.step_session.assert_called_once_with(
-        'claude',
-        step_id=9,
-        model='claude-opus-4-8',
-        session='sess_abc',
-    )
-    node.session_set.assert_called_once_with('claude', 'sess_abc')
-    node.step_cost.assert_called_once_with(step_id=9, cost=0.42)
+    assert node.stamped == [('claude', 9, 'claude-opus-4-8', 'sess_abc')]
+    assert node.persisted == [('claude', 'sess_abc')]
+    assert node.recorded == {9: 0.42}
 
 
 @pytest.mark.parametrize(
@@ -216,7 +210,7 @@ def test_claude_stream_records_stream_model(
     recorded: str,
 ) -> None:
     """The step row records the actual model the stream reports."""
-    node = MagicMock()
+    node = _FakeNode()
     init = {'type': 'system', 'subtype': 'init', 'session_id': 'sess_m'}
     if init_model is not None:
         init['model'] = init_model
@@ -224,12 +218,7 @@ def test_claude_stream_records_stream_model(
 
     render_stream(node, agent='claude', step_id=7, model=cli_model, input=input_stream)
 
-    node.step_session.assert_called_once_with(
-        'claude',
-        step_id=7,
-        model=recorded,
-        session='sess_m',
-    )
+    assert node.stamped == [('claude', 7, recorded, 'sess_m')]
 
 
 def test_claude_stream_detached_keeps_session_unpersisted() -> None:
@@ -238,20 +227,15 @@ def test_claude_stream_detached_keeps_session_unpersisted() -> None:
     When ``detached``, the session never reaches ``.session``, so the turn
     cannot clobber the continuous session.
     """
-    node = MagicMock()
+    node = _FakeNode()
     input_stream = _stream_lines(
         {'type': 'system', 'subtype': 'init', 'session_id': 'sess_x'},
     )
 
     render_stream(node, agent='claude', step_id=4, detached=True, input=input_stream)
 
-    node.step_session.assert_called_once_with(
-        'claude',
-        step_id=4,
-        model=None,
-        session='sess_x',
-    )
-    node.session_set.assert_not_called()
+    assert node.stamped == [('claude', 4, None, 'sess_x')]
+    assert node.persisted == []
 
 
 def test_claude_stream_records_full_per_invocation_cost() -> None:
@@ -259,8 +243,12 @@ def test_claude_stream_records_full_per_invocation_cost() -> None:
 
     Even with a prior step sharing the session, the cost is not reduced.
     """
-    node = MagicMock()
-    node.db.read.return_value = [{'step_id': 1, 'session': 's', 'cost': 0.10}]
+    node = _FakeNode(
+        [
+            {'step_id': 1, 'session': 's', 'cost': 0.10},  # prior step on the session
+            {'step_id': 2, 'session': None, 'cost': None},
+        ]
+    )
     input_stream = _stream_lines(
         {'type': 'system', 'subtype': 'init', 'session_id': 's'},
         {'type': 'result', 'duration_ms': 1000, 'total_cost_usd': 0.05, 'num_turns': 1},
@@ -270,7 +258,7 @@ def test_claude_stream_records_full_per_invocation_cost() -> None:
 
     # recorded as-is (0.05), NOT 0.05 - 0.10 (a cumulative-delta subtraction
     # would be wrong here -- claude's figure is per-invocation)
-    node.step_cost.assert_called_once_with(step_id=2, cost=0.05)
+    assert node.recorded == {2: 0.05}
 
 
 def test_claude_stream_marks_budget_exceeded(
@@ -326,7 +314,7 @@ def test_claude_stream_truncated_records_accumulated_cost(
     blind to the spend.
     """
     monkeypatch.setattr(utils, '_load_pricing', lambda: _CLAUDE_PRICING)
-    node = MagicMock()
+    node = _FakeNode()
     input_stream = _stream_lines(
         {'type': 'system', 'subtype': 'init', 'session_id': 'sess_cut'},
         {
@@ -348,8 +336,7 @@ def test_claude_stream_truncated_records_accumulated_cost(
         input=input_stream,
     )
 
-    recorded = node.step_cost.call_args.kwargs['cost']
-    assert recorded == pytest.approx(_USAGE_FIRST_COST + _USAGE_SECOND_COST)
+    assert node.recorded[11] == pytest.approx(_USAGE_FIRST_COST + _USAGE_SECOND_COST)
 
 
 def test_claude_stream_survives_missing_pricing_cache(
@@ -365,7 +352,7 @@ def test_claude_stream_survives_missing_pricing_cache(
     """
     monkeypatch.setattr(utils, '_PRICING_CACHE', str(tmp_path / 'absent.json'))
     utils._load_pricing.cache_clear()
-    node = MagicMock()
+    node = _FakeNode()
     input_stream = _stream_lines(
         {'type': 'system', 'subtype': 'init', 'session_id': 'sess_nocache'},
         {'type': 'assistant', 'message': {'usage': _USAGE_FIRST}},
@@ -383,8 +370,7 @@ def test_claude_stream_survives_missing_pricing_cache(
 
     # the unpriceable assistant frame flushed nothing; the result frame's
     # authoritative figure is the only recorded cost
-    assert node.step_cost.call_count == 1
-    assert node.step_cost.call_args.kwargs['cost'] == 0.5
+    assert node.costs == [0.5]
 
 
 def test_claude_stream_flushes_cost_per_assistant_event(
@@ -397,7 +383,7 @@ def test_claude_stream_flushes_cost_per_assistant_event(
     event must already be in the step row when the next one arrives.
     """
     monkeypatch.setattr(utils, '_load_pricing', lambda: _CLAUDE_PRICING)
-    node = MagicMock()
+    node = _FakeNode()
     input_stream = _stream_lines(
         {'type': 'assistant', 'message': {'usage': _USAGE_FIRST}},
         {'type': 'assistant', 'message': {'usage': _USAGE_SECOND}},
@@ -411,8 +397,7 @@ def test_claude_stream_flushes_cost_per_assistant_event(
         input=input_stream,
     )
 
-    costs = [call.kwargs['cost'] for call in node.step_cost.call_args_list]
-    assert costs == [
+    assert node.costs == [
         pytest.approx(_USAGE_FIRST_COST),
         pytest.approx(_USAGE_FIRST_COST + _USAGE_SECOND_COST),
     ]
@@ -428,7 +413,7 @@ def test_claude_stream_result_overwrites_accumulated_estimate(
     must record exactly the result figure, never the estimate.
     """
     monkeypatch.setattr(utils, '_load_pricing', lambda: _CLAUDE_PRICING)
-    node = MagicMock()
+    node = _FakeNode()
     input_stream = _stream_lines(
         {'type': 'assistant', 'message': {'usage': _USAGE_FIRST}},
         {'type': 'result', 'duration_ms': 1000, 'total_cost_usd': 0.9, 'num_turns': 1},
@@ -442,7 +427,7 @@ def test_claude_stream_result_overwrites_accumulated_estimate(
         input=input_stream,
     )
 
-    assert node.step_cost.call_args.kwargs['cost'] == 0.9
+    assert node.recorded[13] == 0.9
 
 
 def test_claude_stream_unpriced_model_accumulates_no_cost(
@@ -455,7 +440,7 @@ def test_claude_stream_unpriced_model_accumulates_no_cost(
     frame, when present, still records claude's own figure).
     """
     monkeypatch.setattr(utils, '_load_pricing', lambda: {})
-    node = MagicMock()
+    node = _FakeNode()
     input_stream = _stream_lines(
         {'type': 'assistant', 'message': {'usage': _USAGE_FIRST}},
     )
@@ -468,7 +453,7 @@ def test_claude_stream_unpriced_model_accumulates_no_cost(
         input=input_stream,
     )
 
-    node.step_cost.assert_not_called()
+    assert node.costs == []
 
 
 def test_compute_claude_cost_prices_disjoint_buckets(
@@ -510,7 +495,7 @@ def test_codex_stream_renders_records_and_captures(
             },
         },
     )
-    node = MagicMock()
+    node = _FakeNode([{'step_id': 7, 'session': None, 'cost': None}])
     input_stream = _stream_lines(
         {'type': 'thread.started', 'thread_id': 'thr_abc'},
         {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'Done.'}},
@@ -536,15 +521,10 @@ def test_codex_stream_renders_records_and_captures(
 
     # the agent message is printed, the real thread id stamped + persisted
     assert 'Done.' in capsys.readouterr().out
-    node.step_session.assert_called_once_with(
-        'codex',
-        step_id=7,
-        model='o3',
-        session='thr_abc',
-    )
-    node.session_set.assert_called_once_with('codex', 'thr_abc')
+    assert node.stamped == [('codex', 7, 'o3', 'thr_abc')]
+    assert node.persisted == [('codex', 'thr_abc')]
     # cost = (1000-200)*1e-6 + 200*1e-7 + 50*8e-6 (output already includes reasoning)
-    assert node.step_cost.call_args.kwargs['cost'] == pytest.approx(0.00122)
+    assert node.recorded[7] == pytest.approx(0.00122)
 
 
 def test_codex_stream_uses_last_cumulative_usage_not_sum(
@@ -564,7 +544,7 @@ def test_codex_stream_uses_last_cumulative_usage_not_sum(
             },
         },
     )
-    node = MagicMock()
+    node = _FakeNode([{'step_id': 5, 'session': None, 'cost': None}])
     input_stream = _stream_lines(
         {'type': 'turn.completed', 'usage': {'input_tokens': 100, 'output_tokens': 10}},
         {'type': 'turn.completed', 'usage': {'input_tokens': 300, 'output_tokens': 30}},
@@ -574,7 +554,7 @@ def test_codex_stream_uses_last_cumulative_usage_not_sum(
 
     # only the final cumulative snapshot is priced: 300*1e-6 + 30*8e-6 = 0.00054
     # (NOT the sum of the two snapshots, which would be 0.00072)
-    assert node.step_cost.call_args.kwargs['cost'] == pytest.approx(0.00054)
+    assert node.recorded[5] == pytest.approx(0.00054)
 
 
 def test_codex_stream_detached_keeps_session_unpersisted(
@@ -586,18 +566,13 @@ def test_codex_stream_detached_keeps_session_unpersisted(
     cannot clobber the continuous session.
     """
     monkeypatch.setattr(utils, '_load_pricing', lambda: {})
-    node = MagicMock()
+    node = _FakeNode()
     input_stream = _stream_lines({'type': 'thread.started', 'thread_id': 'thr_x'})
 
     render_stream(node, agent='codex', step_id=3, detached=True, input=input_stream)
 
-    node.step_session.assert_called_once_with(
-        'codex',
-        step_id=3,
-        model=None,
-        session='thr_x',
-    )
-    node.session_set.assert_not_called()
+    assert node.stamped == [('codex', 3, None, 'thr_x')]
+    assert node.persisted == []
 
 
 def test_codex_stream_unpriced_model_records_no_cost(
@@ -605,7 +580,7 @@ def test_codex_stream_unpriced_model_records_no_cost(
 ) -> None:
     """An unknown/unpriced model records no cost rather than crashing the stream."""
     monkeypatch.setattr(utils, '_load_pricing', lambda: {})
-    node = MagicMock()
+    node = _FakeNode()
     input_stream = _stream_lines(
         {'type': 'turn.completed', 'usage': {'input_tokens': 100, 'output_tokens': 10}},
     )
@@ -619,7 +594,7 @@ def test_codex_stream_unpriced_model_records_no_cost(
         input=input_stream,
     )
 
-    node.step_cost.assert_not_called()
+    assert node.costs == []
 
 
 def test_codex_stream_surfaces_error_events(capsys: pytest.CaptureFixture[str]) -> None:
@@ -684,8 +659,7 @@ def test_codex_stream_subtracts_prior_sibling_on_same_session(
 ) -> None:
     """A continuous step records cumulative minus prior steps sharing the thread.
 
-    Exercises the telescoping subtraction against a real (list-backed) db -- the
-    branch the MagicMock-based tests never reached.
+    Exercises the telescoping subtraction against the recorded prior sibling.
     """
     monkeypatch.setattr(utils, '_load_pricing', lambda: _PRICING)
     node = _FakeNode(
@@ -738,14 +712,6 @@ def test_codex_stream_flushes_cost_per_turn(monkeypatch: pytest.MonkeyPatch) -> 
     """
     monkeypatch.setattr(utils, '_load_pricing', lambda: _PRICING)
     node = _FakeNode([{'step_id': 8, 'session': None, 'cost': None}])
-    calls: list[float] = []
-    original = node.step_cost
-
-    def counting(*, step_id: int, cost: float) -> None:
-        calls.append(cost)
-        original(step_id=step_id, cost=cost)
-
-    node.step_cost = counting  # type: ignore[method-assign]
     input_stream = _stream_lines(
         {'type': 'turn.completed', 'usage': {'input_tokens': 100, 'output_tokens': 10}},
         {'type': 'turn.completed', 'usage': {'input_tokens': 300, 'output_tokens': 30}},
@@ -754,9 +720,9 @@ def test_codex_stream_flushes_cost_per_turn(monkeypatch: pytest.MonkeyPatch) -> 
     render_stream(node, agent='codex', step_id=8, model='o3', input=input_stream)
 
     # one flush per turn (cumulative snapshots), plus the end-of-stream record
-    assert calls[0] == pytest.approx(0.00018)
-    assert calls[-1] == pytest.approx(0.00054)
-    assert len(calls) >= 2
+    assert node.costs[0] == pytest.approx(0.00018)
+    assert node.costs[-1] == pytest.approx(0.00054)
+    assert len(node.costs) >= 2
 
 
 def test_compute_codex_cost_floors_uncached_at_zero(
@@ -834,28 +800,39 @@ class _FakeDB:
 
 
 class _FakeNode:
-    """Minimal stand-in exposing the surface ``render_stream`` (codex) touches."""
+    """Minimal stand-in exposing the surface ``render_stream`` touches."""
 
-    def __init__(self: _FakeNode, steps: list[dict]) -> None:
+    def __init__(self: _FakeNode, steps: Optional[list[dict]] = None) -> None:
         self._branch = 'main'
+        steps = steps or []
         # production step rows always carry their owning node
         for row in steps:
             row.setdefault('node', self._branch)
         self.db = _FakeDB(steps)
-        self.recorded: dict = {}
+        self.recorded: dict = {}  # step_id -> the last cost written
+        self.costs: list[float] = []  # every step_cost figure, in flush order
+        self.stamped: list[tuple] = []  # every step_session call, in order
+        self.persisted: list[tuple] = []  # every session_set call, in order
 
     def step_session(
-        self: _FakeNode, agent: str, *, step_id: int, model: object, session: str
+        self: _FakeNode,
+        agent: str,
+        *,
+        step_id: int,
+        model: object,
+        session: str,
     ) -> None:
+        self.stamped.append((agent, step_id, model, session))
         for row in self.db.steps:
             if row['step_id'] == step_id:
                 row['session'] = session
 
     def session_set(self: _FakeNode, agent: str, session: str) -> None:
-        pass
+        self.persisted.append((agent, session))
 
     def step_cost(self: _FakeNode, *, step_id: int, cost: float) -> None:
         self.recorded[step_id] = cost
+        self.costs.append(cost)
         for row in self.db.steps:
             if row['step_id'] == step_id:
                 row['cost'] = cost

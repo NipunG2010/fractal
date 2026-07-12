@@ -28,7 +28,7 @@ from textual.widgets import Input, OptionList, Static, TextArea
 from textual.worker import get_current_worker
 
 from fractal.core.node import ChatCommand, Node
-from fractal.tui import theme
+from fractal.tui import fmt, theme
 from fractal.tui.actions import TuiActions
 from fractal.tui.chat import ChatController, ChatEvent, ChatTurn, resolve_transport
 from fractal.tui.data import TuiData
@@ -217,7 +217,7 @@ class FractalApp(App):
             self.message_pane.post(
                 branch,
                 'error',
-                f'{theme.WARN} agent silent for 2m -- cancelled',
+                f'{theme.WARN} agent silent for {fmt.dur(_CHAT_IDLE_S)} -- cancelled',
             )
         previous = self.snapshot
         self._build()
@@ -429,8 +429,8 @@ class FractalApp(App):
         grid.add_column(ratio=1, no_wrap=True)
         grid.add_column(justify='right', no_wrap=True)
         hints = (
-            f'←→ panes {theme.SEP} {theme.RET} enter {theme.SEP} arrows move'
-            f' {theme.SEP} esc back {theme.SEP} q quit'
+            f'{theme.LEFT}{theme.RIGHT} panes {theme.SEP} {theme.RET} enter'
+            f' {theme.SEP} arrows move {theme.SEP} esc back {theme.SEP} q quit'
         )
         grid.add_row(
             Text.from_markup(f'[{theme.DIM}]{hints}[/]'),
@@ -519,7 +519,7 @@ class FractalApp(App):
             elif direction == 'down':
                 self.focus_id = 'message'
         elif self.focus_id == 'message':
-            # message sits bottom-left: ↑ to the row above, → into the
+            # message sits bottom-left: up to the row above, right into the
             # floor-to-ceiling node pane
             if direction == 'up':
                 self.focus_id = 'radio'

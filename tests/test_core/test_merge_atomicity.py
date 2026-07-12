@@ -14,9 +14,7 @@ from tests._helpers import _git
 
 from .conftest import _parse_project_dir, _resolve_branch
 
-__all__ = [
-    'test_merge_restores_parent_when_signalled_mid_merge',
-]
+__all__ = ['test_merge_restores_parent_when_signalled_mid_merge']
 
 # resolve merge.sh from the worktree source (relative to this test), not the
 # installed package -- a non-editable install would otherwise test a stale copy

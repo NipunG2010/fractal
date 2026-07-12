@@ -1,4 +1,4 @@
-"""Widget tests: wheel input is confined to the pane it is aimed at.
+"""Test the ``fractal.tui.widgets`` module.
 
 Textual only stops a wheel event when the scroll actually moved, so at a
 scroller's limit (or over content that fits) the event would bubble to pan
@@ -56,7 +56,7 @@ async def test_wheel_over_a_scroller_scrolls_it_and_not_the_screen(
             app.chat.append('main.alpha', 'meta', f'line {index}')
         app.message_pane.rescope_convo()
         await pilot.pause()
-        convo = app.query_one('#convo')
+        convo = app.query_one('#m_convo')
         convo.scroll_home(animate=False)
         await pilot.pause()
         screen_before = app.screen.scroll_offset.y

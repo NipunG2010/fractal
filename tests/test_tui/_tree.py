@@ -221,24 +221,27 @@ def build_pair(root: pathlib.Path, *, agent: str = 'claude') -> None:
     user.init(name='alpha', agent=agent)
 
 
-# ------ helper functions
+# ------ helpers
 
 
 def _stamp(seconds_ago: float) -> str:
-    # a core-format timestamp `seconds_ago` before the reference instant
+    """A core-format timestamp ``seconds_ago`` before the reference instant."""
     at = REF_DT - dt.timedelta(seconds=seconds_ago)
     return at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
 
 def _central_db(node: Node) -> pathlib.Path:
-    # the tree's central database (at the user node; the fixture root is main)
+    """The tree's central database (at the user node; the fixture root is main)."""
     return node._repo_dir / '.fractal' / 'main' / '.db'
 
 
 def _pin_setup_events(nodes: dict[str, Node]) -> None:
-    # init logs init/spawn events from a subprocess (outside the frozen clock)
-    # and events.created_at is an SQL DEFAULT besides; pin every setup event
-    # to a distinct instant, in creation order, so logs sort stably
+    """Pin every setup event to a distinct instant so logs sort stably.
+
+    init logs init/spawn events from a subprocess (outside the frozen clock)
+    and ``events.created_at`` is an SQL DEFAULT besides; the pins land in
+    creation order.
+    """
     db_path = _central_db(nodes['main'])
     connection = sqlite3.connect(db_path)
     try:
@@ -257,7 +260,7 @@ def _pin_setup_events(nodes: dict[str, Node]) -> None:
 
 
 def _git_repo(root: pathlib.Path) -> None:
-    # a minimal committed repository (fractal init requires a clean tree)
+    """A minimal committed repository (``fractal init`` requires a clean tree)."""
     root.mkdir(parents=True, exist_ok=True)
     run = ['git', 'init', '-q', '-b', 'main']
     subprocess.run(run, cwd=root, check=True)
@@ -275,8 +278,10 @@ def _git_repo(root: pathlib.Path) -> None:
 
 
 def _walk(
-    specs: tuple[NodeSpec, ...], prefix: str = 'main'
+    specs: tuple[NodeSpec, ...],
+    prefix: str = 'main',
 ) -> list[tuple[str, NodeSpec]]:
+    """Flatten the spec tree into ``(branch, spec)`` pairs, depth-first."""
     result = []
     for spec in specs:
         branch = f'{prefix}.{spec.name}'
@@ -286,9 +291,11 @@ def _walk(
 
 
 def _seed_runs(node: Node, branch: str, spec: NodeSpec, clock: Clock) -> None:
-    # shape the node's history from its final status: settled statuses get one
-    # closed run; `active` gets a completed prior run plus a live one open at
-    # step 3 (EXECUTE)
+    """Shape the node's history from its final status.
+
+    Settled statuses get one closed run; ``active`` gets a completed prior
+    run plus a live one open at step 3 (EXECUTE).
+    """
     if spec.status == 'active':
         _seed_run(
             node,
@@ -343,6 +350,7 @@ def _seed_run(
     status: str,
     exit_code: int,
 ) -> None:
+    """Seed one closed run: ``iters`` settled iterations ending in ``status``."""
     clock.at(start_ago)
     run_id = node.run_start()
     at = start_ago
@@ -390,7 +398,7 @@ def _seed_run(
 
 
 def _seed_live_run(node: Node, branch: str, spec: NodeSpec, clock: Clock) -> None:
-    # the live run: iteration 1 settled, iteration 2 open at step 3 (EXECUTE)
+    """The live run: iteration 1 settled, iteration 2 open at step 3 (EXECUTE)."""
     clock.at(3600.0)
     run_id = node.run_start()
     at = 3600.0
@@ -459,9 +467,12 @@ def _seed_step(
     at: float,
     killed: bool = False,
 ) -> float:
-    # one settled step: start at `at`, run its nominal seconds, record cost +
-    # session (claude weaves sessions; codex reports no cost). A sync pass
-    # (step=0 here) is recorded against the step it precedes -- step 1
+    """One settled step: start at ``at``, run its nominal seconds.
+
+    Records cost + session (claude weaves sessions; codex reports no cost).
+    A sync pass (step=0 here) is recorded against the step it precedes --
+    step 1.
+    """
     clock.at(at)
     name = 'SYNC' if step == 0 else _STEP_NAMES[step - 1]
     stored = 1 if step == 0 else step
@@ -497,8 +508,11 @@ def _pin_iter_session(
     iteration: int,
     spec: NodeSpec,
 ) -> None:
-    # iter_end stamps the session from the live `.session` map (absent in a
-    # seeded tree); pin the deterministic id the steps carry
+    """Pin the deterministic session id the seeded steps carry.
+
+    ``iter_end`` stamps the session from the live ``.session`` map, which is
+    absent in a seeded tree.
+    """
     if spec.agent != 'claude':
         return
     pin(
@@ -510,8 +524,11 @@ def _pin_iter_session(
 
 
 def _seed_radio(nodes: dict[str, Node], clock: Clock) -> None:
-    # radio traffic on alpha: an unread steer, a read note, outbox/public
-    # posts, a reply thread, a react, and one save into the root's archive
+    """Seed radio traffic on alpha.
+
+    An unread steer, a read note, outbox/public posts, a reply thread, a
+    react, and one save into the root's archive.
+    """
     root = nodes['main']
     alpha = nodes['main.alpha']
     db_path = _central_db(root)

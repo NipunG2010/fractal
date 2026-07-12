@@ -9,7 +9,6 @@ shape ``test_core`` uses for its repo helpers.
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import os
 import pathlib
@@ -38,6 +37,12 @@ def _fractal_bin() -> str:
     if found is None:
         pytest.skip('fractal console script not on PATH')
     return found
+
+
+def _require_tmux() -> None:
+    """Skip the test when tmux is unavailable (live-session behaviors need it)."""
+    if shutil.which('tmux') is None:
+        pytest.skip('tmux unavailable')
 
 
 def _worktree_root() -> pathlib.Path:
@@ -86,6 +91,7 @@ def _run(
         capture_output=True,
         text=True,
         env=_cli_env(**env),
+        timeout=180,
     )
 
 
@@ -102,11 +108,15 @@ def _reap_group(proc: subprocess.Popen) -> None:
     unconditionally: a clean exit's already-dead chain is a no-op.
     """
     descendants = _descendant_pids(proc.pid)
-    with contextlib.suppress(ProcessLookupError):
+    try:
         os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     for pid in descendants:
-        with contextlib.suppress(ProcessLookupError):
+        try:
             os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     # drain and reap unless a completed communicate()/wait() already did (its
     # streams are closed then, and a second communicate() would blow up)
     if proc.returncode is None:

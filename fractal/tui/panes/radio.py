@@ -159,12 +159,14 @@ class RadioPane:
     def _foot(self: RadioPane) -> str:
         """Render the foot hints for the active zone."""
         hints = {
-            'source': f'←→ source {theme.SEP} ↓ filters {theme.SEP} esc back',
-            'filter': f'←→ pick {theme.SEP} {theme.RET} open {theme.SEP} ↑↓ zones'
+            'source': f'{theme.LEFT}{theme.RIGHT} source {theme.SEP}'
+            f' {theme.DOWN} filters {theme.SEP} esc back',
+            'filter': f'{theme.LEFT}{theme.RIGHT} pick {theme.SEP} {theme.RET} open'
+            f' {theme.SEP} {theme.UP}{theme.DOWN} zones {theme.SEP} esc back',
+            'list': f'{theme.RET} enter messages {theme.SEP} {theme.UP} zones'
             f' {theme.SEP} esc back',
-            'list': f'{theme.RET} enter messages {theme.SEP} ↑ zones'
-            f' {theme.SEP} esc back',
-            'rows': f'↑↓ select {theme.SEP} {theme.RET} open {theme.SEP} esc list',
+            'rows': f'{theme.UP}{theme.DOWN} select {theme.SEP} {theme.RET} open'
+            f' {theme.SEP} esc list',
         }
         return f'{theme.DOT_ON} [{theme.DIM}]unread {theme.SEP} {hints[self.rfocus]}[/]'
 
@@ -293,7 +295,7 @@ class RadioPane:
         self.paint()
 
     def _zone_lr(self: RadioPane, key: str) -> None:
-        """Handle ←→ in a zone: cycle the source or pick a filter chip."""
+        """Handle left/right in a zone: cycle the source or pick a filter chip."""
         if self.rfocus == 'source':
             self._cycle_source(1 if key == 'right' else -1)
         elif self.rfocus == 'filter':
@@ -331,7 +333,10 @@ class RadioPane:
         self.app.mount(drop)
         drop.styles.height = len(options) + 2
         drop.styles.width = max(len(option) for option in options) + 6
-        drop.styles.offset = (region.x + (0 if self.rfilter == 0 else 22), region.y + 1)
+        # the show drop opens under its chip: past the channel chip + the seam
+        channel_chip = f'channel: {self.fchannel} {theme.CARET_OPEN}'
+        offset = 0 if self.rfilter == 0 else len(channel_chip) + 2
+        drop.styles.offset = (region.x + offset, region.y + 1)
         current = self.fchannel if self.rfilter == 0 else self.fshow
         if current in options:
             drop.highlighted = options.index(current)
@@ -339,7 +344,7 @@ class RadioPane:
         drop.focus()
 
     def key_drop(self: RadioPane, event: Key) -> None:
-        """Handle the filter dropdown: esc closes (⏎ lands via OptionList)."""
+        """Handle the filter dropdown: esc closes (enter lands via OptionList)."""
         if event.key == 'escape':
             self._close_drop()
             event.stop()
@@ -393,7 +398,7 @@ class RadioPane:
         groups = (
             (
                 ('sender', sender),
-                ('session', row['session'] or '—'),
+                ('session', row['session'] or theme.EMPTY),
             ),
             (
                 ('channel', row['channel']),
@@ -404,11 +409,15 @@ class RadioPane:
         )
         blocks = [
             '\n'.join(
-                f'[{theme.DIM}]{fmt.col(label, 11)}[/]{value}' for label, value in group
+                f'[{theme.DIM}]{fmt.col(label, theme.RD_LABEL_W)}[/]{value}'
+                for label, value in group
             )
             for group in groups
         ]
-        subject = f'[{theme.DIM}]{fmt.col("subject", 11)}[/][b]{row["subject"]}[/]'
+        subject = (
+            f'[{theme.DIM}]{fmt.col("subject", theme.RD_LABEL_W)}[/]'
+            f'[b]{row["subject"]}[/]'
+        )
         blocks[-1] = f'{blocks[-1]}\n{subject}'
         meta = '\n\n'.join(blocks)
         return f'{meta}\n\n{row["data"]}'
@@ -441,8 +450,9 @@ class RadioPane:
     def _detail_foot(self: RadioPane) -> str:
         """Render the detail foot (action chips + key hints)."""
         return (
-            self._detail_actions() + f'  [{theme.DIM}]←→ {theme.SEP} {theme.RET} select'
-            f' {theme.SEP} esc back[/]'
+            self._detail_actions()
+            + f'  [{theme.DIM}]{theme.LEFT}{theme.RIGHT} {theme.SEP}'
+            f' {theme.RET} select {theme.SEP} esc back[/]'
         )
 
     def _open_detail(self: RadioPane, row: dict) -> None:

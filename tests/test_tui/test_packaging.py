@@ -7,9 +7,7 @@ import tomllib
 
 import fractal.tui
 
-__all__ = [
-    'test_stylesheet_ships_as_package_data',
-]
+__all__ = ['test_stylesheet_ships_as_package_data']
 
 
 def test_stylesheet_ships_as_package_data() -> None:

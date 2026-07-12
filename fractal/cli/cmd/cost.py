@@ -22,6 +22,12 @@ __all__ = [
 
 _DECIMAL_PRECISION = 4
 
+_BREAKDOWN_COLUMNS = [
+    'node',
+    'max_cost',
+    'spent',
+]
+
 
 def cost_remaining(app: typer.Typer) -> typer.Typer:
     """Register the ``remaining`` command."""
@@ -57,7 +63,7 @@ def cost_remaining(app: typer.Typer) -> typer.Typer:
         store dies with the node.
         """
         if sum(scope is not None for scope in (run_id, iter_id, step_id)) > 1:
-            raise typer.BadParameter('use at most one of --run/--iter/--step.')
+            raise typer.BadParameter('Use at most one of --run/--iter/--step.')
         # a deleted branch fails resolution: report the cap-less 'no budget'
         # when it has a recorded run, keep the not-found error when it never ran
         try:
@@ -123,7 +129,7 @@ def cost_spent(app: typer.Typer) -> typer.Typer:
         """
         require_non_negative(max_depth=max_depth)
         if sum(scope is not None for scope in (run_id, iter_id, step_id)) > 1:
-            raise typer.BadParameter('use at most one of --run/--iter/--step.')
+            raise typer.BadParameter('Use at most one of --run/--iter/--step.')
         # a deleted branch fails resolution: answer through the caller (shared
         # db), its latest recorded run standing in for the current one -- core
         # gives run_id precedence over the caller's own scope
@@ -224,8 +230,7 @@ def cost_breakdown(app: typer.Typer) -> typer.Typer:
             branch, max_cost = node._branch, node.config_get('max_cost')
             children = node.child_list(max_depth=max_depth)
             if children is None:
-                typer.echo('No database.', err=True)
-                raise SystemExit(1)
+                raise RuntimeError('No database.')
         # per-descendant own spend in the run lineage; this is the same set
         # cost spent sums, so the rows below total to it
         breakdown = node.cost_breakdown(
@@ -263,7 +268,7 @@ def cost_breakdown(app: typer.Typer) -> typer.Typer:
                     'spent': round(spent, _DECIMAL_PRECISION),
                 }
                 rows.append(row)
-        print_rows(rows, csv=csv, columns=['node', 'max_cost', 'spent'])
+        print_rows(rows, csv=csv, columns=_BREAKDOWN_COLUMNS)
         # disclose the SUM's silent gap across the same scope the table
         # sums (ended NULL-cost steps) -- stderr keeps the table parseable
         unpriced = node.cost_unpriced(
