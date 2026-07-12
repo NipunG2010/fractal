@@ -25,6 +25,7 @@ def cli(**kwargs: Any) -> None:
     cmd.open(app)
     cmd.pause(app)
     cmd.resume(app)
+    cmd.reset(app)
     cmd.destroy(app)
     # fractal commands (private)
     cmd.stream(app)

@@ -2,6 +2,7 @@
 
 from .test_chat import *
 from .test_db import *
+from .test_files import *
 from .test_merge_atomicity import *
 from .test_node import *
 from .test_packaging import *

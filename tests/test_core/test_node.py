@@ -6,8 +6,10 @@ import fcntl
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
+import uuid
 from typing import Any, Optional
 from unittest.mock import patch
 
@@ -38,6 +40,7 @@ __all__ = [
     'test_merge_refuses_when_parent_worktree_is_dirty',
     'test_merge_event_survives_child_delete',
     'test_destroy_lifecycle',
+    'test_reset_lifecycle',
     'test_init_rejects_inside_worktrees',
     'test_user_init_records_project_and_places_data',
     'test_user_init_repairs_stranded_database',
@@ -62,6 +65,7 @@ __all__ = [
     'test_run_iteration_record_default_agent_model_session',
     'test_step_records_agent_model_session',
     'test_iter_end_backfills_model_from_steps',
+    'test_session_transcript_reads_claude_and_codex',
     'test_run_cost_rollup_spans_iterations_and_sync_steps',
     'test_terminal_end_records_reason',
     'test_terminal_writes_are_first_writer_wins',
@@ -75,6 +79,7 @@ __all__ = [
     'test_status_returns_stored_value',
     'test_status_set_validates',
     'test_status_set_stores_value',
+    'test_title_set_updates_config_and_registry',
     'test_finish_rejects_non_active',
     'test_stop_rejects_non_active',
     'test_signal_rejects_active_node_without_run',
@@ -107,6 +112,7 @@ __all__ = [
     'test_run_script_resolves_invoking_installation_cli',
     'test_commit_resolves_invoking_installation_cli',
     'test_cost_spent_includes_deleted_child',
+    'test_cost_lifetime_sums_all_runs_across_subtree',
     'test_root_anchors_central_db',
     'test_delete_keeps_read_receipts',
     'test_delete_cleans_registry_when_parent_missing',
@@ -753,6 +759,96 @@ def test_destroy_lifecycle(git_repo: pathlib.Path) -> None:
     # destroying again is a clean no-op
     second = Node.destroy(git_repo)
     assert 'Nothing to destroy' in second
+
+
+def test_reset_lifecycle(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reset tears down every worktree but keeps the project and its history.
+
+    One narrative: the refusal guards first (caller inside a worktree, a
+    locked worktree, a paused node), then the teardown over a crashed-active
+    child and a stale tree-wide pause latch, the survivor checks, and the
+    converged state -- a fresh child inits immediately and a second reset is
+    clean.
+    """
+    node = Node(git_repo)
+    node.init(agent='claude', user=True)
+    node.init(name='task')
+    node.init(name='other')
+    task_wt = git_repo / '.worktrees' / 'main.task'
+    task = Node(task_wt)
+
+    # refuse from inside a node worktree (git cannot remove the caller's cwd)
+    monkeypatch.chdir(task_wt)
+    with pytest.raises(RuntimeError, match='inside'):
+        Node.reset(git_repo)
+    monkeypatch.chdir(git_repo)
+
+    # refuse while a worktree is locked, before touching anything
+    subprocess.run(
+        ['git', 'worktree', 'lock', f'{task_wt}'],
+        cwd=git_repo,
+        capture_output=True,
+        check=True,
+    )
+    with pytest.raises(RuntimeError, match='locked'):
+        Node.reset(git_repo)
+    assert task_wt.exists()
+    subprocess.run(
+        ['git', 'worktree', 'unlock', f'{task_wt}'],
+        cwd=git_repo,
+        capture_output=True,
+        check=True,
+    )
+
+    # refuse over a paused node's frozen work
+    task.status_set('paused')
+    with pytest.raises(RuntimeError, match='paused'):
+        Node.reset(git_repo)
+    task.status_set('idle')
+
+    # a crashed-active child (open run, no tmux session) and a stale
+    # tree-wide pause latch ride into the teardown
+    task.status_set('active')
+    task.run_start()
+    latch = node._tree_latch_file
+    latch.write_text('paused\n', encoding='utf-8')
+
+    output = Node.reset(git_repo)
+    assert 'Reset fractal' in output
+    # every worktree and branch is gone; .worktrees/ itself survives
+    assert not task_wt.exists()
+    assert not (git_repo / '.worktrees' / 'main.other').exists()
+    assert (git_repo / '.worktrees').is_dir()
+    branches = subprocess.run(
+        ['git', 'branch', '--list', 'main.*'],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert branches.stdout.strip() == ''
+    # the user node's data and the wiki survive; the registry is cleared the
+    # right way around -- node/sub rows gone, history rows kept and closed
+    assert (git_repo / '.fractal' / 'main' / '.db').is_file()
+    assert (git_repo / 'wiki').is_dir()
+    assert node.db.read('nodes') == []
+    assert node.db.read('subs') == []
+    runs = node.db.read('runs', where={'node': 'main.task'})
+    assert runs
+    assert all(run['status'] == 'exited' for run in runs)
+    assert node.db.read('events', where={'event': 'delete'})
+    # the stale latch went with the tree it froze
+    assert not latch.exists()
+
+    # a fresh child inits immediately (resolution and the latch are clear)
+    node.init(name='again')
+    assert (git_repo / '.worktrees' / 'main.again').is_dir()
+    # resetting again cleanly tears down the new node too
+    Node.reset(git_repo)
+    assert node.db.read('nodes') == []
 
 
 def test_init_rejects_inside_worktrees(
@@ -1521,6 +1617,80 @@ def test_iter_end_backfills_model_from_steps(node_with_db: Node) -> None:
     assert iter_row['model'] == 'claude-fable-5'
 
 
+def test_session_transcript_reads_claude_and_codex(
+    node_with_db: Node,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transcripts resolve per agent, from each agent's real home, gated.
+
+    Claude keys transcripts by the worktree slug under the user's config
+    home; codex rollouts date-nest under the node's own codex home. A
+    transcript found off the deterministic claude path serves only session
+    ids recorded for this node.
+    """
+    node = node_with_db
+    # claude: the projects dir keys by the worktree slug under the config home
+    home = tmp_path / 'claude-home'
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', f'{home}')
+    slug = re.sub(r'[^A-Za-z0-9]', '-', f'{node._root}')
+    session = str(uuid.uuid4())
+    transcript = home / 'projects' / slug / f'{session}.jsonl'
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text('{"type": "turn"}\n', encoding='utf-8')
+    found = node.session_transcript('claude', session)
+    assert found == {
+        'agent': 'claude',
+        'session': session,
+        'path': f'{transcript}',
+        'exists': True,
+        'content': '{"type": "turn"}\n',
+    }
+    # an absent id still returns the deterministic path, so a caller can
+    # poll for the file to appear
+    absent = str(uuid.uuid4())
+    missing = node.session_transcript('claude', absent)
+    assert missing['exists'] is False
+    assert missing['path'] == f'{home / "projects" / slug}/{absent}.jsonl'
+    # a transcript under a foreign slug serves only ids recorded for this
+    # node -- an ungated lookup would expose any session of the OS user
+    stray = str(uuid.uuid4())
+    foreign = home / 'projects' / 'some-other-project' / f'{stray}.jsonl'
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text('{"type": "relocated"}\n', encoding='utf-8')
+    assert node.session_transcript('claude', stray)['exists'] is False
+    run_id = node.run_start()
+    iter_id = node.iter_start(run_id=run_id, iter=1)
+    step_id = node.step_start(iter_id=iter_id, run_id=run_id, step=1, step_name='PLAN')
+    node.step_session('claude', step_id=step_id, model=None, session=stray)
+    relocated = node.session_transcript('claude', stray)
+    assert relocated['exists'] is True
+    assert relocated['content'] == '{"type": "relocated"}\n'
+    # codex: rollouts date-nest under the node's own codex home
+    rollout = str(uuid.uuid4())
+    rollout_file = (
+        node._node_dir
+        / '.codex'
+        / 'sessions'
+        / '2026'
+        / '07'
+        / '11'
+        / f'rollout-2026-07-11T10-00-00-{rollout}.jsonl'
+    )
+    rollout_file.parent.mkdir(parents=True)
+    rollout_file.write_text('{"kind": "rollout"}\n', encoding='utf-8')
+    codex = node.session_transcript('codex', rollout)
+    assert codex['exists'] is True
+    assert codex['path'] == f'{rollout_file}'
+    assert codex['content'] == '{"kind": "rollout"}\n'
+    assert node.session_transcript('codex', str(uuid.uuid4()))['path'] is None
+    # path-escaping ids and unknown agents are rejected at the boundary
+    with pytest.raises(ValueError):
+        node.session_transcript('claude', '../escape')
+    with pytest.raises(ValueError):
+        node.session_transcript('gemini', session)
+
+
 def test_run_cost_rollup_spans_iterations_and_sync_steps(node_with_db: Node) -> None:
     """Run cost sums every step across iterations, including SYNC (step 0).
 
@@ -1898,6 +2068,21 @@ def test_status_set_stores_value(node_with_db: Node) -> None:
     node.status_set('killed')
     # verify it is read back
     assert node.status() == 'killed'
+
+
+def test_title_set_updates_config_and_registry(node_with_db: Node) -> None:
+    """``title_set`` writes the config label and the registry row together."""
+    node = node_with_db
+    # an unregistered node (the user shape: no registry row) stores the label
+    node.title_set('Pretty Root')
+    assert node.config_get('title') == 'Pretty Root'
+    assert node.db.read('nodes') == []
+    # a registered node's row carries the update too, in sync with config
+    node.db.merge({'node': node._branch, 'status': 'idle'}, 'nodes')
+    node.title_set('Pretty Task')
+    assert node.config_get('title') == 'Pretty Task'
+    row = node.db.read('nodes', where={'node': node._branch})[0]
+    assert row['title'] == 'Pretty Task'
 
 
 # ------ finish / stop
@@ -2573,6 +2758,32 @@ def test_cost_spent_includes_deleted_child(
     Node(git_repo / '.worktrees' / 'main.parent.kid').delete()
     assert parent.cost_spent(run_id=p_run) == pytest.approx(1.5)
     assert parent.cost_breakdown(run_id=p_run) == pytest.approx({child_branch: 1.5})
+
+
+def test_cost_lifetime_sums_all_runs_across_subtree(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lifetime cost spans every run per node, over the whole subtree at once.
+
+    ``cost_breakdown`` scopes to one run's spawn lineage; the lifetime view
+    keys each registered branch (the node itself included) to its all-runs
+    total, so one call covers a tree view's per-row spend.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    _record_step_cost(parent, run_id=_active_run(parent), cost=0.25)
+    _record_step_cost(child, run_id=_active_run(child), cost=1.0)
+    # a second child run: lifetime totals accumulate across runs
+    second_run = child.run_start()
+    _record_step_cost(child, run_id=second_run, cost=0.5)
+    assert parent.cost_lifetime() == pytest.approx(
+        {'main.parent': 0.25, 'main.parent.kid': 1.5}
+    )
+    # the user view narrows by depth and zero-fills spendless branches
+    user = Node(git_repo)
+    assert user.cost_lifetime(max_depth=1) == pytest.approx(
+        {'main': 0.0, 'main.parent': 0.25}
+    )
 
 
 def test_root_anchors_central_db(

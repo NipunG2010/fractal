@@ -397,6 +397,19 @@ See `pyproject.toml` for formatter/linter config.
   row's owner; `sender` is always the message author. Deleting a node
   removes only its registry rows and subscriptions; all history rows
   persist. Read the schema in `core/` before adding or changing tables.
+- **Teardown tiers:** `node delete` removes one subtree; `fractal reset`
+  removes every worktree, branch, and registration while the user node's
+  data (config, memory, the central DB with all history) survives;
+  `fractal destroy` is the full inverse of `fractal init`, the database
+  included. All three refuse over running or paused nodes.
+- **Project-files surface:** the `files_*` methods expose a node's work
+  product to consumers: git-tracked files minus machinery (any
+  `.fractal` component, the project wiki, `.git`, `.worktrees` — matched
+  casefolded), with `since` anchors (`base`/`commit`/`iteration`/`run`)
+  resolved from the node's own event log so diffs survive merges,
+  node-scoped and floored at the newest `init` event. Every
+  caller-supplied path validates through `_validate_relpath`;
+  transcripts resolve per agent via `session_transcript`.
 
 ### Shell Scripts (`_scripts/`, `_node/scripts/`)
 

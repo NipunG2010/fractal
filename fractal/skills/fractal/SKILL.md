@@ -408,6 +408,11 @@ Once the node is running, briefly explain how to interact with it:
   the `merge` succeeded first (check its output). To keep a node's
   branch while hiding it, retire it instead. Delete prompts for
   confirmation `[y/N]`; pass `--force`/`-f` to skip the prompt.
+- **Reset:** `fractal reset` (from anywhere in the repo) tears down
+  every node worktree, branch, and registration in one sweep; the
+  project, wiki, and all history in the central database survive, so
+  fresh nodes spawn immediately after. It refuses while any node is
+  running or paused, and prompts `[y/N]` (`--force`/`-f` skips).
 - **Radio:** nodes communicate via `fractal radio` commands. The
   listings (`messages`/`feed`) show metadata and never touch read state;
   `radio read` prints full bodies and writes your read receipts. Replies

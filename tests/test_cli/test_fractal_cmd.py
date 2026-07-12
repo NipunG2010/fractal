@@ -3,9 +3,9 @@
 These drive the real console script as a subprocess (the same shape as
 ``test_lifecycle``/``test_init_bootstrap``) and assert observable behavior:
 ``install`` drops the bundled skills into the per-agent skill trees, ``commit
---check`` gates on a dirty tree, ``destroy`` tears the fractal down (and its
-confirm prompt aborts), and ``_pricing --check`` reports whether a model is priced
-in the cache. ``install`` and ``_pricing`` redirect ``HOME`` so they touch a
+--check`` gates on a dirty tree, ``reset`` recycles the worktrees keeping the
+user data, ``destroy`` tears the fractal down (and its confirm prompt aborts),
+and ``_pricing --check`` reports whether a model is priced in the cache. ``install`` and ``_pricing`` redirect ``HOME`` so they touch a
 throwaway tree, never the real one.
 """
 
@@ -28,6 +28,7 @@ __all__ = [
     'test_install_home_targets_the_home_skill_trees',
     'test_commit_records_the_iteration_and_clears_the_check',
     'test_commit_check_fails_on_a_dirty_worker',
+    'test_reset_force_tears_worktrees_and_keeps_history',
     'test_destroy_force_tears_the_fractal_down',
     'test_destroy_aborts_when_the_prompt_is_declined',
     'test_open_without_textual_names_the_tui_extra',
@@ -76,7 +77,7 @@ def test_install_home_targets_the_home_skill_trees(tmp_path: pathlib.Path) -> No
     assert (home / '.agents' / 'skills' / 'wiki' / 'SKILL.md').is_file()
 
 
-# ------ commit / destroy (against a real worker node)
+# ------ commit / reset / destroy (against a real worker node)
 
 
 def test_commit_records_the_iteration_and_clears_the_check(
@@ -113,6 +114,25 @@ def test_commit_check_fails_on_a_dirty_worker(fractal_repo: dict) -> None:
         assert 'uncommitted changes' in result.stderr
     finally:
         (task / 'scratch.txt').unlink()
+
+
+def test_reset_force_tears_worktrees_and_keeps_history(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``reset --force`` removes worktrees and branches, keeping the user data."""
+    repo = _seed_repo(tmp_path / 'recycled')
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    assert (repo / '.worktrees' / 'main.task').exists()
+    result = _run(repo, 'reset', '--force')
+    assert result.returncode == 0, result.stderr
+    assert 'Reset fractal' in result.stdout
+    # the worktree, branch, and registration are gone; the user node's data
+    # (the central database and its history) is not
+    assert not (repo / '.worktrees' / 'main.task').exists()
+    assert (repo / '.fractal' / 'main' / '.db').is_file()
+    branch = _git(repo, 'branch', '--list', 'main.task').stdout.strip()
+    assert branch == ''
+    assert Node(repo).db.read('nodes') == []
 
 
 def test_destroy_force_tears_the_fractal_down(tmp_path: pathlib.Path) -> None:

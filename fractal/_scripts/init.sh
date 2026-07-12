@@ -358,6 +358,7 @@ fi
 mkdir -p "$WORKTREES_DIR"
 
 WORKTREE_DIR="$WORKTREES_DIR/$BRANCH"
+FORK_SHA=""
 if [[ -d "$WORKTREE_DIR" ]]; then
     echo "Reusing existing worktree at $WORKTREE_DIR"
     if [[ "$RESET" != true ]]; then
@@ -377,6 +378,11 @@ else
         # BASE_REF) so a child inherits the spawning node's work -- never the bare
         # main-repo HEAD, which would start the child divergent from its parent
         git -C "$REPO_DIR" worktree add -q -b "$BRANCH" "$WORKTREE_DIR" "$BASE_REF"
+        # record the fork point for the init event below -- only branch
+        # creation has one (a reused branch or worktree sits at its tip, not
+        # a fork), and nothing commits between here and the event, so HEAD is
+        # the sha the node's whole contribution diffs against
+        FORK_SHA="$(git -C "$WORKTREE_DIR" rev-parse HEAD)"
     fi
     echo "Created worktree at $WORKTREE_DIR on branch $BRANCH"
 fi
@@ -573,7 +579,15 @@ if [[ "$RESET" == true ]] || [[ ! -f "$NODE_DIR/config.json" ]]; then
     echo idle >"$NODE_DIR/.status"
 fi
 
-EVENT_ID=$(fractal event _start init --path="$WORKTREE_DIR" 2>/dev/null || true)
+# the fork sha (branch creation only) rides the init event's metadata -- the
+# node's base diff anchor, resolved newest-first so a re-init of a deleted
+# branch name reads its own fork, never a dead namesake's
+EVENT_ARGS=()
+if [[ -n "$FORK_SHA" ]]; then
+    EVENT_ARGS+=(--metadata="$FORK_SHA")
+fi
+EVENT_ID=$(fractal event _start init ${EVENT_ARGS[@]+"${EVENT_ARGS[@]}"} \
+    --path="$WORKTREE_DIR" 2>/dev/null || true)
 if [[ -n "$EVENT_ID" ]]; then
     fractal event _end "$EVENT_ID" --path="$WORKTREE_DIR" \
         --status=completed 2>/dev/null || true

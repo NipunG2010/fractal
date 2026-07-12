@@ -30,6 +30,7 @@ __all__ = [
     'open',
     'pause',
     'resume',
+    'reset',
     'destroy',
     'stream',
     'pricing',
@@ -261,6 +262,43 @@ def resume(app: typer.Typer) -> typer.Typer:
         node = resolve_node(repo_dir)
         result = node.resume()
         typer.echo(result)
+
+    return app
+
+
+def reset(app: typer.Typer) -> typer.Typer:
+    """Register the ``reset`` command."""
+    # path argument
+    path_help = 'Repository path.'
+    path = typer.Argument('.', help=path_help)
+    # force flag
+    force_help = 'Skip confirmation prompt.'
+    force = typer.Option(False, '--force', '-f', help=force_help)
+
+    @command(app, 'reset')
+    def _reset(
+        path: str = path,
+        force: bool = force,
+    ) -> None:
+        """Reset the fractal: remove every node worktree, keep the history."""
+        # reset is a repo-wide teardown -- resolve to the repo root from any
+        # cwd inside it (the agent's NODE_DIR, a worktree, or the repo root)
+        repo_dir = Node(path)._repo_dir
+        if not force:
+            user = Node(repo_dir)
+            count = len(user.child_list()) if user.exists() else 0
+            s = 's' if count != 1 else ''
+            typer.echo(
+                'Warning: This permanently removes every node worktree,'
+                ' branch, and registration. The user node, project wiki,'
+                ' and all history are left in place.',
+                err=True,
+            )
+            prompt = f'Reset the fractal at {repo_dir} ({count} node{s})?'
+            typer.confirm(prompt, abort=True)
+        output = Node.reset(repo_dir)
+        if output:
+            typer.echo(output)
 
     return app
 
