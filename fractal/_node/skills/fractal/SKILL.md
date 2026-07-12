@@ -130,22 +130,26 @@ budget pool a cheaper token rate buys more steps, not a lower bill.
    project/node dirs. Init is lockfile-serialized -- run calls
    sequentially. A worked example of spawn hygiene -- every cap, the
    model, and the step timeout explicit at init (leaf caps shown -- give
-   a manager child depth/children/descendants), then a registry verify
-   before any configuration; the init call is wrapped to capture the
-   child worktree path from the init output's `Initialized <path>` line
-   -- an unset `$child_worktree` silently reads YOUR OWN config
-   (`--path=` resolves to the current directory; `--path` on
-   `config get` names the child's worktree, not the project root):
+   a manager child depth/children/descendants; fill every placeholder
+   deliberately -- price the `<usd>` caps per Cost above, and when the
+   tree's NODE.md names exact model recipes, they override this generic
+   guidance), then a registry verify before any configuration; the init
+   call is wrapped to capture the child worktree path from the init
+   output's `Initialized <path>` line -- an unset `$child_worktree`
+   silently reads YOUR OWN config (`--path=` resolves to the current
+   directory; `--path` on `config get` names the child's worktree, not
+   the project root):
 
    ```bash
    child_worktree="$(fractal node init sub_a --path="$PROJECT_DIR" \
-       --model=sonnet --max-cost=12 --max-iter-cost=4 \
-       --max-iters=4 --step-timeout=10m \
+       --agent=<agent> --model=<explicit_model> \
+       --max-cost=<usd> --max-iter-cost=<usd> \
+       --max-iters=<n> --step-timeout=<duration> \
        --max-depth=0 --max-children=0 --max-descendants=0 \
        | sed -n 's/^Initialized //p')"
    fractal node list                                # registry row: sub_a present
-   fractal node config get max_cost --path="$child_worktree"   # 12.0 -- caps landed
-   fractal node config get model --path="$child_worktree"      # sonnet
+   fractal node config get max_cost --path="$child_worktree"   # <usd> -- caps landed
+   fractal node config get model --path="$child_worktree"      # <explicit_model>
    ```
 
 2. **Configure:** edit the child's `NODE.md` (instructions + completion

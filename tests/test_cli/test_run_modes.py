@@ -163,8 +163,8 @@ _GATE_MARKER = 'GATE-AND-WAIT'
 _AGENT_STUB = """#!/usr/bin/env bash
 SELF=$(basename "$0")
 
-# simulate a ChatGPT-auth codex rejecting an explicit priced model (the
-# run-start probe path): refuse the sentinel model before recording anything
+# simulate a codex account rejecting an explicit model (the run-start probe
+# path): refuse the sentinel model before recording anything
 if [[ "$SELF" == "codex" ]]; then
     PREV=""
     for ARG in "$@"; do
@@ -2148,9 +2148,10 @@ def test_codex_preflight_probe_aborts_on_model_rejection(repo: dict) -> None:
     """A cost-capped codex node aborts at launch if codex rejects its model.
 
     Codex spend is priced from token counts, so a cost cap needs an explicit
-    ``--model`` -- but a ChatGPT-auth codex account rejects an explicit priced
-    model and would fail every step. The run-start probe catches this and aborts
-    with a clear message before any step (or run) starts.
+    ``--model`` -- but some codex accounts reject some explicit models (e.g. a
+    ChatGPT-plan account lacking the entitlement) and would fail every step.
+    The run-start probe catches this and aborts with the probe's own error
+    before any step (or run) starts.
     """
     node = _make_node(
         repo,
@@ -2166,7 +2167,7 @@ def test_codex_preflight_probe_aborts_on_model_rejection(repo: dict) -> None:
 
     # aborted at launch with the clear message, and no step ever ran
     assert result.returncode != 0, result.stdout
-    assert 'codex rejected model' in result.stderr, result.stderr
+    assert 'codex preflight failed for model' in result.stderr, result.stderr
     assert not calls, (calls, result.stdout)
     # codex's own error is surfaced verbatim, not a hedged guess: the probe relays
     # the agent's message (the stub stands in for the real account-rejection text)
@@ -2174,12 +2175,12 @@ def test_codex_preflight_probe_aborts_on_model_rejection(repo: dict) -> None:
 
 
 def test_codex_preflight_failure_is_loud_and_recoverable(repo: dict) -> None:
-    """A rejected codex preflight stamps a diagnosable, recoverable terminal.
+    """A failed codex preflight stamps a diagnosable, recoverable terminal.
 
     The probe runs before the run row / ``_status active`` / the EXIT trap, so a
     bare abort would strand the node at ``idle`` -- indistinguishable from a
     never-started node, with the diagnosis lost in the dying tmux pane. Instead
-    the abort must (1) record *why* on disk (``.fail_reason`` naming the rejected
+    the abort must (1) record *why* on disk (``.fail_reason`` naming the failing
     model, surfaced by ``node status``/``activity``), (2) stamp the honest
     terminal ``exited`` so the wedge is visible, and (3) leave a forward path:
     a plain ``node start`` refuses with a restart hint (no silent re-fail) while
@@ -2199,7 +2200,7 @@ def test_codex_preflight_failure_is_loud_and_recoverable(repo: dict) -> None:
     _, result = _run_loop(repo, node, capture_name='codexwedge')
     assert result.returncode != 0, result.stdout
 
-    # (1) the reason is persisted on disk, naming the rejected model
+    # (1) the reason is persisted on disk, naming the failing model
     fail_reason = (node_dir / '.fail_reason').read_text(encoding='utf-8')
     assert 'reject-me' in fail_reason, fail_reason
     # (2) the node is stamped exited -- not the idle a never-started node shows
@@ -2232,7 +2233,7 @@ def test_codex_preflight_runs_without_timeout_binary(repo: dict) -> None:
     The codex model probe bounds itself with ``timeout`` only as a convenience --
     a cost cap alone never requires ``timeout`` (only wall-clock caps do). On a
     default macOS host (no coreutils) the probe must skip the wrapper and run
-    codex directly, not abort 127 and misreport it as ``codex rejected model``.
+    codex directly, not abort 127 and misreport it as ``codex preflight failed``.
     """
     node = _make_node(
         repo,
@@ -2260,8 +2261,8 @@ def test_codex_preflight_runs_without_timeout_binary(repo: dict) -> None:
     )
     calls = _collect_calls(capture)
 
-    # launched and ran (no 127 misreported as a model rejection); codex was probed
-    assert 'codex rejected model' not in result.stderr, result.stderr
+    # launched and ran (no 127 misreported as a preflight failure); codex was probed
+    assert 'codex preflight failed' not in result.stderr, result.stderr
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert any(c['agent'] == 'codex' for c in calls.values()), (calls, result.stderr)
 

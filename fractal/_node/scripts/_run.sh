@@ -1477,12 +1477,13 @@ abort_preflight() {
     exit 1
 }
 
-# codex preflight: a ChatGPT-auth codex account rejects an explicit priced model
-# and fails every step (a cost cap forces one, but a model can also be set without
-# a cap); the LiteLLM check above only proves the model priceable, not that codex
-# accepts it, so whenever a token-priced agent has an explicit model, probe codex
-# once with it and abort clearly if it refuses -- an uncapped codex with no model
-# skips this and runs fine
+# codex preflight: some codex accounts reject some explicit models (e.g. a
+# ChatGPT-plan account returning a 400 for a model outside its entitlement; a
+# cost cap forces an explicit model, but one can also be set without a cap);
+# the LiteLLM check above only proves the model priceable, not that codex
+# accepts it, so whenever a token-priced agent has an explicit model, probe
+# codex once with it and abort clearly on failure -- an uncapped codex with no
+# model skips this and runs fine
 if needs_pricing "$AGENT_BASE_COMMAND" && [[ -n "$NODE_MODEL" ]]; then
     # bound the probe so a hung codex (network/auth stall) cannot wedge start;
     # a cost cap alone does not require `timeout` (only wall-clock caps do), so
@@ -1510,15 +1511,18 @@ if needs_pricing "$AGENT_BASE_COMMAND" && [[ -n "$NODE_MODEL" ]]; then
             "'$NODE_MODEL'; codex did not respond" >&2
         abort_preflight "codex preflight timed out"
     elif [[ "$PREFLIGHT_STATUS" -ne 0 ]]; then
-        # lead with codex's own message (the authoritative cause), then the
-        # fractal-side remedy hint -- a ChatGPT-plan account cannot select a
-        # priced model, which a cost cap forces
-        echo "Error: codex rejected model '$NODE_MODEL' for this account:" >&2
+        # lead with codex's own message (the authoritative cause), then a
+        # neutral cause list -- the probe fails for auth, network, rate-limit,
+        # or entitlement reasons, not only model rejection
+        echo "Error: codex preflight failed for model '$NODE_MODEL'" \
+            "(exit $PREFLIGHT_STATUS):" >&2
         [[ -s "$PREFLIGHT_OUT" ]] && cat "$PREFLIGHT_OUT" >&2
-        echo "A ChatGPT-plan codex account cannot select a priced model; run" \
-            "uncapped (unset --max-cost), drop --model, or use an API-key" \
-            "codex account" >&2
-        abort_preflight "codex rejected model '$NODE_MODEL'"
+        echo "Check codex's output above for the cause -- common ones:" \
+            "expired/invalid auth (re-run codex login), network or rate-limit" \
+            "errors (retry), or a model unavailable to this account (some" \
+            "ChatGPT-plan accounts lack access to some models; API-key auth" \
+            "is an alternative)" >&2
+        abort_preflight "codex preflight failed for model '$NODE_MODEL'"
     fi
 fi
 
