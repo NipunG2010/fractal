@@ -123,7 +123,7 @@ class ClaudeParser(StreamParser):
         # frame is the authoritative record, but a killed or timed-out agent
         # never emits one, so each message's usage is priced as it arrives and
         # the running total emitted per event (the stream reader can die by
-        # signal); the eventual result overwrites the estimate. Claude repeats
+        # signal); the eventual result overwrites the estimate; Claude repeats
         # one frame per content block with identical message-level usage, so a
         # message id is priced once -- pricing every block would inflate the
         # estimate toward Nx for an N-block message

@@ -156,9 +156,16 @@ def test_iter_cost_cap_steers_to_reserve(
     Step 1 runs before any spend is recorded, so it is never steered. Step 2 is
     steered into reserve mode iff the iteration's accrued spend (step 1's cost)
     reached ``max_iter_cost`` -- the same soft-cap steering ``max_cost`` applies,
-    now driven by the per-iteration cap.
+    now driven by the per-iteration cap. The run ceiling (a per-iter cap
+    requires one) sits far above every case's spend, so the steering observed
+    is iter-cap driven.
     """
-    prompts = _run_loop(node_env, stub_cost=stub_cost, max_iter_cost=max_iter_cost)
+    prompts = _run_loop(
+        node_env,
+        stub_cost=stub_cost,
+        max_iter_cost=max_iter_cost,
+        max_cost=100.0,
+    )
     # step 1 always runs before spend is recorded -> never in reserve mode
     assert RESERVE_MARKER not in prompts[1]
     # step 2 enters reserve mode iff the iteration's spend hit the cap
@@ -222,16 +229,19 @@ def _run_loop(
     """
     root = node_env['root']
     worktree = node_env['worktree']
-    # set the caps for this run; clear the unset ones (null) so a prior case's
-    # budget never leaks into the next through the shared module node
+    # set the caps for this run in one atomic write, clearing the unset ones
+    # (null) so a prior case's budget never leaks into the next through the
+    # shared module node -- one write, not one per key, so the setter's merged
+    # validation always sees the run ceiling beside the per-iter cap
+    settings = []
     for key, value in (
         ('max_iter_cost', max_iter_cost),
         ('max_cost', max_cost),
         ('reserve_budget', reserve_budget),
     ):
         setting_value = value if value is not None else 'null'
-        setting = f'{key}={setting_value}'
-        assert _run(worktree, 'config', '_set', setting).returncode == 0
+        settings.append(f'{key}={setting_value}')
+    assert _run(worktree, 'config', '_set', *settings).returncode == 0
     # fresh capture dir per run so prompt files do not bleed across cases
     capture = root / f'capture_{max_iter_cost}_{max_cost}_{reserve_budget}_{stub_cost}'
     if capture.exists():

@@ -111,13 +111,15 @@ def resolve_transport(
     # the fork capability is the backend's class-level fact; a node with no
     # agent configured yet (config is agent-editable: blank counts) reads as
     # forking (there is nothing to refuse), an unregistered one as
-    # non-forking (never fork what cannot be forked)
+    # non-forking (never fork what cannot be forked); a broken deployment
+    # hook (RuntimeError) reads the same -- the chat boundary guard surfaces
+    # its error when the turn is built
     parts = agent.split()
     if parts:
         base = parts[0]
         try:
             can_fork = resolve(base, root=root).can_fork
-        except ValueError:
+        except (ValueError, RuntimeError):
             can_fork = False
     else:
         base, can_fork = '', True
@@ -250,7 +252,7 @@ class ChatTurn:
             for event in parsed:
                 # a result closes the turn unless it is a mid-run step_finish
                 # frame from a results-per-step backend (opencode; its final
-                # frame sets final=True). Every other backend emits one
+                # frame sets final=True); every other backend emits one
                 # terminal result; codex's carries final=False for cost reasons
                 # but is still the turn's end
                 is_result = event.kind == 'result'
@@ -310,8 +312,6 @@ class ChatController:
         self._spin_frame = 0
         self._spin_started = 0.0
 
-    # transcripts + cockpit sessions
-
     def transcript(self: ChatController, branch: str) -> list[tuple[str, str]]:
         """Return a branch's transcript (created empty on first access).
 
@@ -339,8 +339,6 @@ class ChatController:
     def set_session(self: ChatController, branch: str, session: str) -> None:
         """Record the cockpit's chat session for a branch (multi-turn resume)."""
         self._sessions[branch] = session
-
-    # in-flight turn
 
     @property
     def turn(self: ChatController) -> Optional[ChatTurn]:
@@ -397,8 +395,6 @@ class ChatController:
             turn.cancel()
         self._turn = None
         self._turn_branch = ''
-
-    # spinner
 
     @property
     def spin_frame(self: ChatController) -> int:

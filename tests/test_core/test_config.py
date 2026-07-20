@@ -160,16 +160,26 @@ def test_config_set_serializes_concurrent_writers(
         ({'max_iters': 0}, 'greater than 0'),
         ({'max_iters': '5'}, 'must be an integer'),
         ({'max_children': -1}, 'must be >= 0'),
+        ({'sync': 'false'}, 'must be a boolean'),
+        ({'detached': 1}, 'must be a boolean'),
         ({'max_cost': 10.0, 'reserve_budget': -0.5}, 'must be >= 0'),
         ({'max_cost': 10.0, 'reserve_budget': 9.95}, '99%'),
         ({'max_cost': 5.0, 'max_iter_cost': 6.0}, 'exceeds max_cost'),
-        ({'max_iter_cost': 1.0, 'max_step_cost': 2.0}, 'exceeds max_iter_cost'),
+        (
+            {'max_cost': 5.0, 'max_iter_cost': 1.0, 'max_step_cost': 2.0},
+            'exceeds max_iter_cost',
+        ),
         ({'max_cost': 5.0, 'max_step_cost': 6.0}, 'exceeds max_cost'),
+        ({'max_iter_cost': 2.0}, 'max_iter_cost requires max_cost'),
+        ({'max_step_cost': 1.0}, 'max_step_cost requires max_cost'),
         ({'sleep': '10'}, 'unit suffix'),
         ({'step_timeout': '0s'}, 'at least 1 second'),
         ({'wait': '0.5s'}, 'at least 1 second'),
         ({'interval': '30m', 'sleep': '10s'}, 'mutually exclusive'),
         ({'interval': '30m', 'iter_timeout': '2h'}, 'exceeds'),
+        ({'scope': ['src', '/abs/root']}, 'repo-relative'),
+        ({'scope': ['../sibling']}, 'repo-relative'),
+        ({'scope': 123}, 'list of strings'),
     ],
     ids=[
         'nan_cost',
@@ -181,16 +191,23 @@ def test_config_set_serializes_concurrent_writers(
         'zero_iters',
         'string_iters',
         'negative_children',
+        'string_sync',
+        'int_detached',
         'negative_reserve',
         'reserve_over_99_percent',
         'iter_cost_over_run',
         'step_cost_over_iter',
         'step_cost_over_run',
+        'iter_cost_without_ceiling',
+        'step_cost_without_ceiling',
         'bare_number_duration',
         'zero_duration',
         'subsecond_duration',
         'interval_sleep_conflict',
         'iter_timeout_over_interval',
+        'absolute_scope_root',
+        'dotdot_scope_root',
+        'non_list_scope',
     ],
 )
 def test_validate_rejects_launch_invariant_violations(
@@ -202,12 +219,18 @@ def test_validate_rejects_launch_invariant_violations(
 
     Non-numeric or non-finite costs slip past every comparison, a
     non-positive ceiling degenerates the budget check into an instant $0
-    finish, an out-of-range reserve or broken ``step <= iter <= run``
-    ordering corrupts the budget math, a non-integer or degenerate integer
-    cap corrupts the loop's caps (a non-positive ``max_iters`` reads as
-    unlimited), and a bare-number or zero-truncating duration bricks the
-    loop at launch or crashes its mid-run re-reads. Only the keys present in the
-    mapping are checked, so each case isolates one invariant.
+    finish, a per-iter/step cap with no ceiling runs unbounded once the
+    per-iter budget drains, an out-of-range reserve or broken
+    ``step <= iter <= run`` ordering corrupts the budget math, a
+    non-integer or degenerate integer cap corrupts the loop's caps (a
+    non-positive ``max_iters`` reads as unlimited), a non-bool mode flag
+    flips the run mode (the loop's ``bool()`` coercion reads a hand-edited
+    ``"false"`` string as ``True``), a bare-number or zero-truncating
+    duration bricks the loop at launch or crashes its mid-run re-reads,
+    and an absolute or ``..`` scope root never matches the commit
+    pipeline's relative prefix check, bricking every scoped commit. Only
+    the keys present in the mapping are checked, so each case isolates one
+    invariant.
     """
     with pytest.raises(ValueError, match=match):
         node_with_db.config.validate(config)

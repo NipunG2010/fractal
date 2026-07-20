@@ -212,7 +212,7 @@ class TuiData:
             return 'idle'
         try:
             return (node_dir / STATUS_FILE).read_text(encoding='utf-8').strip()
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return 'idle'
 
     def config(self: TuiData, branch: str) -> dict:
@@ -221,9 +221,13 @@ class TuiData:
         if node_dir is None:
             return {}
         try:
-            return json.loads((node_dir / CONFIG_FILE).read_text(encoding='utf-8'))
-        except (OSError, json.JSONDecodeError):
+            config = json.loads((node_dir / CONFIG_FILE).read_text(encoding='utf-8'))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return {}
+        # config.json is agent-editable, so a hand edit may leave a non-object
+        # top level (e.g. null) -- degrade it like malformed JSON, never an
+        # AttributeError on .get that crashes the whole cockpit build
+        return config if isinstance(config, dict) else {}
 
     def tmux_session_name(self: TuiData, branch: str) -> str:
         """Return the tmux session name for a branch (the pure core formula).
@@ -484,11 +488,12 @@ class TuiData:
         """
         # steps record the backend's registered name, not the configured
         # command (which may carry an alias or flags); an unregistered agent
-        # keys on its bare word and matches no woven rows
+        # -- or one behind a broken deployment hook (RuntimeError) -- keys on
+        # its bare word and matches no woven rows
         base = agent.split()[0] if agent else agent
         try:
             base = fractal.core.agent.resolve(base, root=self.db_dir).name
-        except ValueError:
+        except (ValueError, RuntimeError):
             pass
         rows = self.rows(
             connection=connection,

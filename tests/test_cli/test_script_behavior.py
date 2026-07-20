@@ -18,8 +18,10 @@ real CLI, pinning edges the end-to-end lifecycle tests don't reach:
   target *during* the merge is refused -- never absorbed into the squash commit
   nor discarded by the recovery ``reset --hard``.
 - **``delete.sh`` unmerged warning** surfaces commits the parent never absorbed
-  on the automation path (the interactive prompt warns only the user), while
-  excluding the generated wiki state that merge-up regenerates on the target.
+  on the automation path (the interactive prompt warns only the user) -- for
+  non-ASCII file names too, which ``core.quotePath`` would otherwise C-quote
+  into pathspecs that match nothing -- while excluding the generated wiki
+  state that merge-up regenerates on the target.
 
 Each test builds its own fresh repo (the merge/delete edges are destructive) and
 shells the scripts directly with the CLI env so ``fractal`` resolves.
@@ -47,6 +49,7 @@ __all__ = [
     'test_delete_warns_on_unmerged_commits',
     'test_delete_does_not_warn_after_squash_merge',
     'test_delete_does_not_warn_after_squash_merge_then_target_advances',
+    'test_delete_warns_on_unmerged_non_ascii_work',
     'test_delete_warns_on_unmerged_wiki_page_work',
     'test_delete_does_not_warn_on_merge_regenerated_wiki_state',
 ]
@@ -480,6 +483,60 @@ def test_delete_does_not_warn_after_squash_merge_then_target_advances(
     # in another path must not resurrect a false unmerged warning
     assert result.returncode == 0, result.stderr
     assert 'not merged' not in result.stderr, (result.stdout, result.stderr)
+    assert not worktree.exists()
+
+
+def test_delete_warns_on_unmerged_non_ascii_work(tmp_path: pathlib.Path) -> None:
+    """Unmerged work under a non-ASCII file name still draws the warning.
+
+    With git's default ``core.quotePath``, ``--name-only`` C-quotes a
+    non-ASCII name (octal escapes, surrounding double quotes included), and
+    feeding that literal back as a pathspec matches nothing -- the
+    preserved-content check would go quiet and swallow the warning. The check
+    reads the changed paths NUL-delimited (emitted verbatim), so a child that
+    squash-merged once and then kept iterating on ``café.md`` -- its *only*
+    unmerged diff, with the machinery edits that init commits on the branch
+    already absorbed by the merge -- warns like any other unmerged work.
+    """
+    repo = _init_tree(tmp_path / 'quotedrepo')
+    # pin git's default path quoting so an operator-level quotePath=false can
+    # never mask the case
+    _git(repo, 'config', 'core.quotePath', 'true')
+    init = _run(repo, 'node', 'init', 'task', '--agent', 'claude', '--local')
+    assert init.returncode == 0, init.stderr
+    worktree = repo / '.worktrees' / 'main.task'
+    # the first iteration lands via merge.sh, absorbing init's machinery
+    # commits so the follow-up work is the branch's only unmerged diff
+    (worktree / 'café.md').write_text('child work\n', encoding='utf-8')
+    _git(worktree, 'add', '-A')
+    _git(worktree, 'commit', '-m', 'child feature work')
+    merge_sh = _scripts_dir() / 'merge.sh'
+    merge = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert merge.returncode == 0, merge.stderr
+    # the child keeps iterating on the page; the parent never absorbs it
+    (worktree / 'café.md').write_text('child work\nmore child work\n', encoding='utf-8')
+    _git(worktree, 'add', '-A')
+    _git(worktree, 'commit', '-m', 'child iterates on the page')
+
+    delete_sh = _scripts_dir() / 'delete.sh'
+    result = subprocess.run(
+        ['bash', f'{delete_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+
+    # the unmerged iteration is real work -- the quoting of its file name
+    # must not swallow the warning
+    assert result.returncode == 0, result.stderr
+    assert 'not merged into main' in result.stderr, (result.stdout, result.stderr)
     assert not worktree.exists()
 
 

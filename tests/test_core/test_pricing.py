@@ -8,6 +8,7 @@ pricing (record unpriced, never crash mid-step).
 
 from __future__ import annotations
 
+import http.client
 import json
 import pathlib
 import socket
@@ -121,6 +122,14 @@ def test_update_caps_the_fetch_with_a_socket_timeout(
 
 
 @pytest.mark.parametrize(
+    argnames='error',
+    argvalues=[
+        pytest.param(OSError('offline'), id='offline'),
+        pytest.param(http.client.IncompleteRead(b''), id='incomplete_read'),
+        pytest.param(http.client.BadStatusLine(''), id='bad_status_line'),
+    ],
+)
+@pytest.mark.parametrize(
     argnames=('cached', 'expected'),
     argvalues=[
         pytest.param(True, 'stale', id='stale'),
@@ -132,11 +141,21 @@ def test_update_degrades_when_the_fetch_fails(
     monkeypatch: pytest.MonkeyPatch,
     cached: bool,
     expected: str,
+    error: Exception,
 ) -> None:
-    """A failed fetch reports ``stale`` with a cache, ``missing`` without."""
+    """A failed fetch reports ``stale`` with a cache, ``missing`` without.
+
+    ``urlretrieve`` fails as ``OSError`` on transport errors, but a server
+    closing mid-body or a garbage status line escapes it as a raw
+    ``http.client.HTTPException`` -- every failure shape must degrade.
+    """
     if cached:
         cache.write_text(json.dumps(_RATES), encoding='utf-8')
-    monkeypatch.setattr(urllib.request, 'urlretrieve', _offline_fetch)
+
+    def retrieve(url: str, filename: pathlib.Path) -> None:
+        raise error
+
+    monkeypatch.setattr(urllib.request, 'urlretrieve', retrieve)
     assert pricing.update() == expected
     # the aborted temp file never survives
     assert list(cache.parent.glob(f'.{cache.name}-*')) == []
@@ -183,8 +202,3 @@ def test_load_degrades_to_empty_on_missing_or_corrupt_cache(
 def _unexpected_fetch(url: str, filename: pathlib.Path) -> None:
     """Fail the test when the fresh path fetches anyway."""
     raise AssertionError('unexpected pricing fetch')
-
-
-def _offline_fetch(url: str, filename: pathlib.Path) -> None:
-    """Simulate an offline fetch."""
-    raise OSError('offline')

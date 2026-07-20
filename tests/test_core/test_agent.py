@@ -500,13 +500,19 @@ def test_record_cost_settles_thread_scope_cumulative_totals(
     iter_id = node.record.iter_start(run_id=run_id, iter=1)
     steps = [
         node.record.step_start(
-            iter_id=iter_id, run_id=run_id, step=step, step_name='EXECUTE'
+            iter_id=iter_id,
+            run_id=run_id,
+            step=step,
+            step_name='EXECUTE',
         )
         for step in (1, 2, 3)
     ]
     for step_id in steps:
         node.record.step_session(
-            'sample', step_id=step_id, model=None, session='thread-1'
+            'sample',
+            step_id=step_id,
+            model=None,
+            session='thread-1',
         )
     # cumulative totals settle to per-step deltas against prior siblings
     backend.record_cost(steps[0], 0.30)
@@ -552,7 +558,10 @@ def test_record_cost_clamps_a_negative_call_scope_figure(
     run_id = node.record.run_start()
     iter_id = node.record.iter_start(run_id=run_id, iter=1)
     step_id = node.record.step_start(
-        iter_id=iter_id, run_id=run_id, step=1, step_name='EXECUTE'
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='EXECUTE',
     )
     backend.record_cost(step_id, -0.42)
     row = node.db.read('steps', where={'step_id': step_id})[0]
@@ -703,5 +712,8 @@ def _step(node: Node) -> int:
     run_id = node.record.run_start()
     iter_id = node.record.iter_start(run_id=run_id, iter=1)
     return node.record.step_start(
-        iter_id=iter_id, run_id=run_id, step=1, step_name='EXECUTE'
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='EXECUTE',
     )

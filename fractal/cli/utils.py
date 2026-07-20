@@ -404,9 +404,21 @@ def resolve_init_target(path: PathLike) -> tuple[Node, pathlib.Path]:
         ``(node, path)`` -- a ``Node`` at the git root and the target's path
         relative to it (``.`` for the repo root).
 
+    Raises:
+        typer.BadParameter: If the target is a linked git worktree (outside
+            the main repo root, so never a sub-project path).
+
     """
     target = init_node(path)
     node = init_node(target.repo_dir)
+    # a linked worktree (git worktree add ../feature) lives outside the main
+    # repo root, so it can never be a sub-project path -- refuse with the
+    # remedy instead of leaking relative_to's raw ValueError
+    if not target.worktree.is_relative_to(target.repo_dir):
+        raise typer.BadParameter(
+            f'{target.worktree} is a linked worktree of {target.repo_dir}.'
+            f' Run `fractal init` from the main checkout.'
+        )
     path = target.worktree.relative_to(target.repo_dir)
     return node, path
 
@@ -489,10 +501,10 @@ def resolve_user_node(path: PathLike) -> Node:
     The tree-wide brake (``pause``/``resume``) must always anchor on the user
     node, but :func:`resolve_node` keys on the repo's *current* branch -- so on
     a non-init checkout (the user on their own branch while nodes run) it
-    silently mis-scopes to a lone child or dies on two. Scan the repo's fractal
-    data dirs (top-level and each sub-project) for the ``config.json`` marked
-    ``user: true`` and pin a ``Node`` to that branch, independent of the git
-    checkout.
+    silently mis-scopes to a lone child or dies on two.
+    :meth:`Node.resolve_user` finds the ``config.json`` marked ``user: true``
+    and pins a ``Node`` to that branch, independent of the git checkout; this
+    wrapper turns its no-fractal ``None`` into the CLI refusal.
 
     Args:
         path: Any path inside the repo.
@@ -504,30 +516,13 @@ def resolve_user_node(path: PathLike) -> Node:
         typer.BadParameter: If the repo has no user node (no fractal).
 
     """
-    repo = Node(path).repo_dir
-    # the user config lives at <repo>/[<project>/].fractal/<branch>/config.json;
-    # check the top level first, then each sub-project dir
-    fractal_dirs = [repo / FRACTAL_FOLDER]
-    fractal_dirs += [
-        sub / FRACTAL_FOLDER
-        for sub in sorted(repo.iterdir())
-        if sub.is_dir() and sub.name != WORKTREES_FOLDER
-    ]
-    for fractal_dir in fractal_dirs:
-        if not fractal_dir.is_dir():
-            continue
-        for config_path in sorted(fractal_dir.glob(f'*/{CONFIG_FILE}')):
-            try:
-                config = json.loads(config_path.read_text(encoding='utf-8'))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if config.get('user'):
-                # the worktree is the fractal dir's parent (<repo> or
-                # <repo>/<project>); the branch is the config dir's name
-                return Node(fractal_dir.parent, branch=config_path.parent.name)
-    raise typer.BadParameter(
-        f'No user node found under {repo}. Run `fractal init` at the repo root.'
-    )
+    user = Node.resolve_user(path)
+    if user is None:
+        repo = Node(path).repo_dir
+        raise typer.BadParameter(
+            f'No user node found under {repo}. Run `fractal init` at the repo root.'
+        )
+    return user
 
 
 def resolve_target(path: PathLike, node: Optional[str] = None) -> Node:

@@ -146,8 +146,15 @@ def test_continue_only_flags_reject_a_bare_start(
     argvalues=[
         ('baddur', {'sleep': '10'}, 'duration with a unit suffix'),
         ('badcost', {'max_iter_cost': 999.0}, 'exceeds max_cost'),
+        ('capless', {'max_cost': None, 'max_iter_cost': 2.0}, 'requires max_cost'),
+        ('badagent', {'agent': 'notreal'}, 'Unsupported agent'),
     ],
-    ids=['bare_number_duration', 'broken_cost_ordering'],
+    ids=[
+        'bare_number_duration',
+        'broken_cost_ordering',
+        'iter_cap_without_ceiling',
+        'unsupported_agent',
+    ],
 )
 def test_start_revalidates_hand_edited_config(
     repo: dict,
@@ -161,12 +168,16 @@ def test_start_revalidates_hand_edited_config(
     bypasses the init/update setters' checks. A bad duration (no unit suffix)
     would otherwise abort the loop after ``start`` already
     printed success, wedging the node idle; a broken cost ordering would launch
-    a degenerate budget. ``start`` must reject both before launching -- exit
-    non-zero with a clear message and no "Started" output.
+    a degenerate budget; a per-iter cap whose ceiling was edited away would
+    spend unbounded once the iteration's budget drains; an agent the registry
+    does not know would kill the loop at boot the same invisible way.
+    ``start`` must reject each before launching -- exit non-zero with a clear
+    message and no "Started" output.
     """
     root = repo['root']
     # a throwaway worker (one per case); init it with a valid budget so start
-    # clears the max_cost guard and reaches the config re-validation
+    # clears the max_cost guard and reaches the config re-validation (a case
+    # may null it back out -- the hand-edit that strips the ceiling)
     assert _run(root, 'node', 'init', name, '--agent', 'claude').returncode == 0
     worktree = root / '.worktrees' / f'main.{name}'
     node = Node(worktree)

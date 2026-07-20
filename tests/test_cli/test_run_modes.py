@@ -2141,13 +2141,14 @@ def test_iter_cost_reserve_continues_next_iteration(repo: dict) -> None:
     """Per-iteration-cost reserve steers the iteration but does NOT end the run.
 
     The total-cost-vs-per-iter-cost split is the reserve contract's other half: a
-    ``--max-iter-cost`` node (with no ``--max-cost``) that hits its per-iteration
-    cap is steered into RESERVE for the rest of that iteration, then continues
-    with a fresh per-iter budget next iteration -- the boundary run-end is gated
-    on ``--max-cost`` and must never fire here. With ``--max-iter-cost 0.3``, a
-    $0.40/step agent over two steps, and ``--max-iters 2``: each iteration steers
-    its second step (iter spend $0.40 >= $0.30) yet both iterations run in full,
-    and the node finishes ``completed``/0.
+    ``--max-iter-cost`` node (its ``--max-cost`` far out of reach) that hits its
+    per-iteration cap is steered into RESERVE for the rest of that iteration,
+    then continues with a fresh per-iter budget next iteration -- the boundary
+    run-end is gated on ``--max-cost`` and must never fire here. With
+    ``--max-iter-cost 0.3``, a $0.40/step agent over two steps, and
+    ``--max-iters 2``: each iteration steers its second step (iter spend
+    $0.40 >= $0.30) yet both iterations run in full, and the node finishes
+    ``completed``/0.
     """
     node = _make_node(
         repo=repo,
@@ -2155,9 +2156,11 @@ def test_iter_cost_reserve_continues_next_iteration(repo: dict) -> None:
         detached=False,
         sync=False,
         max_iters=2,
+        max_cost=100.0,
     )
     worktree = node['worktree']
-    # per-iter cap only, no total cap -- the boundary run-end must not engage
+    # a per-iter cap under a distant total cap -- the boundary run-end keys on
+    # max_cost and must stay far out of reach of the $1.60 total spend
     assert _run(worktree, 'config', '_set', 'max_iter_cost=0.3').returncode == 0
     calls, result = _run_loop(repo, node, capture_name='itercont', stub_cost='0.4')
 
@@ -2579,14 +2582,13 @@ def test_stop_during_approval_wait_records_iteration_stopped(repo: dict) -> None
     ``failed`` (plus a false "failed on <step>" commit). A stop/finish (not a
     timeout) must leave the iteration ``stopped``/``completed``.
     """
+    steps = {'01-work.md': '---\nrequires_approval: true\n---\n# Work\n\nWORK-MARKER\n'}
     node = _make_node(
         repo=repo,
         name='approvalstop',
         detached=False,
         sync=False,
-        steps={
-            '01-work.md': '---\nrequires_approval: true\n---\n# Work\n\nWORK-MARKER\n'
-        },
+        steps=steps,
     )
     worktree = node['worktree']
     capture = repo['root'] / 'capture_approvalstop'

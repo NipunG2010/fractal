@@ -176,7 +176,7 @@ class CodexAgent(Agent):
         # or silently flips a boolean option
         argv += ['--', prompt]
         # run in the worktree (the project): CODEX_HOME supplies
-        # config/auth/skills, so the cwd is the project not the node dir. The
+        # config/auth/skills, so the cwd is the project not the node dir; the
         # env carries only the reserved CODEX_HOME; invocation() composes it
         # over os.environ and the caller overlay
         env = {'CODEX_HOME': str(self.config_dir)}

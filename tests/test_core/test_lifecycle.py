@@ -58,6 +58,7 @@ __all__ = [
     'test_kill_recurses_to_descendants',
     'test_signals_reach_deep_through_inactive_intermediate',
     'test_kill_propagates_deep_status_and_keeps_worktrees',
+    'test_kill_reaps_booting_descendant',
     'test_merge_lifecycle',
     'test_merge_no_op_when_nothing_to_merge',
     'test_merge_excludes_merged_node_seed',
@@ -65,6 +66,7 @@ __all__ = [
     'test_merge_refreshes_parent_wiki_indexes',
     'test_merge_restores_parent_when_index_refresh_fails',
     'test_merge_refuses_when_parent_worktree_is_dirty',
+    'test_merge_refuses_settled_child_into_a_running_target',
     'test_merge_event_survives_child_delete',
 ]
 
@@ -803,6 +805,32 @@ def test_kill_propagates_deep_status_and_keeps_worktrees(
         assert node.exists()
 
 
+def test_kill_reaps_booting_descendant(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kill reaps a child whose loop is still booting, not just active ones.
+
+    A spawn in flight when the kill lands has a tmux session (start.sh
+    created it) but reads ``idle`` -- the loop stamps ``active`` only after
+    its preflight. The sweep must reap it anyway: exiting the fixpoint over
+    the booting child leaves it to stamp ``active`` seconds after the kill
+    returns and run its whole budget in a subtree reported killed.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # rewind the child to its boot window: session live (the helper's probe
+    # already presents it), run row open, 'active' not yet stamped
+    child.status_set('idle')
+    run_scripts = _stub_run_script(monkeypatch, Node)
+    parent.kill()
+    assert parent.status() == 'killed'
+    # the booting child was reaped -- kill.sh ran against its worktree and
+    # its open run row closed killed
+    assert ('kill.sh', f'{child.worktree}') in run_scripts
+    run = child.record.runs(limit=1)[0]
+    assert run['status'] == 'killed'
+
+
 # ------ merge
 
 
@@ -1025,6 +1053,49 @@ def test_merge_refuses_when_parent_worktree_is_dirty(git_repo: pathlib.Path) -> 
     # child's work did not land on the parent
     assert parent_file.read_text(encoding='utf-8') == 'uncommitted edit\n'
     assert not (git_repo / 'feature.txt').is_file()
+
+
+def test_merge_refuses_settled_child_into_a_running_target(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Merging into a live (or paused) target refuses; the target's own loop may.
+
+    ``merge.sh`` squashes, refreshes indexes, and commits inside the target
+    worktree, and its failure paths ``reset --hard`` -- racing the target
+    loop's own writes and commit backstop would absorb or destroy that loop's
+    fresh work. An outside merge of a settled child therefore refuses while
+    the target is active or paused, while the target's own loop (which merges
+    its settled children as part of its normal iteration, single-actor) still
+    merges freely.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    parent_wt = git_repo / '.worktrees' / 'main.parent'
+    child_wt = git_repo / '.worktrees' / 'main.parent.kid'
+    # the child settles with committed work; the parent's loop stays live
+    (child_wt / 'work.txt').write_text('child work\n', encoding='utf-8')
+    _git(child_wt, 'add', 'work.txt')
+    _git(child_wt, 'commit', '-m', 'child work')
+    child.status_set('completed')
+
+    # an outside merge refuses while the target's loop is running...
+    with pytest.raises(RuntimeError, match='active target'):
+        child.merge()
+    # ...and while the target is parked paused (its run frozen mid-flight)
+    parent.status_set('paused')
+    with pytest.raises(RuntimeError, match='paused target'):
+        child.merge()
+    # neither refusal touched the running target's worktree
+    assert not (parent_wt / 'work.txt').exists()
+
+    # the target's own loop merges the settled child while active: the loop
+    # is blocked on the very agent step running the merge, so nothing races
+    parent.status_set('active')
+    node_dir = parent_wt / '.fractal' / 'main.parent'
+    monkeypatch.setenv('_NODE', f'{node_dir}')
+    result = child.merge()
+    assert 'Squash-merged' in result
+    assert (parent_wt / 'work.txt').is_file()
 
 
 def test_merge_event_survives_child_delete(git_repo: pathlib.Path) -> None:

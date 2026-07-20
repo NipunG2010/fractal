@@ -2,9 +2,10 @@
 
 Regressions here drive the real console script on real repos: ``init`` must
 resolve its ``wiki`` step off its own interpreter, leave a repairable state
-behind a failed wiki step, record a sub-project target under its subdir, and
-sweep everything init itself wrote -- never the user's own pending edits --
-into the baseline commit.
+behind a failed wiki step, refuse to adopt a pre-existing docs directory,
+refuse a slash branch with the rule named, record a sub-project target under
+its subdir, and sweep everything init itself wrote -- never the user's own
+pending edits -- into the baseline commit.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ __all__ = [
     'test_init_prefers_the_environments_wiki_over_a_broken_shim',
     'test_init_names_the_missing_wiki_dependency',
     'test_init_failure_leaves_a_repairable_state',
+    'test_init_refuses_to_adopt_a_preexisting_docs_directory',
+    'test_init_refuses_a_slash_branch',
     'test_init_summarizes_creations_and_baseline_commit',
     'test_init_subproject_records_project',
     'test_commit_init_sweeps_the_gitattributes_edit',
@@ -98,6 +101,49 @@ def test_init_failure_leaves_a_repairable_state(tmp_path: pathlib.Path) -> None:
     assert result.returncode == 0, result.stderr
     assert 'Re-created the missing project wiki' in result.stdout
     assert (repo / 'wiki' / '_index.md').is_file()
+
+
+def test_init_refuses_to_adopt_a_preexisting_docs_directory(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A user's own ``wiki/`` docs directory fails init loudly, untouched.
+
+    ``wiki init`` rewrites every page under its root (frontmatter,
+    generated indexes), so a committed docs directory at the wiki path is
+    refused with the remedy named -- never silently rewritten into the
+    baseline.
+    """
+    repo = _init_repo(tmp_path / 'repo')
+    docs = repo / 'wiki'
+    docs.mkdir()
+    (docs / 'Home.md').write_text('# Home\n\nWelcome.\n', encoding='utf-8')
+    _git(repo, 'add', 'wiki')
+    _git(repo, 'commit', '-m', 'docs')
+    result = _run(repo, 'init')
+    assert result.returncode != 0
+    assert 'not a project wiki' in result.stderr
+    assert 're-run init' in result.stderr
+    # the docs are untouched: no rewrite, no wiki tool files, a clean tree
+    assert (docs / 'Home.md').read_text(encoding='utf-8') == '# Home\n\nWelcome.\n'
+    assert _git(repo, 'status', '--porcelain').stdout.strip() == ''
+
+
+def test_init_refuses_a_slash_branch(tmp_path: pathlib.Path) -> None:
+    """``init`` on a ``feat/x``-style branch names the rule, not a raw errno.
+
+    Every per-branch artifact keys on the branch as a single path component,
+    so a slash branch is refused up front with the remedy named -- and
+    nothing partial (no ``.worktrees/``, no node data dir) is left behind.
+    """
+    repo = _init_repo(tmp_path / 'repo')
+    _git(repo, 'checkout', '-b', 'feat/first')
+    result = _run(repo, 'init')
+    assert result.returncode != 0
+    assert "'feat/first'" in result.stderr
+    assert "containing '/' are not supported" in result.stderr
+    # refused before any write: no cache dir, no node data dir
+    assert not (repo / '.worktrees').exists()
+    assert not (repo / '.fractal').exists()
 
 
 def test_init_summarizes_creations_and_baseline_commit(

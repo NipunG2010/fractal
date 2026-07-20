@@ -122,7 +122,10 @@ fi
 # prefix/fnmatch, so a short name false-matches longer session names
 if tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$TMUX_SESSION_NAME"; then
     echo "Error: tmux session already exists: $TMUX_SESSION_NAME" >&2
-    echo "Kill it first with: fractal node kill --path=<path>" >&2
+    # the name may belong to another fractal sharing this repo basename --
+    # do not blindly kill it; stop that node from its own repo, or rename
+    # one repository directory so the sessions no longer collide
+    echo "Stop that node from its own repository, or rename one repo directory." >&2
     exit 1
 fi
 tmux new-session "${TMUX_ARGS[@]}" "$TMUX_CMD"

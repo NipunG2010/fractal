@@ -142,7 +142,7 @@ class OpencodeAgent(Agent):
         argv += ['--', prompt]
         # run in the worktree (opencode walks up from the cwd to the git root
         # for project identity); OPENCODE_CONFIG points config at the node's
-        # file. The env carries only the reserved OPENCODE_CONFIG; provider
+        # file; the env carries only the reserved OPENCODE_CONFIG; provider
         # keys (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, ...) are auto-detected
         # from the ambient environment invocation() composes under it
         env = {'OPENCODE_CONFIG': str(self.config_dir / self.config_file)}

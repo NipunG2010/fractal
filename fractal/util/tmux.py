@@ -8,7 +8,7 @@ from typing import Optional
 __all__ = []
 
 
-def probe() -> Optional[frozenset[str]]:
+def probe(*, socket: Optional[str] = None) -> Optional[frozenset[str]]:
     """Return the set of live tmux session names, or ``None`` when unknown.
 
     The batched form of a per-session existence probe -- a caller checking
@@ -22,13 +22,24 @@ def probe() -> Optional[frozenset[str]]:
     returns ``None``, so a caller about to act destructively on "no
     sessions" can refuse to act on ignorance.
 
+    Every answer is evidence about one server only: the ambient socket's
+    "no sessions" says nothing about sessions alive on another socket, so
+    a caller judging a specific session passes the socket it lives on.
+
+    Args:
+        socket: Server socket path to probe (``tmux -S``); ``None`` probes
+            the ambient socket.
+
     Returns:
         The live tmux session names, or ``None`` when tmux gave no answer.
 
     """
+    # -S pins the probe to one server; without it tmux resolves the
+    # ambient socket ($TMUX, else $TMUX_TMPDIR)
+    server = [] if socket is None else ['-S', socket]
     try:
         result = subprocess.run(
-            ['tmux', 'list-sessions', '-F', '#{session_name}'],
+            ['tmux', *server, 'list-sessions', '-F', '#{session_name}'],
             capture_output=True,
             text=True,
         )

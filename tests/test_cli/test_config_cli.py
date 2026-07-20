@@ -116,6 +116,10 @@ def test_set_rejects_mistyped_coerced_values(
         # cost caps reject non-finite values (NaN/Infinity slip past < 0 and <= 0)
         ('max_cost=NaN', 'max_cost'),
         ('max_step_cost=Infinity', 'max_step_cost'),
+        # scope roots must be repo-relative -- an absolute or '..' root never
+        # matches the commit pipeline's prefix check, bricking every scoped commit
+        ('scope=/abs/root', 'scope'),
+        ('scope=../sibling', 'scope'),
     ],
 )
 def test_set_rejects_invariant_breaking_values(

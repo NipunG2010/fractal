@@ -138,6 +138,10 @@ class Files:
                 continue
             if rel.casefold().startswith(wiki_prefix):
                 continue
+            # a leading ':' is pathspec magic _validate_relpath refuses (glob
+            # chars stay: every downstream git call takes paths literally)
+            if rel.startswith(':'):
+                continue
             if scope and not rel.startswith(scope):
                 continue
             entry: dict[str, Any] = {'path': rel, 'size': 0}
@@ -207,16 +211,19 @@ class Files:
         norm = self._validate_relpath(path)
         if before and since is None:
             raise ValueError('Please specify since when reading the before side.')
+        # literal pathspec magic: a glob char in a tracked name (e.g. a
+        # bracketed route dir) must not widen or empty the match
+        spec = f':(literal){norm}'
         # membership: the tracked set, else (with an anchor) the changed set
         # -- O(1) probes, not a full listing, so a poller never pays O(repo)
-        cmd = ['ls-files', '--error-unmatch', '--', norm]
+        cmd = ['ls-files', '--error-unmatch', '--', spec]
         tracked = fractal.util.git.run(cmd, cwd=self.worktree, check=False)
         anchor = self._diff_anchor(since) if since is not None else None
         if not tracked:
             in_changed = False
             if anchor:
                 cmd = ['diff', '--name-only', '--no-renames', '-z']
-                cmd += [f'{anchor}...HEAD', '--', norm]
+                cmd += [f'{anchor}...HEAD', '--', spec]
                 in_changed = bool(
                     fractal.util.git.run(cmd, cwd=self.worktree, check=False)
                 )
@@ -229,6 +236,7 @@ class Files:
             # literally named 'None' must not answer)
             raw = None
             if anchor:
+                # a rev:path lookup is literal already -- no :(literal) here
                 raw = fractal.util.git.run_bytes(
                     ['show', f'{anchor}:{norm}'],
                     cwd=self.worktree,
@@ -305,7 +313,8 @@ class Files:
 
         """
         norm = self._validate_relpath(path)
-        cmd = ['ls-files', '--error-unmatch', '--', norm]
+        # literal pathspec magic, as for a read
+        cmd = ['ls-files', '--error-unmatch', '--', f':(literal){norm}']
         tracked = fractal.util.git.run(cmd, cwd=self.worktree, check=False)
         abs_path = self.worktree / norm
         # containment at the serving boundary, as for a read: an escaping
@@ -386,10 +395,13 @@ class Files:
         if not message:
             raise ValueError('Please pass a commit message.')
         norm = [self._validate_relpath(entry) for entry in paths]
+        # literal pathspec magic: a glob char in an uploaded name must not
+        # widen or empty the match
+        specs = [f':(literal){entry}' for entry in norm]
         # stage just these paths (pathspec), so other staged work is untouched
-        fractal.util.git.run(['add', '--', *norm], cwd=self.worktree)
+        fractal.util.git.run(['add', '--', *specs], cwd=self.worktree)
         # benign no-op when the paths hold nothing new to commit
-        cmd = ['diff', '--cached', '--name-only', '-z', '--', *norm]
+        cmd = ['diff', '--cached', '--name-only', '-z', '--', *specs]
         if not fractal.util.git.run(cmd, cwd=self.worktree):
             return {'committed': False, 'sha': None, 'paths': norm}
         # commit only these paths (pathspec); --no-verify because bypassing
@@ -397,7 +409,7 @@ class Files:
         # or reject uploaded bytes (the loop's own force path does the same);
         # no push -- the caller owns the branch
         msg = f'{self._node.branch}: files ({message})'
-        cmd = ['commit', '--no-verify', '-m', msg, '--', *norm]
+        cmd = ['commit', '--no-verify', '-m', msg, '--', *specs]
         fractal.util.git.run(cmd, cwd=self.worktree)
         sha = fractal.util.git.run(['rev-parse', 'HEAD'], cwd=self.worktree)
         return {'committed': True, 'sha': sha, 'paths': norm}
@@ -530,9 +542,9 @@ class Files:
 
         The safety boundary for every caller-supplied file path: the path must
         stay inside the worktree and clear of fractal machinery. Rejected are
-        absolute paths and ``..`` traversal; glob and pathspec metacharacters
-        (every downstream git call takes the path as a pathspec, and a glob
-        would widen it to the whole tree); any ``.git`` or ``.fractal``
+        absolute paths and ``..`` traversal; a leading ``:`` (pathspec magic
+        -- glob characters are legal name characters, taken literally by
+        every downstream git call); any ``.git`` or ``.fractal``
         component (in a linked worktree ``.git`` is a *file* whose overwrite
         hijacks the gitdir, and sibling projects' committed seeds are
         machinery too); a leading ``.worktrees`` (on the user node the
@@ -554,8 +566,9 @@ class Files:
         rel = pathlib.PurePosixPath(path)
         if not path or rel.is_absolute() or not rel.parts or '..' in rel.parts:
             raise ValueError(f'Invalid file path: {path!r}')
-        # keep every git pathspec literal: no glob chars, no leading magic
-        if any(char in path for char in '*?[') or path.startswith(':'):
+        # no leading pathspec magic; glob chars are legal name chars that
+        # every downstream pathspec disarms with :(literal)
+        if path.startswith(':'):
             raise ValueError(f'Invalid file path: {path!r}')
         # machinery components, casefolded
         parts = tuple(part.casefold() for part in rel.parts)

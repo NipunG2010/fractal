@@ -830,7 +830,10 @@ def _steps(node: Node, count: int) -> list[int]:
     iter_id = node.record.iter_start(run_id=run_id, iter=1)
     return [
         node.record.step_start(
-            iter_id=iter_id, run_id=run_id, step=step, step_name='EXECUTE'
+            iter_id=iter_id,
+            run_id=run_id,
+            step=step,
+            step_name='EXECUTE',
         )
         for step in range(1, count + 1)
     ]

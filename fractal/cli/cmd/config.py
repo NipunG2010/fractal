@@ -244,12 +244,12 @@ def _config_set(
         key: config[key] if key in config else node.config.get(key) for key in KEYS
     }
     node.config.validate(merged)
-    # init-fixed keys (root/user/project). The operator path (`node config
+    # init-fixed keys (root/user/project): the operator path (`node config
     # set`, check=True) may never write one -- reject its first write too, so
     # `config set user=true` can't brick a child (which carries no `user`) into
-    # a root node and latch the tree-wide pause. Init/internal writes (`config
+    # a root node and latch the tree-wide pause; init/internal writes (`config
     # _set`, check=False) set these once at bootstrap, so they keep the
-    # first-write exemption but still can't change a set value. Checked upfront
+    # first-write exemption but still can't change a set value; checked upfront
     # so a multi-key set stays atomic (no earlier key lands when a later one is
     # rejected)
     for key, value in config.items():

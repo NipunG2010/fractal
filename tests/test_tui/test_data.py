@@ -37,6 +37,8 @@ __all__ = [
     'test_step_denominator_scopes_to_each_run',
     'test_measures_tolerate_a_numeric_config_duration',
     'test_measures_tolerate_a_string_cost_cap',
+    'test_build_tolerates_a_mangled_config',
+    'test_build_tolerates_an_undecodable_status',
     'test_sync_folds_into_its_step',
     'test_open_spans_tick_through_a_sync_window',
     'test_user_root_degrades',
@@ -165,6 +167,13 @@ def test_active_card_streams_live_state(builder: SnapshotBuilder) -> None:
         3740.0,
         4200.0,
     )
+    # the open rows also carry their start instants -- the pane re-ticks
+    # their elapsed between builds, when a quiet tree reuses this snapshot
+    assert (m['started_step'], m['started_iter'], m['started_run']) == (
+        NOW_EPOCH - 3621.0,
+        NOW_EPOCH - 3740.0,
+        NOW_EPOCH - 4200.0,
+    )
     # the open step has reported no cost yet; the run cost chases the subtree
     # (deep, leaf, and stopper all chain into alpha's live run)
     assert m['cost_step'] is None
@@ -257,6 +266,12 @@ def test_settled_card_is_a_time_machine(
     m = snap.measures
     assert (m['step'], m['step_total'], m['step_name']) == step_view
     assert (m['elapsed_step'], m['elapsed_iter'], m['elapsed_run']) == elapsed
+    # settled rows carry no start instants: nothing ticks between builds
+    assert (m['started_step'], m['started_iter'], m['started_run']) == (
+        None,
+        None,
+        None,
+    )
     assert (m['cost_step'], m['cost_iter'], m['cost_run']) == pytest.approx(costs)
     assert (m['run'], m['iter']) == (1, 1)
     # the explorer head agrees with the card
@@ -370,6 +385,48 @@ def test_measures_tolerate_a_string_cost_cap(pair_tree: pathlib.Path) -> None:
     # the build completes; the unparseable cost reads as no cap
     measures = builder.build('main.alpha').measures
     assert measures['cap_run_cost'] is None
+
+
+@pytest.mark.parametrize(
+    argnames='payload',
+    argvalues=[b'{"agent": "claude \xe9"}', b'null'],
+    ids=['undecodable-bytes', 'non-object-json'],
+)
+def test_build_tolerates_a_mangled_config(
+    pair_tree: pathlib.Path,
+    payload: bytes,
+) -> None:
+    """A hand-mangled config.json degrades to the empty config, never a crash.
+
+    config.json is agent-editable, so an edit may leave a non-UTF-8 byte (an
+    undecodable read) or a non-object top level (an ``AttributeError`` on
+    every ``.get``). The build runs inside the poll worker, so either
+    escaping exception would kill the whole cockpit the moment it scopes to
+    the node.
+    """
+    alpha = Node(pair_tree / '.worktrees' / 'main.alpha')
+    (alpha.node_dir / 'config.json').write_bytes(payload)
+    data = TuiData(resolve_node(pair_tree))
+    builder = SnapshotBuilder(data, NodePoller(data.db_dir), now=lambda: NOW_EPOCH)
+    # the build completes; the mangled config reads as empty
+    builder.build('main.alpha')
+    assert data.config('main.alpha') == {}
+
+
+def test_build_tolerates_an_undecodable_status(pair_tree: pathlib.Path) -> None:
+    """A hand-mangled .status degrades to ``idle``, never a crash.
+
+    The tree section reads every branch's ``.status`` on each build, so a
+    stray non-UTF-8 byte in one node's file would otherwise kill the whole
+    cockpit at any scope.
+    """
+    alpha = Node(pair_tree / '.worktrees' / 'main.alpha')
+    (alpha.node_dir / '.status').write_bytes(b'active \xe9')
+    data = TuiData(resolve_node(pair_tree))
+    builder = SnapshotBuilder(data, NodePoller(data.db_dir), now=lambda: NOW_EPOCH)
+    # the build completes; the undecodable status reads as idle
+    builder.build('main')
+    assert data.status('main.alpha') == 'idle'
 
 
 def test_sync_folds_into_its_step(builder: SnapshotBuilder) -> None:

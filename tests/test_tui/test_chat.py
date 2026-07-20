@@ -38,6 +38,7 @@ from ._doubles import MockTurn
 __all__ = [
     'test_resolve_transport_decision_table',
     'test_resolve_transport_consults_the_deployment_hook',
+    'test_resolve_transport_survives_a_broken_deployment_hook',
     'test_chat_turn_streams_a_real_subprocess',
     'test_chat_turn_closes_error_results_with_detail',
     'test_chat_turn_summarizes_only_the_final_opencode_step',
@@ -51,6 +52,7 @@ __all__ = [
     'test_sessionless_chat_spawns_fresh_never_radio',
     'test_live_chat_writes_nothing',
     'test_stale_done_does_not_clear_the_new_turn',
+    'test_broken_deployment_hook_errors_the_turn_not_the_app',
 ]
 
 
@@ -175,6 +177,9 @@ def test_resolve_transport_decision_table(
         assert transport.chat_kwargs == {'session': session, 'resume': resume}
 
 
+# a deployment hook file that fails to load (a sticky RuntimeError on resolve)
+_BROKEN_HOOK_SOURCE = 'raise ValueError("broken hook")\n'
+
 # a deployment hook file registering a forking backend under a new command
 _HOOK_SOURCE = '''\
 from fractal.impl.claude import ClaudeAgent
@@ -212,6 +217,30 @@ def test_resolve_transport_consults_the_deployment_hook(
         root=tmp_path,
     )
     assert (transport.kind, transport.session) == ('fork', 'live01')
+
+
+def test_resolve_transport_survives_a_broken_deployment_hook(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hook file that cannot load degrades the decision, never raises.
+
+    The hook's sticky ``RuntimeError`` meets every resolve, so the transport
+    decision must absorb it -- the agent reads as non-forking and the turn
+    goes fresh; the send boundary owns surfacing the failure itself.
+    """
+    # isolate the hook-file state from the process
+    monkeypatch.setattr(fractal.core.agent, '_LOADED', {})
+    (tmp_path / 'agents.py').write_text(_BROKEN_HOOK_SOURCE, encoding='utf-8')
+    transport = resolve_transport(
+        agent='claude',
+        status='active',
+        detached=False,
+        live_session='live01',
+        root=tmp_path,
+    )
+    assert (transport.kind, transport.session) == ('fresh', None)
+    assert "claude can't fork" in transport.label
 
 
 # ------ ChatTurn against real subprocesses
@@ -546,6 +575,39 @@ async def test_stale_done_does_not_clear_the_new_turn(
                 break
         assert app.chat.turn is None
         assert not app.query('#m_chatpending')
+
+
+async def test_broken_deployment_hook_errors_the_turn_not_the_app(
+    pair_tree: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tree whose hook file cannot load errors the turn, never the cockpit.
+
+    The sticky ``RuntimeError`` meets every resolve on the send path -- the
+    woven-session lookup, the transport decision, and the backend bind -- so
+    it must land in the transcript as an error bubble naming the hook file,
+    not escape a Textual handler and crash the whole app.
+    """
+    # isolate the hook-file state from the process
+    monkeypatch.setattr(fractal.core.agent, '_LOADED', {})
+    # an active node routes the send through the woven-session lookup too
+    Node(pair_tree / '.worktrees' / 'main.alpha').status_set('active')
+    hook = pair_tree / '.fractal' / 'main' / 'agents.py'
+    hook.write_text(_BROKEN_HOOK_SOURCE, encoding='utf-8')
+    app = FractalApp(
+        resolve_node(pair_tree),
+        branch='main.alpha',
+        turn_factory=lambda command, agent: MockTurn([]),
+    )
+    async with app.run_test(size=(150, 48)):
+        app.start_chat('what changed?')
+        convo = app.chat.transcript('main.alpha')
+    assert convo[0] == ('you', 'what changed?')
+    # the failure surfaces as an error bubble naming the file; no turn spawns
+    who, text = convo[-1]
+    assert who == 'error'
+    assert 'agents.py' in text
+    assert app.chat.turn is None
 
 
 # ------ helpers

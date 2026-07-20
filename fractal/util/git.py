@@ -141,7 +141,16 @@ def common_dir(path: pathlib.Path) -> pathlib.Path:
     """
     cmd = ['rev-parse', '--git-common-dir']
     result = run(cmd, cwd=path)
-    return (path / result / '..').resolve()
+    common = (path / result).resolve()
+    # the parent-of-.git derivation only fits the standard layout -- a gitfile
+    # repo (submodule, --separate-git-dir) nests its git dir elsewhere and
+    # records its checkout in core.worktree, which --show-toplevel resolves
+    # from inside the git dir
+    if common.name == '.git':
+        return common.parent
+    cmd = ['rev-parse', '--show-toplevel']
+    result = run(cmd, cwd=common)
+    return pathlib.Path(result)
 
 
 def branch(path: pathlib.Path, *, check: bool = True) -> Optional[str]:

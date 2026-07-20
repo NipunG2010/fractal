@@ -804,11 +804,16 @@ def node_list(app: typer.Typer) -> typer.Typer:
             try:
                 node = resolve_target(path, node)
             except typer.BadParameter:
-                if count:
-                    typer.echo(0)
-                else:
-                    print_rows([], csv=csv, columns=_LIST_COLUMNS)
-                return
+                # a non-init checkout (the user on their own branch while
+                # nodes run) is a live tree, not "no nodes" -- anchor on the
+                # user node by config, not the checkout (mirrors pause)
+                node = Node.resolve_user(path)
+                if node is None:
+                    if count:
+                        typer.echo(0)
+                    else:
+                        print_rows([], csv=csv, columns=_LIST_COLUMNS)
+                    return
         else:
             node = resolve_target(path, node)
         # list nodes
@@ -1095,9 +1100,10 @@ def node_update(app: typer.Typer) -> typer.Typer:
         # reserve retune is core's (child_retune)
         new_reserve = None
         if reserve_budget is not None:
-            effective_max_cost = (
-                max_cost if max_cost is not None else target.config.get('max_cost')
-            )
+            if max_cost is not None:
+                effective_max_cost = max_cost
+            else:
+                effective_max_cost = target.config.get('max_cost')
             new_reserve = parse_reserve_budget(reserve_budget, effective_max_cost)
         # retune through core -- it owns the reserve retune, the effective-cap
         # guards, the merged validation, and the prior capture

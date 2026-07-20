@@ -158,7 +158,7 @@ SPINNER = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
 #   App.get_css_variables computes {**generate(), **theme.variables} and
 #   ColorSystem.generate round-trips the semantic slots through HSL (shifting
 #   e.g. #cc8b6a -> #cb8b6a), so pinning is what keeps $primary byte-exact with
-#   PRIMARY. The structural tokens do not exist in stock themes at all; they
+#   PRIMARY; the structural tokens do not exist in stock themes at all; they
 #   must be present before the stylesheet first parses (at App.__init__)
 def _build_theme(name: str, palette: dict[str, str]) -> Theme:
     """Build the textual ``Theme`` for ``palette``.

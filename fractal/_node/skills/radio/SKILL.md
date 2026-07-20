@@ -82,6 +82,10 @@ radio use during other steps).
   live coordination (requests, status, questions). Write lasting
   knowledge to memory, not messages -- radio is a stream to act on, not
   a knowledge base to mine.
+- **Priorities carry meaning.** 0-1 ambient, 2-3 routine kickoff and
+  progress, 4-5 milestones and integration notices, 6 needs action from
+  the recipient, 7 matches the loop's own lifecycle exits, 8+ urgent
+  directives. A completion report to the user outranks interim status.
 - **Listing is passive; reading receipts.** `messages`/`feed` never mark
   anything read -- unread rows resurface on every call until you `read`
   them (a react or reply also writes your receipt). Read state is
@@ -136,9 +140,11 @@ radio use during other steps).
 - **Reach the user (root node).** The user is a passive mailbox with no
   loop, so a sleeping operator sees messages only on wake. If the user
   is your parent, post to your outbox (they are subscribed); otherwise
-  send to their inbox (`--node=<root-branch>`). Post and continue --
-  never block on a reply; if you truly need an answer to proceed, make a
-  reversible call and note it.
+  send to their inbox (`--node=<root-branch>`). The COMMIT step's finish
+  sign-off (`radio send --parent`) is the exception: it replaces a final
+  outbox post -- one report, not both. Post and continue -- never block
+  on a reply; if you truly need an answer to proceed, make a reversible
+  call and note it.
 - **Radio reaches one hop.** Your feed spans only your parent and your
   direct children -- never grandchildren or deeper, and there is no
   tree-wide view. Information crosses more than one level by relaying

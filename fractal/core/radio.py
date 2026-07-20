@@ -586,7 +586,7 @@ class Radio:
         parent = self._find_message(message_uuid)
         # a bystander cannot reply into a read-only channel: the reply would
         # write there and mark the parent read, and it would make the caller a
-        # thread participant, defeating thread()'s bystander gate. Participants
+        # thread participant, defeating thread()'s bystander gate; participants
         # -- the parent's host owner and its original sender -- are exempt
         # (continuing their own thread), mirroring thread()'s participant rule
         if self.node.branch not in (parent['node'], parent['sender']):
@@ -750,6 +750,8 @@ class Radio:
     def saved(
         self: Radio,
         *,
+        node: Optional[str] = None,
+        channel: Optional[str] = None,
         limit: Optional[int] = None,
         since: Optional[str] = None,
         recent: bool = False,
@@ -757,6 +759,9 @@ class Radio:
         """List saved messages from the archive.
 
         Args:
+            node: Filter by the copy's source host (the ``owner``
+                column).
+            channel: Filter by channel name.
             limit: Maximum rows to return.
             since: Only messages saved after this ISO 8601
                 timestamp.
@@ -767,9 +772,16 @@ class Radio:
             List of archived message dicts.
 
         """
-        # build query
+        # build query -- the node filter keys on owner: the archive's own
+        # node column names the saver (always self here), owner the source
         conditions = ['node = ?']
         params = [self.node.branch]
+        if node is not None:
+            conditions.append('owner = ?')
+            params.append(node)
+        if channel is not None:
+            conditions.append('channel = ?')
+            params.append(channel)
         if since is not None:
             conditions.append('created_at > ?')
             params.append(since)

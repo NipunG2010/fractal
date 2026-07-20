@@ -177,6 +177,10 @@ class FractalApp(App):
         # nav / mode state
         self.focus_id = 'fractal'
         self.mode = 'ring'
+        # row sections a landing skipped while their pane mode was driven
+        # (rebuilt by refresh_stale once the mode exits)
+        self._node_stale = False
+        self._radio_stale = False
         # chat state: transcripts, the in-flight turn, and the spinner all
         # live on the controller -- the app owns the worker and the intervals
         self.chat = ChatController()
@@ -311,7 +315,12 @@ class FractalApp(App):
         self.post_message(SnapshotReady(gen, snapshot))
 
     def on_snapshot_ready(self: FractalApp, message: SnapshotReady) -> None:
-        """Land a worker-built snapshot, dropping a stale or unchanged one."""
+        """Land a worker-built snapshot, dropping a stale one.
+
+        An unchanged snapshot lands as the same object: the panes skip their
+        rebuilds, but the card still repaints while a row is open so its
+        elapsed cells and cap gauges tick between disk writes.
+        """
         if not self.is_running:
             return
         # a result launched before a user-initiated rebuild lost to that
@@ -319,8 +328,13 @@ class FractalApp(App):
         if message.gen != self._build_gen:
             return
         # the steady-tick short-circuit: an unchanged tree posts the same
-        # object, and no pane needs touching
+        # object, and no pane needs rebuilding -- only the open-row clocks,
+        # plus any rows a driven mode left stale, which only this tick can
+        # repay on a then-quiet tree
         if message.snapshot is self.snapshot:
+            if self.snapshot.ticking:
+                self.node_pane.set_card(self.snapshot)
+            self.refresh_stale()
             return
         self.snapshot = message.snapshot
         self._refresh()
@@ -328,27 +342,57 @@ class FractalApp(App):
     def _refresh(self: FractalApp) -> None:
         """Push the current snapshot into the panes (mode-aware).
 
-        The card always refreshes; the explorer/log and the radio rows rebuild
-        only while the user is not driving them (never yank rows out from
-        under a cursor).
+        The geometry re-applies first -- poll-driven data can widen the node
+        pane, and rows rendered wider than a stale pane crop their
+        right-anchored cells. The card always refreshes; the explorer/log and
+        the radio rows rebuild only while the user is not driving them (never
+        yank rows out from under a cursor) -- a driven pane's rows go stale
+        instead, repaid by ``refresh_stale`` once its mode exits.
         """
+        self._resize()
         self._set_header()
         self.tree_pane.rebuild(self.snapshot)
         self.node_pane.set_card(self.snapshot)
-        if self.mode != 'node':
+        self._node_stale = True
+        self._radio_stale = True
+        self.refresh_stale()
+
+    def refresh_stale(self: FractalApp) -> None:
+        """Rebuild any stale row sections the active mode is not driving.
+
+        Runs on every landing, on the steady tick's unchanged-snapshot
+        short-circuit, and on a driven pane's leave -- so rows skipped under
+        a cursor render as soon as, and only when, their mode lets go.
+        """
+        if self._node_stale and self.mode != 'node':
             self.node_pane.rebuild_body(self.snapshot)
-        if self.mode not in ('radio', 'rdrop', 'rdetail', 'rreact'):
+            self._node_stale = False
+        radio_modes = ('radio', 'rdrop', 'rdetail', 'rreact')
+        if self._radio_stale and self.mode not in radio_modes:
             self.radio_pane.rebuild(self.snapshot)
+            self._radio_stale = False
 
     def refresh_radio(self: FractalApp) -> None:
-        """Re-build for a radio source switch (fills the lazy section)."""
+        """Re-build for a radio source switch (fills the lazy section).
+
+        The synchronous build can absorb a pending disk change the poll can
+        never re-deliver (a now-quiet tree keeps posting the same snapshot
+        object, which the identity guard drops), so every pane refreshes --
+        the radio rows explicitly: ``_refresh`` skips them while the user
+        drives the pane, and the switch is exactly that.
+        """
         self._build()
+        self._refresh()
         self.radio_pane.rebuild_rows(self.snapshot)
 
     def refresh_log(self: FractalApp) -> None:
-        """Re-build for a log-scope toggle (fills the subtree section)."""
+        """Re-build for a log-scope toggle (fills the subtree section).
+
+        Every pane refreshes for the same reason as ``refresh_radio``; the
+        body explicitly, since ``_refresh`` skips it in node mode.
+        """
         self._build()
-        self._resize()
+        self._refresh()
         self.node_pane.rebuild_body(self.snapshot)
         self.node_pane.paint_zone()
 
@@ -493,12 +537,13 @@ class FractalApp(App):
             return
         # boundary guard: the node's live state can flip between resolve and
         # build (.status/.session are external); the backend is resolved here
-        # too, so an unknown agent lands on this error path, never inside the
-        # turn's event stream
+        # too, so an unknown agent -- or a broken deployment hook, whose
+        # sticky RuntimeError meets every resolve -- lands on this error
+        # path, never inside the turn's event stream
         try:
             command = node.chat_command(prompt, **transport.chat_kwargs)
             agent = node.agent(command.agent)
-        except ValueError as error:
+        except (ValueError, RuntimeError) as error:
             pane.post(branch, 'error', f'{theme.WARN} {error}')
             return
         pane.post(branch, 'meta', f'{theme.SEP} {transport.label}')

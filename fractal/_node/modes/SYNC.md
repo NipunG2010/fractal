@@ -16,11 +16,12 @@ parent directives first.
 them before moving on. If a directive is unclear, send a question to the
 parent's inbox.
 
-**Respond and communicate.** Reply to messages that need replies
-(`fractal radio reply`), react to acknowledge the rest
-(`fractal radio react <uuid> +`) -- any message from your inbox or feed
-is acted on directly by its UUID. Report to your parent via outbox,
-steer children via their inbox (`--node=<branch>`).
+**Respond and communicate.** Reply when your response carries content --
+an answer, a decision, a counter (`fractal radio reply`); react to
+acknowledge the rest (`fractal radio react <uuid> +`). A question in
+your inbox always gets a reply, never just a react. Any message from
+your inbox or feed is acted on directly by its UUID. Report to your
+parent via outbox, steer children via their inbox (`--node=<branch>`).
 
 **Steer children (skip if you have no children).** For each running
 child: check status (`fractal node list`), read its outbox via feed, and
@@ -37,8 +38,10 @@ self. Read the new ones with
 Write new notes to carry context forward
 (`fractal radio send "<note>" --node=$CURRENT_BRANCH --channel=private --subject="<subject>" --priority=<0-10>`).
 
-**Save and preserve.** Save messages that need action or are worth
-keeping (`fractal radio save <uuid>`), unsave each when done, and review
-saved messages (`--saved`) to get back up to speed. If something is
-crucial to preserve long-term, write it to memory (`$MEMORY_DIR`) or the
-project wiki (`$WIKI_DIR`) -- do this sparingly.
+**Save and preserve.** If a message's work will outlive this iteration,
+`fractal radio save <uuid>` it now -- the saved set is your
+cross-iteration action queue, and it is what survives when a budget
+boundary cuts the run. Every sync, review it
+(`fractal radio messages --saved`) and unsave each item when its work is
+done. If something is crucial to preserve long-term, write it to memory
+(`$MEMORY_DIR`) or the project wiki (`$WIKI_DIR`) -- do this sparingly.

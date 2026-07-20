@@ -10,6 +10,7 @@ from __future__ import annotations
 import pathlib
 
 from fractal.cli.utils import resolve_node
+from fractal.core.node import Node
 from fractal.core.radio import Radio
 from fractal.tui.data import TuiData
 from fractal.tui.poller import NodePoller
@@ -32,6 +33,10 @@ def test_poller_fires_on_change_only(pair_tree: pathlib.Path) -> None:
     assert poller.changed(dirs) == frozenset()
     # a lifecycle transition touches .status -- only that branch reports
     (dirs['main.alpha'] / '.status').write_text('active\n', encoding='utf-8')
+    assert poller.changed(dirs) == frozenset({'main.alpha'})
+    assert poller.changed(dirs) == frozenset()
+    # a config retune touches only config.json -- only that branch reports
+    Node(pair_tree / '.worktrees' / 'main.alpha').config.set('max_cost', 50)
     assert poller.changed(dirs) == frozenset({'main.alpha'})
     assert poller.changed(dirs) == frozenset()
     # a database write touches the central WAL -- every watched branch reports
@@ -65,3 +70,8 @@ def test_builder_reuses_snapshot_until_disk_changes(
     second = builder.build('main.alpha')
     assert second is not first
     assert [row['subject'] for row in second.messages] == ['ping']
+    # a config retune on a quiet tree rebuilds too -- the new cap shows
+    Node(pair_tree / '.worktrees' / 'main.alpha').config.set('max_cost', 50)
+    third = builder.build('main.alpha')
+    assert third is not second
+    assert third.config['max_cost'] == 50

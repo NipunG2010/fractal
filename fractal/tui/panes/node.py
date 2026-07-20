@@ -181,7 +181,7 @@ class NodePane:
         """
         selected = self._selection(snap)
         if selected is None:
-            return snap.card, snap.measures
+            return snap.card, self._live_measures(snap.measures)
         ref, run, it, step = selected
         card = dict(snap.card)
         if step is not None:
@@ -259,6 +259,23 @@ class NodePane:
             return None
         return max(0.0, t - row['started'].timestamp())
 
+    def _live_measures(self: NodePane, m: Optional[dict]) -> Optional[dict]:
+        """Re-tick the open rows' elapsed figures against the render clock.
+
+        The snapshot bakes elapsed at build time and a quiet tree reuses the
+        same snapshot tick after tick, so the open rows' start instants are
+        measured here -- the card's clocks and cap gauges stay live between
+        disk writes.
+        """
+        if m is None:
+            return None
+        live = dict(m)
+        for scope in ('step', 'iter', 'run'):
+            started = m[f'started_{scope}']
+            if started is not None:
+                live[f'elapsed_{scope}'] = max(0.0, self.app.now() - started)
+        return live
+
     def rebuild_body(self: NodePane, snap: Snapshot) -> None:
         """Re-mount the explorer and the event log."""
         self._ex_rebuild(snap)
@@ -290,9 +307,10 @@ class NodePane:
         glyph, color = fractal.tui.fmt.status_style(card['status'], card['signal'])
         status = card['status']
         label = f'{glyph} {status}'
-        signal = (
-            _SIGNAL_ING.get(card['signal'], card['signal']) if card['signal'] else ''
-        )
+        if card['signal']:
+            signal = _SIGNAL_ING.get(card['signal'], card['signal'])
+        else:
+            signal = ''
         width = self._content_w()
         branch = card['branch'] + user_tag(card['branch'], self.app.data.root_branch)
         # truncate only on real collision: the branch may use everything
@@ -397,15 +415,14 @@ class NodePane:
         # squeezing the gauges out
         figs = []
         for scope, elapsed, elapsed_cap, cost, cost_cap in scopes:
-            figs.append(
-                (
-                    scope,
-                    _figure(elapsed, elapsed_cap, fractal.tui.fmt.dur),
-                    (elapsed or 0) / elapsed_cap if elapsed_cap else 0.0,
-                    _figure(cost, cost_cap, fractal.tui.fmt.money),
-                    (cost or 0) / cost_cap if cost_cap else 0.0,
-                )
+            fig = (
+                scope,
+                _figure(elapsed, elapsed_cap, fractal.tui.fmt.dur),
+                (elapsed or 0) / elapsed_cap if elapsed_cap else 0.0,
+                _figure(cost, cost_cap, fractal.tui.fmt.money),
+                (cost or 0) / cost_cap if cost_cap else 0.0,
             )
+            figs.append(fig)
         # both gauges share one fixed width and trail their text (the row
         # ends ragged-right rather than stretching to the pane edge)
         gap = fractal.tui.theme.GAUGE_GAP
@@ -585,9 +602,10 @@ class NodePane:
         dot = fractal.tui.fmt.dot(entry.get('status') or '')
         text = fractal.tui.fmt.esc(entry['label'])
         label = f'{indent}{marker}{dot} {text}'
-        duration = (
-            fractal.tui.fmt.dur(entry['duration']) if entry.get('duration') else ''
-        )
+        if entry.get('duration'):
+            duration = fractal.tui.fmt.dur(entry['duration'])
+        else:
+            duration = ''
         session = fractal.tui.fmt.esc(entry.get('session') or '-')
         cost = entry.get('cost') or ''
         return Static(
@@ -927,6 +945,8 @@ class NodePane:
     def leave(self: NodePane) -> None:
         """Return to ring mode."""
         self.app.mode = 'ring'
+        # repay any row rebuild a landing skipped while this mode drove
+        self.app.refresh_stale()
         self.paint_zone()
         self.app.paint_ring()
 

@@ -6,21 +6,24 @@ set -euo pipefail
 
 usage() {
     cat <<USAGE
-Usage: destroy.sh <repo>
+Usage: destroy.sh <repo> [options]
 
 Destroy the repo's fractal: every worktree, branch, and the user node.
 
 Options:
-    --help|-h    Show this help message
+    --branch=<branch>    User node branch (default: the current checkout)
+    --help|-h            Show this help message
 USAGE
     exit 0
 }
 
 REPO=""
+BRANCH=""
 
 for arg in "$@"; do
     case "$arg" in
         --help | -h) usage ;;
+        --branch=*) BRANCH="${arg#*=}" ;;
         *)
             if [[ -z "$REPO" ]]; then
                 REPO="$arg"
@@ -49,10 +52,13 @@ REPO_NAME=${REPO##*/}
 WORKTREES_DIR="$REPO/.worktrees"
 
 # ------ derive the user node's data directory
-# the current branch's node dir nests under the .worktrees/.project/<branch>
+# the user branch's node dir nests under the .worktrees/.project/<branch>
 # project prefix (mirrors Node.node_dir); read the cache BEFORE the teardown
-# below removes it
-BRANCH=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
+# below removes it. the caller names the user branch (the checkout may sit
+# on another one); a standalone run falls back to the current branch
+if [[ -z "$BRANCH" ]]; then
+    BRANCH=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
+fi
 PROJECT="."
 PROJECT_FILE="$WORKTREES_DIR/.project/$BRANCH"
 if [[ -f "$PROJECT_FILE" ]]; then

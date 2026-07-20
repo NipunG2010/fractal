@@ -63,7 +63,9 @@ maintains -- are the exception: each is a hard issue, fixed by repairing
 the target or removing the row with `wiki update --prune`. The
 **parent** reconciles stale sibling links when children merge up:
 indexes refresh mechanically at commit and merge, so its integration job
-is repairing or pruning what lint reports, not rerunning `wiki update`.
+is repairing or pruning what lint reports, not rerunning `wiki update`
+-- plus refreshing any navigation or status tables it authored (lint
+cannot see a stale "in flight" row for a page that has since merged).
 
 Wikilinks also stay inside the wiki you are writing in. A `[[...]]` link
 targets another page in the same wiki; anything outside it -- source
@@ -71,12 +73,48 @@ files, configs, or the other knowledge base (project wiki vs. memory) --
 is referenced in plain text or backticks, never linked. `wiki lint`
 notes out-of-wiki wikilinks as stale.
 
-## Scale
+## Structure
 
-A large flat wiki shards into folders: move related pages into a
-subfolder and rerun `wiki update` -- indexes regenerate around the new
-layout, and inbound links the move broke surface as stale-link notes to
-repair. Before dumping a big tree, preflight with `wiki map --stat` (a
-one-line size summary of what the same flags would print) and bound the
-dump with `--depth` and `--desc-limit=<n>` -- descriptions print
-untruncated by default.
+Lay the wiki out as topical folders from the start: each domain area
+gets a folder with its own `_index.md`, and pages join the folder that
+owns their subsystem. A flat root is fine below ~6-8 pages; planning
+more, create the folders before the pages -- the directory tree is what
+makes a wiki browsable, searchable, and navigable, and it should mirror
+the domain the way a good module layout mirrors a design. A shape to aim
+for:
+
+```text
+wiki/
+  _index.md
+  <subsystem>/
+    _index.md
+    <topic>.md
+    ...
+  <subsystem>/
+    _index.md
+    <sub-area>/
+      _index.md
+      <topic>.md
+      ...
+    <sub-area>/
+      ...
+    <topic>.md
+    ...
+  ...
+```
+
+Nest deeper as areas grow: when a folder accumulates pages spanning more
+than one concern, split them into sub-folders, each with its own
+`_index.md`. Every index is the table of contents for its level, so
+structured nesting is what keeps the wiki navigable at any size -- a
+reader answers "where does this live?" by descending a few links instead
+of scanning one long list, and related pages sit beside each other where
+cross-links suggest themselves.
+
+A grown flat wiki shards into folders the same way after the fact: move
+related pages into a subfolder and rerun `wiki update` -- indexes
+regenerate around the new layout, and inbound links the move broke
+surface as stale-link notes to repair. Before dumping a big tree,
+preflight with `wiki map --stat` (a one-line size summary of what the
+same flags would print) and bound the dump with `--depth` and
+`--desc-limit=<n>` -- descriptions print untruncated by default.

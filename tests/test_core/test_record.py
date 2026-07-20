@@ -104,7 +104,10 @@ def test_rows_carry_their_started_numbers(node_with_db: Node) -> None:
     iter_id = record.iter_start(run_id=run_id, iter=7)
     sync = record.step_start(iter_id=iter_id, run_id=run_id, step=0, step_name='SYNC')
     work = record.step_start(
-        iter_id=iter_id, run_id=run_id, step=1, step_name='PREPARE'
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='PREPARE',
     )
     assert node.db.read('iters', where={'iter_id': iter_id})[0]['iter'] == 7
     assert node.db.read('steps', where={'step_id': sync})[0]['step'] == 0
@@ -157,7 +160,10 @@ def test_terminal_end_records_reason(node_with_db: Node) -> None:
     # a failed step with a reason, and a clean step with none
     failed = record.step_start(iter_id=iter_id, run_id=run_id, step=1, step_name='EXEC')
     record.step_end(
-        step_id=failed, status='failed', exit_code=1, metadata='agent error'
+        step_id=failed,
+        status='failed',
+        exit_code=1,
+        metadata='agent error',
     )
     ok = record.step_start(iter_id=iter_id, run_id=run_id, step=2, step_name='EXEC')
     record.step_end(step_id=ok, status='completed', exit_code=0)
@@ -211,7 +217,10 @@ def test_row_closers_transition_once_and_report_it(node_with_db: Node) -> None:
     run_id = record.run_start()
     iter_id = record.iter_start(run_id=run_id, iter=1)
     step_id = record.step_start(
-        iter_id=iter_id, run_id=run_id, step=1, step_name='WORK'
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='WORK',
     )
     # the first close wins each row; the loser observes 0 and changes nothing
     assert record.step_end(step_id=step_id, status='completed', exit_code=0) == 1
@@ -560,7 +569,10 @@ def test_approval_gate_is_first_approval_wins(node_with_db: Node) -> None:
     run_id = record.run_start()
     iter_id = record.iter_start(run_id=run_id, iter=1)
     step_id = record.step_start(
-        iter_id=iter_id, run_id=run_id, step=1, step_name='GATE'
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='GATE',
     )
     # NULL: a fresh step needs no approval, so the gate read passes
     assert record.step_approved(step_id=step_id)
@@ -896,7 +908,10 @@ def test_session_transcript_reads_claude_and_codex(
     run_id = node.record.run_start()
     iter_id = node.record.iter_start(run_id=run_id, iter=1)
     step_id = node.record.step_start(
-        iter_id=iter_id, run_id=run_id, step=1, step_name='PLAN'
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='PLAN',
     )
     node.record.step_session('claude', step_id=step_id, model=None, session=stray)
     relocated = node.sessions.transcript('claude', stray)

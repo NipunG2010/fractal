@@ -189,17 +189,15 @@ def test_failed_init_preserves_reused_branch_but_prunes_created(
     Node(git_repo).init(agent='claude', user=True)
 
     def show_ref(branch: str) -> bool:
-        result = subprocess.run(
-            [
-                'git',
-                '-C',
-                f'{git_repo}',
-                'show-ref',
-                '--verify',
-                f'refs/heads/{branch}',
-            ],
-            capture_output=True,
-        )
+        cmd = [
+            'git',
+            '-C',
+            f'{git_repo}',
+            'show-ref',
+            '--verify',
+            f'refs/heads/{branch}',
+        ]
+        result = subprocess.run(cmd, capture_output=True)
         return result.returncode == 0
 
     # an orphan branch: exists with no worktree (a half-deleted / out-of-band node)

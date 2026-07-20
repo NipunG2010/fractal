@@ -176,9 +176,10 @@ class Record:
         Stamps ``status``/``exit_code``/``ended_at`` on the node's
         runs/iters/steps rows that are still open (``ended_at IS NULL``),
         first-writer-wins so a clean end's rows are left untouched. Shared
-        by :meth:`run_start`, :meth:`Node._reconcile_status`, and
-        :meth:`Node._mark_active_killed` so the cascade has one definition
-        and the DB can never diverge from the ``.status`` file. The row
+        by :meth:`run_start`, :meth:`Loop._on_exit`,
+        :meth:`Node._reconcile_status`, and :meth:`Node._mark_active_killed`
+        so the cascade has one definition and the DB can never diverge
+        from the ``.status`` file. The row
         cascade -- the unpriced pre-read, the three closes, and the marker
         stamps -- commits as one transaction, so a crash mid-cascade can
         never leave e.g. a closed run over still-active iteration/step
@@ -197,7 +198,7 @@ class Record:
             status: Terminal status for the open rows.
             skip_event: The in-flight kill event to leave untouched; when
                 given, stray active events are swept as well.
-            metadata: Stamped on the closing run rows only (the kill
+            metadata: Stamped on the closing run rows only (the close's
                 attribution); ``None`` leaves metadata untouched.
             connection: Transaction to run the row cascade inside (from
                 :meth:`Database.transaction`); opens its own when omitted.
@@ -417,15 +418,12 @@ class Record:
         # lands -- and the lookup is scoped per step, so a newer paused row
         # from a later pause cycle can never shadow an earlier approval
         while True:
-            paused = self.db.read(
-                'steps',
-                where={
-                    'iter_id': newest['iter_id'],
-                    'status': 'paused',
-                    'step': resume_step,
-                },
-                limit=1,
-            )
+            where = {
+                'iter_id': newest['iter_id'],
+                'status': 'paused',
+                'step': resume_step,
+            }
+            paused = self.db.read('steps', where=where, limit=1)
             if not paused:
                 break
             if not paused[0]['metadata'].startswith('awaiting approval'):

@@ -523,6 +523,9 @@ def _init_repo_with_driver(repo: pathlib.Path) -> None:
     the ``wiki _merge %O %A %B %L %P`` driver and the ``**/_index.md
     merge=wiki`` attribute -- so a future rename in the wiki package fails
     these merges loudly instead of quietly testing a wiring nothing ships.
+    The ``wiki/.wiki/settings.json`` marker declares the wiki root:
+    ``wiki _merge`` gates the index merge on it, and an ``_index.md``
+    outside every declared wiki takes git's default text merge instead.
     """
     repo.mkdir(parents=True, exist_ok=True)
     _git(repo, 'init', '-b', 'main')
@@ -539,7 +542,9 @@ def _init_repo_with_driver(repo: pathlib.Path) -> None:
         '**/_index.md merge=wiki\n',
         encoding='utf-8',
     )
-    _git(repo, 'add', '.gitattributes')
+    (repo / 'wiki' / '.wiki').mkdir(parents=True)
+    (repo / 'wiki' / '.wiki' / 'settings.json').write_text('{}\n', encoding='utf-8')
+    _git(repo, 'add', '.gitattributes', 'wiki/.wiki/settings.json')
     _git(repo, 'commit', '-m', 'configure driver')
 
 

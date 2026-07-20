@@ -2,8 +2,8 @@
 
 Covers the paused state's guard matrix (only resume/kill legal), the
 parent-first pause and leaf-first resume fan-out, pausing-node
-withdrawal, and the user-node latch that blocks spawns and starts
-tree-wide.
+withdrawal, and the user-node latch that blocks spawns, starts, and
+targeted resumes tree-wide.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ __all__ = [
     'test_resume_withdraws_a_pausing_node',
     'test_pause_fans_out_top_down_and_resume_leaf_first',
     'test_pause_latch_blocks_spawn_and_start',
+    'test_pause_latch_blocks_targeted_resume',
     'test_tree_pause_latches_depth_one',
 ]
 
@@ -254,6 +255,38 @@ def test_pause_latch_blocks_spawn_and_start(
         child.start(continue_run=True)
 
 
+def test_pause_latch_blocks_targeted_resume(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A paused ancestor refuses a targeted resume of a deeper node.
+
+    The resume boot skips the ancestor walk (the leaf-first fan-out's
+    exemption), so without the verb-side refusal a targeted resume would
+    relaunch a child to run new work inside a subtree the pause froze --
+    the equivalent start refuses the identical state. Resuming the
+    latching ancestor relaunches the child with it.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    _stub_run_script(monkeypatch, Node)
+    # both loops park (simulated -- the loops are stubbed here)
+    parent.status_set('paused')
+    child.status_set('paused')
+    with pytest.raises(RuntimeError, match='Cannot resume under a paused node'):
+        child.resume()
+    # the withdrawal path is latched too: a child still parking under a
+    # parked parent keeps its pending pause
+    child.status_set('active')
+    child.record.signal_set('pause', 'incoming')
+    with pytest.raises(RuntimeError, match='Cannot resume under a paused node'):
+        child.resume()
+    assert child.record.signal_get('pause') is not None
+    # resuming the latching parent relaunches the child with it (leaf-first)
+    child.status_set('paused')
+    result = parent.resume()
+    assert 'Resumed 2 nodes' in result
+
+
 def test_tree_pause_latches_depth_one(
     git_repo: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -280,11 +313,14 @@ def test_tree_pause_latches_depth_one(
         Node(git_repo).init(name='another')
     with pytest.raises(RuntimeError, match='Cannot start under a paused node'):
         newtop.start()
-    # both loops park (simulated), then the tree-wide release lifts the latch
+    # both loops park (simulated); the brake refuses a targeted depth-1
+    # resume too -- only the tree-wide release lifts the latch
     parent.status_set('paused')
     child.status_set('paused')
     with pytest.MonkeyPatch().context() as mp:
         _stub_run_script(mp, Node)
+        with pytest.raises(RuntimeError, match='Cannot resume under a paused node'):
+            parent.resume()
         result = user.resume()
     assert 'Resumed 2 nodes' in result
     _stub_run_script(monkeypatch, newtop)

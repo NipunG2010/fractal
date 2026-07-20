@@ -19,7 +19,7 @@ import typing
 from typing import Any, Optional
 
 import fractal.util
-from fractal.constants import PAUSE_ABORT_FILE, PGID_FILE, STEP_PGID_FILE
+from fractal.constants import PAUSE_ABORT_FILE, PGID_FILE, SOCKET_FILE, STEP_PGID_FILE
 from fractal.exceptions import AgentStreamError, _Abort
 
 from . import commit, pricing, render, worktree
@@ -59,6 +59,15 @@ _SETUP_FAIL_CAP = 3
 # cap a failure reason or log-tail snippet to a readable one-liner: the raw
 # log line or message behind it can be arbitrarily long
 _REASON_CHARS = 250
+
+# figure-free heads of the loop's budget-abort reasons; a finish reason
+# bearing one is a budget abort -- bare when self-sent, carrying the fan-out
+# attribution when cascaded from an ancestor
+_BUDGET_REASON_STEMS = (
+    'cost budget reserve reached',
+    'subtree cost budget reached',
+    'cost budget exceeded in finish wind-down',
+)
 
 
 class Step:
@@ -274,7 +283,7 @@ class Loop:
         # interval defaults the per-iteration deadline to the slot (an
         # iteration cannot run past its cadence) -- but only when none was
         # set: an explicit tighter iter_timeout is honored, never loosened to
-        # the full interval. A looser one is rejected at the config boundary
+        # the full interval; a looser one is rejected at the config boundary
         # (Config.validate); this raise backstops direct loop construction
         if self._interval_seconds > 0:
             if self._iter_timeout_seconds > self._interval_seconds:
@@ -308,6 +317,7 @@ class Loop:
         self._iter_label = ''
         self._timed_out = False
         self._paused = False
+        self._last_iter_failed = False
         self._run_end_epoch = 0
         self._iter_end_epoch = 0
         self._run_id: Optional[int] = None
@@ -321,6 +331,11 @@ class Loop:
         self._budget_reason = ''
         self._budget_stem = ''
         self._untracked_warned = False
+        self._unreadable_warned = False
+        # last good ledger readings -- a failed read falls back to these,
+        # never to the full cap
+        self._last_run_spent: Optional[float] = None
+        self._last_iter_headroom: Optional[float] = None
         self._setup_fails = 0
         self._setup_abort = False
         self._fail_reason: Optional[str] = None
@@ -378,10 +393,30 @@ class Loop:
             self._adopt()
         except _Abort:
             return 1
+        # record the tmux socket the session lives on ($TMUX is
+        # "socket_path,server_pid,session_index" inside the pane), before
+        # the active stamp so no reconcile ever probes an active node
+        # without it: Node._reconcile_status asks this server, not
+        # whichever socket the probing shell resolves, so a shell with a
+        # different TMUX_TMPDIR never misreads the live session as gone; a
+        # tmux-less launch (the test harness) drops any stale record so
+        # the ambient probe rules
+        try:
+            tmux_env = os.environ.get('TMUX', '')
+            if tmux_env:
+                socket_path, *_ = tmux_env.split(',')
+                (node.node_dir / SOCKET_FILE).write_text(
+                    f'{socket_path}\n',
+                    encoding='utf-8',
+                )
+            else:
+                (node.node_dir / SOCKET_FILE).unlink(missing_ok=True)
+        except OSError:
+            pass
         # stamp the node active -- under the .worktrees flock, so a retire
         # that won the boot window (its flock-guarded read legally saw
         # 'idle' after start's checks but before this stamp) is honored
-        # instead of clobbered. Guarded so a transient failure (a DB
+        # instead of clobbered; guarded so a transient failure (a DB
         # contended under wide fan-out) never aborts the run and strands
         # .status at 'idle' (a missed stamp self-corrects as the loop runs)
         retired = False
@@ -465,10 +500,8 @@ class Loop:
         finally:
             self._on_exit()
 
-    # boot
-
     def _preflight(self: Loop) -> None:
-        """Fail fast (binary, pricing, provider probe via seam hooks).
+        """Fail fast (step files, binary, pricing, provider probe via seam hooks).
 
         Aborts stamp ``exited`` + reason, never strand ``idle``.
         """
@@ -480,7 +513,16 @@ class Loop:
         # model, gives pricing nothing to do
         self._needs_pricing = False
         for path in sorted((node.node_dir / 'steps').glob('*.md')):
-            step = Step.load(path)
+            # step files are hand-edited: a bad byte must abort through the
+            # machinery below -- a bare UnicodeDecodeError names a byte
+            # offset but no file, and would escape before the run row or
+            # the active stamp exists, stranding .status at idle
+            try:
+                step = Step.load(path)
+            except UnicodeDecodeError as error:
+                reason = f'Step file {path.name} is not valid UTF-8.'
+                print(f'Error: {reason} ({error})', file=sys.stderr)
+                self._abort_preflight(reason)
             command = step.agent or self._agent_command
             try:
                 backend = node.agent(command, step.provider)
@@ -549,8 +591,8 @@ class Loop:
         # rows are exactly what `resume` re-adopts, and the frozen worktree is
         # what pause preserves -- recording a fresh exited run would reconcile
         # them shut, leaving `--continue` (which discards the frozen work) as
-        # the only recovery. The caller already surfaced the reason, so leave
-        # the node paused and adoptable for a fixed-environment resume. The
+        # the only recovery; the caller already surfaced the reason, so leave
+        # the node paused and adoptable for a fixed-environment resume; the
         # exception is a resume with no open run to adopt (force_record): there
         # is nothing to preserve, so record and stamp exited like a fresh boot
         if self._resume and not force_record:
@@ -558,7 +600,7 @@ class Loop:
             # event completed when tmux comes up (closing the span), before this
             # preflight runs, so the wait until a fixed-environment resume would
             # otherwise charge the run/iter deadlines -- timing the run out on
-            # the very recovery this guard preserves. Best-effort like the
+            # the very recovery this guard preserves; best-effort like the
             # boot-path writes below: a transient DB error must not turn the
             # clean park into a crash (the node stays paused either way)
             try:
@@ -712,15 +754,13 @@ class Loop:
                 f'Continuing: committing operator edits under .fractal/{node.branch}...'
             )
             fractal.util.git.run(['add', '-A', '--', f'{node_dir}'], cwd=worktree)
-            fractal.util.git.run(
-                [
-                    'commit',
-                    '--no-verify',
-                    '-m',
-                    f'{node.branch}: operator edits (committed at continue)',
-                ],
-                cwd=worktree,
-            )
+            cmd = [
+                'commit',
+                '--no-verify',
+                '-m',
+                f'{node.branch}: operator edits (committed at continue)',
+            ]
+            fractal.util.git.run(cmd, cwd=worktree)
         print('Continuing: cleaning uncommitted changes...')
         # preserve config.json across the clean -- the documented way to
         # re-tune before continuing (e.g. adjust max_iters), and the agent
@@ -735,7 +775,9 @@ class Loop:
         fractal.util.git.run(['clean', '-fd'], cwd=worktree, check=False)
         if backup is not None:
             try:
-                config_path.write_bytes(backup)
+                # atomic, so a kill mid-restore cannot tear the file a later
+                # node load would refuse to parse
+                fractal.util.filesystem.write_atomic(config_path, backup)
             except OSError:
                 pass
 
@@ -743,17 +785,20 @@ class Loop:
         """Print the startup banner from the boot-pinned run parameters."""
         max_label = f'{self._max_iters}' if self._max_iters > 0 else 'unlimited'
         timeout_label = self._timeout if self._run_timeout_seconds > 0 else 'none'
-        iter_timeout_label = (
-            self._iter_timeout if self._iter_timeout_seconds > 0 else 'none'
-        )
-        step_timeout_label = (
-            self._step_timeout if self._step_timeout_seconds > 0 else 'none'
-        )
+        if self._iter_timeout_seconds > 0:
+            iter_timeout_label = self._iter_timeout
+        else:
+            iter_timeout_label = 'none'
+        if self._step_timeout_seconds > 0:
+            step_timeout_label = self._step_timeout
+        else:
+            step_timeout_label = 'none'
         interval_label = self._interval if self._interval_seconds > 0 else 'none'
         sleep_label = self._sleep if self._sleep_seconds > 0 else 'none'
-        cost_label = (
-            f'${self._max_cost_label}' if self._max_cost is not None else 'none'
-        )
+        if self._max_cost is not None:
+            cost_label = f'${self._max_cost_label}'
+        else:
+            cost_label = 'none'
         if self._max_iter_cost is not None:
             iter_cost_label = f'${self._max_iter_cost_label}/iter'
         else:
@@ -778,8 +823,6 @@ class Loop:
             f' | sync: {sync_label} | wait: {wait_label}'
         )
 
-    # iteration machinery
-
     def _main_loop(self: Loop) -> None:
         """Run iterations until a stop gate, signal, or park breaks out."""
         node = self.node
@@ -787,7 +830,7 @@ class Loop:
             # re-read max_iters here so a mid-run retune reaches the stop gate
             # below (the cost-cap re-read sits after that gate, so it cannot
             # cover this); skip the first pass -- run start read the same
-            # config moments earlier. Config is a live-edited steering
+            # config moments earlier; config is a live-edited steering
             # surface, so a malformed edit warns and keeps the prior value
             # instead of crashing the run
             if self._iter > 0:
@@ -883,10 +926,17 @@ class Loop:
             # checks take their own fresh reads, so this read feeds the
             # iteration's budget labels and per-step reserve derivation, and
             # a config-vs-registry mismatch must warn loudly, not linger;
-            # iteration 1 skips both -- run start read the same
-            # config moments earlier
+            # iteration 1 skips both -- run start read the same config
+            # moments earlier; a malformed edit warns and keeps the prior
+            # caps, like the retunes above
             if self._iter > 1:
-                self._read_cost_caps()
+                try:
+                    self._read_cost_caps()
+                except ValueError as error:
+                    print(
+                        f'Warning: {error}; keeping the previous cost caps',
+                        file=sys.stderr,
+                    )
                 self._reconcile_caps()
 
             self._build_cost_budget()
@@ -1039,6 +1089,9 @@ class Loop:
             else:
                 iter_status = 'completed'
                 iter_exit_code = 0
+            # carried to the finalize matrix: a failed final iteration must
+            # not be laundered into a clean max-iters completion
+            self._last_iter_failed = iter_failed
             try:
                 node.record.iter_end(
                     iter_id=self._iter_id,
@@ -1211,6 +1264,8 @@ class Loop:
 
         started = False
         self._reserve = False
+        # a fresh iteration voids the cached headroom
+        self._last_iter_headroom = None
 
         for step in steps:
             step_num = step.number
@@ -1326,6 +1381,12 @@ class Loop:
 
             # if finishing, wait for children before last step
             if step_num == step_count and self._signal('finish'):
+                # the drain is bounded by the run wall alone -- clear the
+                # iteration deadline so it cannot time out a wait over
+                # still-active children (mirrors the pre/post-iteration
+                # clears); the final step that follows runs off the step
+                # and run walls
+                self._iter_end_epoch = 0
                 if not self._wait_for_children(f'before {step_name}'):
                     # a pause parks the drain as-is (no commit); the finish
                     # signal survives on the adopted run and re-arms the
@@ -1518,9 +1579,10 @@ class Loop:
                     # shape reads in `node activity`; the failed first
                     # attempt keeps its plain reason
                     if attempt > 0:
-                        step_reason = (
-                            f'{step_reason}; retry' if step_reason else 'retry'
-                        )
+                        if step_reason:
+                            step_reason = f'{step_reason}; retry'
+                        else:
+                            step_reason = 'retry'
                     try:
                         node.record.step_end(
                             step_id=self._step_id,
@@ -1844,39 +1906,38 @@ class Loop:
         if self._step_budget_value is not None:
             step_budget = f'{self._step_budget_value:.6g}'
         env = dict(self._env_base)
-        env.update(
-            {
-                'MAX_COST': self._max_cost_label,
-                'MAX_ITER_COST': self._max_iter_cost_label,
-                'MAX_STEP_COST': self._max_step_cost_label,
-                'AGENT_COMMAND': self._agent_command,
-                'DETACHED': 'true' if self._detached else 'false',
-                'RUN_TIMEOUT_SECONDS': f'{self._run_timeout_seconds}',
-                'ITER_TIMEOUT_SECONDS': f'{self._iter_timeout_seconds}',
-                'STEP_TIMEOUT_SECONDS': f'{self._step_timeout_effective}',
-                'INTERVAL_SECONDS': f'{self._interval_seconds}',
-                'ITER': f'{self._iter}',
-                'CONTINUE_MODE': 'true' if self._continue else 'false',
-                'RESUME_MODE': 'true' if self._resume_mode else 'false',
-                '_NODE': f'{self.node.node_dir}',
-                # external env consumers key node identity off this branch,
-                # not _NODE's basename (an incidental dir-layout fact)
-                'NODE_BRANCH': self.node.branch,
-                'RUN_ID': f'{self._run_id}',
-                'RUN_END_EPOCH': f'{self._run_end_epoch}',
-                'ITER_END_EPOCH': f'{self._iter_end_epoch}',
-                'ITER_TIMESTAMP': self._iter_timestamp,
-                'ITER_REF': self._iter_ref,
-                'ITER_LABEL': self._iter_label,
-                'TIME_BUDGET': self._time_budget,
-                'COST_BUDGET': self._cost_budget,
-                'STEP_LABEL': step_label,
-                'STEP_MODEL': self._step_model,
-                'STEP_LIMIT_SECONDS': f'{self._step_limit_seconds}',
-                'STEP_DETACHED': 'true' if self._step_detached else 'false',
-                'STEP_BUDGET': step_budget,
-            }
-        )
+        overlay = {
+            'MAX_COST': self._max_cost_label,
+            'MAX_ITER_COST': self._max_iter_cost_label,
+            'MAX_STEP_COST': self._max_step_cost_label,
+            'AGENT_COMMAND': self._agent_command,
+            'DETACHED': 'true' if self._detached else 'false',
+            'RUN_TIMEOUT_SECONDS': f'{self._run_timeout_seconds}',
+            'ITER_TIMEOUT_SECONDS': f'{self._iter_timeout_seconds}',
+            'STEP_TIMEOUT_SECONDS': f'{self._step_timeout_effective}',
+            'INTERVAL_SECONDS': f'{self._interval_seconds}',
+            'ITER': f'{self._iter}',
+            'CONTINUE_MODE': 'true' if self._continue else 'false',
+            'RESUME_MODE': 'true' if self._resume_mode else 'false',
+            '_NODE': f'{self.node.node_dir}',
+            # external env consumers key node identity off this branch,
+            # not _NODE's basename (an incidental dir-layout fact)
+            'NODE_BRANCH': self.node.branch,
+            'RUN_ID': f'{self._run_id}',
+            'RUN_END_EPOCH': f'{self._run_end_epoch}',
+            'ITER_END_EPOCH': f'{self._iter_end_epoch}',
+            'ITER_TIMESTAMP': self._iter_timestamp,
+            'ITER_REF': self._iter_ref,
+            'ITER_LABEL': self._iter_label,
+            'TIME_BUDGET': self._time_budget,
+            'COST_BUDGET': self._cost_budget,
+            'STEP_LABEL': step_label,
+            'STEP_MODEL': self._step_model,
+            'STEP_LIMIT_SECONDS': f'{self._step_limit_seconds}',
+            'STEP_DETACHED': 'true' if self._step_detached else 'false',
+            'STEP_BUDGET': step_budget,
+        }
+        env.update(overlay)
         # always exported, blank when unset: the overlay must mask any
         # inherited ITER_ID/STEP_ID (a nested launch keeps the caller's
         # env), or the agent's CLI calls would attribute rows to
@@ -2146,10 +2207,10 @@ class Loop:
             # a stream-consumer failure the handler above SIGKILLed the agent
             # for surfaces here as a signal death -- defer to the stream_error
             # branch below so it owns the attribution (right side + traceback),
-            # rather than bury the real fault under a generic 'agent error'. Safe
+            # rather than bury the real fault under a generic 'agent error'; safe
             # because stream_error is set only on a fractal-side stream failure:
             # a genuine agent crash closes stdout, so the reader hits EOF and
-            # returns without raising (stream_error stays None -> here).
+            # returns without raising (stream_error stays None -> here)
             if stream_error is None:
                 # a signal death surfaces as a negative returncode -- report it
                 # in the 128+N convention the exit banner prints
@@ -2182,7 +2243,7 @@ class Loop:
         if stream_error is not None:
             # an agent that named a failure on its own stream (drained clean,
             # exit 0) is an agent error; a fractal-side stream-consumer failure
-            # is a "stream error". Both surface the detail on the pane and .err,
+            # is a "stream error"; both surface the detail on the pane and .err,
             # but node activity must attribute the failure to the right side
             print(f'Error: {stream_error}', file=sys.stderr)
             if self._consume_pause_abort():
@@ -2480,8 +2541,6 @@ class Loop:
                 log.write(line)
         return process.wait() == 0
 
-    # budget and deadline policy
-
     def _read_cost_caps(self: Loop) -> None:
         """Load the budget-cap keys.
 
@@ -2489,12 +2548,33 @@ class Loop:
         boundary checks themselves, so a mid-run retune (config edit or
         node update) reaches the very next probe instead of staying
         pinned to the run-start values.
+
+        Raises:
+            ValueError: When an edited cap violates the launch
+                invariants (:meth:`Config.validate`), before any cap is
+                reassigned -- boot propagates the refusal; the mid-run
+                readers warn and keep the previous caps.
+
         """
         config = self.node.config
-        self._max_cost = config.get('max_cost')
-        self._max_iter_cost = config.get('max_iter_cost')
-        self._max_step_cost = config.get('max_step_cost')
+        max_cost = config.get('max_cost')
+        max_iter_cost = config.get('max_iter_cost')
+        max_step_cost = config.get('max_step_cost')
         reserve = config.get('reserve_budget')
+        # re-check the launch invariants before assigning anything: the
+        # documented steering path edits config.json directly, bypassing the
+        # setters' validation, and an unchecked cap would crash the next
+        # float() or degenerate the boundary probes
+        config_values = {
+            'max_cost': max_cost,
+            'max_iter_cost': max_iter_cost,
+            'max_step_cost': max_step_cost,
+            'reserve_budget': reserve,
+        }
+        config.validate(config_values)
+        self._max_cost = max_cost
+        self._max_iter_cost = max_iter_cost
+        self._max_step_cost = max_step_cost
         # a budget set out-of-band (config set max_cost) bypasses node init's
         # 10% reserve default, leaving no cleanup buffer; mirror that default
         # here so the RESERVE nudge fires before the ceiling however
@@ -2508,12 +2588,14 @@ class Loop:
         # the label strings mirror the config values verbatim (an int cap
         # reads `5`, a float `5.0`)
         self._max_cost_label = f'{self._max_cost}' if self._max_cost is not None else ''
-        self._max_iter_cost_label = (
-            f'{self._max_iter_cost}' if self._max_iter_cost is not None else ''
-        )
-        self._max_step_cost_label = (
-            f'{self._max_step_cost}' if self._max_step_cost is not None else ''
-        )
+        if self._max_iter_cost is not None:
+            self._max_iter_cost_label = f'{self._max_iter_cost}'
+        else:
+            self._max_iter_cost_label = ''
+        if self._max_step_cost is not None:
+            self._max_step_cost_label = f'{self._max_step_cost}'
+        else:
+            self._max_step_cost_label = ''
 
     def _reconcile_caps(self: Loop) -> None:
         """Heal config/registry cap drift, one loud warning per drift."""
@@ -2548,23 +2630,35 @@ class Loop:
     def _run_spent(self: Loop) -> Optional[float]:
         """Return the run's subtree spend at the ledger's display precision.
 
-        Budgets are per-run (runs are isolated); ``None`` when the spend
-        is untracked or unreadable.
+        Budgets are per-run (runs are isolated); ``None`` when the
+        spend is untracked. A failed read warns and returns the last
+        good reading -- never ``None``, which reads as untracked and
+        would disarm the budget probes for a mere contention window.
         """
         try:
             spent = self.node.cost.spent(run_id=self._run_id)
             if spent == 0.0 and self.node.cost.untracked(run_id=self._run_id):
                 return None
         except Exception:
-            return None
-        return round(spent, 4)
+            self._warn_unreadable_spend()
+            return self._last_run_spent
+        self._last_run_spent = round(spent, 4)
+        return self._last_run_spent
 
     def _run_remaining(self: Loop) -> float:
-        """Return the run's remaining budget, clamped at 0 (display precision)."""
+        """Return the run's remaining budget, clamped at 0 (display precision).
+
+        A failed read derives from the last good spend reading -- never
+        the full cap, which would size the per-step leash as if nothing
+        were spent while the ledger is merely contended.
+        """
         try:
             remaining = self.node.cost.remaining(run_id=self._run_id)
         except Exception:
+            self._warn_unreadable_spend()
             remaining = None
+            if self._last_run_spent is not None:
+                remaining = float(self._max_cost or 0) - self._last_run_spent
         if remaining is None:
             remaining = float(self._max_cost or 0)
         return round(max(0.0, remaining), 4)
@@ -2602,8 +2696,12 @@ class Loop:
         if self._max_iter_cost is not None and self._iter_id is not None:
             try:
                 iter_remaining = self.node.cost.remaining(iter_id=self._iter_id)
+                self._last_iter_headroom = iter_remaining
             except Exception:
-                iter_remaining = None
+                # a failed read holds the last good headroom, not the full
+                # cap the unset-cap fallback below grants
+                self._warn_unreadable_spend()
+                iter_remaining = self._last_iter_headroom
             if iter_remaining is None:
                 iter_remaining = float(self._max_iter_cost)
             iter_remaining = round(max(0.0, iter_remaining), 4)
@@ -2625,8 +2723,15 @@ class Loop:
         queuing more steps within the iteration.
         """
         # read the caps live: a cap granted (or retuned) mid-iteration must
-        # reach this very probe, not wait for the iteration top
-        self._read_cost_caps()
+        # reach this very probe, not wait for the iteration top; a malformed
+        # edit warns and keeps the prior caps, never crashing the run
+        try:
+            self._read_cost_caps()
+        except ValueError as error:
+            print(
+                f'Warning: {error}; keeping the previous cost caps',
+                file=sys.stderr,
+            )
         if self._max_cost is None:
             return False
         if self._signal('finish'):
@@ -2657,8 +2762,15 @@ class Loop:
         boundary hard ceiling; soft, recursive.
         """
         # read the caps live: a cap granted (or retuned) mid-iteration must
-        # reach this very probe, not wait for the iteration top
-        self._read_cost_caps()
+        # reach this very probe, not wait for the iteration top; a malformed
+        # edit warns and keeps the prior caps, never crashing the run
+        try:
+            self._read_cost_caps()
+        except ValueError as error:
+            print(
+                f'Warning: {error}; keeping the previous cost caps',
+                file=sys.stderr,
+            )
         if self._max_cost is None:
             return False
         if self._signal('finish'):
@@ -2721,6 +2833,22 @@ class Loop:
             ' (unpriced steps); budget guards cannot trip.'
         )
 
+    def _warn_unreadable_spend(self: Loop) -> None:
+        """Scream once per run when a cost-ledger read fails.
+
+        Shared by every budget reader: the failed read falls back to
+        the last good reading rather than the full cap, so the guards
+        stay armed (if stale) until the ledger reads again -- advisory
+        only; a contended read never re-inflates spend authority.
+        """
+        if self._unreadable_warned:
+            return
+        self._unreadable_warned = True
+        print(
+            'WARNING: cost read failed; budget guards hold the last good'
+            ' reading until the ledger reads again.'
+        )
+
     def _send_exit_notice(self: Loop, status: str, reason: str) -> None:
         """Post a radio notice for an abnormal run end.
 
@@ -2747,8 +2875,6 @@ class Loop:
             )
         except Exception:
             pass
-
-    # signals
 
     def _signal(self: Loop, name: str) -> bool:
         """Return whether a signal row is set on this run."""
@@ -2808,28 +2934,34 @@ class Loop:
         resume, so a finishing parent must wait for it, never complete
         over it; one query for both statuses, so a child flipping
         between them mid-poll is never missed by two separate snapshots.
+        A booting child counts too -- the live view reads an idle node
+        with a live tmux session as ``active``, so a child started by a
+        late step (its loop still in preflight, the active stamp pending)
+        is never read as drained.
         """
         try:
             rows = self.node.list(status='active,paused', live=True, decorated=False)
         except Exception:
-            return False
+            # an inconclusive probe (DB contention, a transient git
+            # failure) counts as active -- the drain must prove the
+            # subtree empty, never infer it from a failed read; the
+            # wait's stop/timeout interrupts bound a persistent fault
+            return True
         return len(rows) > 0
-
-    # terminal cascade
 
     def _finalize(self: Loop) -> int:
         """Run the ordered terminal cascade and return the exit code.
 
         Drain backstop, pause park (rows left open), final commit sweep,
-        over-cap sweep, cascaded-budget sweep, status matrix, run end,
-        abnormal-exit radio notice.
+        over-cap sweep, cascaded- and parked-budget sweeps, status
+        matrix, run end, abnormal-exit radio notice.
         """
         node = self.node
         # drain backstop: a resume can re-enter at the loop's max-iters or
         # timeout gate without reaching an in-loop drain -- a pending finish
         # must still wait for the subtree before the cascade below stamps
         # completed; idempotent for normal exits (a drained finish returns
-        # immediately), and a pause landing here parks like any other. A
+        # immediately), and a pause landing here parks like any other; a
         # stop or timeout that interrupts the drain abandons the finish:
         # the cascade below must not claim a completed finish over a
         # subtree it never drained
@@ -2922,6 +3054,19 @@ class Loop:
                 )
                 attribution = finish_reason[finish_reason.index('(via finish of ') :]
                 self._budget_stem = f'ancestor budget abort {attribution}'
+            elif finish_reason.startswith(_BUDGET_REASON_STEMS):
+                # parked-abort sweep: a pause can park the run between a
+                # self-sent budget finish and its landing, and the abort
+                # flags die with the parked loop process -- the resumed
+                # probes stay disarmed on the pending finish and a reserve
+                # stop sits below the over-cap threshold, so re-adopt the
+                # abort from the signal row (its persisted record) to keep
+                # the exited/0 landing
+                print(f'=== Budget abort resumed from park ({finish_reason}) ===')
+                self._budget_hit = True
+                self._budget_reason = finish_reason
+                # the stem is the reason's figure-free head
+                self._budget_stem = finish_reason.split(' (', 1)[0]
 
         exit_reason = None
         if self._budget_hit:
@@ -2952,6 +3097,8 @@ class Loop:
                 exit_reason = 'Stopped by request'
             elif self._max_iters > 0 and self._iter >= self._max_iters:
                 exit_reason = f'Reached max iterations ({self._max_iters})'
+                if self._last_iter_failed:
+                    exit_reason += '; final iteration failed'
             else:
                 exit_reason = f'Exited at iteration {self._run_id}.{self._iter}'
             try:
@@ -2984,7 +3131,13 @@ class Loop:
             # by the max-iters clause
             node_status, run_status, run_exit_code = 'stopped', 'stopped', 0
         elif self._max_iters > 0 and self._iter >= self._max_iters:
-            node_status, run_status, run_exit_code = 'completed', 'completed', 0
+            if self._last_iter_failed:
+                # a failed final iteration is abnormal even at the max-iters
+                # boundary (mirrors the timeout leg) -- completed would
+                # launder a dead iteration into a clean run
+                node_status, run_status, run_exit_code = 'exited', 'exited', 1
+            else:
+                node_status, run_status, run_exit_code = 'completed', 'completed', 0
         else:
             # unexpected exit -- abnormal, exit 1
             node_status, run_status, run_exit_code = 'exited', 'exited', 1
@@ -3023,14 +3176,16 @@ class Loop:
     def _on_exit(self: Loop) -> None:
         """Settle the loop's exit (the EXIT-trap mirror).
 
-        Stamps ``exited`` and closes the run row only when status is
-        still ``active``; heals caps; drops ``.pgid``; never relabels a
-        recorded terminal.
+        Stamps ``exited`` and closes the still-open run/iter/step rows
+        only when status is still ``active``; heals caps; drops ``.pgid``
+        and ``.socket``; never relabels a recorded terminal.
         """
         node = self.node
-        # drop the pgid handle -- the loop is ending in-band, nothing to reap
+        # drop the pgid and socket handles -- the loop is ending in-band,
+        # nothing to reap and no session left to probe
         try:
             (node.node_dir / PGID_FILE).unlink(missing_ok=True)
+            (node.node_dir / SOCKET_FILE).unlink(missing_ok=True)
         except OSError:
             pass
         # heal config/registry cap drift before the row goes dark -- a
@@ -3046,21 +3201,21 @@ class Loop:
                 node.status_set('exited')
             except Exception:
                 pass
-            if self._run_id is not None:
-                try:
-                    node.record.run_end(
-                        run_id=self._run_id,
-                        status='exited',
-                        exit_code=1,
-                        metadata='Loop exited abnormally',
-                    )
-                except Exception:
-                    pass
+            # close the whole open lifecycle (the shared cascade), not just
+            # the run row: an in-band crash strands the iteration and step
+            # rows open too, and nothing heals them later --
+            # _reconcile_status no-ops once .status reads exited -- so a
+            # row left open here would read active forever
+            try:
+                node.record.close_open(
+                    'exited',
+                    metadata='Loop exited abnormally',
+                )
+            except Exception:
+                pass
             # the crash-path twin of the terminal cascade's notice, mirroring
             # the reason this branch just recorded
             self._send_exit_notice('exited', 'Loop exited abnormally')
-
-    # commit backstops
 
     def _commit_check(self: Loop) -> bool:
         """Return whether the worktree is clean (the porcelain backstop check)."""
@@ -3106,8 +3261,6 @@ class Loop:
         except Exception as error:
             print(f'Error: {error}', file=sys.stderr)
 
-    # helpers
-
     def _iter_label_text(self: Loop) -> str:
         """Return the iteration progress label (``N of M`` / ``N (no limit)``)."""
         if self._max_iters > 0:
@@ -3126,8 +3279,6 @@ class Loop:
         except Exception:
             return None
         return round(spent, 4)
-
-    # event hooks
 
     def on_iteration(
         self: Loop,
@@ -3302,13 +3453,7 @@ def _is_cascaded_budget_reason(reason: str, /) -> bool:
     Fan-out always carries the tripping ancestor's raw reason, so the
     match is an exact budget-stem prefix plus the fan-out attribution.
     """
-    return '(via finish of ' in reason and reason.startswith(
-        (
-            'cost budget reserve reached',
-            'subtree cost budget reached',
-            'cost budget exceeded in finish wind-down',
-        )
-    )
+    return '(via finish of ' in reason and reason.startswith(_BUDGET_REASON_STEMS)
 
 
 def _boot_env(node: Node, *, detached: bool, meta: str) -> dict[str, str]:

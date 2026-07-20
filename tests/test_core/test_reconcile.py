@@ -4,16 +4,21 @@ A loop that dies without ending leaves an ``active`` status with no
 tmux session; the reject-active operations reconcile it to the honest
 ``exited`` (closing open rows and healing cap drift) before
 proceeding. Also pins the heal's definitive-answer requirement (an
-inconclusive tmux probe never reaps) and kill's stale-active behavior.
+inconclusive tmux probe never reaps), the reap's identity guard (a
+recycled pgid is spared), and kill's stale-active behavior.
 """
 
 from __future__ import annotations
 
+import os
 import pathlib
+import signal
 import subprocess
+import time
 
 import pytest
 
+from fractal.constants import PGID_FILE, SOCKET_FILE
 from fractal.core.node import Node
 from tests._helpers import _stub_run_script
 
@@ -25,6 +30,7 @@ __all__ = [
     'test_reconcile_status_heals_caps_on_crashed_node',
     'test_reconcile_requires_a_definitive_tmux_answer',
     'test_kill_unchanged_on_stale_active',
+    'test_reap_orphan_reaps_only_the_recorded_group',
 ]
 
 
@@ -136,6 +142,9 @@ def test_reconcile_status_heals_caps_on_crashed_node(
         ('error', 'active'),
         # tmux answered 'no server running': the session is provably gone
         ('no-server', 'exited'),
+        # the ambient socket has no server, but the loop recorded its own
+        # socket at boot and the session is alive there: no heal
+        ('recorded-socket', 'active'),
     ],
 )
 def test_reconcile_requires_a_definitive_tmux_answer(
@@ -150,11 +159,21 @@ def test_reconcile_requires_a_definitive_tmux_answer(
     nothing about liveness, so the active node keeps its status and its open
     run: healing on ignorance would reap a healthy loop's process groups from
     any shell without tmux visibility. tmux's ``no server running`` refusal
-    is a definitive empty answer, so the genuinely crashed node still heals.
+    is a definitive empty answer, so the genuinely crashed node still heals --
+    but only from the server the loop recorded at boot: a shell resolving a
+    different socket (its own ``TMUX_TMPDIR``) would otherwise read a live
+    session as gone and reap the healthy loop.
     """
     node = node_with_db
     node.status_set('active')
     run_id = node.record.run_start()
+    # the loop's boot-time socket record: the reconcile must ask this
+    # server, not the ambient one
+    recorded_socket = '/tmp/fx-test/other-socket'  # noqa: S108
+    if tmux_answer == 'recorded-socket':
+        (node.node_dir / SOCKET_FILE).write_text(
+            f'{recorded_socket}\n', encoding='utf-8'
+        )
     # restore the real probe (the fixture shadows it as always-alive)
     node._tmux_session_exists = Node._tmux_session_exists.__get__(node)
 
@@ -170,6 +189,22 @@ def test_reconcile_requires_a_definitive_tmux_answer(
             return real_run(cmd, *args, **kwargs)
         if tmux_answer == 'absent':
             raise FileNotFoundError(2, 'No such file or directory', 'tmux')
+        if tmux_answer == 'recorded-socket':
+            # only the recorded server holds the session; every other
+            # socket (the ambient one included) has no server at all
+            if '-S' in cmd and cmd[cmd.index('-S') + 1] == recorded_socket:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout=f'{node.tmux_session}\n',
+                    stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout='',
+                stderr='no server running on /tmp/tmux-501/default',
+            )
         stderrs = {
             'error': 'error connecting to /tmp/tmux-501/default (Permission denied)',
             'no-server': 'no server running on /tmp/tmux-501/default',
@@ -208,3 +243,61 @@ def test_kill_unchanged_on_stale_active(
     _stub_run_script(monkeypatch, node)
     node.kill()
     assert node.status() == 'killed'
+
+
+# ------ orphan reap identity
+
+
+@pytest.mark.parametrize(
+    argnames='recycled',
+    argvalues=[
+        # the leader predates its record (the normal shape): the recorded
+        # group -- reaped
+        False,
+        # the record predates the leader: the OS re-issued a dead group's
+        # id to a stranger -- spared
+        True,
+    ],
+)
+def test_reap_orphan_reaps_only_the_recorded_group(
+    node_with_db: Node,
+    recycled: bool,
+) -> None:
+    """The reap verifies a stale pgid's identity, not just its liveness.
+
+    A ``.pgid`` that outlives its loop can name a pid the OS has since
+    recycled to an unrelated same-user group -- alive, so an existence
+    probe alone passes and the reap would TERM/KILL a stranger. The group
+    is the recorded one only while its leader is no younger than the
+    record (the file's mtime); a leader started after the record marks a
+    recycled pid, read as already gone. The stale record is dropped either
+    way, and only a genuine reap logs the ``orphan`` audit event.
+    """
+    node = node_with_db
+    # a live same-user group standing in for the recorded one; backdating
+    # the record makes the leader postdate it, i.e. a recycled pid
+    leader = subprocess.Popen(['sleep', '300'], start_new_session=True)
+    pgid_file = node.node_dir / PGID_FILE
+    try:
+        pgid_file.write_text(f'{leader.pid}\n', encoding='utf-8')
+        if recycled:
+            stale = time.time() - 3600
+            os.utime(pgid_file, (stale, stale))
+        node._reap_orphan()
+        if recycled:
+            # the recycled group is spared -- alive and unsignaled
+            assert leader.poll() is None
+        else:
+            # the recorded group draws the TERM
+            assert leader.wait(timeout=5) != 0
+        # the stale record is dropped either way
+        assert not pgid_file.exists()
+        # only a genuine reap logs the audit event
+        events = node.db.read('events', where={'event': 'orphan'})
+        assert bool(events) is not recycled
+    finally:
+        try:
+            os.killpg(leader.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        leader.wait()

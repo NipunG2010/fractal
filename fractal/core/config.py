@@ -201,7 +201,7 @@ class Config:
         # on a config sidecar (auto-released if the holder dies) -- concurrent
         # setters (a parent retune racing the child's own title write)
         # otherwise load the same snapshot and the loser's key silently
-        # reverts. A sidecar, not the tree-wide .worktrees flock: init holds
+        # reverts; a sidecar, not the tree-wide .worktrees flock: init holds
         # that lock across init.sh, whose `config _set` lands here in a
         # subprocess, so re-taking it would deadlock every init
         lock_path = self.path.parent / (CONFIG_FILE + LOCK_FILE)
@@ -228,11 +228,16 @@ class Config:
         the file directly, bypassing the init/update setters' checks. Rejects
         a non-numeric or non-finite cost (NaN/Infinity slip past every
         comparison), a non-positive ceiling (which makes the subtree check
-        finish the node at $0), an out-of-range reserve, a broken
-        ``step <= iter <= run`` cost ordering, a non-integer or degenerate
-        integer cap (a non-positive ``max_iters`` reads as unlimited in the
-        loop), and a bare-number or zero-truncating duration (which bricks
-        the loop at launch or at its mid-run re-reads).
+        finish the node at $0), a per-iter/step cap with no ceiling (which
+        the loop cannot enforce once the per-iter budget drains), an
+        out-of-range reserve, a broken ``step <= iter <= run`` cost
+        ordering, a non-integer or degenerate integer cap (a non-positive
+        ``max_iters`` reads as unlimited in the loop), a non-bool mode flag
+        (the loop's ``bool()`` coercion reads a hand-edited ``"false"``
+        string as ``True``), a bare-number or zero-truncating duration
+        (which bricks the loop at launch or at its mid-run re-reads), and
+        an absolute or ``..`` scope root (which never matches the commit
+        pipeline's relative prefix check, bricking every scoped commit).
 
         Args:
             config: The config mapping to validate; the stored
@@ -271,6 +276,15 @@ class Config:
                     raise ValueError('max_iters must be greater than 0.')
             elif int_value < 0:
                 raise ValueError(f'{int_key} must be >= 0.')
+        # mode flags must be plain bools -- the loop coerces them with
+        # bool(), so a hand-edited "false" string reads as True and launches
+        # the exact mode the operator wrote the file to disable
+        for bool_key in BOOL_KEYS:
+            bool_value = config.get(bool_key)
+            if bool_value is None:
+                continue
+            if type(bool_value) is not bool:
+                raise ValueError(f'{bool_key} must be a boolean.')
         # alias cost ceilings
         max_cost = config.get('max_cost')
         max_iter_cost = config.get('max_iter_cost')
@@ -279,6 +293,14 @@ class Config:
         # a ceiling must be positive (0/negative degenerates the subtree check)
         if max_cost is not None and max_cost <= 0:
             raise ValueError('max_cost must be greater than 0.')
+        # a per-iter/step cap with no run ceiling can't be enforced (once the
+        # per-iter budget drains, later steps run unbounded) -- init rejects
+        # the combination, so the file re-check must too
+        if max_cost is None:
+            if max_iter_cost is not None:
+                raise ValueError('max_iter_cost requires max_cost.')
+            if max_step_cost is not None:
+                raise ValueError('max_step_cost requires max_cost.')
         # reserve must sit in [0, 99% of max_cost)
         if reserve_budget is not None:
             if reserve_budget < 0:
@@ -340,6 +362,25 @@ class Config:
                     f'iter_timeout ({iter_timeout_value}) exceeds'
                     f' interval ({interval_value}).'
                 )
+        # scope roots must be repo-relative subdirectories, exactly as init
+        # enforces -- an absolute or '..' root (any JSON type can land here
+        # via a hand-edit, as above) never matches the commit pipeline's
+        # relative prefix check, bricking every scoped commit
+        scope = config.get('scope')
+        if scope is not None:
+            # tolerate the space-joined string form the read path splits
+            if isinstance(scope, str):
+                scope = scope.split()
+            scope_is_list = isinstance(scope, list)
+            if not scope_is_list or not all(isinstance(root, str) for root in scope):
+                raise ValueError('scope must be a list of strings.')
+            for root in scope:
+                rel = pathlib.PurePosixPath(root)
+                if rel.is_absolute() or '..' in rel.parts:
+                    raise ValueError(
+                        f'scope must be a repo-relative subdirectory, not'
+                        f' {root!r} (no absolute or ".." paths).'
+                    )
 
     def reconcile(self: Config) -> dict[str, tuple[Any, Any]]:
         """Reconcile the registry cap row to this node's config file.

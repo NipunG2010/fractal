@@ -60,6 +60,12 @@ The terminal UI is optional. To include it, install the `tui` extra:
 pip install 'plasma-fractal[tui]'
 ```
 
+or
+
+```bash
+pip install 'fractal[tui]'
+```
+
 Open the dashboard from your project root with `fractal open`.
 
 ### Skill
@@ -77,16 +83,16 @@ codex plugin marketplace add plasma-ai/plugins
 codex plugin add fractal@plasma
 ```
 
-Or from the CLI, which copies the fractal and wiki skills into
-`~/.claude/skills` and `~/.agents/skills` (add `--project` for the
-current project only):
+Another install route is from the CLI, which copies (or symlinks) the
+skills (fractal and wiki) into `~/.claude/skills` and `~/.agents/skills`
+(add `--project` for the current project only):
 
 ```bash
 fractal install [--link]
 ```
 
 After upgrading the package, re-run `fractal install` to refresh the
-copied skill (pass `--link` for symlinked install).
+copied skills (pass `--link` for symlinked install).
 
 ## Usage
 
@@ -97,12 +103,12 @@ branch from their parent. Agents iterate in tmux sessions, and all state
 database.
 
 Five agent backends are supported — Claude Code (`claude`), Codex
-(`codex`), Grok Build (`grok`), opencode (`opencode`), and Oh My Pi
+(`codex`), Grok Build (`grok`), OpenCode (`opencode`), and Oh My Pi
 (`omp`) — selected per node with `--agent` (children inherit it). Claude
 and Codex can additionally route through OpenRouter with
 `--provider=openrouter`, which authenticates via `OPENROUTER_API_KEY`
-from the launching shell; opencode and omp reach OpenRouter natively
-through their own `openrouter/<author>/<model>` model ids.
+from the launching shell; OpenCode and Oh My Pi reach OpenRouter
+natively through their own `openrouter/<author>/<model>` model ids.
 
 Use the `/fractal` skill to spawn and manage agent nodes. The `fractal`
 CLI is also available directly — run `fractal --help` and

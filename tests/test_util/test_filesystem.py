@@ -13,6 +13,7 @@ __all__ = [
     'test_write_atomic_writes_text_as_utf8_verbatim',
     'test_write_atomic_writes_raw_bytes',
     'test_write_atomic_preserves_mode',
+    'test_write_atomic_writes_through_a_symlink',
     'test_write_atomic_failure_discards_temp',
 ]
 
@@ -44,6 +45,21 @@ def test_write_atomic_preserves_mode(tmp_path: pathlib.Path) -> None:
     write_atomic(target, 'second\n')
     assert target.read_text(encoding='utf-8') == 'second\n'
     assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_atomic_writes_through_a_symlink(tmp_path: pathlib.Path) -> None:
+    """A symlinked destination updates its target and the link survives.
+
+    The swap must land on the resolved target, never on the link itself --
+    replacing the link with a regular file would strand the target stale.
+    """
+    target = tmp_path / 'real.txt'
+    target.write_text('orig\n', encoding='utf-8')
+    link = tmp_path / 'link.txt'
+    link.symlink_to('real.txt')
+    write_atomic(link, 'new\n')
+    assert link.is_symlink()
+    assert target.read_text(encoding='utf-8') == 'new\n'
 
 
 def test_write_atomic_failure_discards_temp(

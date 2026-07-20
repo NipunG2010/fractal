@@ -17,6 +17,7 @@ from tests._helpers import _git
 
 __all__ = [
     'test_resolution_verbs_read_the_repo',
+    'test_common_dir_resolves_a_submodule_checkout',
     'test_worktree_probe_reflects_on_disk_state',
     'test_unchecked_failure_degrades_to_none',
     'test_missing_git_binary_degrades_to_none',
@@ -54,6 +55,40 @@ def test_resolution_verbs_read_the_repo(repo: pathlib.Path) -> None:
     _git(repo, 'worktree', 'add', '-b', 'main.wt', f'{worktree}', 'main')
     assert fractal.util.git.common_dir(worktree) == repo
     assert fractal.util.git.common_dir(repo) == repo
+
+
+def test_common_dir_resolves_a_submodule_checkout(
+    repo: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """``common_dir`` resolves a submodule checkout to its own root.
+
+    A submodule's git dir nests inside the superproject
+    (``.git/modules/<name>``), so the root is not the common dir's parent --
+    it resolves back through ``core.worktree`` to the checkout, from a linked
+    worktree of the submodule included.
+    """
+    super_dir = tmp_path / 'super'
+    super_dir.mkdir()
+    _git(super_dir, 'init', '-b', 'main')
+    _git(super_dir, 'config', 'user.name', 'Test User')
+    _git(super_dir, 'config', 'user.email', 'test@example.com')
+    _git(
+        super_dir,
+        '-c',
+        'protocol.file.allow=always',
+        'submodule',
+        'add',
+        f'{repo}',
+        'sub',
+    )
+    _git(super_dir, 'commit', '-m', 'add submodule')
+    sub = super_dir / 'sub'
+    assert fractal.util.git.common_dir(sub) == sub
+    # a linked worktree of the submodule resolves to the checkout as well
+    worktree = tmp_path / 'sub_wt'
+    _git(sub, 'worktree', 'add', '-b', 'main.wt', f'{worktree}', 'main')
+    assert fractal.util.git.common_dir(worktree) == sub
 
 
 # ------ worktree probe

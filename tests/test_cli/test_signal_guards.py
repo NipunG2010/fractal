@@ -242,28 +242,38 @@ def test_active_node_accepts_graceful_signals(
     assert _run(wt, 'node', 'status').stdout.strip() == f'active ({suffix})'
 
 
-def test_user_node_resolves_from_a_non_init_checkout(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize('project', ['.', 'sub', 'pkgs/sub'])
+def test_user_node_resolves_from_a_non_init_checkout(
+    tmp_path: pathlib.Path,
+    project: str,
+) -> None:
     """The tree-wide brake resolves the user node by config, not the checkout.
 
     On a non-init branch (the user on their own branch while nodes run),
     ``resolve_node`` keys on the current branch and scopes the brake to a lone
     child; ``resolve_user_node`` finds the ``user: true`` config regardless of
-    checkout, so pause/resume never silently mis-scope.
+    checkout, so pause/resume never silently mis-scope. On a sub-project tree
+    the resolved node must anchor at the git root -- ``Node.node_dir`` derives
+    the ``<project>/`` prefix from the ``.worktrees/.project`` cache, so a
+    sub-project anchor would double the prefix and read an empty config. A
+    nested sub-project sits below the top-level directory scan, so its config
+    is discovered through the same cache.
     """
     root = tmp_path / 'repo'
-    root.mkdir()
+    target = root if project == '.' else root / project
+    target.mkdir(parents=True)
     _git(root, 'init', '-b', 'main')
     _git(root, 'config', 'user.email', 't@t.local')
     _git(root, 'config', 'user.name', 't')
-    (root / 'README.md').write_text('# r\n', encoding='utf-8')
-    wiki = root / 'wiki'
+    (target / 'README.md').write_text('# r\n', encoding='utf-8')
+    wiki = target / 'wiki'
     wiki.mkdir()
     (wiki / '_index.md').write_text(
         '---\nname: wiki\n---\n# wiki\n\n***\n', encoding='utf-8'
     )
     _git(root, 'add', '-A')
     _git(root, 'commit', '-m', 'init')
-    assert _run(root, 'init').returncode == 0
+    assert _run(root, 'init', project).returncode == 0
     assert _run(root, 'node', 'init', 'kid', '--agent', 'claude').returncode == 0
     # the user checks the repo root out to their own branch while the node exists
     _git(root, 'checkout', '-b', 'sidework')

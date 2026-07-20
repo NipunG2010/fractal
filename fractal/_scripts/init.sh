@@ -285,7 +285,9 @@ reject_subsecond() {
     local LABEL="$2"
     [[ -z "$VALUE" ]] && return 0
     local SECS
-    SECS=$(awk -v d="$VALUE" 'BEGIN {
+    # LC_ALL=C: awk's string-to-number conversion follows the process locale,
+    # so a comma-decimal locale would truncate a dot-decimal "0.5" to 0
+    SECS=$(LC_ALL=C awk -v d="$VALUE" 'BEGIN {
         u = substr(d, length(d))
         m = (u == "m") ? 60 : (u == "h") ? 3600 : (u == "d") ? 86400 : 1
         printf "%d", (d + 0) * m
@@ -410,6 +412,13 @@ WORKTREES_DIR="$REPO_DIR/.worktrees"
 
 # base ref must have a committed wiki; top-level nodes also require a clean tree
 BASE_REF="${BASE:-$PARENT_BRANCH}"
+# the ref must exist before the wiki check reads through it -- cat-file fails
+# identically for a missing ref and a missing wiki, and a --base typo must
+# name the real problem, not prescribe creating a wiki
+if ! git -C "$REPO_DIR" rev-parse --verify --quiet "$BASE_REF^{commit}" >/dev/null; then
+    echo "Error: base branch '$BASE_REF' does not exist" >&2
+    exit 1
+fi
 if [[ "$PROJECT_PATH" == "." ]]; then
     WIKI_DIR="wiki"
 else
@@ -448,7 +457,6 @@ fi
 mkdir -p "$WORKTREES_DIR"
 
 WORKTREE_DIR="$WORKTREES_DIR/$BRANCH"
-FORK_SHA=""
 if [[ -d "$WORKTREE_DIR" ]]; then
     echo "Reusing existing worktree at $WORKTREE_DIR"
     if [[ "$RESET" != true ]]; then
@@ -468,14 +476,17 @@ else
         # BASE_REF) so a child inherits the spawning node's work -- never the bare
         # main-repo HEAD, which would start the child divergent from its parent
         git -C "$REPO_DIR" worktree add -q -b "$BRANCH" "$WORKTREE_DIR" "$BASE_REF"
-        # record the fork point for the init event below -- only branch
-        # creation has one (a reused branch or worktree sits at its tip, not
-        # a fork), and nothing commits between here and the event, so HEAD is
-        # the sha the node's whole contribution diffs against
-        FORK_SHA="$(git -C "$WORKTREE_DIR" rev-parse HEAD)"
     fi
     echo "Created worktree at $WORKTREE_DIR on branch $BRANCH"
 fi
+# record the incarnation's fork point for the init event below: the fork sha
+# on branch creation, and the reused tip on a re-init (--reset, or a re-added
+# worktree over an existing branch) -- history rows persist across both, so
+# an unstamped re-init would let the base anchor fall back to the original
+# fork and reach past the re-init into the dead incarnation's contribution;
+# nothing commits between here and the event, so HEAD is the sha this
+# incarnation diffs against
+FORK_SHA="$(git -C "$WORKTREE_DIR" rev-parse HEAD)"
 
 if [[ "$PROJECT_PATH" == "." ]]; then
     NODE_DIR="$WORKTREE_DIR/.fractal/$BRANCH"
@@ -650,16 +661,10 @@ if [[ "$RESET" == true ]] || [[ ! -f "$NODE_DIR/config.json" ]]; then
     echo idle >"$NODE_DIR/.status"
 fi
 
-# the fork sha (branch creation only) rides the init event's metadata -- the
-# node's base diff anchor, resolved newest-first so a re-init of a deleted
-# branch name reads its own fork, never a dead namesake's; declared =() so
-# the += below builds a clean array -- bash 3.2 prepends an empty element to
-# a bare-declared scalar on first +=, and the +-expansion stays set-u-safe
-EVENT_ARGS=()
-if [[ -n "$FORK_SHA" ]]; then
-    EVENT_ARGS+=(--metadata="$FORK_SHA")
-fi
-EVENT_ID=$(fractal event _start init ${EVENT_ARGS[@]+"${EVENT_ARGS[@]}"} \
+# the fork sha rides the init event's metadata -- the node's base diff
+# anchor, resolved newest-first so a re-init of a deleted branch name reads
+# its own fork, never a dead namesake's
+EVENT_ID=$(fractal event _start init --metadata="$FORK_SHA" \
     --path="$WORKTREE_DIR" 2>/dev/null || true)
 [[ "$EVENT_ID" =~ ^[0-9]+$ ]] || EVENT_ID=""
 if [[ -n "$EVENT_ID" ]]; then

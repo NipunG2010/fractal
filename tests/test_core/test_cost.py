@@ -390,7 +390,10 @@ def test_cost_untracked_distinguishes_null_from_zero(node_with_db: Node) -> None
     # a step that never recorded a cost -> spend sums to 0 but is untracked
     iter_1 = node.record.iter_start(run_id=run_id, iter=1)
     null_step = node.record.step_start(
-        iter_id=iter_1, run_id=run_id, step=1, step_name='PLAN'
+        iter_id=iter_1,
+        run_id=run_id,
+        step=1,
+        step_name='PLAN',
     )
     node.record.step_end(step_id=null_step, status='completed', exit_code=0)
     assert node.cost.spent() == 0.0

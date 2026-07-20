@@ -24,7 +24,10 @@ is a hang, not load.
 
 The full memory update happens in REVIEW. But if you discover something
 that would be lost if the session ended (a finding, blocker, or
-convention), write it to memory now.
+convention), write it to memory now -- a new page needs `desc:`
+frontmatter and `wiki update --path=$MEMORY_DIR` to be findable later.
+Your first memory write creates the topical layout (one page per topic,
+stubs fine -- see the memory skill), not a grab-bag page.
 
 If you hit a blocker someone else owns, raise it on the radio now rather
 than waiting for the next sync -- send it to your parent's inbox

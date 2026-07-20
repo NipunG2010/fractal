@@ -23,6 +23,7 @@ __all__ = [
     'test_list_all_shows_retired',
     'test_list_live_trusts_real_state',
     'test_list_live_relabels_crashed_active',
+    'test_list_live_reads_booting_idle_as_active',
     'test_list_renders_config_caps_over_stale_registry',
     'test_list_decorates_exited_with_run_reason',
     'test_list_flags_orphan_rows',
@@ -128,6 +129,36 @@ def test_list_live_relabels_crashed_active(
     assert live[child.branch] == 'exited'
     # display-only: the child's own .status file is untouched
     assert child.status() == 'active'
+
+
+def test_list_live_reads_booting_idle_as_active(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--live`` reads an idle node with a live tmux session as active.
+
+    A started child holds 'idle' from start.sh's launch until its loop
+    stamps 'active' after preflight, but its tmux session is already
+    live -- the boot window. The live view reads it as active: a
+    finishing parent's drain probes ``status='active,paused'`` live, and
+    an 'idle' reading there would let the parent complete over a child
+    started seconds earlier. Display-only, and a sessionless idle node
+    (spawned, never started) stays idle -- it must never block a drain.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # the boot window: .status still 'idle', the tmux session already live
+    child.status_set('idle')
+    live = {row['node']: row['status'] for row in parent.list(live=True)}
+    assert live[child.branch] == 'active'
+    # the finish drain's exact probe must see the booting child
+    draining = parent.list(status='active,paused', live=True, decorated=False)
+    assert child.branch in {row['node'] for row in draining}
+    # display-only: the child's own .status file is untouched
+    assert child.status() == 'idle'
+    # no live session (a spawned child never started) stays idle
+    monkeypatch.setattr('fractal.util.tmux.probe', frozenset)
+    live = {row['node']: row['status'] for row in parent.list(live=True)}
+    assert live[child.branch] == 'idle'
 
 
 def test_list_renders_config_caps_over_stale_registry(

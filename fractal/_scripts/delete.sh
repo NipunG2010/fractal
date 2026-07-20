@@ -124,16 +124,16 @@ if [[ -n "$MERGE_TARGET" ]] \
     if [[ -n "$MERGE_BASE" ]] \
         && ! git -C "$REPO_DIR" merge-base --is-ancestor "$BRANCH" "$MERGE_TARGET" 2>/dev/null; then
         # collect the non-seed paths the branch changed vs the base into an array
-        # (read line-by-line so a path with a space stays one entry); an empty
-        # array means only the seed changed -- nothing to warn about
-        CHANGED=$(git -C "$REPO_DIR" diff --name-only "$MERGE_BASE" "$BRANCH" \
+        # (read NUL-delimited: -z emits paths verbatim, so a space stays one
+        # entry and a non-ASCII name is never C-quoted by core.quotePath into a
+        # pathspec that matches nothing); an empty array means only the seed
+        # changed -- nothing to warn about
+        CHANGED_PATHS=()
+        while IFS= read -r -d '' CHANGED_PATH; do
+            CHANGED_PATHS+=("$CHANGED_PATH")
+        done < <(git -C "$REPO_DIR" diff --name-only -z "$MERGE_BASE" "$BRANCH" \
             -- "$SEED_EXCLUDE" ":(exclude,glob)$WIKI_PREFIX/**/_index.md" \
             ":!$WIKI_PREFIX/.wiki" 2>/dev/null || true)
-        CHANGED_PATHS=()
-        while IFS= read -r CHANGED_PATH; do
-            [[ -z "$CHANGED_PATH" ]] && continue
-            CHANGED_PATHS+=("$CHANGED_PATH")
-        done <<<"$CHANGED"
         # warn only when the target still differs from the branch on those paths
         # (after a squash merge the target already matches them -> no warning)
         if [[ ${#CHANGED_PATHS[@]} -gt 0 ]] \

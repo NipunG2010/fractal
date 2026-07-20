@@ -37,6 +37,7 @@ __all__ = [
     'test_run_timeout_none_without_active_run',
     'test_iter_timeout_counts_down_from_iteration_start',
     'test_iter_timeout_none_without_active_iteration',
+    'test_interval_defaults_the_iteration_limit_to_the_slot',
     'test_run_scope_anchors_on_run_iter_scope_on_iter',
     'test_default_reports_soonest_of_run_and_iter',
     'test_time_remaining_credits_paused_spans',
@@ -135,6 +136,29 @@ def test_iter_timeout_none_without_active_iteration(node_with_db: Node) -> None:
     node.config.set('iter_timeout', TIMEOUT)
     node.record.run_start()
     assert node.time.remaining(scope='iter') is None
+
+
+def test_interval_defaults_the_iteration_limit_to_the_slot(node_with_db: Node) -> None:
+    """An interval node with no ``--iter-timeout`` is still slot-bounded.
+
+    The loop bounds every interval iteration by its cadence, so the readers
+    must mirror that default: ``limit('iter')`` answers with the slot,
+    ``remaining(scope='iter')`` counts it down from the active iteration's
+    start (the resume anchor reads this credited figure), and an explicit
+    (tighter) ``--iter-timeout`` still wins.
+    """
+    node = node_with_db
+    node.config.set('interval', TIMEOUT)
+    assert node.time.limit('iter') == TIMEOUT_SECONDS
+    run_id = node.record.run_start()
+    iter_id = node.record.iter_start(run_id=run_id, iter=1)
+    _age_iter(node, iter_id, 100.0)
+    remaining = node.time.remaining(scope='iter')
+    assert remaining is not None
+    assert 498.0 < remaining <= TIMEOUT_SECONDS - 100.0
+    # an explicit tighter iter_timeout is honored, never loosened to the slot
+    node.config.set('iter_timeout', '5m')
+    assert node.time.limit('iter') == 300.0
 
 
 def test_run_scope_anchors_on_run_iter_scope_on_iter(node_with_db: Node) -> None:

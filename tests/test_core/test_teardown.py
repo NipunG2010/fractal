@@ -47,6 +47,7 @@ __all__ = [
     'test_teardown_refuses_on_inconclusive_tmux_probe',
     'test_teardown_locked_preflight_precedes_paused_settle',
     'test_destroy_lifecycle',
+    'test_destroy_prunes_phantom_node_branches',
     'test_reset_lifecycle',
 ]
 
@@ -756,6 +757,34 @@ def test_destroy_lifecycle(git_repo: pathlib.Path) -> None:
     # destroying again is a clean no-op
     second = Node.destroy(git_repo)
     assert 'Nothing to destroy' in second
+
+
+def test_destroy_prunes_phantom_node_branches(git_repo: pathlib.Path) -> None:
+    """Destroy deletes the branch of a node whose worktree vanished out of band.
+
+    A phantom node (registry row present, worktree ``rm -rf``'d out of band)
+    gives ``destroy.sh`` no worktree to enumerate, so its branch would outlive
+    the teardown -- and with the central DB (the last record of the branch)
+    gone, a later re-init of the name would silently resurrect the old
+    history instead of forking fresh from the parent.
+    """
+    node = Node(git_repo)
+    node.init(agent='claude', user=True)
+    node.init(name='phantom')
+    # rm -rf the worktree out of band -- the branch and registry row survive
+    shutil.rmtree(git_repo / '.worktrees' / 'main.phantom')
+
+    output = Node.destroy(git_repo)
+    assert 'Destroyed fractal' in output
+    # the phantom's branch went with the teardown
+    branches = subprocess.run(
+        ['git', 'branch', '--list', 'main.phantom'],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert branches.stdout.strip() == ''
 
 
 def test_reset_lifecycle(

@@ -73,7 +73,7 @@ class GrokParser(StreamParser):
             # for API-key traffic) -- a pool/subscription model like
             # grok-build carries no LiteLLM price entry, so token pricing
             # would drop real spend to NULL; fall back to token pricing from
-            # usage when the wire reports no cost. An absent (or present-null)
+            # usage when the wire reports no cost; an absent (or present-null)
             # usage with no wire cost stays NULL (unpriced), never $0
             wire_cost = event.get('total_cost_usd')
             usage = event.get('usage')
@@ -181,7 +181,7 @@ class GrokAgent(Agent):
         else:
             argv += ['-r', session]
         # run in the worktree: GROK_HOME supplies config/auth/sessions, so the
-        # cwd is the project not the node dir. The env carries only the
+        # cwd is the project not the node dir; the env carries only the
         # reserved GROK_HOME; XAI_API_KEY or the linked OAuth store rides the
         # ambient environment invocation() composes under it
         env = {'GROK_HOME': str(self.config_dir)}

@@ -62,6 +62,7 @@ class RadioPane:
         self.fshow = 'all'
         self.rsel = 0
         self.rd_action = 0
+        self._rows: list[dict] = []
         self._detail_row: Optional[dict] = None
         self._read_overrides: set[str] = set()
 
@@ -227,6 +228,10 @@ class RadioPane:
         """Re-mount the message rows."""
         box = self.app.query_one('#radiorows', PaneScroll)
         rows = self.rows(snap)
+        # the rows as mounted: while the user drives the pane the app keeps
+        # landing fresh snapshots without rebuilding the rows, so the cursor
+        # resolves against this list, never the live snapshot
+        self._rows = rows
         self.rsel = min(self.rsel, max(0, len(rows) - 1))
         box.remount(*[Static(self._row_render(row), classes='rrow') for row in rows])
         self.app.call_after_refresh(self.paint)
@@ -289,6 +294,8 @@ class RadioPane:
         """Return to ring mode."""
         self.app.mode = 'ring'
         self.rfocus = 'source'
+        # repay any row rebuild a landing skipped while this mode drove
+        self.app.refresh_stale()
         self.rebuild_head()
         self.paint()
         self.app.paint_ring()
@@ -306,8 +313,7 @@ class RadioPane:
                     self.rsel -= 1
                     self.paint()
             elif key == 'down':
-                rows = self.rows(self.app.snapshot)
-                self.rsel = min(len(rows) - 1, self.rsel + 1)
+                self.rsel = min(len(self._rows) - 1, self.rsel + 1)
                 self.paint()
             elif key == 'enter':
                 self._open_row()
@@ -418,7 +424,7 @@ class RadioPane:
         snapshot lands); any other node's mailbox is observed without
         touching -- or appearing to touch -- its state.
         """
-        rows = self.rows(self.app.snapshot)
+        rows = self._rows
         if not rows:
             return
         row = rows[min(self.rsel, len(rows) - 1)]

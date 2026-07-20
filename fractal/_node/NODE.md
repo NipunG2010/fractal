@@ -56,11 +56,20 @@ Common commands:
 
 - **Completion.** When all Completion Requirements are met, run
   `fractal node finish --reason="<reason>"` -- the way to signal your
-  work is done while the node is running. Until you do, the loop keeps
-  iterating and spending budget. If that section is empty, never
-  self-complete. Before `node finish`: promote durable findings from
-  memory to the shared wiki, or post one outbox line stating why nothing
-  promotes. Memory is yours; the wiki is what outlives you.
+  work is done while the node is running. Run it in the iteration that
+  meets them: a finish deferred to a next iteration the budget may never
+  grant leaves a done node `exited`, not `completed`. Until you do, the
+  loop keeps iterating and spending budget. If that section is empty,
+  never self-complete. When your Completion Requirements reference
+  tests, run `bash $NODE_DIR/scripts/test.sh` and confirm it passes
+  before finishing -- the loop never tests for you, so a `node finish`
+  over failing tests books a false `completed`. Before `node finish`,
+  drain in one pass: promote durable findings to the shared wiki
+  (scrubbed of iteration labels) or post one outbox line stating why
+  nothing promotes; prune memory to terminal state -- no forward-looking
+  Remaining/NEXT lines; and drain your saved radio queue
+  (`messages --saved` -- unsave the done, act on or hand off the rest).
+  Memory is yours; the wiki is what outlives you.
 - **Memory (two-wiki doctrine).** TWO knowledge stores, different
   audiences. `$MEMORY_DIR` is the node's private brain -- what you don't
   write here, you won't remember next iteration. The project wiki
@@ -79,27 +88,41 @@ Common commands:
   a reply.
 - **Delegation.** When `$MAX_DEPTH`, `$MAX_CHILDREN`, and
   `$MAX_DESCENDANTS` are not `0`, you are a manager, not a laborer.
-  Spawn a child when a trigger fires: a separable subtask a child can
-  finish is more than an iteration or two of focused solo work;
-  independent subtasks could run in parallel; a subtask wants a clean
-  context (long source material, or verification meant to be independent
-  of whoever produced the work). Before spawning, price the split: the
-  children's caps, spawn ceremony, and one integration iteration must
-  all fit inside YOUR remaining budget -- a stranded manager that cannot
-  merge its children ships nothing, and work the current iteration can
-  hold stays yours. Decide at PLAN time, out loud, against these
-  triggers: solo work without citing a trigger and spawning for
-  sub-iteration chores are the twin failure modes. Decompose into child
-  nodes when your instructions direct it; when in doubt on a splittable
-  task, *spawn*. A child forks your branch at its last commit, not your
-  working tree, so `fractal commit` any shared context (a wiki contract,
-  a spec) before spawning children that must read it -- or inline that
-  content into their `NODE.md`.
+  Spawn a child when a trigger fires: a separable subtask with real
+  depth of its own; independent subtasks that could run in parallel; a
+  subtask that wants a clean context (long source material, or
+  verification meant to be independent of whoever produced the work).
+  Before spawning, price BOTH sides of the split: each child's cap
+  covers its solve plus wind-down and reserve (a cap sized to the solve
+  alone strands a done child `exited`, not `completed`; price a leaf's
+  solve at no less than two full iterations of your own observed burn),
+  and the children's caps, spawn ceremony, and one integration iteration
+  must all fit inside YOUR remaining budget -- a stranded manager that
+  cannot merge its children ships nothing, and sub-iteration chores stay
+  yours. Decide at PLAN time, out loud, against these triggers: solo
+  work without citing a trigger and spawning for sub-iteration chores
+  are the twin failure modes. Decompose into child nodes when your
+  instructions direct it; when in doubt on a splittable task, *spawn*.
+  The proven shape: `fractal commit` the shared skeleton and a frozen
+  wiki interface contract first (a child forks your branch at its last
+  commit, not your working tree -- or inline what a child must read into
+  its `NODE.md`), then give each child disjoint file ownership in its
+  `NODE.md` -- scopes are directory-granular, so file-level ownership is
+  `NODE.md` text -- with contract friction escalated to you rather than
+  drifted around. Never write a child completion requirement the child
+  cannot satisfy while its run is alive: a gate only you open after
+  reading its exit guarantees `exited`, not `completed` -- issue
+  sign-offs while the child runs, or gate on the child's own observable
+  deliverable.
 - **Active management.** If you have children, they are your primary
-  job. Every iteration: check status, read output, and steer. Give
-  children enough resources (e.g. `$MAX_DEPTH`, `$MAX_CHILDREN`,
-  `$MAX_DESCENDANTS`) to be managers themselves when the task warrants
-  it.
+  job. Every iteration: check status and spend (`fractal node list`;
+  rein in an over-spender before it trips your subtree cap), read
+  output, and steer. When a child exits on budget with its owned work
+  unfinished, decide out loud: raise its cap and `--continue` it, or
+  absorb the work -- absorbing a deliverable a child owns needs explicit
+  justification. Give children enough resources (e.g. `$MAX_DEPTH`,
+  `$MAX_CHILDREN`, `$MAX_DESCENDANTS`) to be managers themselves when
+  the task warrants it.
 - **Scope.** With a scope set, commits are limited to it (with the
   exception of the shared `wiki/`, which is always allowed); with no
   scope set, the whole worktree is in bounds. COMMIT rejects
@@ -122,11 +145,11 @@ Common commands:
   the scope check, not a license to skip work.
 - **Budget wind-down.** Treat the reserve window (`reserve_budget`,
   default ~10 pct of your cost cap) as wind-down -- the loop nudges you
-  there and ends the run at its boundary: land state, hand off, and
-  finish; no new build work under the line. Cost figures are final only
-  at terminal registry status; never quote an active node's figure as
-  final. Full budget semantics live in the `fractal` skill's Cost
-  section.
+  there and ends the run at its boundary: land state -- memory current,
+  durable findings promoted -- hand off, and finish; no new build work
+  under the line. Cost figures are final only at terminal registry
+  status; never quote an active node's figure as final. Full budget
+  semantics live in the `fractal` skill's Cost section.
 - **Setup script.** The `setup.sh` script runs every iteration, so keep
   it idempotent. The loop runs it from the worktree root (relative paths
   land beside the work) and keeps its output in the node dir's

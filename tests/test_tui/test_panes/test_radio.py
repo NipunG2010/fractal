@@ -31,6 +31,7 @@ __all__ = [
     'test_empty_rows_open_is_a_no_op',
     'test_detail_react_and_save_write_through',
     'test_opening_the_roots_own_message_marks_it_read',
+    'test_enter_opens_the_highlighted_row_after_a_snapshot_lands',
     'test_detail_chat_hands_off_to_the_composer',
     'test_hostile_message_markup_renders_literally',
 ]
@@ -200,8 +201,13 @@ async def test_empty_rows_open_is_a_no_op(
     async with app.run_test(size=(150, 48)) as pilot:
         pane = app.radio_pane
         # filter to a channel with no messages, then dive into the (empty) rows
-        pane.fchannel = 'private'
-        await pilot.press('right', 'enter', 'down', 'down')
+        await pilot.press('right', 'enter', 'down', 'enter')  # drop the channel filter
+        drop = app.query_one('#rdrop', OptionList)
+        drop.highlighted = ['all', 'inbox', 'outbox', 'public', 'private'].index(
+            'private'
+        )
+        await pilot.press('enter')  # apply: alpha has no private messages
+        await pilot.press('down')
         assert pane.rfocus == 'rows'
         assert pane.rows(app.snapshot) == []
         await pilot.press('enter')  # no row to open
@@ -311,6 +317,67 @@ async def test_opening_the_roots_own_message_marks_it_read(
     finally:
         connection.close()
     assert [row['node'] for row in readers] == ['main']
+
+
+async def test_enter_opens_the_highlighted_row_after_a_snapshot_lands(
+    pair_tree: pathlib.Path,
+) -> None:
+    """A snapshot landing under the cursor never redirects the open.
+
+    While the user drives the rows the app keeps landing fresh snapshots
+    without rebuilding them (never yank rows out from under a cursor). A new
+    arrival sorts in above the highlight (newest first), so resolving the
+    cursor against the fresh snapshot would open -- and read-stamp -- the
+    row above the one on screen.
+    """
+    root = resolve_node(pair_tree)
+    highlighted, _, _ = Radio(root).send(
+        node='main',
+        channel='public',
+        subject='the one on screen',
+        data='the row under the cursor',
+        priority=5,
+    )
+    app = FractalApp(root, branch='main')
+    async with app.run_test(size=(150, 48)) as pilot:
+        await pilot.press('right', 'enter', 'down', 'down')  # into the rows
+        assert (app.radio_pane.rfocus, app.radio_pane.rsel) == ('rows', 0)
+        # a new message arrives mid-browse and its snapshot lands off-thread
+        before = app.snapshot
+        Radio(root).send(
+            node='main',
+            channel='public',
+            subject='the new arrival',
+            data='shifts every row down one',
+            priority=5,
+        )
+        app._tick()
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if app.snapshot is not before:
+                break
+        assert [row['subject'] for row in app.snapshot.messages] == [
+            'the new arrival',
+            'the one on screen',
+        ]
+        await pilot.press('enter')  # open: the highlight still shows the first send
+        await pilot.pause()
+        assert app.mode == 'rdetail'
+        assert app.radio_pane._detail_row['message_uuid'] == highlighted
+    data = TuiData(root)
+    data.refresh_worktrees()
+    connection = data.connect()
+    try:
+        readers = data.rows(
+            connection=connection,
+            query='SELECT m.message_uuid FROM reads r JOIN messages m'
+            ' ON r.message_id = m.message_id WHERE r.node = ?',
+            params=('main',),
+        )
+    finally:
+        connection.close()
+    # the receipt stamped the opened row -- and only it
+    assert [row['message_uuid'] for row in readers] == [highlighted]
 
 
 async def test_detail_chat_hands_off_to_the_composer(pair_tree: pathlib.Path) -> None:

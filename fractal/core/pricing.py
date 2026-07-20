@@ -51,6 +51,7 @@ def update(max_age: Optional[str] = None) -> str:
     # fetch to a per-process temp file, then swap in atomically; import urllib
     # locally so the http/ssl stack stays off every CLI cold-start -- only this
     # fetch needs it, and most commands (and the cache-fresh path above) never do
+    import http.client
     import socket
     import urllib.request
 
@@ -67,14 +68,16 @@ def update(max_age: Optional[str] = None) -> str:
     socket.setdefaulttimeout(_FETCH_TIMEOUT_SECONDS)
     try:
         # fetch the price table (pinned https url; scheme is safe); a stall
-        # raises socket.timeout into the OSError fallback below
+        # raises socket.timeout (an OSError), but a malformed response --
+        # truncated chunked body, garbage status line -- escapes urlretrieve
+        # as a raw HTTPException, so the fallback must catch both classes
         urllib.request.urlretrieve(_PRICING_URL, tmp)  # noqa: S310
         os.replace(tmp, cache)
         # invalidate the process memo so rates() re-reads the fresh table --
         # without this the loop's per-iteration refresh is inert (a run that
         # first read a stale/empty table would price against it forever)
         _load.cache_clear()
-    except OSError:
+    except (OSError, http.client.HTTPException):
         return 'stale' if cache.exists() else 'missing'
     finally:
         socket.setdefaulttimeout(saved_timeout)

@@ -15,6 +15,7 @@ PAUSE_ABORT_FILE = '.pause_abort'
 PAUSED_FILE = '.paused'
 PGID_FILE = '.pgid'
 SESSION_FILE = '.session'
+SOCKET_FILE = '.socket'
 STATUS_FILE = '.status'
 STEP_PGID_FILE = '.step_pgid'
 

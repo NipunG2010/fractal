@@ -121,8 +121,10 @@ class Time:
 
         Pure config -- no row reads -- so it answers for an idle node too:
         the ``run`` scope reads the whole-run ``timeout`` key, ``iter``/
-        ``step`` their per-level timeouts. With no ``scope`` the soonest
-        applicable limit (the smallest configured) is returned.
+        ``step`` their per-level timeouts; an unset ``iter_timeout`` falls
+        back to ``interval`` (the loop bounds an interval iteration by its
+        slot). With no ``scope`` the soonest applicable limit (the smallest
+        configured) is returned.
 
         Args:
             scope: ``'run'``, ``'iter'``, or ``'step'`` to query one
@@ -143,6 +145,10 @@ class Time:
             timeout = self._node.config.get('timeout')
         elif scope == 'iter':
             timeout = self._node.config.get('iter_timeout')
+            # interval bounds the iteration to its slot when no explicit
+            # iter_timeout is set (mirrors the loop's per-iteration default)
+            if not timeout:
+                timeout = self._node.config.get('interval')
         elif scope == 'step':
             timeout = self._node.config.get('step_timeout')
         else:

@@ -24,6 +24,8 @@ def write_atomic(path: pathlib.Path, data: Union[str, bytes]) -> None:
     leaves a torn one. Staging to a dot-prefixed temp file in the
     target's directory and swapping it into place makes every read
     all-or-nothing. Text writes land utf-8 with LF endings verbatim.
+    A symlinked destination resolves first, so the swap updates the
+    link's target and the link itself survives.
     ``mkstemp`` creates the temp ``0600`` and ``os.replace`` carries
     that mode onto the target, so an existing target's mode is
     preserved explicitly and a fresh file honors the umask.
@@ -33,6 +35,10 @@ def write_atomic(path: pathlib.Path, data: Union[str, bytes]) -> None:
         data: Payload -- ``str`` lands utf-8 with LF endings, ``bytes`` verbatim.
 
     """
+    # resolve so a symlinked destination is written through, not replaced:
+    # os.replace swaps the final path component, which would swap out the
+    # link itself and strand its target stale
+    path = path.resolve()
     fd, tmp = tempfile.mkstemp(
         dir=path.parent,
         prefix=f'.{path.name}-',

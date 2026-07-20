@@ -97,6 +97,21 @@ class Snapshot:
     saved: tuple[dict, ...]  # scope's archive (lazy)
     geometry: Geometry
 
+    @property
+    def ticking(self: Snapshot) -> bool:
+        """Return whether the card shows an open row measuring the live clock.
+
+        A quiet tree reuses this object tick after tick; while this holds
+        the app still repaints the card, so the open rows' elapsed cells
+        and cap gauges keep ticking between disk writes.
+        """
+        measures = self.measures
+        return measures is not None and (
+            measures['started_step'] is not None
+            or measures['started_iter'] is not None
+            or measures['started_run'] is not None
+        )
+
 
 class SnapshotBuilder:
     """Snapshot builder over per-branch section caches keyed by poll tokens."""
@@ -180,7 +195,7 @@ class SnapshotBuilder:
         # reconcile crashed-but-active nodes for display only: a loop that died
         # leaves .status 'active' with no tmux session; fetch the live sessions
         # once and drop any brief whose session is gone so it rebuilds as the
-        # honest 'exited'. A crash doesn't move the .status mtime, so the poller
+        # honest 'exited'; a crash doesn't move the .status mtime, so the poller
         # can't catch it -- liveness is checked here EVERY build, ahead of the
         # short-circuit below, or a node that crashed since the last build would
         # stay 'active' in the reused snapshot forever
@@ -565,6 +580,12 @@ class SnapshotBuilder:
             'elapsed_step': self._elapsed(step) if step else None,
             'elapsed_iter': self._elapsed(it) if it else None,
             'elapsed_run': self._elapsed(run),
+            # open rows also carry their start instant: a quiet tree reuses
+            # this snapshot tick after tick, so the pane re-ticks their
+            # elapsed against the render clock instead of the baked value
+            'started_step': _open_epoch(step),
+            'started_iter': _open_epoch(it),
+            'started_run': _open_epoch(run),
             'cost_step': step['cost'] if step else None,
             'cost_iter': sum(s['cost'] or 0 for s in it_steps) if it else None,
             'cost_run': spends[run['run_id']],
@@ -939,6 +960,16 @@ def _end_epoch(row: dict) -> float:
     if row['started'] is None or row['duration'] is None:
         return math.inf
     return row['started'].timestamp() + row['duration']
+
+
+def _open_epoch(row: Optional[dict]) -> Optional[float]:
+    """Return an open row's start instant; ``None`` once settled (no tick)."""
+    if row is None or row['ended_at'] is not None:
+        return None
+    started = parse_ts(row['started_at'])
+    if started is None:
+        return None
+    return started.timestamp()
 
 
 def _step_total(steps: list[dict], run: dict) -> Optional[int]:

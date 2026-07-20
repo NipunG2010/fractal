@@ -22,6 +22,7 @@ from fractal.constants import (
     PAUSED_FILE,
     PGID_FILE,
     PROJECT_FOLDER,
+    SOCKET_FILE,
     STATUS_FILE,
     STATUSES,
     STEP_PGID_FILE,
@@ -90,8 +91,7 @@ class Node:
             branch: Pin the node's branch instead of reading it from git.
                 Only for resolving a node whose worktree is checked out to a
                 different branch (the user node from a non-init checkout, via
-                :func:`fractal.cli.utils.resolve_user_node`); ``None`` reads
-                the live git branch.
+                :meth:`resolve_user`); ``None`` reads the live git branch.
 
         """
         self._root = pathlib.Path(path).expanduser().resolve()
@@ -276,13 +276,25 @@ class Node:
 
         Mirrors ``start.sh``'s check exactly: an exact-match (not ``tmux -t``,
         which resolves targets by prefix/fnmatch and false-matches longer
-        names) of the session name against ``tmux list-sessions``. ``None``
-        when the probe is inconclusive -- :func:`fractal.util.tmux.probe` got
-        no answer from tmux (binary absent, or ``list-sessions`` failed for
-        anything but the definitive ``no server running``) -- so the
-        reconcile path never mistakes a blind host for a dead loop.
+        names) of the session name against ``tmux list-sessions``. The
+        listing asks the server the session lives on -- the socket the loop
+        recorded at boot (``.socket``) -- because a tmux answer is evidence
+        about one server only: the ambient socket's "no sessions" (a shell
+        with a different ``TMUX_TMPDIR``) says nothing about a session alive
+        on the recorded one; without a record (a tmux-less launch), the
+        ambient socket is all there is. ``None`` when the probe is
+        inconclusive -- :func:`fractal.util.tmux.probe` got no answer from
+        tmux (binary absent, or ``list-sessions`` failed for anything but
+        the definitive ``no server running``) -- so the reconcile path never
+        mistakes a blind host for a dead loop.
         """
-        sessions = fractal.util.tmux.probe()
+        # probe the recorded socket, not whichever one this shell resolves
+        socket_file = self.node_dir / SOCKET_FILE
+        if socket_file.exists():
+            socket = socket_file.read_text(encoding='utf-8').strip()
+            sessions = fractal.util.tmux.probe(socket=socket)
+        else:
+            sessions = fractal.util.tmux.probe()
         if sessions is None:
             return None
         return self.tmux_session in sessions
@@ -309,8 +321,9 @@ class Node:
         host or after a filesystem transplant to another. An inconclusive
         probe (no answer from tmux) also skips the heal: the reap keys off
         proof the session is gone, never off ignorance -- a shell without
-        tmux visibility (a cron/CI host, a different socket) must not kill
-        a healthy loop's process groups.
+        tmux visibility (a cron/CI host) must not kill a healthy loop's
+        process groups, and a shell on a *different* socket gets its proof
+        from the loop's recorded one (see :meth:`_tmux_session_exists`).
 
         Never reconciles the node from inside its own running loop: the loop
         self-finishes (``send_budget_finish`` calls ``node finish``), and a
@@ -327,6 +340,9 @@ class Node:
             self.record.close_open('exited')
             self.status_set('exited')
             self.config.reconcile()
+            # the heal is the record's catch -- the settled node keeps no
+            # socket handle (the next boot writes a fresh one)
+            (self.node_dir / SOCKET_FILE).unlink(missing_ok=True)
 
     def _reap_orphan(self: Node) -> None:
         """Kill surviving process groups recorded by a dead loop.
@@ -339,7 +355,9 @@ class Node:
         spending -- headless. The reap follows ``kill.sh``'s TERM-grace-KILL
         cadence and logs an ``orphan`` event naming each reaped pgid.
         Best-effort: a dead, recycled, or foreign group reads as already
-        gone.
+        gone -- recycled meaning the OS re-issued a dead group's id to an
+        unrelated same-user group, which answers a liveness probe but is
+        younger than its record (:func:`_recorded_group`).
         """
         for name in (PGID_FILE, STEP_PGID_FILE):
             pgid_file = self.node_dir / name
@@ -350,6 +368,11 @@ class Node:
                 pgid = int(pgid_file.read_text(encoding='utf-8').strip())
                 os.killpg(pgid, 0)
             except (ValueError, ProcessLookupError, PermissionError):
+                pgid = 0
+            # aliveness is not identity: a recycled pid answers the probe
+            # from an unrelated group -- spare any group younger than its
+            # record
+            if pgid > 0 and not _recorded_group(pgid, pgid_file.stat().st_mtime):
                 pgid = 0
             # reap the group and audit the reap
             if pgid > 0:
@@ -396,6 +419,63 @@ class Node:
             )
             if worktree:
                 return cls(worktree)
+        return None
+
+    @classmethod
+    def resolve_user(cls: type[Node], path: PathLike) -> Optional[Node]:
+        """Resolve the repo's user (root) node by config, not the checkout.
+
+        A bare ``Node`` keys on the repo's *current* branch, so on a non-init
+        checkout (the user on their own branch while nodes run) the user node
+        reads as uninitialized even though the fractal exists. Scan the repo's
+        fractal data dirs (top-level and each sub-project) for the
+        ``config.json`` marked ``user: true`` and pin a ``Node`` to that
+        branch, independent of the git checkout.
+
+        Args:
+            path: Any path inside the repo.
+
+        Returns:
+            The user (root) node, branch-pinned, or ``None`` when there is
+            no user node to find (no fractal, or no git repo at all).
+
+        """
+        # mirror exists(): a repo-less path has no user node, not an error
+        try:
+            repo = cls(path).repo_dir
+        except RuntimeError:
+            return None
+        # the user config lives at <repo>/[<project>/].fractal/<branch>/config.json;
+        # check the top level first, then each sub-project dir
+        fractal_dirs = [repo / FRACTAL_FOLDER]
+        fractal_dirs += [
+            sub / FRACTAL_FOLDER
+            for sub in sorted(repo.iterdir())
+            if sub.is_dir() and sub.name != WORKTREES_FOLDER
+        ]
+        # a nested sub-project (e.g. packages/foo) sits below iterdir's reach;
+        # its dir resolves through the .worktrees/.project cache (written at
+        # init, kept through reset)
+        project_dir = repo / WORKTREES_FOLDER / PROJECT_FOLDER
+        if project_dir.is_dir():
+            for project_file in sorted(project_dir.iterdir()):
+                project = worktree.project_path(repo, project_file.name)
+                if project != '.':
+                    fractal_dirs.append(repo / project / FRACTAL_FOLDER)
+        for fractal_dir in fractal_dirs:
+            if not fractal_dir.is_dir():
+                continue
+            for config_path in sorted(fractal_dir.glob(f'*/{CONFIG_FILE}')):
+                try:
+                    config = json.loads(config_path.read_text(encoding='utf-8'))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if config.get('user'):
+                    # anchor at the git root -- Node.node_dir derives the
+                    # <project>/ prefix from the .worktrees/.project cache, so a
+                    # sub-project anchor would double the prefix (mirrors
+                    # resolve_init_target); the branch is the config dir's name
+                    return cls(repo, branch=config_path.parent.name)
         return None
 
     def exists(self: Node) -> bool:
@@ -501,6 +581,8 @@ class Node:
             Script output.
 
         """
+        from .agent import resolve
+
         # coerce path to a str -- downstream '.' comparisons and persisted
         # caches expect the string form
         if path is not None:
@@ -515,13 +597,16 @@ class Node:
             raise ValueError('Node name is required.')
         worktree.validate_name(name)
         # flatten scope entries -- the CLI form is comma-separated, with
-        # repeated flags tolerated, so each entry may carry several roots
+        # repeated flags tolerated, and whitespace is the stored form's
+        # separator (config _set splits on it), so split on both here;
+        # validating the pre-split string would pass roots the canonical
+        # form later shatters
         if scope:
             scope = [
-                root.strip()
+                root
                 for entry in scope
-                for root in entry.split(',')
-                if root.strip()
+                for chunk in entry.split(',')
+                for root in chunk.split()
             ]
             # a scope root is a repo-relative subdirectory -- reject an
             # absolute or '..' path, which would persist into config.json
@@ -611,21 +696,20 @@ class Node:
         # .worktrees flock below, after a fresh re-read, so concurrent fan-out
         # cannot each pass the check before any of them takes the lock (a TOCTOU
         # race that would defeat the caps)
-        self.config.validate(
-            {
-                'max_cost': max_cost,
-                'max_iter_cost': max_iter_cost,
-                'max_step_cost': max_step_cost,
-                'reserve_budget': reserve_budget,
-                'timeout': timeout,
-                'iter_timeout': iter_timeout,
-                'step_timeout': step_timeout,
-                'step_retry_backoff': step_retry_backoff,
-                'interval': interval,
-                'sleep': sleep,
-                'wait': wait,
-            }
-        )
+        config_values = {
+            'max_cost': max_cost,
+            'max_iter_cost': max_iter_cost,
+            'max_step_cost': max_step_cost,
+            'reserve_budget': reserve_budget,
+            'timeout': timeout,
+            'iter_timeout': iter_timeout,
+            'step_timeout': step_timeout,
+            'step_retry_backoff': step_retry_backoff,
+            'interval': interval,
+            'sleep': sleep,
+            'wait': wait,
+        }
+        self.config.validate(config_values)
         # inherit local from the parent; local is immutable once set
         if parent.config.get('local'):
             if parent is self:
@@ -651,6 +735,13 @@ class Node:
                     'No --agent given and no ancestor has one configured;'
                     " pass --agent or set a default with 'fractal init --agent'."
                 )
+        # resolve the agent's base command against the registry now, reading
+        # the CLASS without construction (the child node does not exist yet)
+        # -- a junk name would store fine and kill the loop at boot inside
+        # the tmux pane, after start already printed its success, so the
+        # typo refuses here with the registry's supported-list error
+        base_word, *_ = agent.split()
+        resolved = resolve(base_word, root=parent.db.path.parent)
         # inherit the provider route the same way, materializing it only when
         # the child's agent supports routes -- an openrouter-defaulting
         # ancestor must never pin a route on a route-less backend (no raise
@@ -660,23 +751,8 @@ class Node:
                 if ancestor_provider := ancestor.config.get('provider'):
                     provider = ancestor_provider
                     break
-            if provider is not None:
-                # read the CLASS's routes without construction (the child node
-                # does not exist yet); a junk agent stores fine and fails at
-                # the seam today -- skip materialization the same way
-                from .agent import resolve
-
-                base_word, *_ = agent.split()
-                try:
-                    resolved = resolve(
-                        base_word,
-                        root=parent.db.path.parent,
-                    )
-                    providers = resolved.providers
-                    if provider not in providers:
-                        provider = None
-                except ValueError:
-                    provider = None
+            if provider is not None and provider not in resolved.providers:
+                provider = None
         # inherit the parent's preference config when requested -- explicit
         # flags win, values land in the child's config as a spawn-time
         # snapshot, and budget-class keys (costs, iters, depth/children,
@@ -807,6 +883,23 @@ class Node:
                 repo_dir=self.repo_dir,
                 branch=child_branch,
             )
+            # a case-insensitive filesystem resolves a name differing from a
+            # sibling only by case onto the sibling's worktree dir -- init.sh
+            # would then run every path below (node dir, init event, a
+            # --reset's rm -rf) against the sibling's node -- so refuse when
+            # the child's path lands on another branch's worktree
+            if child_worktree_dir is None:
+                child_path = self.repo_dir / WORKTREES_FOLDER / child_branch
+                if child_path.is_dir():
+                    worktrees = fractal.util.git.worktree_map(self.repo_dir)
+                    for branch, worktree_dir in worktrees.items():
+                        if child_path.samefile(worktree_dir):
+                            raise ValueError(
+                                f'Node {child_branch!r} would alias existing'
+                                f' node {branch!r} on this case-insensitive'
+                                ' filesystem; use a name that differs by more'
+                                ' than letter case.'
+                            )
             # refuse an implicit adopt: exiting 0 against an existing node
             # would leave its old config in place and silently drop the
             # requested caps -- reuse is explicit in this CLI, never an accident
@@ -923,8 +1016,29 @@ class Node:
             Confirmation message.
 
         """
+        from .agent import resolve
+
         # alias branch
         branch = self.branch
+        # a detached checkout (a tag clone, CI, mid-bisect) resolves to the
+        # literal 'HEAD' -- a name git reserves, so it can only mean detachment
+        # -- and a tree anchored on that pseudo-ref re-resolves to whatever is
+        # checked out later, orphaning the registry and stranding the baseline
+        if branch == 'HEAD':
+            raise ValueError(
+                'Cannot initialize a user node on a detached HEAD.'
+                " Check out a branch first ('git switch -c <branch>')."
+            )
+        # reject a slash branch up front -- every per-branch artifact (the
+        # .project cache entry, the .fractal/<branch> data dir, the scripts'
+        # reads of both) keys on the branch as a single path component, so a
+        # 'feat/x'-style branch fails here before any partial init is written
+        if '/' in branch:
+            raise ValueError(
+                f'Cannot initialize a user node on branch {branch!r}:'
+                " branch names containing '/' are not supported -- switch"
+                ' to a slash-free branch and re-run init.'
+            )
         # default the path to self._root relative to the repo root; coerce to a
         # str so it serializes cleanly into config.json and the .project cache
         if path is None:
@@ -953,6 +1067,15 @@ class Node:
         # ASCII identifier) up front so a bad dir name fails before any partial
         # init is written; it doubles as the wiki name
         wiki_name = worktree.derive_project_name(self.repo_dir)
+        # resolve the default agent against the registry up front, for the
+        # same reason -- a typo'd name would store fine, every spawn would
+        # inherit it, and each start's loop would die on a vanishing tmux
+        # pane with the registry error unread; the node dir (the central
+        # DB's future home, derivable pre-init) is consulted for a hook
+        # file when present -- a fresh init has none, so built-ins gate
+        if agent is not None:
+            base_word, *_ = agent.split()
+            resolve(base_word, root=self.node_dir)
         # idempotent: an existing user node is not clobbered, but a partial
         # prior init (config.json written before db/radio/wiki) is repaired
         # on re-run -- db.init and radio.init are both idempotent
@@ -982,6 +1105,25 @@ class Node:
             if created:
                 message += ' Re-created the missing project wiki.'
             return message
+        # refuse if another active fractal on this machine shares this repo's
+        # tmux namespace: node sessions and `node kill` resolve by the global
+        # name '<repo-basename> (<branch>)', so two fractals under one basename
+        # collide and a kill can cross-fire onto the other tree. tmux names
+        # carry no repo path, but this fractal does not exist yet, so any live
+        # session under our basename is necessarily a different repo's.
+        repo_name = self.repo_dir.name.replace('.', '-').replace(':', '-')
+        sessions = fractal.util.tmux.probe()
+        if sessions is not None:
+            prefix = f'{repo_name} ('
+            clash = next((name for name in sessions if name.startswith(prefix)), None)
+            if clash is not None:
+                raise RuntimeError(
+                    f'Another active fractal already uses the tmux name'
+                    f' {repo_name!r} (session {clash!r}). Two fractals sharing a'
+                    f' repository basename collide on node sessions and'
+                    f' `node kill` -- rename this repository directory or stop'
+                    f' that fractal first.'
+                )
         # write the project cache first so node_dir resolves under <project>/
         worktree.set_project_path(self.repo_dir, branch, path)
         # create node directory (under <repo_dir>/<project>/.fractal/<branch>)
@@ -1042,8 +1184,8 @@ class Node:
         """
         # prepend the user node's own seed dir so the top-level branch ignores it;
         # child seeds (.fractal/<branch>.<child>) stay tracked so meta and merge-up
-        # keep working -- `fractal track` opts the top-level branch back in. Skip
-        # when the repo has no commit yet (no branch to resolve a node from).
+        # keep working -- `fractal track` opts the top-level branch back in; skip
+        # when the repo has no commit yet (no branch to resolve a node from)
         branch = fractal.util.git.branch(self._root, check=False)
         user = None
         if branch:
@@ -1107,6 +1249,8 @@ class Node:
             retune echo, the continue-from-killed countermand).
 
         """
+        from .agent import resolve
+
         # reject user nodes
         if self.is_user:
             raise RuntimeError('Cannot start a user node.')
@@ -1135,6 +1279,22 @@ class Node:
             raise RuntimeError(
                 f'Cannot start under a paused node ({latched}). Resume it first.'
             )
+        # refuse a foreign tmux-session collision on a fresh start: a
+        # first-start node has no session of its own, so a live session under
+        # its name belongs to another fractal sharing this repo's basename,
+        # and `node kill`/attach would resolve ambiguously across both; a
+        # continue is exempt -- its own session may legitimately be present,
+        # and start.sh's exact-name check still backstops that path
+        if not continue_run:
+            session = self.tmux_session
+            sessions = fractal.util.tmux.probe()
+            if sessions is not None and session in sessions:
+                raise RuntimeError(
+                    f'Cannot start: the tmux session {session!r} is already'
+                    f' active for another fractal (a repository sharing this'
+                    f' basename and node name). Stop it, or rename one'
+                    f' repository directory.'
+                )
         # launch-time notices (the retune echo, the kill countermand) ride
         # the returned confirmation -- core never prints; the CLI echoes it
         notices: list[str] = []
@@ -1179,7 +1339,7 @@ class Node:
             # acknowledgment; node-dir paths are exempt (the restore commits
             # them, config.json included); -uall is load-bearing: without it git
             # collapses an untracked node dir to a bare `?? .fractal/` entry the
-            # prefix filter would miss. Checked before the retune below so a
+            # prefix filter would miss; checked before the retune below so a
             # refused continue never persists a --max-cost the caller passed
             if not clean:
                 node_prefix = f'{self.node_dir.relative_to(self._root)}/'
@@ -1257,6 +1417,15 @@ class Node:
         # the loop after start prints "Started", wedging the node idle with the
         # only error on a dying tmux pane
         self.config.validate()
+        # resolve the stored agent against the registry the way the loop's
+        # boot does (the loop reads this node's own config key, never the
+        # ancestor walk) -- the same steering path can typo or drop it, and
+        # the loop's registry error would land on the same dying pane
+        agent = self.config.get('agent')
+        if not agent:
+            raise ValueError('No agent configured; set --agent at node init.')
+        base_word, *_ = agent.split()
+        resolve(base_word, root=self.db.path.parent)
         # a blind node reads no channels -- sweep any subscriptions that
         # landed between init (which seeds none) and this launch
         if self.config.get('blind'):
@@ -1617,13 +1786,36 @@ class Node:
         self._run_script('stop.sh', f'{self._root}')
         self.record.event_end(event_id=event_id, status='completed')
 
+    def _killable(self: Node, current: str) -> bool:
+        """Return whether ``current`` admits a kill of this node.
+
+        ``active`` and ``paused`` always do. ``idle`` does only while the
+        node's tmux session is live -- a boot in flight (``start.sh``
+        created the session, the loop's preflight has not stamped
+        ``active`` yet), which a status read alone cannot tell from a
+        never-started node. An inconclusive probe reads as no session:
+        the reap keys off proof a loop lives, never off ignorance.
+
+        Args:
+            current: The node status the caller read.
+
+        Returns:
+            Whether a kill may proceed.
+
+        """
+        if current in ('active', 'paused'):
+            return True
+        return current == 'idle' and bool(self._tmux_session_exists())
+
     def kill(self: Node, reason: Optional[str] = None) -> str:
         """Kill the node and its active or paused descendants (children first).
 
         Reaps each tmux session and marks its active rows ``killed``. Paused
         nodes are killable -- the escape hatch for a parked subtree; with no
         loop alive the kill is pure bookkeeping (``kill.sh`` no-ops and the
-        open rows close ``killed``).
+        open rows close ``killed``). A booting node -- session up, ``active``
+        not yet stamped -- is killable too (:meth:`_killable`), so a spawn
+        in flight when the kill lands is reaped, not skipped.
 
         Args:
             reason: Optional reason for killing.
@@ -1636,7 +1828,7 @@ class Node:
         # no descendant reaped; the self-kill below re-checks under the flock
         # for the race window
         current = self.status()
-        if current not in ('active', 'paused'):
+        if not self._killable(current):
             self._signal_refuse(
                 verb='kill',
                 event='kill',
@@ -1647,17 +1839,19 @@ class Node:
         # NOTE: re-enumerate to a fixpoint -- a descendant that registered
         #   mid-sweep (a spawn already in flight when the kill signal landed)
         #   would escape a single pass, so re-read until no fresh live
-        #   descendant appears; seen bounds the loop (each branch is reaped
-        #   at most once and the subtree is finite), so it converges even if
-        #   a stuck child never settles. Each helper guards its own node
-        #   under the flock, so a descendant that settled mid-sweep is
-        #   skipped (refusal recorded) while the self-act refusal raises.
+        #   descendant appears; _killable also admits a booting descendant
+        #   ('idle' until preflight stamps 'active'), which a status-only
+        #   filter would exit over; seen bounds the loop (each branch is
+        #   reaped at most once and the subtree is finite), so it converges
+        #   even if a stuck child never settles; each helper guards its own
+        #   node under the flock, so a descendant that settled mid-sweep is
+        #   skipped (refusal recorded) while the self-act refusal raises
         seen: set[str] = set()
         while True:
             fresh = [
                 (row, descendant)
                 for row, descendant in self._live_descendants()
-                if row['status'] in ('active', 'paused') and row['node'] not in seen
+                if descendant._killable(row['status']) and row['node'] not in seen
             ]
             if not fresh:
                 break
@@ -1698,7 +1892,7 @@ class Node:
             # re-read under the lock -- a rival verb or the settling loop
             # may have moved this node since the caller enumerated it
             current = self.status()
-            if current not in ('active', 'paused'):
+            if not self._killable(current):
                 self._signal_refuse(
                     verb='kill',
                     event='kill',
@@ -1866,6 +2060,15 @@ class Node:
                 raise RuntimeError(
                     f'Cannot resume: node is not paused (status: {current}).'
                 )
+            # refuse to resume into a paused subtree -- the pause latch
+            # admits no new work while an ancestor is frozen, and the
+            # resume boot skips the ancestor walk (the leaf-first fan-out's
+            # exemption), so the verb itself must refuse; resuming the
+            # latching node relaunches this one with it
+            if latched := self.pause_latched(skip_self=True):
+                raise RuntimeError(
+                    f'Cannot resume under a paused node ({latched}). Resume it first.'
+                )
         # a node still parking (active with a pending pause signal) has a live
         # loop that cannot be relaunched -- withdraw its pause instead, so the
         # loop never parks; the resume event closes the span for the credit
@@ -1927,21 +2130,30 @@ class Node:
             raise
         self.record.event_end(event_id=event_id, status='completed')
 
-    def pause_latched(self: Node, *, tree_only: bool = False) -> Optional[str]:
+    def pause_latched(
+        self: Node,
+        *,
+        tree_only: bool = False,
+        skip_self: bool = False,
+    ) -> Optional[str]:
         """Return the branch of the nearest paused or pausing node at-or-above.
 
         The pause latch: a paused subtree admits no new work, so ``init``
-        (spawn) and ``start`` refuse -- and a booting loop parks -- while
-        any ancestor (or the node itself) is ``paused`` or still ``active``
-        with a pending ``pause`` signal, or while the tree-wide latch (a
-        user-node pause) is set. Walks by name so a pruned intermediate
-        never hides a paused ancestor.
+        (spawn), ``start``, and a targeted :meth:`resume` refuse -- and a
+        booting loop parks -- while any ancestor (or the node itself) is
+        ``paused`` or still ``active`` with a pending ``pause`` signal, or
+        while the tree-wide latch (a user-node pause) is set. Walks by name
+        so a pruned intermediate never hides a paused ancestor.
 
         Args:
             tree_only: Check only the tree-wide latch, skipping the
                 ancestor walk -- the resume-boot variant, where paused
                 ancestors are the leaf-first fan-out's normal state but a
                 NEW tree-wide brake must still park the boot.
+            skip_self: Skip the node itself in the walk -- the resume-verb
+                variant, where the target is legally paused but a frozen
+                ancestor (or the tree-wide brake) must still refuse the
+                relaunch.
 
         Returns:
             The latching node's branch (the root branch for the tree-wide
@@ -1951,6 +2163,8 @@ class Node:
         if not tree_only:
             for node in self._self_and_ancestors():
                 if node.is_user:
+                    continue
+                if skip_self and node is self:
                     continue
                 status = node.status()
                 if status == 'paused':
@@ -1973,6 +2187,11 @@ class Node:
         The full commit history is preserved on the node's
         branch; only a single squash commit lands on the target.
 
+        Refuses while the target is active or paused -- the squash, index
+        refresh, and recovery ``reset --hard`` all mutate the target
+        worktree -- except from inside the target's own loop, which merges
+        its settled children as part of its normal iteration.
+
         Returns:
             Script output.
 
@@ -1988,6 +2207,34 @@ class Node:
             raise RuntimeError('Cannot merge an active node. Stop or kill it first.')
         if current == 'paused':
             raise RuntimeError('Cannot merge a paused node. Resume or kill it first.')
+        # the target must be settled too: merge.sh squashes, refreshes
+        # indexes, and commits inside the target worktree, and its failure
+        # paths reset --hard -- racing a live target loop would absorb or
+        # destroy that loop's fresh work; the target's own loop is exempt
+        # (a node merging a settled child is single-actor: the loop is
+        # blocked on the very agent step running the merge); resolve the
+        # target as merge.sh does (base config, else the dotted parent),
+        # reconciled so a crashed-but-active target never wedges the merge,
+        # and leave a target that does not resolve to merge.sh's own errors
+        target_branch = self.config.get('base') or ''
+        if not target_branch and '.' in self.branch:
+            target_branch, *_ = self.branch.rsplit('.', 1)
+        target_worktree = fractal.util.git.find_worktree(self.repo_dir, target_branch)
+        if target_worktree is not None:
+            target = self.__class__(target_worktree)
+            if not target._is_own_loop():
+                target._reconcile_status()
+                target_status = target.status()
+                if target_status == 'active':
+                    raise RuntimeError(
+                        f'Cannot merge into active target {target_branch}.'
+                        ' Stop or kill it first.'
+                    )
+                if target_status == 'paused':
+                    raise RuntimeError(
+                        f'Cannot merge into paused target {target_branch}.'
+                        ' Resume or kill it first.'
+                    )
         # run merge script -- merge.sh resolves the target and logs the
         # merge event on it (it's the single source of truth for the target)
         result = self._run_script('merge.sh', f'{self._root}')
@@ -2361,8 +2608,27 @@ class Node:
             Script output.
 
         """
-        node = Node(path)
-        result = Node._guarded_teardown(node, 'destroy.sh', path)
+        # anchor on the user node by config, not the checkout: on a non-init
+        # branch a bare Node(path) reads uninitialized, skipping the pre-flight
+        # and paused settle, and the script would key the data dir off the
+        # wrong branch, leaving the config and central DB behind
+        node = Node.resolve_user(path) or Node(path)
+        # snapshot the registry before the teardown: the script removes the
+        # central DB with the user node's data dir, so the phantom prune
+        # below must read the branch list while it still exists
+        registry = node.db.read('nodes') if node.exists() else []
+        result = Node._guarded_teardown(
+            node,
+            'destroy.sh',
+            path,
+            f'--branch={node.branch}',
+        )
+        # prune every snapshot branch: a no-op for the worktrees the script
+        # tore down, and the cleanup destroy.sh cannot do for a phantom (its
+        # worktree rm -rf'd out of band) -- a stale branch would resurrect
+        # old history under a later re-init of the name
+        for branch in sorted({row['node'] for row in registry}):
+            worktree.prune_branch(node.repo_dir, branch)
         # strip fractal's block from the shared info/exclude (the inverse of
         # exclude_update: same whole-line markers, all other content preserved)
         worktree.exclude_strip(path)
@@ -2389,7 +2655,10 @@ class Node:
             Script output.
 
         """
-        node = Node(path)
+        # anchor on the user node by config, not the checkout: on a non-init
+        # branch a bare Node(path) reads uninitialized, skipping the registry
+        # snapshot (orphaning its rows), the reconcile, and the latch cleanup
+        node = Node.resolve_user(path) or Node(path)
         repo_dir = node.repo_dir
         # snapshot the registry before the teardown: the deregistration below
         # must sweep exactly the rows that predate the script, never a node a
@@ -2450,6 +2719,7 @@ class Node:
         node: Node,
         script: str,
         path: pathlib.Path,
+        *args: str,
     ) -> subprocess.CompletedProcess[str]:
         """Run a tree-teardown script behind the pre-flight, settle, and flock.
 
@@ -2477,6 +2747,7 @@ class Node:
             script: The teardown script (``destroy.sh``/``reset.sh``); its
                 stem names the verb in the kill attribution.
             path: Git repository root, passed through to the script.
+            *args: Extra script arguments, passed through after the path.
 
         Returns:
             Completed process result.
@@ -2533,8 +2804,8 @@ class Node:
         worktrees = node.repo_dir / WORKTREES_FOLDER
         if worktrees.is_dir():
             with worktree.lock(node.repo_dir):
-                return node._run_script(script, f'{path}')
-        return node._run_script(script, f'{path}')
+                return node._run_script(script, f'{path}', *args)
+        return node._run_script(script, f'{path}', *args)
 
     def status(self: Node) -> str:
         """Return the node's current status.
@@ -2657,10 +2928,11 @@ class Node:
             status: Filter to a status, or several comma-separated
                 (overrides the retired/all default).
             live: Reconcile each row against the child's real
-                ``.status()``, dropping descendants whose worktree is gone and
-                relabeling a crashed ``active`` node (no live tmux session) to
-                ``exited`` (the authoritative view). Read-only -- it does not
-                persist the relabel.
+                ``.status()``, dropping descendants whose worktree is gone,
+                relabeling a crashed ``active`` node (no live tmux session)
+                to ``exited``, and a booting ``idle`` node (live session,
+                the loop not yet stamped) to ``active`` (the authoritative
+                view). Read-only -- it does not persist the relabel.
             decorated: Append each active descendant's pending stop/finish
                 signal (``active (stopping)``) and each exited one's
                 recorded end reason (``exited (<reason>)``) to its
@@ -2675,8 +2947,9 @@ class Node:
         if live:
             # _live_descendants reconciles each row to the child's real status and
             # drops gone worktrees; additionally relabel a crashed-but-active node
-            # ('active' with no live tmux session) to 'exited' -- display-only,
-            # mirroring the TUI snapshot reconcile, so --live is the authoritative
+            # ('active' with no live tmux session) to 'exited' and a booting idle
+            # node (live session) to 'active' -- display-only, mirroring the TUI
+            # snapshot reconcile, so --live is the authoritative
             # settled-vs-crashed view (one tmux probe for the whole subtree); an
             # inconclusive probe (no tmux answer) proves nothing, so the stored
             # status stands
@@ -2687,6 +2960,15 @@ class Node:
                     if _base_status(row.get('status')) == 'active':
                         if node.tmux_session not in sessions:
                             row = {**row, 'status': 'exited'}
+                    # a started child holds 'idle' until its loop stamps
+                    # 'active' after preflight, but its session is already
+                    # live -- read the boot window as 'active', so a finishing
+                    # ancestor's drain never completes over a child started
+                    # seconds earlier; a sessionless idle node (spawned, never
+                    # started) stays idle and never blocks a drain
+                    elif _base_status(row.get('status')) == 'idle':
+                        if node.tmux_session in sessions:
+                            row = {**row, 'status': 'active'}
                 rows.append(row)
         else:
             rows = self.child_list(max_depth=max_depth)
@@ -3037,6 +3319,13 @@ class Node:
     ) -> int:
         """Register a child node.
 
+        Caps land on the row verbatim, ``None`` included: a ``--reset``
+        re-init upserts over the old row, and an omitted cap must clear
+        there just as it does in the reseeded ``config.json`` -- reconcile
+        leaves config-absent keys alone, so a stale registry cap would
+        otherwise survive every future heal and misreport an uncapped node
+        as capped.
+
         Args:
             name: Child node name.
             title: Child's display name.
@@ -3053,17 +3342,13 @@ class Node:
         data = {
             'node': branch,
             'status': 'idle',
+            'max_cost': max_cost,
+            'max_depth': max_depth,
+            'max_children': max_children,
+            'max_descendants': max_descendants,
         }
         if title is not None:
             data['title'] = title
-        if max_cost is not None:
-            data['max_cost'] = max_cost
-        if max_depth is not None:
-            data['max_depth'] = max_depth
-        if max_children is not None:
-            data['max_children'] = max_children
-        if max_descendants is not None:
-            data['max_descendants'] = max_descendants
         result = self.db.merge(data, 'nodes', conflict=['node'])
         # auto-subscribe to the child's readable channels (seeded by the
         # child's radio.init before registration, so validation always
@@ -3552,6 +3837,8 @@ class Node:
                 the base command has no registered backend.
 
         """
+        from .agent import resolve
+
         # resolve the command, refusing an agentless node
         command = command or self.agent_effective()
         if command is None:
@@ -3562,8 +3849,6 @@ class Node:
         # threading the tree root so a deployment hook file's subclasses win
         # across processes (imported at call time -- node.py never imports
         # agent.py at runtime, keeping the node<->seam boundary one-way)
-        from .agent import resolve
-
         name, *_ = command.split()
         if provider is None:
             provider = self.provider_effective()
@@ -4044,3 +4329,47 @@ def _base_status(status: Optional[str]) -> str:
     """
     result, *_ = (status or '').partition(' ')
     return result
+
+
+def _recorded_group(pgid: int, recorded_at: float) -> bool:
+    """Return whether a live process group is the one its record named.
+
+    A group id is its leader's pid, and the leader is already running when
+    the loop records it -- so a leader ``ps`` dates *after* the record is a
+    recycled pid fronting an unrelated group. A group that outlived its
+    leader still matches: the OS cannot re-issue the id while any member
+    survives. No answer to arbitrate with (``ps`` failed, an unparseable
+    instant) reads as not the recorded group -- sparing a stranger beats
+    reaping a maybe-orphan.
+
+    Args:
+        pgid: A live process group id (its leader's pid).
+        recorded_at: Epoch instant the group was recorded.
+
+    Returns:
+        Whether the group can be treated as the recorded one.
+
+    """
+    # ask ps for the leader's start instant (LC_ALL pins the format)
+    env = {**os.environ, 'LC_ALL': 'C'}
+    try:
+        result = subprocess.run(
+            ['ps', '-p', f'{pgid}', '-o', 'lstart='],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except OSError:
+        return False
+    lstart = result.stdout.strip()
+    # no process wears the leader's pid: the live group outlived its
+    # leader, which pins its identity
+    if result.returncode != 0 or not lstart:
+        return True
+    try:
+        started = time.mktime(time.strptime(lstart, '%a %b %d %H:%M:%S %Y'))
+    except ValueError:
+        return False
+    # a second of slack: lstart floors to the second, and the record
+    # follows the leader's spawn within the same one
+    return started <= recorded_at + 1.0

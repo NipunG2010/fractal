@@ -324,9 +324,10 @@ def tree_lines(
         )
         hang = f'[{theme.DIM}]{hang}[/]' if hang else ''
         if entry['has_kids']:
-            caret = (
-                theme.CARET_CLOSED if entry['branch'] in collapsed else theme.CARET_OPEN
-            )
+            if entry['branch'] in collapsed:
+                caret = theme.CARET_CLOSED
+            else:
+                caret = theme.CARET_OPEN
             marker = f'[{theme.DIM}]{caret}[/] '
         else:
             marker = '  '

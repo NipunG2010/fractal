@@ -27,6 +27,7 @@ __all__ = [
     'test_files_read_caps_content_and_enforces_the_allowlist',
     'test_files_read_truncation_preserves_line_terminators',
     'test_files_list_round_trips_non_ascii_paths',
+    'test_files_glob_metachar_paths_round_trip',
     'test_files_archive_zips_the_set_without_machinery',
     'test_files_symlinks_serve_in_tree_targets_only',
     'test_files_list_changed_is_the_diff_from_base',
@@ -38,6 +39,7 @@ __all__ = [
     'test_files_read_before_serves_both_sides_of_the_diff',
     'test_files_list_changed_survives_a_merge_into_the_base',
     'test_files_write_lands_in_worktree_and_rejects_escapes',
+    'test_files_write_through_a_symlink_updates_the_target',
     'test_files_commit_commits_only_the_named_paths',
     'test_files_writes_refuse_on_a_paused_node',
 ]
@@ -135,8 +137,9 @@ def test_files_read_caps_content_and_enforces_the_allowlist(
     assert binary['size'] > 0
     # the download path serves the same file straight from disk
     assert node.files.path('output/logo.png').read_bytes().startswith(b'\x89PNG')
-    # machinery, traversal, case variants, globs, and unknown paths are all
-    # rejected -- by both the read and the download path
+    # machinery, traversal, case variants, leading pathspec magic, and unknown
+    # paths (glob chars taken literally) are all rejected -- by both the read
+    # and the download path
     for bad in (
         f'.fractal/{node.branch}/config.json',
         '.Fractal/x',
@@ -186,6 +189,40 @@ def test_files_list_round_trips_non_ascii_paths(node_with_db: Node) -> None:
     assert name in {entry['path'] for entry in node.files.list()}
     assert node.files.read(name)['content'] == 'encore\n'
     assert node.files.path(name).name == name
+
+
+def test_files_glob_metachar_paths_round_trip(node_with_db: Node) -> None:
+    """A tracked name with glob chars (a bracketed route) stays servable.
+
+    Framework-conventional names like Next.js ``app/[id]/page.tsx`` are glob
+    metacharacters to git -- every surface must take them literally, so the
+    single-char sibling the bracket expression would match never answers in
+    the route's place.
+    """
+    node = node_with_db
+    root = node.worktree
+    # a dynamic route, plus the sibling its bracket expression globs to
+    (root / 'app' / '[id]').mkdir(parents=True)
+    (root / 'app' / '[id]' / 'page.tsx').write_text('dynamic\n', encoding='utf-8')
+    (root / 'app' / 'i').mkdir()
+    (root / 'app' / 'i' / 'page.tsx').write_text('sibling\n', encoding='utf-8')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-m', 'routes')
+    # the bracketed path lists, reads, and downloads -- as itself
+    assert 'app/[id]/page.tsx' in {entry['path'] for entry in node.files.list()}
+    assert node.files.read('app/[id]/page.tsx')['content'] == 'dynamic\n'
+    assert node.files.path('app/[id]/page.tsx').read_text() == 'dynamic\n'
+    # the before side resolves through the same literal plumbing
+    (root / 'app' / '[id]' / 'page.tsx').write_text('rewritten\n', encoding='utf-8')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-m', 'rewrite')
+    before = node.files.read('app/[id]/page.tsx', since='commit', before=True)
+    assert before['content'] == 'dynamic\n'
+    # an upload with a bracketed name commits as that one literal path
+    node.files.write('app/[slug]/page.tsx', b'slug\n')
+    node.files.commit(['app/[slug]/page.tsx'], 'add slug route')
+    committed = _git(root, 'show', '--name-only', '--format=', 'HEAD')
+    assert committed.stdout.split() == ['app/[slug]/page.tsx']
 
 
 def test_files_archive_zips_the_set_without_machinery(node_with_db: Node) -> None:
@@ -483,8 +520,8 @@ def test_files_write_lands_in_worktree_and_rejects_escapes(
 ) -> None:
     """``Files.write`` puts bytes in the worktree; escapes are rejected.
 
-    Parent dirs are created; traversal, machinery, case-variant, and glob
-    paths are all rejected.
+    Parent dirs are created; traversal, machinery, and case-variant paths
+    are all rejected.
     """
     node = node_with_db
     # a new file in a fresh subdir -- parents are created, bytes land on disk
@@ -500,8 +537,9 @@ def test_files_write_lands_in_worktree_and_rejects_escapes(
     node.files.write('inputs/logo.png', b'\x89PNG\r\n\x1a\n\x00\xff')
     logo = node.worktree / 'inputs' / 'logo.png'
     assert logo.read_bytes() == b'\x89PNG\r\n\x1a\n\x00\xff'
-    # escapes (traversal, absolute, empty, glob) and machinery (case variants
-    # included -- APFS matches case-insensitively) are all rejected
+    # escapes (traversal, absolute, empty), leading pathspec magic, and
+    # machinery (case variants included -- APFS matches case-insensitively)
+    # are all rejected
     for bad in (
         '../escape',
         '/abs/path',
@@ -516,13 +554,41 @@ def test_files_write_lands_in_worktree_and_rejects_escapes(
         '.git/hooks/pre-commit',
         '.worktrees/x',
         '.WorkTrees/x',
-        '*',
-        'a?.txt',
-        'x[1].txt',
         ':!x',
     ):
         with pytest.raises(ValueError):
             node.files.write(bad, b'x')
+
+
+def test_files_write_through_a_symlink_updates_the_target(
+    node_with_db: Node,
+) -> None:
+    """A write through an in-tree symlink lands in the target; the link lives.
+
+    The read side serves an in-tree link by target content, so a
+    read-modify-write round trip must update the target through the link --
+    never swap the link for a regular file and strand the target stale. An
+    escaping link stays unwritable, as it is unreadable.
+    """
+    node = node_with_db
+    root = node.worktree
+    (root / 'target.txt').write_text('inside\n', encoding='utf-8')
+    (root / 'inside.link').symlink_to('target.txt')
+    # a tracked link to a file outside the worktree (the exfiltration case)
+    secret = root.parent / 'secret.txt'
+    secret.write_text('outside\n', encoding='utf-8')
+    (root / 'escape.link').symlink_to(secret)
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-m', 'links')
+    # the in-tree link survives the write and its target holds the new bytes
+    node.files.write('inside.link', b'updated\n')
+    assert (root / 'inside.link').is_symlink()
+    assert (root / 'target.txt').read_bytes() == b'updated\n'
+    assert node.files.read('inside.link')['content'] == 'updated\n'
+    # the escaping link is not writable, and its target is untouched
+    with pytest.raises(ValueError):
+        node.files.write('escape.link', b'x\n')
+    assert secret.read_text(encoding='utf-8') == 'outside\n'
 
 
 def test_files_commit_commits_only_the_named_paths(node_with_db: Node) -> None:
@@ -569,7 +635,7 @@ def test_files_commit_commits_only_the_named_paths(node_with_db: Node) -> None:
         node.files.commit([], 'msg')
     with pytest.raises(ValueError):
         node.files.commit(['inputs/keep.txt'], '')
-    for bad in ('../escape', '.fractal/x', '.git/x', '*'):
+    for bad in ('../escape', '.fractal/x', '.git/x', ':!x'):
         with pytest.raises(ValueError):
             node.files.commit([bad], 'msg')
 

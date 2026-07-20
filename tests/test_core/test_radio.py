@@ -631,10 +631,16 @@ def test_cross_node_read_respects_read_only(
     root, peer = radio_pair
     # a read-only message in the peer's inbox and a readable outbox cast
     private_uuid, _, _ = root.send(
-        peer.node.branch, subject='secret', data='d', priority=0
+        peer.node.branch,
+        subject='secret',
+        data='d',
+        priority=0,
     )
     public_uuid, _, _ = peer.send(
-        channel='outbox', subject='cast', data='d', priority=0
+        channel='outbox',
+        subject='cast',
+        data='d',
+        priority=0,
     )
     extra = (1,) if method == 'react' else ()
     call = getattr(root, method)
@@ -642,7 +648,10 @@ def test_cross_node_read_respects_read_only(
         # root sent the inbox message, so it may thread that conversation;
         # a peer-only private note keeps root a non-participant
         secret, _, _ = peer.send(
-            channel='private', subject='note', data='d', priority=0
+            channel='private',
+            subject='note',
+            data='d',
+            priority=0,
         )
         with pytest.raises(PermissionError, match='read-only'):
             call(secret)
@@ -676,7 +685,10 @@ def test_thread_hides_read_only_rows_from_bystanders(
     # author broadcasts on its outbox; parent replies (reroutes to the
     # author's inbox); author replies back (reroutes to the parent's inbox)
     root_uuid, _, _ = author.send(
-        channel='outbox', subject='run exited', data='public notice', priority=5
+        channel='outbox',
+        subject='run exited',
+        data='public notice',
+        priority=5,
     )
     reply_uuid, _, _ = parent.reply(root_uuid, 'private feedback: creds are hunter2')
     author.reply(reply_uuid, 'private ack to parent')
@@ -716,7 +728,10 @@ def test_reply_refuses_a_read_only_message_for_a_bystander(
     bystander = _register_peer(parent, 'bystander')
     # author broadcasts (readable outbox); parent replies -> author's inbox
     root_uuid, _, _ = author.send(
-        channel='outbox', subject='run exited', data='notice', priority=5
+        channel='outbox',
+        subject='run exited',
+        data='notice',
+        priority=5,
     )
     reply_uuid, _, _ = parent.reply(root_uuid, 'private: creds are hunter2')
     bystander.subscribe(author.node.branch)

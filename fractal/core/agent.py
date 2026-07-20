@@ -76,6 +76,8 @@ def resolve(name: str, *, root: Optional[pathlib.Path] = None) -> type[Agent]:
     Raises:
         ValueError: If no backend is registered under ``name``, or the
             registered backend module cannot be imported.
+        RuntimeError: If the tree's deployment hook file fails to load
+            (sticky -- re-raised on every later resolve for that tree).
 
     """
     # consult the deployment hook file first, so injected subclasses resolve

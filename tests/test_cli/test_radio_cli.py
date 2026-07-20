@@ -55,6 +55,7 @@ __all__ = [
     'test_outbox_reply_routes_to_sender_inbox',
     'test_react_toggles_positive_and_negative',
     'test_save_unsave_round_trips_through_archive',
+    'test_saved_listings_honor_filters',
     'test_subscribe_unsubscribe_manage_subs',
     'test_channel_create_and_delete_lifecycle',
     'test_cross_node_read_emits_receipt_without_mutating_sender',
@@ -1071,6 +1072,43 @@ def test_save_unsave_round_trips_through_archive(repo: dict) -> None:
     # unsaving a message that was never archived is an error
     missing = _radio(alpha, 'unsave', 'DEADBEEF')
     assert missing.returncode != 0
+
+
+def test_saved_listings_honor_filters(repo: dict) -> None:
+    """``--saved`` narrows by the listing's filters instead of dropping them.
+
+    The archive is one flat todo queue surfaced by both listings, so
+    ``messages --saved`` honors ``--channel`` and ``feed --saved`` honors
+    ``--node``/``--channel`` (``--node`` names the copy's source host);
+    an unmatched filter empties the view rather than returning the whole
+    archive.
+    """
+    alpha = repo['alpha']
+    note = _send(alpha, 'note body', channel='private', subject='sfn')
+    cast = _post(repo['root'], 'cast body', channel='outbox', subject='sfc')
+    assert _radio(alpha, 'save', note).returncode == 0
+    assert _radio(alpha, 'save', cast).returncode == 0
+    try:
+        # messages --saved narrows by channel
+        listed = _radio(alpha, 'messages', '--saved', '--channel', 'private')
+        assert note in listed.stdout
+        assert cast not in listed.stdout
+        # feed --saved narrows by source node and by channel
+        listed = _radio(alpha, 'feed', '--saved', '--node', 'main')
+        assert cast in listed.stdout
+        assert note not in listed.stdout
+        listed = _radio(alpha, 'feed', '--saved', '--channel', 'outbox')
+        assert cast in listed.stdout
+        assert note not in listed.stdout
+        # an unmatched filter empties the view, never the whole archive
+        listed = _radio(alpha, 'feed', '--saved', '--node', 'main.ghost')
+        assert listed.returncode == 0
+        assert note not in listed.stdout
+        assert cast not in listed.stdout
+    finally:
+        # round-trip the archive so the shared repo stays clean
+        for uuid in (note, cast):
+            assert _radio(alpha, 'unsave', uuid).returncode == 0
 
 
 def test_subscribe_unsubscribe_manage_subs(repo: dict) -> None:

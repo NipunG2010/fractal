@@ -431,7 +431,12 @@ def radio_messages(app: typer.Typer) -> typer.Typer:
         radio = Radio(resolve_node(path))
         # --saved: show archived messages
         if saved:
-            rows = radio.saved(limit=limit, since=since, recent=recent)
+            rows = radio.saved(
+                channel=channel,
+                limit=limit,
+                since=since,
+                recent=recent,
+            )
             if json:
                 print_json(rows, columns=_SAVED_COLUMNS)
             else:
@@ -605,7 +610,13 @@ def radio_feed(app: typer.Typer) -> typer.Typer:
         radio = Radio(resolve_node(path))
         # --saved: show archived messages
         if saved:
-            rows = radio.saved(limit=limit, since=since, recent=recent)
+            rows = radio.saved(
+                node=node,
+                channel=channel,
+                limit=limit,
+                since=since,
+                recent=recent,
+            )
             if json:
                 print_json(rows, columns=_SAVED_COLUMNS)
             else:

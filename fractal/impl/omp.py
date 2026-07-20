@@ -157,7 +157,7 @@ class OmpAgent(Agent):
         argv += ['--', prompt]
         # run in the worktree (omp anchors the project at the cwd);
         # PI_CODING_AGENT_DIR relocates config, credentials, and the session
-        # tree to the node dir. The env carries only the reserved
+        # tree to the node dir; the env carries only the reserved
         # PI_CODING_AGENT_DIR; provider keys (OPENROUTER_API_KEY, ...) ride the
         # ambient environment invocation() composes under it
         env = {'PI_CODING_AGENT_DIR': str(self.config_dir)}

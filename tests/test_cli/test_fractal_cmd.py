@@ -33,14 +33,40 @@ __all__ = [
     'test_reset_force_tears_worktrees_and_keeps_history',
     'test_destroy_force_tears_the_fractal_down',
     'test_destroy_aborts_when_the_prompt_is_declined',
+    'test_reset_off_branch_counts_nodes_and_clears_the_registry',
+    'test_destroy_off_branch_removes_the_user_data',
     'test_track_untrack_round_trip_prints_git_follow_ups',
     'test_open_without_textual_names_the_tui_extra',
     'test_open_rejects_light_and_dark_together',
+    'test_open_anchors_on_the_user_node_from_a_non_init_checkout',
 ]
 
 # the skills both agents receive (fractal ships its own; wiki ships via the
 # plasma-wiki dependency, installed alongside)
 _SKILLS = ('fractal', 'wiki')
+
+# cockpit stand-in for the open anchoring test: sitecustomize plants it in
+# sys.modules at subprocess startup, so the lazy ``from fractal.tui import``
+# resolves to a stub that prints the anchor and focus instead of a terminal app
+_TUI_STUB = """\
+import sys
+import types
+
+stub = types.ModuleType('fractal.tui')
+
+
+class FractalApp:
+    def __init__(self, node, *, branch=None):
+        self._line = f'cockpit root={node.branch} focus={branch}'
+
+    def run(self):
+        print(self._line)
+
+
+stub.FractalApp = FractalApp
+stub.theme = types.SimpleNamespace(select=lambda palette: None)
+sys.modules['fractal.tui'] = stub
+"""
 
 
 # ------ install
@@ -205,6 +231,53 @@ def test_destroy_aborts_when_the_prompt_is_declined(tmp_path: pathlib.Path) -> N
     assert (repo / '.fractal').exists()
 
 
+def test_reset_off_branch_counts_nodes_and_clears_the_registry(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``reset`` anchors on the user node by config, not the checkout.
+
+    On a non-init branch the confirmation must still count the real nodes
+    (the count is the authorization to kill them), and the accepted teardown
+    must still sweep the registry -- a surviving row would resurrect old
+    history under a later re-init of the name.
+    """
+    repo = _seed_repo(tmp_path / 'sideworked')
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    # the user checks the repo root out to their own branch (mirrors track)
+    _git(repo, 'checkout', '-b', 'sidework')
+    # the confirmation still names the real node count from the side branch
+    declined = _run(repo, 'reset', stdin='n\n')
+    assert declined.returncode != 0
+    assert '(1 node)?' in declined.stdout
+    # the accepted teardown still sweeps the registry rows
+    accepted = _run(repo, 'reset', stdin='y\n')
+    assert accepted.returncode == 0, accepted.stderr
+    assert not (repo / '.worktrees' / 'main.task').exists()
+    _git(repo, 'checkout', 'main')
+    assert (repo / '.fractal' / 'main' / '.db').is_file()
+    assert Node(repo).db.read('nodes') == []
+
+
+def test_destroy_off_branch_removes_the_user_data(tmp_path: pathlib.Path) -> None:
+    """``destroy`` tears the user node's data down from any checkout.
+
+    The data-dir removal keys on the user node's branch, not the current
+    one -- a destroy from a side branch must not leave the config and
+    central database behind while reporting success.
+    """
+    repo = _seed_repo(tmp_path / 'sidedoomed')
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    _git(repo, 'checkout', '-b', 'sidework')
+    # the confirmation still names the real node count from the side branch
+    declined = _run(repo, 'destroy', stdin='n\n')
+    assert declined.returncode != 0
+    assert '(1 node)?' in declined.stdout
+    result = _run(repo, 'destroy', '--force')
+    assert result.returncode == 0, result.stderr
+    assert not (repo / '.worktrees').exists()
+    assert not (repo / '.fractal').exists()
+
+
 # ------ track / untrack
 
 
@@ -254,7 +327,7 @@ def test_track_untrack_round_trip_prints_git_follow_ups(
     assert not _ignored(repo, seed_dir)
 
 
-# ------ open (tui extra)
+# ------ open
 
 
 def test_open_without_textual_names_the_tui_extra(tmp_path: pathlib.Path) -> None:
@@ -292,6 +365,38 @@ def test_open_rejects_light_and_dark_together(tmp_path: pathlib.Path) -> None:
     assert result.returncode != 0
     assert 'mutually exclusive' in result.stderr
     assert 'Traceback' not in result.stdout + result.stderr
+
+
+def test_open_anchors_on_the_user_node_from_a_non_init_checkout(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``open <node>`` anchors the cockpit on the user node from any checkout.
+
+    The cockpit anchors on the user node by config, not the checkout (mirrors
+    pause): a branch-keyed resolution on a non-init checkout would refuse to
+    open even with the node to focus named explicitly. The TUI is stubbed
+    through ``sitecustomize`` (imported at subprocess startup) to print the
+    resolved anchor and focus instead of needing a terminal.
+    """
+    repo = _seed_repo(tmp_path / 'sideopened')
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    assert _run(repo, 'node', 'init', 'docs', '--agent', 'claude').returncode == 0
+    shim = tmp_path / 'shim'
+    shim.mkdir()
+    (shim / 'sitecustomize.py').write_text(_TUI_STUB, encoding='utf-8')
+    # the conftest env overlay replaces PYTHONPATH wholesale, so compose
+    # shim + worktree (the worktree entry keeps the edited package importable)
+    pythonpath = os.pathsep.join((str(shim), str(_worktree_root())))
+    # the user checks the repo root out to their own branch (mirrors track)
+    _git(repo, 'checkout', '-b', 'sidework')
+    result = _run(repo, 'open', 'main.task', PYTHONPATH=pythonpath)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'cockpit root=main focus=main.task'
+    # a bare open from the init checkout still anchors and focuses the root
+    _git(repo, 'checkout', 'main')
+    result = _run(repo, 'open', PYTHONPATH=pythonpath)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'cockpit root=main focus=main'
 
 
 # ------ helpers

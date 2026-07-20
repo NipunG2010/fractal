@@ -406,7 +406,7 @@ Once the node is running, briefly explain how to interact with it:
   anywhere in the repo) brake and release the whole tree; the brake also
   latches every new `node init`/`start` — new top-level nodes included —
   until `fractal resume` lifts it (a subtree `fractal node resume` under
-  a tree-wide brake only re-parks at boot — the brake holds until
+  a paused ancestor or a tree-wide brake refuses — the brake holds until
   `fractal resume`). Paused state is durable: it survives a reboot or a
   filesystem copy of the repo to another machine. A paused node holds
   its spawn slot and blocks its parent's finish-drain; only `resume`,

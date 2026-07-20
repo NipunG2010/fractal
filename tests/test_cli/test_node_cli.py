@@ -57,6 +57,7 @@ __all__ = [
     'test_list_filters_by_retired_and_depth',
     'test_list_status_count_and_live',
     'test_list_rejects_invalid_filters',
+    'test_list_whole_tree_from_a_non_init_checkout',
     'test_status_reports_idle_from_anywhere',
     'test_rm_rf_worktree_lists_orphan_then_force_deletes',
     'test_list_shows_stored_status_for_orphaned_terminal_node',
@@ -948,6 +949,35 @@ def test_list_rejects_invalid_filters(repo: dict) -> None:
         bad_depth = _run(root, 'node', 'list', '--max-depth', depth)
         assert bad_depth.returncode == 2, depth
         assert 'max-depth' in (bad_depth.stdout + bad_depth.stderr)
+
+
+def test_list_whole_tree_from_a_non_init_checkout(repo: dict) -> None:
+    """A bare ``list`` anchors on the user node from a non-init checkout.
+
+    On a non-init branch (the user on their own branch while nodes run),
+    branch-keyed resolution finds no node and dies on the multi-worktree
+    ambiguity -- the whole-tree listing must anchor on the user node by
+    config instead of reporting the live fleet as empty (count 0, exit 0).
+    Checks out a side branch and restores ``main`` so the shared fixture
+    is left as other tests expect.
+    """
+    root = repo['root']
+    # the user checks the repo root out to their own branch while nodes exist
+    _git(root, 'checkout', '-b', 'sidework')
+    try:
+        listing = _run(root, 'node', 'list', '--csv')
+        count = _run(root, 'node', 'list', '--count')
+    finally:
+        # restore the fixture
+        _git(root, 'checkout', 'main')
+        _git(root, 'branch', '-D', 'sidework')
+    # the whole tree lists (never empty while the fleet is registered)
+    assert listing.returncode == 0
+    assert 'main.task' in listing.stdout
+    assert 'main.docs' in listing.stdout
+    # --count agrees with the csv cardinality
+    assert count.returncode == 0
+    assert int(count.stdout.strip()) == len(listing.stdout.splitlines()) - 1
 
 
 def test_status_reports_idle_from_anywhere(repo: dict) -> None:

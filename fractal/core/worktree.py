@@ -374,7 +374,8 @@ def ensure_project_wiki(
     The wiki lives at ``<worktree>/wiki`` (repo root) or
     ``<worktree>/<project>/wiki`` (sub-project). ``name`` is the validated
     display name; the wiki is seeded with the strict ASCII-identifier
-    naming policy. A failed ``wiki init`` is surfaced, not swallowed.
+    naming policy. A failed ``wiki init`` is surfaced, not swallowed, and
+    a pre-existing directory that is not a wiki is refused, never adopted.
 
     Args:
         worktree: The user node's worktree root.
@@ -394,6 +395,20 @@ def ensure_project_wiki(
         wiki_dir = worktree / path / 'wiki'
     if (wiki_dir / '_index.md').exists():
         return False
+    # refuse to adopt a pre-existing docs directory: `wiki init` rewrites
+    # every page under its root (frontmatter, generated indexes), so a
+    # user's own wiki/ fails loud here instead of being silently rewritten;
+    # an empty dir or one carrying the .wiki marker is a partial prior
+    # init, repaired in place
+    foreign = wiki_dir.is_dir() and not (wiki_dir / '.wiki').exists()
+    if foreign and any(wiki_dir.iterdir()):
+        relative = wiki_dir.relative_to(worktree)
+        raise RuntimeError(
+            f'{relative}/ already exists and is not a project wiki --'
+            ' adopting it would rewrite its files in place. Move the'
+            ' directory aside and re-run init, or adopt it deliberately'
+            f' first: wiki init --path={relative}'
+        )
     # note when the derived name was adjusted from the repo directory name
     if name != repo_dir.name:
         logger.info(

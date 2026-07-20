@@ -15,10 +15,12 @@ import subprocess
 from typing import Any
 
 import pytest
+import typer
 
 import fractal.core
 from fractal.cli.utils import init_node, resolve_init_target, resolve_node
 from fractal.core.node import Node
+from tests._helpers import _git
 
 from .conftest import (
     _make_git_repo,
@@ -32,11 +34,17 @@ __all__ = [
     'test_init_scope_places_node_dir_at_project_root',
     'test_init_populates_skills_and_supports_reset',
     'test_reset_reseeds_scripts',
+    'test_reset_clears_stale_registry_caps',
+    'test_reset_re_anchors_base_at_the_reset_point',
     'test_init_materializes_title_in_registry',
     'test_init_on_existing_node_refuses_loudly',
+    'test_init_refuses_when_an_active_fractal_shares_the_repo_name',
+    'test_start_refuses_a_foreign_session_name_collision',
     'test_reset_refuses_a_running_or_frozen_node',
+    'test_init_refuses_case_variant_of_existing_sibling',
     'test_root_anchors_central_db',
     'test_user_init_on_a_dotted_branch',
+    'test_user_init_rejects_detached_head',
     'test_user_init_stores_and_updates_agent',
     'test_child_inherits_agent_from_ancestor',
     'test_child_inherits_provider_when_the_agent_routes',
@@ -46,18 +54,23 @@ __all__ = [
     'test_child_inherits_skills_only_on_request',
     'test_child_inherits_config_preferences_not_caps',
     'test_init_requires_resolvable_agent',
+    'test_init_refuses_unsupported_agent',
     'test_init_requires_project_wiki',
+    'test_init_names_a_missing_base_branch',
     'test_init_rejects_inside_worktrees',
     'test_user_init_repairs_stranded_database',
     'test_user_init_rejects_second_project_on_same_branch',
     'test_init_rejects_subsecond_duration',
+    'test_init_accepts_fractional_duration_under_comma_locale',
     'test_init_rejects_incoherent_pacing',
     'test_init_rejects_absolute_or_traversal_scope',
+    'test_init_normalizes_scope_before_validating',
     'test_child_inherits_subproject_from_parent',
     'test_init_ignores_cross_repo_ambient_node',
     'test_init_node_default_path_ignores_cross_repo_ambient',
     'test_resolve_node_targets_subproject_user_node',
     'test_resolve_init_target_anchors_subproject_at_git_root',
+    'test_resolve_init_target_refuses_linked_worktree',
 ]
 
 
@@ -197,6 +210,60 @@ def test_reset_reseeds_scripts(git_repo: pathlib.Path) -> None:
     assert test_sh.read_text(encoding='utf-8') == stock
 
 
+def test_reset_clears_stale_registry_caps(git_repo: pathlib.Path) -> None:
+    """``--reset`` clears registry caps the re-init omits.
+
+    Reset returns a stock node whose ``config.json`` carries only the new
+    caps, and ``node list`` reads limits from the central ``nodes`` row
+    (blank means unlimited) -- so an omitted cap must clear on the row too.
+    Reconcile cannot heal it later (config-absent keys are left alone), so
+    a surviving spawn-time cap would forever report a bound the node no
+    longer enforces.
+    """
+    node = Node(git_repo)
+    node.init(agent='claude', user=True)
+    node.init(name='task', max_cost=5.0, max_children=3)
+    # the re-init sets max_depth only -- the old cost/width caps must go
+    node.init(name='task', reset=True, max_depth=2)
+    rows = {row['node']: row for row in node.db.read('nodes')}
+    row = rows['main.task']
+    assert row['max_cost'] is None
+    assert row['max_children'] is None
+    assert row['max_depth'] == 2
+
+
+def test_reset_re_anchors_base_at_the_reset_point(git_repo: pathlib.Path) -> None:
+    """``--reset`` stamps the reused tip as the new incarnation's fork point.
+
+    History rows persist across reset, so a re-init whose init event carries
+    no fork sha would fall back to the original fork -- reporting the dead
+    incarnation's whole contribution as ``base`` until the first post-reset
+    commit event lands, then silently flipping to post-reset scope.
+    """
+    node = Node(git_repo)
+    node.init(agent='claude', user=True)
+    output = node.init(name='task')
+    project_dir = _parse_project_dir(output)
+    worker = Node(project_dir)
+    # the dead incarnation's work: one committed file, its commit event logged
+    (project_dir / 'old_work.txt').write_text('old\n', encoding='utf-8')
+    _git(project_dir, 'add', 'old_work.txt')
+    _git(project_dir, 'commit', '-m', 'old work')
+    sha = _git(project_dir, 'rev-parse', 'HEAD').stdout.strip()
+    worker.record.event_start('commit', metadata=sha)
+    node.init(name='task', reset=True)
+    # base starts empty: no scope reaches past the re-init
+    assert not worker.files.list(since='base')
+    # and covers exactly the new incarnation's work once it commits
+    (project_dir / 'new_work.txt').write_text('new\n', encoding='utf-8')
+    _git(project_dir, 'add', 'new_work.txt')
+    _git(project_dir, 'commit', '-m', 'new work')
+    sha = _git(project_dir, 'rev-parse', 'HEAD').stdout.strip()
+    worker.record.event_start('commit', metadata=sha)
+    changed = {entry['path'] for entry in worker.files.list(since='base')}
+    assert changed == {'new_work.txt'}
+
+
 def test_init_materializes_title_in_registry(initialized_node: dict) -> None:
     """A real init stamps the de-slugged title onto the central registry row.
 
@@ -229,6 +296,46 @@ def test_init_on_existing_node_refuses_loudly(
     assert node.config.get('max_cost') == 0.10
 
 
+def test_init_refuses_when_an_active_fractal_shares_the_repo_name(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`fractal init` refuses if another live fractal shares this basename.
+
+    Two repositories with the same directory basename produce the same tmux
+    session namespace (``<basename> (<branch>)``), so their node sessions --
+    and ``node kill``, which resolves by that global name -- would collide.
+    tmux names carry no repo path, but this fractal does not exist yet, so a
+    live session under our basename can only be a different repo's; refuse
+    the init rather than create a fractal that cannot be operated safely.
+    """
+    repo_name = git_repo.name.replace('.', '-').replace(':', '-')
+    sessions = frozenset({f'{repo_name} (main.other)'})
+    monkeypatch.setattr('fractal.util.tmux.probe', lambda *, socket=None: sessions)
+    with pytest.raises(RuntimeError, match='Another active fractal'):
+        Node(git_repo).init(agent='claude', user=True)
+
+
+def test_start_refuses_a_foreign_session_name_collision(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`node start` refuses when its session name is already live elsewhere.
+
+    A different repository sharing this one's basename and node name yields
+    an identical tmux session name; starting anyway would make ``node
+    kill``/attach resolve ambiguously across both trees. The node is idle,
+    so a live session under its name is necessarily foreign.
+    """
+    Node(git_repo).init(agent='claude', user=True)
+    Node(git_repo).init(name='worker', local=True)
+    node = Node(git_repo / '.worktrees' / 'main.worker')
+    sessions = frozenset({node.tmux_session})
+    monkeypatch.setattr('fractal.util.tmux.probe', lambda *, socket=None: sessions)
+    with pytest.raises(RuntimeError, match='already active for another fractal'):
+        node.start()
+
+
 @pytest.mark.parametrize(
     argnames=('status', 'remedy'),
     argvalues=[
@@ -259,6 +366,37 @@ def test_reset_refuses_a_running_or_frozen_node(
         Node(git_repo).init(name='task', reset=True)
     # the node survived: reset never ran
     assert node.exists()
+
+
+def test_init_refuses_case_variant_of_existing_sibling(
+    git_repo: pathlib.Path,
+) -> None:
+    """A name differing from a sibling only by case is refused, not aliased.
+
+    On a case-insensitive filesystem the case-variant's worktree path
+    resolves onto the sibling's dir, so init.sh would stamp a spurious init
+    event on the sibling (re-flooring its base diff anchor), register a
+    phantom registry row whose deletion prunes the sibling's branch, and a
+    ``--reset`` would wipe the sibling's node files through the alias.
+    """
+    Node(git_repo).init(agent='claude', user=True)
+    Node(git_repo).init(name='task')
+    # the alias exists only where the filesystem is case-insensitive; on a
+    # case-sensitive one the case-variant is a legitimately distinct node
+    if not (git_repo / '.worktrees' / 'main.TASK').is_dir():
+        pytest.skip('requires a case-insensitive filesystem')
+    with pytest.raises(ValueError, match='case-insensitive'):
+        Node(git_repo).init(name='TASK')
+    # --reset hits the same refusal -- it would otherwise rm -rf the
+    # sibling's node dir through the alias
+    with pytest.raises(ValueError, match='case-insensitive'):
+        Node(git_repo).init(name='TASK', reset=True)
+    # the sibling is untouched: no phantom row, no second init event
+    root = Node(git_repo)
+    rows = {row['node'] for row in root.db.read('nodes')}
+    assert 'main.TASK' not in rows
+    events = root.db.read('events', where={'node': 'main.task', 'event': 'init'})
+    assert len(events) == 1
 
 
 def test_root_anchors_central_db(
@@ -309,6 +447,29 @@ def test_user_init_on_a_dotted_branch(tmp_path: pathlib.Path) -> None:
     # a phantom 'v1'
     with pytest.raises(ValueError, match='No parent node'):
         node.radio.send(parent=True, subject='s', data='d', priority=3)
+
+
+def test_user_init_rejects_detached_head(tmp_path: pathlib.Path) -> None:
+    """A detached checkout is refused up front, leaving no init state behind.
+
+    Git resolves a detached HEAD (a tag clone, CI checkout, mid-bisect) to
+    the literal branch name ``HEAD`` -- a pseudo-ref that re-resolves to
+    whatever is checked out later, so a tree anchored on it would orphan its
+    registry and strand the baseline as dangling commits at the next
+    checkout. Init must name the remedy and write nothing.
+    """
+    repo = _make_git_repo(tmp_path / 'detached')
+    subprocess.run(
+        ['git', 'checkout', '--detach'],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    )
+    with pytest.raises(ValueError, match='detached HEAD'):
+        Node(repo).init(agent='claude', user=True)
+    # nothing landed: no node data dir, no project cache
+    assert not (repo / '.fractal').exists()
+    assert not (repo / '.worktrees').exists()
 
 
 def test_user_init_stores_and_updates_agent(git_repo: pathlib.Path) -> None:
@@ -578,7 +739,10 @@ def test_child_inherits_config_preferences_not_caps(
     assert sub.config.get('max_children') is None
     # explicit flags win, and --interval blocks the rival sleep key
     Node(git_repo).init(
-        name='pinned', inherit=['config'], model='sonnet', interval='1h'
+        name='pinned',
+        inherit=['config'],
+        model='sonnet',
+        interval='1h',
     )
     pinned = Node(git_repo / '.worktrees' / 'main.mgr.pinned')
     assert pinned.config.get('model') == 'sonnet'
@@ -591,6 +755,32 @@ def test_init_requires_resolvable_agent(git_repo: pathlib.Path) -> None:
     """Spawning without ``--agent`` and no ancestor default is refused."""
     Node(git_repo).init(user=True)  # user node carries no agent
     with pytest.raises(ValueError, match='No --agent'):
+        Node(git_repo).init(name='task')
+
+
+def test_init_refuses_unsupported_agent(git_repo: pathlib.Path) -> None:
+    """A typo'd ``--agent`` refuses at init, naming the supported backends.
+
+    A junk name would store fine and kill the loop at boot inside the tmux
+    pane -- after ``start`` already printed its success -- stranding the node
+    idle with the diagnosis lost when the pane closes. The user init (the
+    README's first command, where every spawn inherits the default), explicit
+    spawn names, and inherited defaults all refuse the same way, and the
+    refusal leaves nothing behind.
+    """
+    # the front door: a typo'd tree-wide default refuses before storing
+    with pytest.raises(ValueError, match='Unsupported agent'):
+        Node(git_repo).init(agent='cluade', user=True)
+    Node(git_repo).init(agent='claude', user=True)
+    with pytest.raises(ValueError, match='Unsupported agent'):
+        Node(git_repo).init(name='task', agent='notreal')
+    # nothing landed -- no worktree, no registry row
+    assert not (git_repo / '.worktrees' / 'main.task').exists()
+    assert not Node(git_repo).db.exists('nodes', where={'node': 'main.task'})
+    # a junk inherited default (the user config is a steering surface, so a
+    # typo can land there directly) refuses at the spawn that inherits it
+    Node(git_repo).config.set('agent', 'notreal')
+    with pytest.raises(ValueError, match='Unsupported agent'):
         Node(git_repo).init(name='task')
 
 
@@ -643,6 +833,21 @@ def test_init_requires_project_wiki(tmp_path: pathlib.Path) -> None:
     node.init(agent='claude', user=True)
     with pytest.raises(RuntimeError, match='project wiki'):
         node.init(name='bad')
+
+
+def test_init_names_a_missing_base_branch(git_repo: pathlib.Path) -> None:
+    """A ``--base`` typo names the missing branch, not a missing wiki.
+
+    The wiki precondition reads through the base ref, so a nonexistent
+    branch would fail that check for a missing-ref reason and prescribe
+    creating a wiki -- the wrong remedy for a typo. The ref check runs
+    first and names the real problem.
+    """
+    node = Node(git_repo)
+    node.init(agent='claude', user=True)
+    with pytest.raises(RuntimeError, match="does_not_exist' does not exist") as err:
+        node.init(name='task', base='does_not_exist')
+    assert 'wiki' not in str(err.value)
 
 
 def test_init_rejects_inside_worktrees(
@@ -730,6 +935,25 @@ def test_init_rejects_subsecond_duration(
         node.init(name='task', agent='claude', **kwargs)
 
 
+def test_init_accepts_fractional_duration_under_comma_locale(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A comma-decimal locale never rejects a valid fractional duration.
+
+    init.sh re-checks the sub-second gate with awk, whose string-to-number
+    conversion follows the process locale on macOS -- under a comma-decimal
+    locale a dot-decimal ``0.5h`` (30 minutes) would truncate to ``0`` and
+    be rejected as sub-second. The gate pins awk to the C locale, so the
+    caller's locale never changes what parses.
+    """
+    monkeypatch.setenv('LC_ALL', 'de_DE.UTF-8')
+    Node(git_repo).init(agent='claude', user=True)
+    Node(git_repo).init(name='task', agent='claude', iter_timeout='0.5h')
+    task = Node(git_repo / '.worktrees' / 'main.task')
+    assert task.config.get('iter_timeout') == '0.5h'
+
+
 @pytest.mark.parametrize(
     argnames=('kwargs', 'match'),
     argvalues=[
@@ -773,6 +997,27 @@ def test_init_rejects_absolute_or_traversal_scope(
     node.init(agent='claude', user=True)
     with pytest.raises(ValueError, match='repo-relative subdirectory'):
         node.init(name='scoped', scope=[root])
+
+
+def test_init_normalizes_scope_before_validating(git_repo: pathlib.Path) -> None:
+    """Core init splits scope on the canonical separators, then validates.
+
+    Whitespace is the stored form's list separator (``config _set`` splits
+    on it), so a space-carrying entry is several roots, not one -- and
+    validating the pre-split string would let a traversal root ride into
+    config.json inside a space form, where the canonical split later frees
+    it. Init must land the same list ``config _set`` would, with every
+    split root individually validated.
+    """
+    node = Node(git_repo)
+    node.init(agent='claude', user=True)
+    # the mixed comma+space form lands as the canonical list
+    node.init(name='scoped', scope=['roots/a,roots/b roots/c'])
+    child = Node(git_repo / '.worktrees' / 'main.scoped')
+    assert child.config.get('scope') == ['roots/a', 'roots/b', 'roots/c']
+    # a traversal root hiding inside a space form cannot bypass validation
+    with pytest.raises(ValueError, match='repo-relative subdirectory'):
+        node.init(name='sneaky', scope=['roots/a ../escape'])
 
 
 # ------ sub-projects and ambient resolution
@@ -909,3 +1154,24 @@ def test_resolve_init_target_anchors_subproject_at_git_root(
     node, project = resolve_init_target(f'{app_dir}')
     assert node.worktree == git_repo
     assert str(project) == 'app'
+
+
+def test_resolve_init_target_refuses_linked_worktree(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Init from a linked git worktree fails with the main-checkout remedy.
+
+    A linked worktree (``git worktree add ../feature``) lives outside the main
+    repo root, so it can never be a sub-project path -- the resolver must
+    refuse with the remedy (run init from the main checkout), not leak
+    ``relative_to``'s raw ValueError.
+    """
+    repo = _make_git_repo(tmp_path / 'main')
+    subprocess.run(
+        ['git', 'worktree', 'add', '-b', 'feature', '../feature'],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    )
+    with pytest.raises(typer.BadParameter, match='main checkout'):
+        resolve_init_target(f'{tmp_path / "feature"}')

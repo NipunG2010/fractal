@@ -22,6 +22,9 @@
 .pgid
 .step_pgid
 
+# Tmux socket handle
+.socket
+
 # Obsidian config
 .obsidian/
 

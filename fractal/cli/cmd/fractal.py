@@ -324,12 +324,11 @@ def open(app: typer.Typer) -> typer.Typer:
         # tokens are read at render time, so one select re-skins everything)
         theme.select('light' if light else 'dark')
         node = resolve_target(path, node)
-        project_dir = node.repo_dir / node.project_path
-        root = resolve_node(project_dir)
-        if root.is_user:
-            FractalApp(root, branch=node.branch).run()
-        else:
-            raise RuntimeError(f'Directory is not a user node: {project_dir}.')
+        # anchor the cockpit on the user node by config, not the checkout
+        # (mirrors pause): a branch-keyed resolution on a non-init checkout
+        # refuses to open even with the node to focus named explicitly
+        root = resolve_user_node(node.repo_dir)
+        FractalApp(root, branch=node.branch).run()
 
     return app
 
@@ -399,8 +398,11 @@ def reset(app: typer.Typer) -> typer.Typer:
         # cwd inside it (the agent's NODE_DIR, a worktree, or the repo root)
         repo_dir = Node(path).repo_dir
         if not force:
-            user = Node(repo_dir)
-            count = len(user.child_list()) if user.exists() else 0
+            # anchor on the user node by config, not the checkout (mirrors
+            # pause): a bare Node(repo_dir) on a non-init branch counts 0
+            # nodes and hides the paused-node kill warning below
+            user = Node.resolve_user(repo_dir)
+            count = len(user.child_list()) if user else 0
             s = 's' if count != 1 else ''
             typer.echo(
                 'Warning: This permanently removes every node worktree,'
@@ -410,7 +412,7 @@ def reset(app: typer.Typer) -> typer.Typer:
             )
             # the confirmation is the authorization to kill paused nodes, so
             # it must name them (the teardown settles their frozen work)
-            paused = len(user.list(status='paused', live=True)) if user.exists() else 0
+            paused = len(user.list(status='paused', live=True)) if user else 0
             if paused:
                 p = 's' if paused != 1 else ''
                 hold = 'hold' if paused != 1 else 'holds'
@@ -447,8 +449,11 @@ def destroy(app: typer.Typer) -> typer.Typer:
         # cwd inside it (the agent's NODE_DIR, a worktree, or the repo root)
         repo_dir = Node(path).repo_dir
         if not force:
-            user = Node(repo_dir)
-            count = len(user.child_list()) if user.exists() else 0
+            # anchor on the user node by config, not the checkout (mirrors
+            # pause): a bare Node(repo_dir) on a non-init branch counts 0
+            # nodes and hides the paused-node kill warning below
+            user = Node.resolve_user(repo_dir)
+            count = len(user.child_list()) if user else 0
             s = 's' if count != 1 else ''
             typer.echo(
                 'Warning: This permanently removes every node worktree and'
@@ -458,7 +463,7 @@ def destroy(app: typer.Typer) -> typer.Typer:
             )
             # the confirmation is the authorization to kill paused nodes, so
             # it must name them (the teardown settles their frozen work)
-            paused = len(user.list(status='paused', live=True)) if user.exists() else 0
+            paused = len(user.list(status='paused', live=True)) if user else 0
             if paused:
                 p = 's' if paused != 1 else ''
                 hold = 'hold' if paused != 1 else 'holds'

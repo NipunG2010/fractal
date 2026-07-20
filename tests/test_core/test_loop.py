@@ -13,12 +13,14 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+import sqlite3
 import subprocess
 import time
 from typing import Any, Optional
 
 import pytest
 
+from fractal.constants import SOCKET_FILE
 from fractal.core import pricing
 from fractal.core.event import Event
 from fractal.core.loop import Loop, Step, StepResult
@@ -36,17 +38,21 @@ __all__ = [
     'test_malformed_midrun_retune_warns_and_keeps_the_previous_value',
     'test_provider_frontmatter_rebinds_the_boot_agent',
     'test_agent_env_publishes_node_branch',
+    'test_boot_records_the_tmux_socket_for_the_reconcile_probe',
+    'test_continue_restore_lands_config_all_or_nothing',
     'test_stream_fault_attributes_to_the_stream_side',
     'test_agent_stderr_tolerates_non_utf8_output',
     'test_agent_launch_failure_books_a_failed_step',
     'test_setup_tolerates_non_utf8_output',
     'test_unsupported_provider_frontmatter_refuses_the_step',
     'test_discover_steps_orders_and_validates_prefixes',
+    'test_preflight_aborts_on_a_non_utf8_step_file',
     'test_park_if_latched_walks_ancestors_with_resume_exemption',
     'test_step_budget_math_binds_the_tightest_cap',
     'test_step_budget_reserve_window_floors_at_remaining',
     'test_boundary_checks_read_live_caps',
     'test_untracked_spend_under_caps_warns_once',
+    'test_failed_cost_reads_hold_the_last_good_reading',
     'test_cap_gate_demands_a_priced_model_from_tracking_gaps',
     'test_pending_finish_winds_down_in_reserve_for_budget_cascades',
     'test_pending_finish_between_iterations_starts_none',
@@ -62,11 +68,13 @@ __all__ = [
     'test_ceiling_trip_during_retry_backoff_abandons_the_retry',
     'test_err_snapshots_keep_every_attempts_diagnosis',
     'test_run_end_drain_outlives_the_closed_iterations_deadline',
+    'test_before_last_step_drain_uses_the_run_wall_not_the_iter_deadline',
     'test_finalize_terminal_cascade_matrix',
     'test_stop_during_finish_drain_books_stopped',
     'test_pre_iteration_finish_drain_uses_the_run_wall_not_the_iter_deadline',
     'test_finalize_reclassifies_budget_overruns_on_finish',
     'test_finalize_park_leaves_rows_open',
+    'test_crash_exit_closes_the_open_iteration_and_step_rows',
     'test_run_fires_hook_pairings_off_stdout',
     'test_sync_launch_fires_step_pairing',
     'test_run_fires_iteration_failure_on_unhandled_loop_error',
@@ -287,9 +295,11 @@ def test_malformed_midrun_retune_warns_and_keeps_the_previous_value(
     """A malformed mid-run config edit warns and keeps the prior values.
 
     Config is a live-edited steering surface: the iteration-top re-reads
-    of ``max_iters``/``step_timeout``/``wait`` must warn and fall back on
-    a hand-edit the launch validation never saw (a bare number, a
-    non-integer), never crash the run and lose the remaining iterations.
+    of ``max_iters``/``step_timeout``/``wait`` and the cost-cap reads
+    (the iteration top and both budget probes) must warn and fall back
+    on a hand-edit the launch validation never saw (a bare number, a
+    non-integer, a non-numeric cap), never crash the run and lose the
+    remaining iterations.
     """
     monkeypatch.setenv('_NODE', '')
     _configure(loop_node, max_iters=2, step_timeout='30s')
@@ -301,7 +311,13 @@ def test_malformed_midrun_retune_warns_and_keeps_the_previous_value(
             self: EditingLoop, step: Step, prompt: str, **kwargs: Any
         ) -> StepResult:
             """Break the config mid-run, then run the scripted outcome."""
-            _configure(self.node, max_iters='two', step_timeout='600', wait='soon')
+            _configure(
+                self.node,
+                max_iters='two',
+                step_timeout='600',
+                wait='soon',
+                max_cost='25 USD',
+            )
             return super()._launch(step, prompt, **kwargs)
 
     loop = EditingLoop(loop_node)
@@ -313,6 +329,7 @@ def test_malformed_midrun_retune_warns_and_keeps_the_previous_value(
     assert 'keeping the previous value' in err
     assert 'keeping the previous step_timeout' in err
     assert 'keeping the previous wait' in err
+    assert 'keeping the previous cost caps' in err
 
 
 def test_provider_frontmatter_rebinds_the_boot_agent(
@@ -388,6 +405,77 @@ def test_agent_env_publishes_node_branch(
     # every launch published the node's branch for external consumers
     assert loop.envs
     assert all(env['NODE_BRANCH'] == loop_node.branch for env in loop.envs)
+
+
+def test_boot_records_the_tmux_socket_for_the_reconcile_probe(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boot records the pane's tmux socket; an in-band exit drops the record.
+
+    ``Node._reconcile_status`` probes the server the session lives on via
+    this record, so it must land before any step runs (a reconcile racing a
+    fresh boot from a different-socket shell must already find it) and must
+    not outlive the loop -- a surviving record, like ``.pgid``, would mark a
+    death no cleanup could catch.
+    """
+    socket_path = '/tmp/fx-test/socket'  # noqa: S108
+    monkeypatch.setenv('TMUX', f'{socket_path},4242,0')
+    socket_file = loop_node.node_dir / SOCKET_FILE
+
+    class RecordingLoop(MockLoop):
+        """Mock loop reading the socket record where a step would run."""
+
+        def __init__(self: RecordingLoop, node: Node, **kwargs: Any) -> None:
+            """Initialize ``RecordingLoop``."""
+            super().__init__(node, **kwargs)
+            self.recorded: list[str] = []
+
+        def _launch(
+            self: RecordingLoop, step: Step, prompt: str, **kwargs: Any
+        ) -> StepResult:
+            """Record the socket file's content alongside the outcome."""
+            self.recorded.append(socket_file.read_text(encoding='utf-8'))
+            return super()._launch(step, prompt, **kwargs)
+
+    loop = RecordingLoop(loop_node)
+    assert loop.run() == 0
+    # every step ran under the recorded socket, and the exit dropped it
+    assert loop.recorded
+    assert all(text.strip() == socket_path for text in loop.recorded)
+    assert not socket_file.exists()
+
+
+def test_continue_restore_lands_config_all_or_nothing(
+    node_with_db: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The continue restore rewrites ``config.json`` all-or-nothing.
+
+    The restore rewrites the fleet's most-read file right after the
+    checkout/clean -- the same file ``Config.set`` only ever lands via
+    the unique-temp ``os.replace`` swap, because every sibling command
+    parses it live. The injected ``write_bytes`` double models a kill
+    landing inside an in-place write's truncate window; the staged swap
+    never opens the target itself, so the retuned config survives whole
+    and parseable.
+    """
+    node = node_with_db
+    # the documented steering flow: retune config.json between runs
+    _configure(node, max_iters=3)
+    config_path = node.node_dir / 'config.json'
+    expected = json.loads(config_path.read_text(encoding='utf-8'))
+    loop = MockLoop(node)
+
+    def tear(path: pathlib.Path, data: bytes) -> int:
+        """Model a kill mid-write: the truncate lands, the payload never does."""
+        with path.open('wb'):
+            pass
+        return 0
+
+    monkeypatch.setattr(pathlib.Path, 'write_bytes', tear)
+    loop._clean_worktree()
+    assert json.loads(config_path.read_text(encoding='utf-8')) == expected
 
 
 def test_stream_fault_attributes_to_the_stream_side(
@@ -629,6 +717,33 @@ def test_discover_steps_orders_and_validates_prefixes(
     assert 'Error:' in capsys.readouterr().err
 
 
+def test_preflight_aborts_on_a_non_utf8_step_file(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A step file with an invalid byte aborts preflight naming the file.
+
+    Step files are hand-edited, so a bad byte is a boundary failure, not a
+    crash: a bare ``UnicodeDecodeError`` names a byte offset but no file
+    and would escape before the run row or the ``active`` stamp exists --
+    stranding ``.status`` at ``idle`` (a never-started node) with the
+    diagnosis lost in the dying pane. The abort machinery instead lands a
+    closed ``exited`` run row naming the file and stamps the honest
+    terminal.
+    """
+    monkeypatch.setenv('_NODE', '')
+    (loop_node.node_dir / 'steps' / '01-PLAN.md').write_bytes(b'# PLAN \xff\n')
+    loop = Loop(loop_node)
+    assert loop.run() == 1
+    # the reason landed on a closed exited run row, and the stamp is honest
+    assert loop_node.status() == 'exited'
+    run = loop_node.db.read('runs', where={'node': loop_node.branch})[0]
+    assert (run['status'], run['exit_code']) == ('exited', 1)
+    assert '01-PLAN.md' in run['metadata']
+    assert 'not valid UTF-8' in capsys.readouterr().err
+
+
 # ------ boot latch
 
 
@@ -679,7 +794,10 @@ def test_step_budget_math_binds_the_tightest_cap(loop_node: Node) -> None:
     loop._read_cost_caps()
     loop._iter_id = node.record.iter_start(run_id=loop._run_id, iter=2)
     step_id = node.record.step_start(
-        iter_id=loop._iter_id, run_id=loop._run_id, step=1, step_name='PLAN'
+        iter_id=loop._iter_id,
+        run_id=loop._run_id,
+        step=1,
+        step_name='PLAN',
     )
     node.record.step_cost(step_id=step_id, cost=0.4)
     node.record.step_end(step_id=step_id, status='completed', exit_code=0)
@@ -766,6 +884,55 @@ def test_untracked_spend_under_caps_warns_once(
     _record_unpriced_step(node, run_id=uncapped._run_id)
     assert uncapped._check_reserve_boundary() is False
     assert capsys.readouterr().out == ''
+
+
+def test_failed_cost_reads_hold_the_last_good_reading(
+    loop_node: Node,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A contended ledger holds the guards at the last good reading.
+
+    A failed read must not size the per-step leash at the full cap
+    ("nothing spent") or read as untracked spend: the leash and the
+    boundary probes hold the last good reading until the ledger reads
+    again, and the once-per-run warning names the read failure instead
+    of blaming unpriced steps.
+    """
+    node = loop_node
+    _configure(node, max_cost=10.0, max_iter_cost=1.0, reserve_budget=1.0)
+    loop = MockLoop(node)
+    loop._read_cost_caps()
+    loop._run_id = node.record.run_start()
+    # spend deep into the reserve window across two iterations, leaving the
+    # current iteration a thin headroom
+    _record_step_cost(node, run_id=loop._run_id, cost=8.9)
+    loop._iter_id = node.record.iter_start(run_id=loop._run_id, iter=2)
+    step_id = node.record.step_start(
+        iter_id=loop._iter_id,
+        run_id=loop._run_id,
+        step=1,
+        step_name='PLAN',
+    )
+    node.record.step_cost(step_id=step_id, cost=0.7)
+    node.record.step_end(step_id=step_id, status='completed', exit_code=0)
+    # good reads prime the guards: the ceiling probe reads the spend, the
+    # leash reads the iteration headroom
+    assert loop._check_subtree_ceiling() is False
+    assert loop._step_budget() == pytest.approx(0.3)
+
+    # the DB degrades: every read raises like a lock timeout would
+    def locked_read(*args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.OperationalError('database is locked')
+
+    monkeypatch.setattr(node.db, 'read', locked_read)
+    # the leash holds the residual readings, not the full caps
+    assert loop._step_budget() == pytest.approx(0.3)
+    assert 'WARNING: cost read failed' in capsys.readouterr().out
+    # the reserve boundary still trips on the last good spend, and the
+    # attribution stays honest -- no unpriced-steps (untracked) blame
+    assert loop._check_reserve_boundary() is True
+    assert 'untracked' not in capsys.readouterr().out
 
 
 def test_cap_gate_demands_a_priced_model_from_tracking_gaps(
@@ -1384,6 +1551,56 @@ def test_run_end_drain_outlives_the_closed_iterations_deadline(
     assert loop_node.status() == 'completed'
 
 
+def test_before_last_step_drain_uses_the_run_wall_not_the_iter_deadline(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The finishing iteration's before-last-step drain outlives iter_timeout.
+
+    A finish landing mid-iteration drains the subtree before the final
+    step so that step integrates the children's work. Like the pre- and
+    post-iteration drains, the wait is bounded by the run wall alone:
+    the live iteration's deadline left armed would time it out over
+    children that were finishing normally -- the iteration books failed,
+    the final step never runs, and the finalize backstop re-drains and
+    stamps the run completed over the skipped wind-down.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _configure(loop_node, iter_timeout='2s', wait='1s')
+
+    class FinishingLoop(MockLoop):
+        """Mock loop with scripted descendant polls and a first-step finish."""
+
+        def __init__(self: FinishingLoop, node: Node, **kwargs: Any) -> None:
+            """Initialize ``FinishingLoop``."""
+            super().__init__(node, **kwargs)
+            self.polls = [True] * 5
+
+        def _launch(self: FinishingLoop, *args: Any, **kwargs: Any) -> StepResult:
+            """Land the finish signal during the step's launch."""
+            self.node.record.signal_set('finish', 'done')
+            return super()._launch(*args, **kwargs)
+
+        def _descendants_active(self: FinishingLoop) -> bool:
+            """Report the children active until the scripted polls run out."""
+            return bool(self.polls and self.polls.pop(0))
+
+    loop = FinishingLoop(loop_node)
+    assert loop.run() == 0
+    out = capsys.readouterr().out
+    # the drain waits the children out past the live iteration's deadline
+    assert loop.polls == []
+    assert '--- Waiting for children: timed out ---' not in out
+    # and the final step ran, so the goal-met terminal is honest
+    assert len(loop.launched) == 2
+    iteration = loop_node.db.read('iters', where={'node': loop_node.branch})[0]
+    assert (iteration['status'], iteration['exit_code']) == ('completed', 0)
+    run = loop_node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert (run['status'], run['exit_code']) == ('completed', 0)
+    assert loop_node.status() == 'completed'
+
+
 # ------ terminal cascade
 
 
@@ -1429,6 +1646,20 @@ def test_run_end_drain_outlives_the_closed_iterations_deadline(
             0,
             'Reached max iterations (2)',
         ),
+        # a failed final iteration is abnormal even at the max-iters
+        # boundary -- the run must not launder a dead iteration into a
+        # clean completion
+        (
+            lambda loop: (
+                setattr(loop, '_max_iters', 2),
+                setattr(loop, '_iter', 2),
+                setattr(loop, '_last_iter_failed', True),
+            ),
+            'exited',
+            'exited',
+            1,
+            'Reached max iterations (2); final iteration failed',
+        ),
         # a goal-met finish records completed with no reason
         (
             lambda loop: loop.node.record.signal_set('finish', 'done'),
@@ -1465,6 +1696,21 @@ def test_run_end_drain_outlives_the_closed_iterations_deadline(
             1,
             'Timed out at iteration {run}.0 (no limit)',
         ),
+        # an inconclusive subtree probe during the drain counts as active,
+        # never drained -- the run must not claim a completed finish over
+        # children it could not see; the run wall stays the bounded escape
+        (
+            lambda loop: (
+                loop.node.record.signal_set('finish', 'done'),
+                setattr(loop, '_run_end_epoch', 1),
+                setattr(loop, '_wait_seconds', 1),
+                setattr(loop.node, 'list', _locked_list),
+            ),
+            'exited',
+            'exited',
+            1,
+            'Timed out at iteration {run}.0 (no limit)',
+        ),
         # a budget abort is never a goal-met completion, but it is a
         # designed landing -- exited with exit 0, the budget discriminator
         (
@@ -1494,9 +1740,11 @@ def test_run_end_drain_outlives_the_closed_iterations_deadline(
         'timeout',
         'stop',
         'max_iters',
+        'max_iters_failed_final_iter',
         'finish',
         'stop_abandons_finish_drain',
         'timeout_abandons_finish_drain',
+        'inconclusive_probe_reads_active',
         'budget',
         'setup_abort',
     ],
@@ -1618,12 +1866,14 @@ def test_pre_iteration_finish_drain_uses_the_run_wall_not_the_iter_deadline(
 
 
 def test_finalize_reclassifies_budget_overruns_on_finish(loop_node: Node) -> None:
-    """The over-cap and cascaded-budget sweeps reclassify a finish as exited.
+    """The over-cap, cascaded, and parked budget sweeps reclassify a finish.
 
     The in-loop budget checks disarm once a finish signal exists, so a
-    self-signalled finish that crossed the cap -- and a budget finish
-    cascaded from an ancestor -- both reach the cascade budget-clean and
-    would close as goal-met ``completed`` without the sweeps.
+    self-signalled finish that crossed the cap, a budget finish cascaded
+    from an ancestor, and a self-sent budget finish resumed from a pause
+    park (the abort flags die with the parked process) all reach the
+    cascade budget-clean and would close as goal-met ``completed``
+    without the sweeps.
     """
     node = loop_node
     # over-cap sweep: finish set, spend past the cap (back-dated cost rows)
@@ -1652,6 +1902,20 @@ def test_finalize_reclassifies_budget_overruns_on_finish(loop_node: Node) -> Non
     assert row['metadata'] == (
         f'ancestor budget abort: {reason}; this run spent $1.0000 of $5.0'
     )
+    # parked-abort sweep: a self-sent reserve stop parked by a pause loses
+    # the abort flags with the loop process, and the reserve threshold sits
+    # below the over-cap sweep's full cap -- the resumed loop re-adopts the
+    # abort from the persisted signal row
+    _configure(node, max_cost=10.0)
+    parked = MockLoop(node)
+    parked._run_id = node.record.run_start()
+    reason = 'cost budget reserve reached (spent $9.2000 >= $10.0 max - $1.0 reserve)'
+    node.record.signal_set('finish', reason)
+    _record_step_cost(node, run_id=parked._run_id, cost=9.2)
+    assert parked._finalize() == 0
+    row = node.db.read('runs', where={'run_id': parked._run_id})[0]
+    assert (row['status'], row['exit_code']) == ('exited', 0)
+    assert row['metadata'] == reason
     # a NON-budget cascaded finish stays a goal-met completion
     clean = MockLoop(node)
     clean._run_id = node.record.run_start()
@@ -1688,6 +1952,38 @@ def test_finalize_park_leaves_rows_open(
     )
 
 
+def test_crash_exit_closes_the_open_iteration_and_step_rows(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-band crash settles every open row, not just the run's.
+
+    An attached-pane Ctrl-C (or any unhandled error escaping mid-step)
+    reaches the exit trap with the iteration and step rows still open.
+    The trap must close all three tables with the terminal it stamps on
+    ``.status``: nothing heals them later -- ``_reconcile_status`` no-ops
+    once the status reads ``exited`` -- so a row left open here would
+    read active forever.
+    """
+    monkeypatch.setenv('_NODE', '')
+    loop = MockLoop(loop_node)
+
+    def interrupt(step: Step, prompt: str, **kwargs: Any) -> StepResult:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(loop, '_launch', interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        loop.run()
+    assert loop_node.status() == 'exited'
+    # the run, its iteration, and the interrupted step all read the same
+    # terminal -- no phantom active row survives the crash
+    for table in ('runs', 'iters', 'steps'):
+        rows = loop_node.db.read(table, where={'node': loop_node.branch})
+        assert rows
+        assert {row['status'] for row in rows} == {'exited'}
+        assert all(row['ended_at'] is not None for row in rows)
+
+
 # ------ hook pairings
 
 
@@ -1716,6 +2012,9 @@ def test_run_fires_hook_pairings_off_stdout(
         StepResult(status='failed', exit_code=2, reason='agent error (exit 2)'),
     ]
     loop = TrackingLoop(loop_node, results=results)
+    # the process exit is always clean; the failed final iteration's abnormal
+    # outcome lands in the run row (asserted below), never a clean max-iters
+    # completion
     assert loop.run() == 0
     captured = capsys.readouterr()
     out = captured.out
@@ -1763,7 +2062,7 @@ def test_run_fires_hook_pairings_off_stdout(
     assert by_number[2]['status'] == 'failed'
     assert by_number[2]['metadata'] == 'agent error (exit 2)'
     run = loop_node.db.read('runs', where={'run_id': loop._run_id})[0]
-    assert run['status'] == 'completed'
+    assert run['status'] == 'exited'
 
 
 def test_sync_launch_fires_step_pairing(
@@ -2006,6 +2305,11 @@ def _configure(node: Node, **values: Any) -> None:
     config = json.loads(path.read_text(encoding='utf-8'))
     config.update(values)
     path.write_text(json.dumps(config, indent=2), encoding='utf-8')
+
+
+def _locked_list(**kwargs: Any) -> list[Any]:
+    """Fail the live subtree probe like a contended central-DB read."""
+    raise sqlite3.OperationalError('database is locked')
 
 
 def _record_unpriced_step(node: Node, *, run_id: int) -> None:
