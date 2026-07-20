@@ -10,13 +10,13 @@
 
 Hierarchical agent loops with recursive self-organization.
 
-In a fractal, autonomous agent loops arrange themselves into a tree: a
-node iterates toward a goal in its own `git worktree` and spawns child
-nodes for separable subtasks, so the tree grows to fit the problem
-rather than a fixed plan. Hard caps (iterations, depth, children, cost,
-time) keep each loop bounded, and an operator can steer or stop it at
-any point. Run metadata (including cost) lands in one local `SQLite`
-database, which can be interacted with live in a terminal UI.
+In a fractal, autonomous agent loops arrange themselves into a tree: a node
+iterates toward a goal in its own `git worktree` and spawns child nodes for
+separable subtasks, so the tree grows to fit the problem rather than a fixed
+plan. Hard caps (iterations, depth, children, cost, time) keep each loop
+bounded, and an operator can steer or stop it at any point. Run metadata
+(including cost) lands in one local `SQLite` database, which can be interacted
+with live in a terminal UI.
 
 ______________________________________________________________________
 
@@ -32,9 +32,9 @@ ______________________________________________________________________
 ______________________________________________________________________
 
 This package is a pointer to
-[`plasma-fractal`](https://pypi.org/project/plasma-fractal/) and
-contains no code. Each release pins the matching `plasma-fractal`
-release exactly, so the two names are interchangeable:
+[`plasma-fractal`](https://pypi.org/project/plasma-fractal/) and contains no
+code. Each release pins the matching `plasma-fractal` release exactly, so the
+two names are interchangeable:
 
 ```bash
 pip install fractal
@@ -43,8 +43,8 @@ pip install fractal
 installs `plasma-fractal`. The `tui` extra applies as well:
 `pip install 'fractal[tui]'` installs `plasma-fractal[tui]`.
 
-Versions of `fractal` before 1.0.0 were an unrelated package from a
-previous owner of the name; the pointer begins at 1.0.0.
+Versions of `fractal` before 1.0.0 were an unrelated package from a previous
+owner of the name; the pointer begins at 1.0.0.
 
 ## License
 
