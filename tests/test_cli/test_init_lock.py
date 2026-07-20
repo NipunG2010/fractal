@@ -14,6 +14,7 @@ wedges the lock fails loudly instead of hanging.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import signal
 import subprocess
@@ -24,7 +25,7 @@ import pytest
 
 from tests._helpers import _git
 
-from .conftest import _cli_env, _fractal_bin, _run
+from .conftest import _cli_env, _fractal_bin, _reap_group, _run
 
 __all__ = [
     'test_concurrent_init_serializes_without_crashing',
@@ -45,7 +46,7 @@ _LOCK_HOLDER = (
 
 @pytest.fixture(scope='module')
 def repo(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
-    """A repo with a user (root) node so child ``init`` calls have a parent.
+    """Return a repo with a user (root) node so child ``init`` calls have a parent.
 
     Module-scoped and built once via the real CLI; tests use distinct child
     names so they never collide on the shared repo.
@@ -88,7 +89,11 @@ def test_concurrent_init_serializes_without_crashing(repo: pathlib.Path) -> None
         try:
             out, err = proc.communicate(timeout=120)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            # init spawns its own script chain: reap the whole group, not the pid
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             out, err = proc.communicate()
         outcomes.append((proc.returncode, out, err))
     # every init succeeded and none hit git's ref lock
@@ -103,8 +108,8 @@ def test_concurrent_init_serializes_without_crashing(repo: pathlib.Path) -> None
 
 
 @pytest.mark.parametrize(
-    'sig',
-    [signal.SIGKILL, signal.SIGTERM],
+    argnames='sig',
+    argvalues=[signal.SIGKILL, signal.SIGTERM],
     ids=['sigkill', 'sigterm'],
 )
 def test_held_lock_blocks_init_until_holder_dies(
@@ -142,10 +147,13 @@ def test_held_lock_blocks_init_until_holder_dies(
         assert init.returncode == 0, err
         assert (repo / '.worktrees' / f'main.{name}').is_dir()
     finally:
-        for proc in (init, holder):
-            if proc is not None and proc.poll() is None:
-                proc.kill()
-                proc.wait()
+        # init spawns its own script chain: reap the whole group, not the pid
+        if init is not None:
+            _reap_group(init)
+        # the holder is a single leaf process, so a pid kill reaps it fully
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait()
 
 
 # ------ helpers
@@ -185,6 +193,7 @@ def _init_proc(repo: pathlib.Path, name: str) -> subprocess.Popen:
         stderr=subprocess.PIPE,
         text=True,
         env=_cli_env(),
+        start_new_session=True,
     )
 
 

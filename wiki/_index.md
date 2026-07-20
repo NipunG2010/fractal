@@ -1,11 +1,10 @@
 ---
 name: fractal
-desc: ...
-category: null
+desc: Hierarchical agent loops with recursive self-organization.
 tags: []
 sources: []
 created: 2026-07-12T02:13:53Z
-updated: 2026-07-12T02:13:53Z
+updated: 2026-07-18T22:53:51Z
 ---
 
 # fractal

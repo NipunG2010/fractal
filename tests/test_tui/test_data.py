@@ -8,33 +8,45 @@ past the seeded reference instant, so live-elapsed values are exact constants.
 
 from __future__ import annotations
 
+import json
+import pathlib
+import sqlite3
 from collections.abc import Callable
 from typing import Any, Optional
 
 import pytest
 
+import fractal.core.agent
+from fractal.cli.utils import resolve_node
+from fractal.core.node import Node
+from fractal.impl.claude import ClaudeAgent
 from fractal.tui.data import TuiData, display_name_of
+from fractal.tui.poller import NodePoller
 from fractal.tui.snapshot import SnapshotBuilder
 
-from ._tree import active_branches, session_for
-
-# the real reader, captured before the autouse conftest stub replaces it
-_live_sessions = TuiData.live_sessions
+from ._tree import NOW_EPOCH, active_branches, deterministic_core, session_for
 
 __all__ = [
+    'test_display_name_of',
     'test_tree_topology_and_flags',
     'test_tree_shows_crashed_active_as_exited',
-    'test_live_sessions_empty_when_tmux_absent',
+    'test_crash_between_quiet_builds_reconciles_to_exited',
     'test_active_card_streams_live_state',
     'test_settled_card_is_a_time_machine',
     'test_six_cap_matrix',
+    'test_step_denominator_scopes_to_each_run',
+    'test_measures_tolerate_a_numeric_config_duration',
+    'test_measures_tolerate_a_string_cost_cap',
     'test_sync_folds_into_its_step',
+    'test_open_spans_tick_through_a_sync_window',
     'test_user_root_degrades',
     'test_codex_carries_no_cost_or_sessions',
     'test_radio_reads_are_the_nodes_own',
     'test_subtree_log_merges_descendants',
+    'test_lost_reads_degrade_and_retry',
+    'test_lost_spend_read_degrades_and_retries',
+    'test_live_session_keys_on_the_resolved_backend_name',
     'test_read_surface_never_stamps_read_state',
-    'test_display_name_of',
 ]
 
 # the canonical tree as the tree pane shows it: DFS over creation order
@@ -54,8 +66,8 @@ _TREE = (
 
 
 @pytest.mark.parametrize(
-    ('branch', 'title', 'expected'),
-    [
+    argnames=('branch', 'title', 'expected'),
+    argvalues=[
         ('main.data_pipeline', 'Custom Name', 'Custom Name'),
         ('main.data_pipeline', None, 'Data Pipeline'),
         ('main.alpha.deep_node', None, 'Deep Node'),
@@ -110,22 +122,31 @@ def test_tree_shows_crashed_active_as_exited(
     assert data.status('main.gamma') == 'active'
 
 
-def test_live_sessions_empty_when_tmux_absent(
+def test_crash_between_quiet_builds_reconciles_to_exited(
     data: TuiData,
+    builder: SnapshotBuilder,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A host with no tmux binary reads as no live sessions, never a crash.
+    """A loop that crashes between builds shows ``exited`` on the next build.
 
-    The probe runs every poll tick inside the Textual timer callback, so a
-    missing ``tmux`` (``FileNotFoundError``) must fold into the empty set the
-    docstring promises rather than escape and panic the cockpit.
+    A crash leaves ``.status`` ``active`` and never moves its mtime, so the
+    poller reports nothing moved and the build short-circuits. The liveness
+    reconcile must therefore run every build, ahead of the short-circuit --
+    otherwise the cockpit shows the dead node ``active`` forever.
     """
-
-    def _no_tmux(*_args: Any, **_kwargs: Any) -> None:
-        raise FileNotFoundError(2, 'No such file or directory', 'tmux')
-
-    monkeypatch.setattr('fractal.tui.data.subprocess.run', _no_tmux)
-    assert _live_sessions(data) == frozenset()
+    live = {data.tmux_session_name(branch) for branch in active_branches()}
+    monkeypatch.setattr(data, 'live_sessions', lambda: frozenset(live))
+    # first build: every active node is live
+    first = builder.build('main')
+    assert {r['branch']: r['status'] for r in first.tree}['main.gamma'] == 'active'
+    # main.gamma's loop crashes -- its session vanishes, but nothing on disk
+    # moves, so the poller sees a quiet tree
+    live.discard(data.tmux_session_name('main.gamma'))
+    second = builder.build('main')
+    # the reconcile ran despite the quiet tree: gamma now reads exited
+    assert second is not first
+    assert {r['branch']: r['status'] for r in second.tree}['main.gamma'] == 'exited'
+    assert data.status('main.gamma') == 'active'  # display only, disk untouched
 
 
 def test_active_card_streams_live_state(builder: SnapshotBuilder) -> None:
@@ -182,8 +203,8 @@ def test_active_card_streams_live_state(builder: SnapshotBuilder) -> None:
 
 
 @pytest.mark.parametrize(
-    ('branch', 'status', 'step_view', 'elapsed', 'costs'),
-    [
+    argnames=('branch', 'status', 'step_view', 'elapsed', 'costs'),
+    argvalues=[
         pytest.param(
             'main.alpha.deep.leaf',
             'completed',
@@ -260,6 +281,97 @@ def test_six_cap_matrix(builder: SnapshotBuilder) -> None:
     )
 
 
+def test_step_denominator_scopes_to_each_run(pair_tree: pathlib.Path) -> None:
+    """A run's step denominator is its own pipeline length, not the all-time max.
+
+    A pipeline trimmed between runs (5 -> 3) must show the newer run's own N:
+    an all-time ``MAX(step)`` would stamp ``/5`` on the trimmed run forever,
+    while the run-scoped max reads ``/3``.
+    """
+    alpha = Node(pair_tree / '.worktrees' / 'main.alpha')
+    with deterministic_core() as clock:
+        clock.at(600.0)
+        # run 1: a full 5-step pipeline, settled
+        run1 = alpha.record.run_start()
+        it1 = alpha.record.iter_start(run_id=run1, iter=1)
+        for n, name in enumerate(('PREPARE', 'PLAN', 'EXECUTE', 'REVIEW', 'COMMIT'), 1):
+            sid = alpha.record.step_start(
+                iter_id=it1,
+                run_id=run1,
+                step=n,
+                step_name=name,
+            )
+            alpha.record.step_end(step_id=sid, status='completed', exit_code=0)
+        alpha.record.iter_end(iter_id=it1, status='completed', exit_code=0)
+        alpha.record.run_end(run_id=run1, status='exited', exit_code=0)
+        # run 2: the pipeline trimmed to 3 steps, still running (step 3 active)
+        run2 = alpha.record.run_start()
+        it2 = alpha.record.iter_start(run_id=run2, iter=1)
+        for n, name in enumerate(('PREPARE', 'EXECUTE', 'COMMIT'), 1):
+            sid = alpha.record.step_start(
+                iter_id=it2,
+                run_id=run2,
+                step=n,
+                step_name=name,
+            )
+            if n < 3:
+                alpha.record.step_end(step_id=sid, status='completed', exit_code=0)
+    alpha.status_set('active')
+    data = TuiData(resolve_node(pair_tree))
+    builder = SnapshotBuilder(data, NodePoller(data.db_dir), now=lambda: NOW_EPOCH)
+    snap = builder.build('main.alpha')
+
+    # the card reads run 2's own pipeline length (3), never the all-time 5
+    assert snap.measures['step_total'] == 3
+
+
+def test_measures_tolerate_a_numeric_config_duration(pair_tree: pathlib.Path) -> None:
+    """A bare-number duration in config.json degrades to no cap, never a crash.
+
+    config.json is agent-editable, so a self-tuning node may write
+    ``timeout: 3600`` (an int) instead of ``'1h'``. ``_measures`` must coerce
+    before parsing -- a raw int would hit ``.strip()`` and crash the whole
+    cockpit build, killing scope-to and ``fractal open <node>`` at boot.
+    """
+    alpha = Node(pair_tree / '.worktrees' / 'main.alpha')
+    config_path = alpha.node_dir / 'config.json'
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    config['timeout'] = 3600  # a bare int, not the '1h' the parser expects
+    config_path.write_text(json.dumps(config), encoding='utf-8')
+    with deterministic_core() as clock:
+        clock.at(100.0)
+        alpha.record.run_start()
+    data = TuiData(resolve_node(pair_tree))
+    builder = SnapshotBuilder(data, NodePoller(data.db_dir), now=lambda: NOW_EPOCH)
+    # the build completes; the unparseable numeric duration reads as no cap
+    measures = builder.build('main.alpha').measures
+    assert measures['cap_run_s'] is None
+
+
+def test_measures_tolerate_a_string_cost_cap(pair_tree: pathlib.Path) -> None:
+    """A non-numeric cost cap in config.json degrades to no cap, never a crash.
+
+    config.json is agent-editable, so a self-tuning node may write a string
+    ``max_cost`` (or ``reserve_budget``). The node pane divides and subtracts
+    against the cap, so ``_measures`` must coerce -- a raw string would hit
+    ``cost / cap`` and crash the cockpit build, the cost sibling of the
+    duration crash above.
+    """
+    alpha = Node(pair_tree / '.worktrees' / 'main.alpha')
+    config_path = alpha.node_dir / 'config.json'
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    config['max_cost'] = 'lots'  # a string, not the float the gauges divide by
+    config_path.write_text(json.dumps(config), encoding='utf-8')
+    with deterministic_core() as clock:
+        clock.at(100.0)
+        alpha.record.run_start()
+    data = TuiData(resolve_node(pair_tree))
+    builder = SnapshotBuilder(data, NodePoller(data.db_dir), now=lambda: NOW_EPOCH)
+    # the build completes; the unparseable cost reads as no cap
+    measures = builder.build('main.alpha').measures
+    assert measures['cap_run_cost'] is None
+
+
 def test_sync_folds_into_its_step(builder: SnapshotBuilder) -> None:
     """SYNC passes stay out of step N/N and fold into the step they precede."""
     snap = builder.build('main.alpha')
@@ -292,6 +404,66 @@ def test_sync_folds_into_its_step(builder: SnapshotBuilder) -> None:
         3,
         'start',
     )
+
+
+def test_open_spans_tick_through_a_sync_window(pair_tree: pathlib.Path) -> None:
+    """Open iter/run elapsed keep ticking while only a SYNC step is active.
+
+    The displayed step falls back to the settled numbered step and reports
+    its final wall time, but the open iteration and run measure against the
+    live clock -- never the none-valued ellipsis. The card and the open
+    run/iter explorer rows all read the currently running session.
+    """
+    # seed a run parked in a SYNC window: PREPARE settled, SYNC active
+    alpha = Node(pair_tree / '.worktrees' / 'main.alpha')
+    with deterministic_core() as clock:
+        clock.at(600.0)
+        run_id = alpha.record.run_start()
+        clock.at(590.0)
+        iter_id = alpha.record.iter_start(run_id=run_id, iter=1)
+        clock.at(580.0)
+        step_id = alpha.record.step_start(
+            iter_id=iter_id,
+            run_id=run_id,
+            step=1,
+            step_name='PREPARE',
+        )
+        alpha.record.step_session(
+            'claude',
+            step_id=step_id,
+            model='opus 4.8',
+            session='prep-sess',
+        )
+        clock.at(520.0)
+        alpha.record.step_end(step_id=step_id, status='completed', exit_code=0)
+        clock.at(510.0)
+        sync_id = alpha.record.step_start(
+            iter_id=iter_id,
+            run_id=run_id,
+            step=1,
+            step_name='SYNC',
+        )
+        alpha.record.step_session(
+            'claude',
+            step_id=sync_id,
+            model='opus 4.8',
+            session='sync-sess',
+        )
+    alpha.status_set('active')
+    # build with the pinned clock ten minutes past the reference instant
+    data = TuiData(resolve_node(pair_tree))
+    builder = SnapshotBuilder(data, NodePoller(data.db_dir), now=lambda: NOW_EPOCH)
+    snap = builder.build('main.alpha')
+    m = snap.measures
+    # the displayed step is the settled PREPARE with its final wall time
+    assert (m['step'], m['step_name'], m['elapsed_step']) == (1, 'PREPARE', 60.0)
+    # the open iteration and run tick on the injected clock
+    assert (m['elapsed_iter'], m['elapsed_run']) == (1190.0, 1200.0)
+    # the running session shows everywhere, not a settled leftover (nor "-")
+    assert snap.card['session'] == 'sync-sess'
+    run_row = snap.history[0]
+    assert run_row['session'] == 'sync-sess'
+    assert run_row['iters'][0]['session'] == 'sync-sess'
 
 
 def test_user_root_degrades(builder: SnapshotBuilder) -> None:
@@ -377,6 +549,89 @@ def test_subtree_log_merges_descendants(builder: SnapshotBuilder) -> None:
     assert restored.geometry == scoped.geometry
 
 
+def test_lost_reads_degrade_and_retry(builder: SnapshotBuilder) -> None:
+    """A lost read never blanks a build: empty sections now, recovery next tick.
+
+    Every section loader shares one degradation contract over the contended
+    store: mark the branch for retry, cache the empty placeholder, keep the
+    build alive. The next build folds the retry set back in and fills the
+    sections without any new disk movement.
+    """
+    with pytest.MonkeyPatch().context() as mp:
+
+        def lost(self: TuiData) -> sqlite3.Connection:
+            raise sqlite3.OperationalError('database is locked')
+
+        mp.setattr(TuiData, 'connect', lost)
+        snap = builder.build('main.alpha', want_feed=True, want_archive=True)
+    # the focused sections degrade to their placeholders, never a crash
+    assert snap.card is None
+    assert snap.history == ()
+    assert snap.messages == ()
+    assert snap.feed == ()
+    assert snap.saved == ()
+    # the retry lands on the very next build -- no new disk movement needed
+    recovered = builder.build('main.alpha', want_feed=True, want_archive=True)
+    assert recovered.card is not None
+    assert recovered.history != ()
+    assert [row['subject'] for row in recovered.messages] == [
+        'hello',
+        'status',
+        'note',
+        'steer',
+    ]
+    assert [row['subject'] for row in recovered.saved] == ['status']
+
+
+def test_lost_spend_read_degrades_and_retries(builder: SnapshotBuilder) -> None:
+    """A spend read lost after the sections loaded degrades, never crashes.
+
+    The run-spend pass opens its own connection once the focused sections are
+    already read, so it can lose alone (a writer landing mid-build). Each
+    figure degrades to the cached in-memory math and the scope retries on the
+    very next build.
+    """
+    with pytest.MonkeyPatch().context() as mp:
+
+        def lost(self: TuiData) -> sqlite3.Connection:
+            raise sqlite3.OperationalError('database is locked')
+
+        mp.setattr(TuiData, 'reader', lost)
+        snap = builder.build('main.alpha')
+    # the build survives on the in-memory fallback (the same figure here --
+    # the canonical tree carries no orphaned descendants)
+    assert snap.card is not None
+    assert snap.measures['cost_run'] == pytest.approx(2.82)
+    assert snap.history[0]['spend'] == pytest.approx(2.82)
+    # the retry lands on the very next build -- no new disk movement needed
+    recovered = builder.build('main.alpha')
+    assert recovered is not snap
+    assert recovered.measures['cost_run'] == pytest.approx(2.82)
+
+
+def test_live_session_keys_on_the_resolved_backend_name(
+    data: TuiData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The woven-session lookup keys step rows by the backend's name.
+
+    Step rows record ``Agent.name``, so a config that reaches a backend
+    through a registry alias (or carries flags) must key the lookup by the
+    resolved name, not the configured word; an unregistered agent matches
+    no woven rows.
+    """
+
+    class Claudette(ClaudeAgent):
+        """The claude backend reached through a registry alias."""
+
+    live = session_for('main.alpha', 2, 2)
+    monkeypatch.setitem(fractal.core.agent._AGENTS, 'claudette', Claudette)
+    with data.reader() as connection:
+        assert data.live_session(connection, 'main.alpha', 'claude -v') == live
+        assert data.live_session(connection, 'main.alpha', 'claudette') == live
+        assert data.live_session(connection, 'main.alpha', 'ghost') is None
+
+
 # ------ the read firewall
 
 
@@ -403,9 +658,13 @@ _READ_SURFACE: dict[str, Callable[[TuiData, SnapshotBuilder], Any]] = {
     'channel-rows': lambda data, builder: _query(data, 'main.alpha', data.channel_rows),
     'archive-rows': lambda data, builder: _query(data, 'main', data.archive_rows),
     'live-session': lambda data, builder: _query(
-        data,
-        'main.alpha',
-        lambda connection, branch: data.live_session(connection, branch, 'claude'),
+        data=data,
+        branch='main.alpha',
+        reader=lambda connection, branch: data.live_session(
+            connection=connection,
+            branch=branch,
+            agent='claude',
+        ),
     ),
     'snapshot': lambda data, builder: builder.build(
         'main.alpha',
@@ -420,8 +679,8 @@ def _read_state(data: TuiData) -> tuple:
     connection = data.connect()
     try:
         reads = data.rows(
-            connection,
-            'SELECT message_id, node FROM reads ORDER BY message_id, node',
+            connection=connection,
+            query='SELECT message_id, node FROM reads ORDER BY message_id, node',
         )
     finally:
         connection.close()

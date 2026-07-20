@@ -1,0 +1,35 @@
+[project]
+name = "fractal"
+version = "1.0.0"
+description = "Hierarchical agent loops with recursive self-organization."
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Plasma AI", email = "eng@plasma.ai" },
+]
+maintainers = [
+    { name = "Plasma AI", email = "eng@plasma.ai" },
+]
+dependencies = [
+    "plasma-fractal==1.0.0",
+]
+
+[project.optional-dependencies]
+tui = [
+    "plasma-fractal[tui]==1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/plasma-ai/fractal"
+Repository = "https://github.com/plasma-ai/fractal"
+Issues = "https://github.com/plasma-ai/fractal/issues"
+Documentation = "https://docs.plasma.ai/fractal"
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,10 +1,11 @@
 """Implements ``RadioPane`` -- the message pane.
 
-Three sources over the scoped node's radio (modes: ``radio``/``rdrop``/``rdetail``):
-its own ``Messages``, the cross-subtree ``Feed`` (every descendant's
-public/outbox posts), and the ``Archive`` of saved messages. A zone ladder
-(source tabs, filters, list, rows) drives selection; opening a row shows the
-detail view with its Reply / Chat / React / Save action bar. All reads come
+Three sources over the scoped node's radio (modes:
+``radio``/``rdrop``/``rdetail``/``rreact``): its own ``Messages``, the
+cross-subtree ``Feed`` (every descendant's public/outbox posts), and the
+``Archive`` of saved messages. A zone ladder (source tabs, filters, rows)
+drives selection; opening a row shows the detail view with its
+Reply / Chat / React / Save action bar (React drops a +1 / -1 choice). All reads come
 from the snapshot; the only writes are the explicit detail actions (and the
 read receipt on open) through ``TuiActions``.
 """
@@ -22,11 +23,14 @@ from textual.containers import Vertical
 from textual.events import Key
 from textual.widgets import OptionList, Rule as Divider, Static
 
-from fractal.tui import fmt, theme
+import fractal.tui.fmt
+import fractal.tui.theme
 from fractal.tui.data import leaf_of, user_tag
 from fractal.tui.widgets import PaneScroll
 
 if typing.TYPE_CHECKING:
+    from textual.widget import Widget
+
     from fractal.tui.app import FractalApp
     from fractal.tui.snapshot import Snapshot
 
@@ -34,6 +38,10 @@ __all__ = ['RadioPane']
 
 # the source tabs, in display and cycle order (left/right steps through them)
 _SOURCES = ('Messages', 'Feed', 'Archive')
+
+# the detail action chips, in display and cycle order (left/right steps
+# through them; React drops its +1 / -1 choice above its own chip)
+_RD_ACTIONS = ('Reply', 'Chat', 'React', 'Save')
 
 
 class RadioPane:
@@ -59,12 +67,12 @@ class RadioPane:
 
     @property
     def want_feed(self: RadioPane) -> bool:
-        """Whether the snapshot must populate the feed section."""
+        """Return whether the snapshot must populate the feed section."""
         return self.source == 'Feed'
 
     @property
     def want_archive(self: RadioPane) -> bool:
-        """Whether the snapshot must populate the archive section."""
+        """Return whether the snapshot must populate the archive section."""
         return self.source == 'Archive'
 
     def compose(self: RadioPane) -> ComposeResult:
@@ -94,14 +102,17 @@ class RadioPane:
         for row in rows:
             if self.fchannel != 'all' and row['channel'] != self.fchannel:
                 continue
-            read = row['read'] or row['message_uuid'] in self._read_overrides
-            if self.source == 'Messages':
-                if self.fshow == 'unread' and read:
-                    continue
-                if self.fshow == 'read' and not read:
-                    continue
+            read = self._is_read(row)
+            if self.fshow == 'unread' and read:
+                continue
+            if self.fshow == 'read' and not read:
+                continue
             result.append(row)
         return result
+
+    def _is_read(self: RadioPane, row: dict) -> bool:
+        """Return whether a row reads as read (its state or a local override)."""
+        return row['read'] or row['message_uuid'] in self._read_overrides
 
     def _src(self: RadioPane) -> str:
         """Render the source tabs (Messages / Feed / Archive)."""
@@ -109,28 +120,34 @@ class RadioPane:
         for source in _SOURCES:
             if source == self.source:
                 if self.rfocus == 'source':
-                    result.append(f'[reverse {theme.PRIMARY}] {source} [/]')
+                    result.append(f'[reverse {fractal.tui.theme.PRIMARY}] {source} [/]')
                 else:
-                    result.append(f'[{theme.PRIMARY}] {source} [/]')
+                    result.append(f'[{fractal.tui.theme.PRIMARY}] {source} [/]')
             else:
-                result.append(f' [{theme.DIM}]{source}[/] ')
+                result.append(f' [{fractal.tui.theme.DIM}]{source}[/] ')
         return ' '.join(result)
 
     def _filters(self: RadioPane) -> str:
-        """Render the channel/show filter chips."""
-        channel = f'channel: {self.fchannel} {theme.CARET_OPEN}'
-        show = f'show: {self.fshow} {theme.CARET_OPEN}'
-        if self.rfocus == 'filter':
-            if self.rfilter == 0:
-                channel = f'[reverse {theme.PRIMARY}] {channel} [/]'
-                show = f'[{theme.DIM}]{show}[/]'
-            else:
-                channel = f'[{theme.DIM}]{channel}[/]'
-                show = f'[reverse {theme.PRIMARY}] {show} [/]'
+        """Render the channel/show filter chips.
+
+        Each chip reserves its one-space padding in every state -- the coral
+        box when focused, an invisible margin otherwise -- so moving the
+        focus between the chips never shifts the row.
+        """
+        ch_text = f'channel: {self.fchannel} {fractal.tui.theme.CARET_OPEN}'
+        sh_text = f'show: {self.fshow} {fractal.tui.theme.CARET_OPEN}'
+        focus = self.rfocus == 'filter'
+        channel_lit = focus and self.rfilter == 0
+        show_lit = focus and self.rfilter == 1
+        if channel_lit:
+            channel = f'[reverse {fractal.tui.theme.PRIMARY}] {ch_text} [/]'
         else:
-            channel = f'[{theme.DIM}]{channel}[/]'
-            show = f'[{theme.DIM}]{show}[/]'
-        return f'{channel}  {show}'
+            channel = f' [{fractal.tui.theme.DIM}]{ch_text}[/] '
+        if show_lit:
+            show = f'[reverse {fractal.tui.theme.PRIMARY}] {sh_text} [/]'
+        else:
+            show = f' [{fractal.tui.theme.DIM}]{sh_text}[/] '
+        return f'{channel}{show}'
 
     def _grid(self: RadioPane, left: str, right: str) -> Table:
         """Build a one-row grid: flexing left side, right-snapped timestamp.
@@ -141,7 +158,7 @@ class RadioPane:
         """
         grid = Table.grid(expand=True)
         grid.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
-        grid.add_column(width=theme.GAP + 1, no_wrap=True)
+        grid.add_column(width=fractal.tui.theme.GAP + 1, no_wrap=True)
         grid.add_column(justify='right', no_wrap=True)
         grid.add_column(width=1, no_wrap=True)
         grid.add_row(Text.from_markup(left), Text(), Text.from_markup(right), Text(' '))
@@ -149,39 +166,50 @@ class RadioPane:
 
     def _cols(self: RadioPane) -> Table:
         """Render the column header line."""
-        gap = ' ' * theme.GAP
-        left = (
-            f'  [{theme.DIM}]{fmt.col("sender", theme.SENDER_W)}'
-            f'{gap}{fmt.col("channel", theme.CHANNEL_W)}{gap}subject[/]'
-        )
-        return self._grid(left, f'[{theme.DIM}]timestamp[/]')
+        gap = ' ' * fractal.tui.theme.GAP
+        sender = fractal.tui.fmt.col('sender', fractal.tui.theme.SENDER_W)
+        channel = fractal.tui.fmt.col('channel', fractal.tui.theme.CHANNEL_W)
+        left = f'  [{fractal.tui.theme.DIM}]{sender}{gap}{channel}{gap}subject[/]'
+        return self._grid(left, f'[{fractal.tui.theme.DIM}]timestamp[/]')
 
     def _foot(self: RadioPane) -> str:
         """Render the foot hints for the active zone."""
         hints = {
-            'source': f'{theme.LEFT}{theme.RIGHT} source {theme.SEP}'
-            f' {theme.DOWN} filters {theme.SEP} esc back',
-            'filter': f'{theme.LEFT}{theme.RIGHT} pick {theme.SEP} {theme.RET} open'
-            f' {theme.SEP} {theme.UP}{theme.DOWN} zones {theme.SEP} esc back',
-            'list': f'{theme.RET} enter messages {theme.SEP} {theme.UP} zones'
-            f' {theme.SEP} esc back',
-            'rows': f'{theme.UP}{theme.DOWN} select {theme.SEP} {theme.RET} open'
-            f' {theme.SEP} esc list',
+            'source': f'{fractal.tui.theme.LEFT}{fractal.tui.theme.RIGHT} source'
+            f' {fractal.tui.theme.SEP} {fractal.tui.theme.DOWN} filters'
+            f' {fractal.tui.theme.SEP} esc back',
+            'filter': f'{fractal.tui.theme.LEFT}{fractal.tui.theme.RIGHT} pick'
+            f' {fractal.tui.theme.SEP} {fractal.tui.theme.RET} open'
+            f' {fractal.tui.theme.SEP} {fractal.tui.theme.UP}{fractal.tui.theme.DOWN}'
+            f' zones {fractal.tui.theme.SEP} esc back',
+            'rows': f'{fractal.tui.theme.UP}{fractal.tui.theme.DOWN} select'
+            f' {fractal.tui.theme.SEP} {fractal.tui.theme.RET} open'
+            f' {fractal.tui.theme.SEP} esc back',
         }
-        return f'{theme.DOT_ON} [{theme.DIM}]unread {theme.SEP} {hints[self.rfocus]}[/]'
+        return (
+            f'{fractal.tui.theme.DOT_ON} [{fractal.tui.theme.DIM}]unread'
+            f' {fractal.tui.theme.SEP} {hints[self.rfocus]}[/]'
+        )
 
     def _row_render(self: RadioPane, row: dict) -> Table:
         """Render one message row (unread dot, sender, channel, subject)."""
-        read = row['read'] or row['message_uuid'] in self._read_overrides
-        dot = ' ' if read else theme.DOT_ON
-        gap = ' ' * theme.GAP
+        read = self._is_read(row)
+        dot = ' ' if read else fractal.tui.theme.DOT_ON
+        gap = ' ' * fractal.tui.theme.GAP
         root = self.app.data.root_branch
         name = leaf_of(row['sender']) + user_tag(row['sender'], root)
-        sender = fmt.col(name, theme.SENDER_W)
-        channel = fmt.col(row['channel'], theme.CHANNEL_W)
-        left = f'{dot} {sender}{gap}{channel}{gap}{row["subject"]}'
-        stamp = fmt.timestamp(row['created_at'], self.app.tz)
-        return self._grid(left, f'[{theme.DIM}]{stamp}[/]')
+        # escape after col: the pad width is by visible length, and markup
+        # escapes render as single chars, so alignment survives
+        sender = fractal.tui.fmt.esc(
+            fractal.tui.fmt.col(name, fractal.tui.theme.SENDER_W)
+        )
+        channel = fractal.tui.fmt.esc(
+            fractal.tui.fmt.col(row['channel'], fractal.tui.theme.CHANNEL_W)
+        )
+        subject = fractal.tui.fmt.esc(row['subject'])
+        left = f'{dot} {sender}{gap}{channel}{gap}{subject}'
+        stamp = fractal.tui.fmt.timestamp(row['created_at'], self.app.tz)
+        return self._grid(left, f'[{fractal.tui.theme.DIM}]{stamp}[/]')
 
     def rebuild(self: RadioPane, snap: Snapshot) -> None:
         """Re-mount the head and rows."""
@@ -204,18 +232,10 @@ class RadioPane:
         self.app.call_after_refresh(self.paint)
 
     def paint(self: RadioPane) -> None:
-        """Paint the list zone tint and the selected row."""
-        listing = self.app.query_one('#radiorows')
-        listing.set_class(
-            self.app.mode == 'radio' and self.rfocus == 'list',
-            'zonefocus',
-        )
+        """Paint the selected row highlight."""
+        in_rows = self.app.mode == 'radio' and self.rfocus == 'rows'
         for index, widget in enumerate(self.app.query('#radiorows .rrow')):
-            selected = (
-                self.app.mode == 'radio'
-                and self.rfocus == 'rows'
-                and index == self.rsel
-            )
+            selected = in_rows and index == self.rsel
             widget.set_class(selected, 'rsel')
             if selected:
                 widget.scroll_visible(animate=False)
@@ -227,6 +247,30 @@ class RadioPane:
         self.app.query_one('#rdetail').display = False
         self.app.query_one('#radiolist').display = True
         self.rebuild(snap)
+
+    def click_row(self: RadioPane, row: Widget) -> bool:
+        """Move the row cursor to the clicked message; a re-click opens it.
+
+        The first click lands the cursor, like arrowing there; a click on
+        the already-highlighted row acts like ``enter`` (opens the detail).
+
+        Returns:
+            Whether ``row`` is a selectable message row.
+
+        """
+        rows = list(self.app.query('#radiorows .rrow'))
+        if row not in rows:
+            return False
+        index = rows.index(row)
+        if self.app.mode == 'radio' and self.rfocus == 'rows' and self.rsel == index:
+            self._open_row()
+            return True
+        self.app.mode = 'radio'
+        self.rfocus = 'rows'
+        self.rsel = index
+        self.rebuild_head()
+        self.paint()
+        return True
 
     def enter(self: RadioPane) -> None:
         """Enter the pane on the source tabs (or back into an open detail)."""
@@ -247,19 +291,20 @@ class RadioPane:
         self.rfocus = 'source'
         self.rebuild_head()
         self.paint()
-        self.app._apply()
+        self.app.paint_ring()
 
     def key(self: RadioPane, event: Key) -> None:
         """Handle radio mode: the zone ladder and row selection."""
         key = event.key
         if self.rfocus == 'rows':
             if key == 'escape':
-                self.rfocus = 'list'
-                self.rebuild_head()
-                self.paint()
+                self.leave()
             elif key == 'up':
-                self.rsel = max(0, self.rsel - 1)
-                self.paint()
+                if self.rsel <= 0:
+                    self._zone(-1)  # past the first row -> the filter chips
+                else:
+                    self.rsel -= 1
+                    self.paint()
             elif key == 'down':
                 rows = self.rows(self.app.snapshot)
                 self.rsel = min(len(rows) - 1, self.rsel + 1)
@@ -284,13 +329,16 @@ class RadioPane:
         event.stop()
 
     def _zone(self: RadioPane, step: int) -> None:
-        """Step the zone ladder (source / filter / list); past the top leaves."""
-        zones = ['source', 'filter', 'list']
+        """Step the zone ladder (source / filter / rows); past the top leaves."""
+        zones = ['source', 'filter', 'rows']
         index = zones.index(self.rfocus) + step
         if index < 0:
             self.leave()
             return
         self.rfocus = zones[min(index, len(zones) - 1)]
+        if self.rfocus == 'rows':
+            # arriving in the rows lands the cursor on the first message
+            self.rsel = 0
         self.rebuild_head()
         self.paint()
 
@@ -303,14 +351,9 @@ class RadioPane:
             self.rebuild_head()
 
     def _zone_enter(self: RadioPane) -> None:
-        """Open the focused zone (filter drop, or down into the rows)."""
+        """Open the focused zone (the filter drop; the rows open themselves)."""
         if self.rfocus == 'filter':
             self._open_filter()
-        elif self.rfocus == 'list':
-            self.rfocus = 'rows'
-            self.rsel = 0
-            self.rebuild_head()
-            self.paint()
 
     def _cycle_source(self: RadioPane, step: int) -> None:
         """Cycle the message source and re-render."""
@@ -333,8 +376,8 @@ class RadioPane:
         self.app.mount(drop)
         drop.styles.height = len(options) + 2
         drop.styles.width = max(len(option) for option in options) + 6
-        # the show drop opens under its chip: past the channel chip + the seam
-        channel_chip = f'channel: {self.fchannel} {theme.CARET_OPEN}'
+        # the show drop opens under its chip: past the channel chip's padded box
+        channel_chip = f'channel: {self.fchannel} {fractal.tui.theme.CARET_OPEN}'
         offset = 0 if self.rfilter == 0 else len(channel_chip) + 2
         drop.styles.offset = (region.x + offset, region.y + 1)
         current = self.fchannel if self.rfilter == 0 else self.fshow
@@ -390,15 +433,15 @@ class RadioPane:
     def _detail_text(self: RadioPane, row: dict) -> str:
         """Render the detail body: labeled rows in grouped blocks.
 
-        Who (sender + the session that wrote it) · where/when · what -- then
+        Who (sender + the session that wrote it), where/when, what -- then
         the body.
         """
-        stamp = fmt.timestamp(row['created_at'], self.app.tz)
+        stamp = fractal.tui.fmt.timestamp(row['created_at'], self.app.tz)
         sender = row['sender'] + user_tag(row['sender'], self.app.data.root_branch)
         groups = (
             (
                 ('sender', sender),
-                ('session', row['session'] or theme.EMPTY),
+                ('session', row['session'] or fractal.tui.theme.EMPTY),
             ),
             (
                 ('channel', row['channel']),
@@ -409,18 +452,20 @@ class RadioPane:
         )
         blocks = [
             '\n'.join(
-                f'[{theme.DIM}]{fmt.col(label, theme.RD_LABEL_W)}[/]{value}'
+                f'[{fractal.tui.theme.DIM}]'
+                f'{fractal.tui.fmt.col(label, fractal.tui.theme.RD_LABEL_W)}[/]'
+                f'{fractal.tui.fmt.esc(str(value))}'
                 for label, value in group
             )
             for group in groups
         ]
-        subject = (
-            f'[{theme.DIM}]{fmt.col("subject", theme.RD_LABEL_W)}[/]'
-            f'[b]{row["subject"]}[/]'
-        )
+        label = fractal.tui.fmt.col('subject', fractal.tui.theme.RD_LABEL_W)
+        value = fractal.tui.fmt.esc(row['subject'])
+        subject = f'[{fractal.tui.theme.DIM}]{label}[/][b]{value}[/]'
         blocks[-1] = f'{blocks[-1]}\n{subject}'
         meta = '\n\n'.join(blocks)
-        return f'{meta}\n\n{row["data"]}'
+        data = fractal.tui.fmt.esc(row['data'])
+        return f'{meta}\n\n{data}'
 
     def _sender_session(self: RadioPane, row: dict) -> Optional[str]:
         """Look up the sender's live loop session (what Chat would fork).
@@ -429,30 +474,31 @@ class RadioPane:
         """
         agent = self.app.data.config(row['sender']).get('agent') or ''
         try:
-            connection = self.app.data.connect()
-            try:
+            with self.app.data.reader() as connection:
                 return self.app.data.live_session(connection, row['sender'], agent)
-            finally:
-                connection.close()
-        except sqlite3.Error:
+        except (FileNotFoundError, sqlite3.Error):
             return None
 
     def _detail_actions(self: RadioPane) -> str:
         """Render the Reply / Chat / React / Save action chips."""
         result = []
-        for index, label in enumerate(('Reply', 'Chat', 'React', 'Save')):
+        for index, label in enumerate(_RD_ACTIONS):
             if index == self.rd_action:
-                result.append(f'[{theme.BG} on {theme.PRIMARY}] {label} [/]')
+                result.append(
+                    f'[{fractal.tui.theme.INK_INVERSE} on'
+                    f' {fractal.tui.theme.PRIMARY}] {label} [/]'
+                )
             else:
-                result.append(f'[{theme.CHROME}] {label} [/]')
+                result.append(f'[{fractal.tui.theme.CHROME}] {label} [/]')
         return '  '.join(result)
 
     def _detail_foot(self: RadioPane) -> str:
         """Render the detail foot (action chips + key hints)."""
         return (
             self._detail_actions()
-            + f'  [{theme.DIM}]{theme.LEFT}{theme.RIGHT} {theme.SEP}'
-            f' {theme.RET} select {theme.SEP} esc back[/]'
+            + f'  [{fractal.tui.theme.DIM}]{fractal.tui.theme.LEFT}'
+            f'{fractal.tui.theme.RIGHT} {fractal.tui.theme.SEP}'
+            f' {fractal.tui.theme.RET} select {fractal.tui.theme.SEP} esc back[/]'
         )
 
     def _open_detail(self: RadioPane, row: dict) -> None:
@@ -472,34 +518,72 @@ class RadioPane:
         if key == 'escape':
             self._close_detail()
         elif key in ('left', 'right'):
-            self.rd_action = (self.rd_action + (1 if key == 'right' else -1)) % 4
+            step = 1 if key == 'right' else -1
+            self.rd_action = (self.rd_action + step) % len(_RD_ACTIONS)
             self.app.query_one('#radiofoot', Static).update(self._detail_foot())
         elif key == 'enter' and row is not None:
-            if self.rd_action == 0:
+            action = _RD_ACTIONS[self.rd_action]
+            if action == 'Reply':
                 # the detail stays open for reference while the reply composes
                 self.app.compose_reply(row)
-            elif self.rd_action == 1:
+            elif action == 'Chat':
                 session = row['session'] or self._sender_session(row)
                 self._close_detail()
                 self.leave()
                 self.app.compose_chat(row, session=session)
-            elif self.rd_action == 2:
-                self._act(row, 'react')
+            elif action == 'React':
+                self._open_react()
             else:
                 self._act(row, 'save')
         else:
             return
         event.stop()
 
-    def _act(self: RadioPane, row: dict, action: str) -> None:
+    def _open_react(self: RadioPane) -> None:
+        """Drop the +1 / -1 choice above the React chip."""
+        options = ['+1', '-1']
+        region = self.app.query_one('#radiofoot').region
+        drop = OptionList(*options, id='rreact')
+        self.app.mount(drop)
+        drop.styles.height = len(options) + 2
+        drop.styles.width = max(len(option) for option in options) + 6
+        # above the foot, at the React chip (past every chip before it)
+        before = _RD_ACTIONS[: _RD_ACTIONS.index('React')]
+        offset = sum(len(f' {label} ') + 2 for label in before)
+        drop.styles.offset = (region.x + offset, region.y - (len(options) + 2))
+        drop.highlighted = 0
+        self.app.mode = 'rreact'
+        drop.focus()
+
+    def key_react(self: RadioPane, event: Key) -> None:
+        """Handle the react dropdown: esc closes (enter lands via OptionList)."""
+        if event.key == 'escape':
+            self._close_react()
+            event.stop()
+
+    def _close_react(self: RadioPane) -> None:
+        """Remove the react dropdown and return to the detail."""
+        for drop in self.app.query('#rreact'):
+            drop.remove()
+        self.app.set_focus(None)
+        self.app.mode = 'rdetail'
+
+    def pick_react(self: RadioPane, value: str) -> None:
+        """Apply a react pick (forwarded from the app's OptionList event)."""
+        row = self._detail_row
+        self._close_react()
+        if row is not None:
+            self._act(row, 'react', value=1 if value == '+1' else -1)
+
+    def _act(self: RadioPane, row: dict, action: str, *, value: int = 1) -> None:
         """React/Save through the write surface; failures notify."""
         try:
             if action == 'react':
                 self.app.actions.react(
                     message_uuid=row['message_uuid'],
-                    value=1,
+                    value=value,
                 )
-                self.app.notify('reacted +1')
+                self.app.notify(f'reacted {value:+d}')
             else:
                 self.app.actions.save(message_uuid=row['message_uuid'])
                 self.app.notify('saved to archive')

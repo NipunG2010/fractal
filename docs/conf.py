@@ -23,7 +23,7 @@ year = dt.date.today().year
 
 project = 'fractal'
 author = 'Plasma AI'
-copyright = f'{year}: ' + author
+copyright = f'{year}: {author}'
 
 # The full version, including alpha/beta/rc tags
 release = importlib.import_module('fractal').__version__

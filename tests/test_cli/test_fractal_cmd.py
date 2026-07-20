@@ -2,18 +2,18 @@
 
 These drive the real console script as a subprocess (the same shape as
 ``test_lifecycle``/``test_init_bootstrap``) and assert observable behavior:
-``install`` drops the bundled skills into the per-agent skill trees, ``commit
---check`` gates on a dirty tree, ``reset`` recycles the worktrees keeping the
-user data, ``destroy`` tears the fractal down (and its confirm prompt aborts),
-and ``_pricing --check`` reports whether a model is priced in the cache. ``install`` and ``_pricing`` redirect ``HOME`` so they touch a
-throwaway tree, never the real one.
+``install`` drops the bundled skills into the per-agent skill trees (or
+symlinks them with ``--link``), ``commit --check`` gates on a dirty tree,
+``reset`` recycles the worktrees keeping the user data, and ``destroy`` tears
+the fractal down (and its confirm prompt aborts). ``install`` redirects
+``HOME`` so it touches a throwaway tree, never the real one.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import pathlib
+import subprocess
 
 import pytest
 
@@ -25,14 +25,17 @@ from .conftest import _run, _worktree_root
 __all__ = [
     'test_install_project_copies_skills_into_both_agents',
     'test_install_replaces_a_prior_copy',
+    'test_install_link_symlinks_the_skills',
+    'test_install_swaps_a_copy_for_a_link_and_back',
     'test_install_home_targets_the_home_skill_trees',
     'test_commit_records_the_iteration_and_clears_the_check',
     'test_commit_check_fails_on_a_dirty_worker',
     'test_reset_force_tears_worktrees_and_keeps_history',
     'test_destroy_force_tears_the_fractal_down',
     'test_destroy_aborts_when_the_prompt_is_declined',
+    'test_track_untrack_round_trip_prints_git_follow_ups',
     'test_open_without_textual_names_the_tui_extra',
-    'test_pricing_check_reports_priced_models',
+    'test_open_rejects_light_and_dark_together',
 ]
 
 # the skills both agents receive (fractal ships its own; wiki ships via the
@@ -67,6 +70,39 @@ def test_install_replaces_a_prior_copy(tmp_path: pathlib.Path) -> None:
     assert (tmp_path / '.claude' / 'skills' / 'fractal' / 'SKILL.md').is_file()
 
 
+def test_install_link_symlinks_the_skills(tmp_path: pathlib.Path) -> None:
+    """``install --link`` symlinks each skill at its live source, not a copy."""
+    result = _run(tmp_path, 'install', '--project', '--link')
+    assert result.returncode == 0, result.stderr
+    for agent_dir in ('.claude', '.agents'):
+        for skill in _SKILLS:
+            skill_dir = tmp_path / agent_dir / 'skills' / skill
+            assert skill_dir.is_symlink(), f'{skill} not linked in {agent_dir}'
+            assert (skill_dir / 'SKILL.md').is_file()
+    # the fractal link points at this worktree's source (PYTHONPATH puts it
+    # first), so edits there are live in the installed skill
+    linked = (tmp_path / '.claude' / 'skills' / 'fractal').resolve()
+    assert linked == _worktree_root() / 'fractal' / 'skills' / 'fractal'
+    assert result.stdout.count('Linked ') == len(_SKILLS) * 2
+
+
+def test_install_swaps_a_copy_for_a_link_and_back(tmp_path: pathlib.Path) -> None:
+    """A re-install replaces a copy with a link and a link with a copy."""
+    assert _run(tmp_path, 'install', '--project').returncode == 0
+    skill_dir = tmp_path / '.claude' / 'skills' / 'fractal'
+    assert skill_dir.is_dir()
+    assert not skill_dir.is_symlink()
+    # a linking re-install replaces the copied dir with a symlink
+    assert _run(tmp_path, 'install', '--project', '--link').returncode == 0
+    assert skill_dir.is_symlink()
+    assert (skill_dir / 'SKILL.md').is_file()
+    # a copying re-install replaces the symlink with a real dir again
+    assert _run(tmp_path, 'install', '--project').returncode == 0
+    assert skill_dir.is_dir()
+    assert not skill_dir.is_symlink()
+    assert (skill_dir / 'SKILL.md').is_file()
+
+
 def test_install_home_targets_the_home_skill_trees(tmp_path: pathlib.Path) -> None:
     """Without ``--project`` the install lands under ``$HOME`` skill trees."""
     home = tmp_path / 'home'
@@ -86,8 +122,10 @@ def test_commit_records_the_iteration_and_clears_the_check(
     """A real worker commit lands the work; ``--check`` then sees a clean tree.
 
     A freshly-spawned worker carries its uncommitted node seed, so ``--check``
-    flags it dirty. A real ``commit`` stages and commits (echoing its output);
-    afterwards ``--check`` passes -- the gate is satisfied.
+    flags it dirty. A pre-labeled message is rejected with re-commit guidance
+    (the pipeline composes the subject labels itself); a bare ``commit``
+    stages and commits (echoing its output); afterwards ``--check`` passes --
+    the gate is satisfied.
     """
     repo = _seed_repo(tmp_path / 'committer')
     assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
@@ -96,6 +134,10 @@ def test_commit_records_the_iteration_and_clears_the_check(
     assert _run(task, 'commit', '--check').returncode != 0
     # a real commit stages the work + seed and lands a commit on the branch
     (task / 'feature.txt').write_text('the work\n', encoding='utf-8')
+    # a message repeating the composed labels is rejected, exit 1
+    rejected = _run(task, 'commit', 'main.task: iteration 3 fix')
+    assert rejected.returncode == 1
+    assert 'bare lowercase summary' in rejected.stderr
     committed = _run(task, 'commit', 'add feature')
     assert committed.returncode == 0, committed.stderr
     subject = _git(task, 'log', '-1', '--format=%s').stdout
@@ -111,7 +153,7 @@ def test_commit_check_fails_on_a_dirty_worker(fractal_repo: dict) -> None:
     try:
         result = _run(task, 'commit', '--check')
         assert result.returncode != 0
-        assert 'uncommitted changes' in result.stderr
+        assert 'Uncommitted changes' in result.stderr
     finally:
         (task / 'scratch.txt').unlink()
 
@@ -163,6 +205,55 @@ def test_destroy_aborts_when_the_prompt_is_declined(tmp_path: pathlib.Path) -> N
     assert (repo / '.fractal').exists()
 
 
+# ------ track / untrack
+
+
+def test_track_untrack_round_trip_prints_git_follow_ups(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``track``/``untrack`` toggle the seed-dir ignore and print git follow-ups.
+
+    The verbs rewrite only the repo-local exclude block -- the index is never
+    touched, so each prints the git command that finishes the move. Both are
+    idempotent: repeating one is a no-op that prints the same follow-up.
+    """
+    repo = _seed_repo(tmp_path / 'toggled')
+    # neutralize any global excludes file so the ignore state below is
+    # attributable to fractal's exclude block alone
+    _git(repo, 'config', 'core.excludesFile', os.devnull)
+    seed_dir = '.fractal/main'
+    # a fresh tree is untracked: the seed dir is git-ignored
+    assert _ignored(repo, seed_dir)
+    # track lifts the ignore and prints the staging follow-up without staging
+    result = _run(repo, 'track')
+    assert result.returncode == 0, result.stderr
+    assert f'git add -- {seed_dir}' in result.stdout
+    assert not _ignored(repo, seed_dir)
+    assert _git(repo, 'ls-files', seed_dir).stdout == ''
+    # idempotent: a second track is a no-op printing the same follow-up
+    result = _run(repo, 'track')
+    assert result.returncode == 0, result.stderr
+    assert f'git add -- {seed_dir}' in result.stdout
+    assert not _ignored(repo, seed_dir)
+    # untrack restores the ignore and prints the unstage follow-up
+    result = _run(repo, 'untrack')
+    assert result.returncode == 0, result.stderr
+    assert f'git rm -r --cached -- {seed_dir}' in result.stdout
+    assert _ignored(repo, seed_dir)
+    # idempotent the same way in reverse
+    result = _run(repo, 'untrack')
+    assert result.returncode == 0, result.stderr
+    assert f'git rm -r --cached -- {seed_dir}' in result.stdout
+    assert _ignored(repo, seed_dir)
+    # the verbs anchor on the user node by config, not the checkout, so they
+    # stay usable when the repo root sits on a non-init branch
+    _git(repo, 'checkout', '-b', 'sidework')
+    result = _run(repo, 'track')
+    assert result.returncode == 0, result.stderr
+    assert f'git add -- {seed_dir}' in result.stdout
+    assert not _ignored(repo, seed_dir)
+
+
 # ------ open (tui extra)
 
 
@@ -191,30 +282,29 @@ def test_open_without_textual_names_the_tui_extra(tmp_path: pathlib.Path) -> Non
     assert 'Traceback' not in result.stdout + result.stderr
 
 
-# ------ pricing cache check
+def test_open_rejects_light_and_dark_together(tmp_path: pathlib.Path) -> None:
+    """``open --light --dark`` is a flag conflict, refused at the boundary.
 
-
-def test_pricing_check_reports_priced_models(tmp_path: pathlib.Path) -> None:
-    """``_pricing --check`` exits 0 for a priced model and 1 otherwise."""
-    home = tmp_path / 'home'
-    cache = home / '.fractal'
-    cache.mkdir(parents=True)
-    pricing = {
-        'opus-4.8': {'input_cost_per_token': 1e-05, 'output_cost_per_token': 5e-05},
-        'no-rates-model': {'max_tokens': 200000},
-    }
-    (cache / 'pricing.json').write_text(json.dumps(pricing), encoding='utf-8')
-    priced = _run(tmp_path, '_pricing', '--check', 'opus-4.8', HOME=str(home))
-    assert priced.returncode == 0, priced.stderr
-    # a model that exists but carries no rate keys is not "priced"
-    unrated = _run(tmp_path, '_pricing', '--check', 'no-rates-model', HOME=str(home))
-    assert unrated.returncode == 1
-    # an absent model is not priced either
-    absent = _run(tmp_path, '_pricing', '--check', 'ghost-model', HOME=str(home))
-    assert absent.returncode == 1
+    The palette flags validate before the lazy TUI import and the node
+    resolution, so the refusal needs no fractal (an empty directory does).
+    """
+    result = _run(tmp_path, 'open', '--light', '--dark')
+    assert result.returncode != 0
+    assert 'mutually exclusive' in result.stderr
+    assert 'Traceback' not in result.stdout + result.stderr
 
 
 # ------ helpers
+
+
+def _ignored(repo: pathlib.Path, path: str) -> bool:
+    """Whether git ignores ``path`` in ``repo`` (``check-ignore`` exit 0)."""
+    result = subprocess.run(
+        ['git', 'check-ignore', '-q', path],
+        cwd=repo,
+        capture_output=True,
+    )
+    return result.returncode == 0
 
 
 def _seed_repo(path: pathlib.Path) -> pathlib.Path:
@@ -239,7 +329,11 @@ def _seed_repo(path: pathlib.Path) -> pathlib.Path:
 
 @pytest.fixture(scope='module')
 def fractal_repo(tmp_path_factory: pytest.TempPathFactory) -> dict:
-    """A repo with a user node and one worker node ``task`` (built once)."""
+    """Return a repo with a user node and one worker node ``task`` (built once).
+
+    READ-ONLY by convention: the dirty-tree check removes its scratch file
+    in a ``finally`` block, so the tree is always left as built.
+    """
     root = tmp_path_factory.mktemp('fractal_cmd')
     _seed_repo(root)
     assert _run(root, 'node', 'init', 'task', '--agent', 'claude').returncode == 0

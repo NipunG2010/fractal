@@ -1,0 +1,257 @@
+"""The list overlay pipeline.
+
+Covers default vs ``--all`` filtering, the live view (trusting real
+state and relabeling crashed-active rows), config-cap overlays over
+stale registry rows, orphan flagging, and the ``last`` activity-age
+column with its staleness flag.
+"""
+
+from __future__ import annotations
+
+import pathlib
+
+import pytest
+
+from fractal.core.node import Node
+from tests._helpers import _past_timestamp
+
+from .conftest import _active_run, _spawn_parent_child
+
+__all__ = [
+    'test_list_returns_nodes',
+    'test_list_hides_retired',
+    'test_list_all_shows_retired',
+    'test_list_live_trusts_real_state',
+    'test_list_live_relabels_crashed_active',
+    'test_list_renders_config_caps_over_stale_registry',
+    'test_list_decorates_exited_with_run_reason',
+    'test_list_flags_orphan_rows',
+    'test_list_renders_last_activity_age',
+    'test_list_flags_stale_active_rows',
+]
+
+
+# ------ listing
+
+
+def test_list_returns_nodes(node_with_db: Node) -> None:
+    """List returns child node records."""
+    node = node_with_db
+    # register a child
+    node.child_add('backend', max_cost=10.0)
+    # list nodes
+    nodes = node.list()
+    assert len(nodes) >= 1
+    for row in nodes:
+        assert 'status' in row
+        assert 'node' in row
+
+
+def test_list_hides_retired(node_with_db: Node) -> None:
+    """List excludes retired nodes by default."""
+    node = node_with_db
+    # register a child and set it to retired
+    node.child_add('hidden')
+    branch = f'{node.branch}.hidden'
+    node.db.update({'status': 'retired'}, 'nodes', where={'node': branch})
+    # verify retired node is hidden
+    nodes = node.list()
+    branches = {row['node'] for row in nodes}
+    assert branch not in branches
+
+
+def test_list_all_shows_retired(node_with_db: Node) -> None:
+    """List with all_nodes includes retired nodes."""
+    node = node_with_db
+    # register a child and set it to retired
+    node.child_add('archived')
+    branch = f'{node.branch}.archived'
+    node.db.update({'status': 'retired'}, 'nodes', where={'node': branch})
+    # verify retired node is included with all_nodes
+    nodes = node.list(all_nodes=True)
+    branches = {row['node'] for row in nodes}
+    assert branch in branches
+
+
+# ------ live view and overlays
+
+
+def test_list_live_trusts_real_state(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``live`` reflects each child's real status and drops gone worktrees."""
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # the live reconcile relabels a crashed active node (no tmux session) to
+    # exited, so present this child's session as alive to test the active case
+    monkeypatch.setattr(
+        'fractal.util.tmux.probe',
+        lambda: frozenset({child.tmux_session}),
+    )
+    # corrupt the parent's cached registry: stale status for the real child,
+    # plus a phantom descendant that has no worktree
+    parent.db.update({'status': 'completed'}, 'nodes', where={'node': child.branch})
+    parent.db.merge({'node': 'main.parent.ghost', 'status': 'active'}, 'nodes')
+
+    # the cached listing believes the registry verbatim (the phantom, worktree
+    # gone, is flagged orphan rather than dropped)
+    cached = {row['node']: row['status'] for row in parent.list()}
+    assert cached[child.branch] == 'completed'
+    assert cached['main.parent.ghost'] == 'orphan'
+
+    # the live listing trusts the child's real status and drops the phantom
+    live = {row['node']: row['status'] for row in parent.list(live=True)}
+    assert live[child.branch] == 'active'
+    assert 'main.parent.ghost' not in live
+
+
+def test_list_live_relabels_crashed_active(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--live`` reads an active node with no tmux session as exited.
+
+    A loop that crashed leaves ``.status`` 'active' with no live session;
+    ``--live`` is the authoritative view, so it relabels that to 'exited' (a
+    settled-vs-crashed check can trust it) -- without persisting the change,
+    even through the decoration pass (the CLI's default), which skips the
+    relabeled row rather than reach ``status_display``'s reconcile.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # no live tmux sessions -> the active child reads as crashed
+    monkeypatch.setattr(
+        'fractal.util.tmux.probe',
+        frozenset,
+    )
+    rows = parent.list(live=True, decorated=True)
+    live = {row['node']: row['status'] for row in rows}
+    assert live[child.branch] == 'exited'
+    # display-only: the child's own .status file is untouched
+    assert child.status() == 'active'
+
+
+def test_list_renders_config_caps_over_stale_registry(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Listings render a present child's config caps, not the stale row.
+
+    A rescue top-up edits the child's config directly (no ``node update``),
+    so the registry row keeps the pre-rescue cap and ``node list`` lies to
+    the parent verifying the top-up landed. Config is enforcement truth, so
+    both listing flavors must render it -- display-only, the row itself
+    stays a cache (it heals at ``node update`` and exit).
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # seed the registry cap via the blessed path, then top up config only --
+    # the rescue move (config edit + continue, no node update)
+    parent.child_update('kid', max_cost=12.0)
+    child.config.set('max_cost', 15.0)
+    # both listing flavors render the config cap
+    cached = {row['node']: row['max_cost'] for row in parent.list()}
+    assert cached[child.branch] == 15.0
+    monkeypatch.setattr(
+        'fractal.util.tmux.probe',
+        lambda: frozenset({child.tmux_session}),
+    )
+    live = {row['node']: row['max_cost'] for row in parent.list(live=True)}
+    assert live[child.branch] == 15.0
+    # display-only: the registry row keeps its cache until update/exit heals
+    row = child.db.read('nodes', where={'node': child.branch}, limit=1)[0]
+    assert row['max_cost'] == 12.0
+
+
+def test_list_decorates_exited_with_run_reason(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A decorated listing carries an exited child's recorded end reason.
+
+    ``node list`` inherits the ``status_display`` terminal decoration: an
+    ``exited`` row whose latest run recorded why it ended reads
+    ``exited (<reason>)``. Display-only -- the bare listing stays cheap,
+    and status filters still match on the bare first chunk.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # land the child's run on its budget with the boundary's reason recorded
+    reason = 'subtree cost budget reached (spent $6.0000 >= $5.0 max)'
+    run_id = _active_run(child)
+    child.record.run_end(run_id=run_id, status='exited', exit_code=0, metadata=reason)
+    child.status_set('exited')
+    # the decorated listing carries the reason; the bare one stays bare
+    decorated = {row['node']: row['status'] for row in parent.list(decorated=True)}
+    assert decorated[child.branch] == f'exited ({reason})'
+    plain = {row['node']: row['status'] for row in parent.list()}
+    assert plain[child.branch] == 'exited'
+    # filters match the bare first chunk, decoration notwithstanding
+    filtered = parent.list(status='exited', decorated=True)
+    assert [row['node'] for row in filtered] == [child.branch]
+
+
+def test_list_flags_orphan_rows(node_with_db: Node) -> None:
+    """Plain ``list`` flags a registry row whose worktree is gone as orphan.
+
+    A phantom node (worktree removed out of band) would otherwise render as a
+    healthy 'idle'; plain list stays a pure reader but marks it 'orphan'.
+    """
+    node = node_with_db
+    # a registry-only child (child_add registers a row but builds no worktree)
+    node.child_add('phantom')
+    branch = f'{node.branch}.phantom'
+    rows = {row['node']: row['status'] for row in node.list()}
+    assert rows[branch] == 'orphan'
+
+
+# ------ last-activity ages
+
+
+def test_list_renders_last_activity_age(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``last`` renders the age of each node's newest activity instant.
+
+    The newest instant wins -- an aged event must not shadow a fresh run
+    start -- and a registry-only row with no recorded activity stays blank.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # age the child's events; its run start stays fresh
+    child.db.update(
+        data={'created_at': _past_timestamp(30 * 60)},
+        table='events',
+        where={'node': child.branch},
+    )
+    parent.child_add('phantom')
+    rows = {row['node']: row['last'] for row in parent.list()}
+    # the fresh run start wins over the aged events (seconds, not '30m')
+    assert rows[child.branch].endswith('s')
+    assert '!' not in rows[child.branch]
+    assert rows[f'{parent.branch}.phantom'] is None
+
+
+def test_list_flags_stale_active_rows(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An active node quiet past ``max(step_timeout, 5m)`` is flagged stale.
+
+    The ``!`` suffix marks an active loop that has written nothing for
+    longer than a step should take: past the 5m floor with no
+    ``step_timeout``, lifted by a live ``step_timeout`` above the age.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    # push every activity instant on the child past the 5m floor
+    stamp = _past_timestamp(20 * 60)
+    child.db.update({'created_at': stamp}, 'events', where={'node': child.branch})
+    child.db.update({'started_at': stamp}, 'runs', where={'node': child.branch})
+    rows = {row['node']: row['last'] for row in parent.list()}
+    assert rows[child.branch] == '20m!'
+    # a step_timeout above the age lifts the flag (the 5m floor is a max)
+    child.config.set('step_timeout', '1h')
+    rows = {row['node']: row['last'] for row in parent.list()}
+    assert rows[child.branch] == '20m'
+    # a settled node is never flagged, however old its last activity
+    child.config.set('step_timeout', '1m')
+    child.status_set('completed')
+    rows = {row['node']: row['last'] for row in parent.list()}
+    assert rows[child.branch] == '20m'

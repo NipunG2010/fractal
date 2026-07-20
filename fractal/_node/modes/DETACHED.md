@@ -7,5 +7,5 @@ your **radio private channel** (`fractal radio read --channel=private`),
 handoff for the next step:
 
 ```bash
-fractal radio send <context> --channel=private --subject=<subject> --priority=<priority>
+fractal radio send "<context>" --node=$CURRENT_BRANCH --channel=private --subject="<subject>" --priority=<0-10>
 ```

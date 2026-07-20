@@ -16,7 +16,7 @@ from typing import Optional
 from fractal.core.radio import Radio
 
 if typing.TYPE_CHECKING:
-    from fractal.tui.data import TuiData
+    from .data import TuiData
 
 __all__ = ['TuiActions']
 
@@ -56,13 +56,14 @@ class TuiActions:
             The new message's 8-char UUID.
 
         """
-        return self._radio.send(
+        message_uuid, _, _ = self._radio.send(
             node=target,
             channel=channel,
             subject=subject,
             data=data,
             priority=priority,
         )
+        return message_uuid
 
     def reply(
         self: TuiActions,
@@ -83,8 +84,8 @@ class TuiActions:
 
         """
         reply_uuid, _, _ = self._radio.reply(
-            message_uuid,
-            data,
+            message_uuid=message_uuid,
+            data=data,
             priority=priority,
         )
         return reply_uuid

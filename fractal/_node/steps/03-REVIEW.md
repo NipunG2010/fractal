@@ -8,13 +8,14 @@ Review the diff (`git status`, `git diff`) for mistakes, missed edge
 cases, and style violations; fix and re-validate.
 
 **Update memory** per the memory skill: fold this iteration's findings
-into child pages, refresh the indexes, and split any bloated index into
-child pages. Then `wiki update --path=$MEMORY_DIR` and
-`wiki lint --path=$MEMORY_DIR`; iterate until clean.
+into child pages and split any bloated index into child pages. Then
+`wiki lint --path=$MEMORY_DIR` and repair what it flags; iterate until
+the only remaining lines are `Requires update` diffs (the indexes
+refresh mechanically at commit).
 
 **Project-wide learnings** (architecture, conventions, patterns useful
 to other nodes) go in `$WIKI_DIR`, not node memory. After editing, run
-`wiki update --path=$WIKI_DIR` and `wiki lint --path=$WIKI_DIR`.
+`wiki lint --path=$WIKI_DIR`.
 
 Append a `## Post-Mortem` section (accomplishments, deviations,
 next-iteration notes) to each plan you wrote this iteration -- list them

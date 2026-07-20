@@ -15,8 +15,11 @@ PROJECT=""
 SCOPE=""
 BASE=""
 META=""
+INHERIT=""
 AGENT=""
+PROVIDER=""
 MODEL=""
+EFFORT=""
 MAX_ITERS=""
 MAX_DEPTH=""
 MAX_CHILDREN=""
@@ -24,6 +27,8 @@ MAX_DESCENDANTS=""
 TIMEOUT=""
 ITER_TIMEOUT=""
 STEP_TIMEOUT=""
+STEP_RETRIES=""
+STEP_RETRY_BACKOFF=""
 INTERVAL=""
 SLEEP=""
 WAIT=""
@@ -32,8 +37,9 @@ MAX_ITER_COST=""
 MAX_STEP_COST=""
 RESERVE_BUDGET=""
 SYNC=""
+DETACHED=""
 LOCAL=false
-DETACHED=false
+BLIND=false
 RESET=false
 
 usage() {
@@ -43,35 +49,52 @@ Usage: init.sh <name> <repo> [options]
 Initialize an autonomous node.
 
 Options:
-    --title=<name>               Human-readable display name (default: de-slugged name)
-    --parent=<branch>            Parent node branch (resolved by the caller)
-    --root=<branch>              Tree root branch (resolved by the caller)
-    --project=<relpath>          Sub-project within the repo (default: inherit the parent's)
-    --scope=<subdirs>            Subdirectory scope within the worktree (comma-separated; repeatable)
-    --base=<branch>              Branch to start from
-    --meta=<branch>              Meta-configure the target node (stores its branch)
-    --agent=<agent>              Agent type (currently claude or codex)
-    --model=<model>              Model override (passed to agent CLI via --model)
-    --max-iters=<n>              Per-run iteration cap (default: unlimited)
-    --max-depth=<n>              Maximum child node nesting depth (default: unlimited)
-    --max-children=<n>           Maximum number of child nodes (default: unlimited)
-    --max-descendants=<n>        Maximum total descendants in this subtree (default: unlimited)
-    --timeout=<duration>         Per-run time budget (e.g. 30s, 10m, 1.5h)
-    --iter-timeout=<duration>    Per-iteration time budget (e.g. 30s, 10m, 1.5h)
-    --step-timeout=<duration>    Per-step time budget (e.g. 30s, 10m)
-    --interval=<duration>        Run iterations on a fixed schedule (e.g. 30m, 1h)
-    --sleep=<duration>           Delay between iterations (e.g. 30s, 5m)
-    --wait=<duration>            Sleep between approval-wait sync invocations (default: 1s)
-    --max-cost=<usd>             Maximum cost in USD per run; every new run re-arms the full cap
-    --max-iter-cost=<usd>        Maximum cost per iteration in USD
-    --max-step-cost=<usd>        Cost per step in USD (warn-only when unenforceable)
-    --reserve-budget=<usd>       Budget reserved for cleanup (shifts reserve mode)
-    --sync                       Enable sync mode before each step (default)
-    --no-sync                    Disable sync mode before each step
-    --local                      Skip pushing to remote after each commit
-    --detached                   Run each step as a separate invocation (default: continuous)
-    --reset                      Delete node files and reinitialize
-    --help|-h                    Show this help message
+    --title=<name>                     Human-readable display name (default: de-slugged name)
+    --parent=<branch>                  Parent node branch (resolved by the caller)
+    --root=<branch>                    Tree root branch (resolved by the caller)
+    --project=<relpath>                Sub-project within the repo
+                                       (default: inherit the parent's)
+    --scope=<subdirs>                  Subdirectory scope within the worktree
+                                       (comma-separated; repeatable)
+    --base=<branch>                    Branch to start from
+    --meta=<branch>                    Meta-configure the target node (stores its branch)
+    --inherit=<surfaces>               Seed surfaces from the parent node instead of the
+                                       package seed (comma-separated; repeatable): steps,
+                                       scripts, skills, config, all
+    --agent=<agent>                    Agent type
+                                       (currently claude, codex, grok, opencode, or omp)
+    --provider=<provider>              Provider route for the agent (e.g. openrouter)
+    --model=<model>                    Model override (passed to agent CLI via --model)
+    --effort=<effort>                  Reasoning-effort override (passed to agent CLI)
+    --max-iters=<n>                    Per-run iteration cap (default: unlimited)
+    --max-depth=<n>                    Maximum child node nesting depth (default: unlimited)
+    --max-children=<n>                 Maximum number of child nodes (default: unlimited)
+    --max-descendants=<n>              Maximum total descendants in this subtree
+                                       (default: unlimited)
+    --timeout=<duration>               Per-run time budget (e.g. 30s, 10m, 1.5h)
+    --iter-timeout=<duration>          Per-iteration time budget (e.g. 30s, 10m, 1.5h)
+    --step-timeout=<duration>          Per-step time budget (e.g. 30s, 10m)
+    --step-retries=<n>                 Retries per failed step (default: 1; 0 disables)
+    --step-retry-backoff=<duration>    Delay before each step retry (default: 10s)
+    --interval=<duration>              Run iterations on a fixed schedule (e.g. 30m, 1h)
+    --sleep=<duration>                 Delay between iterations (e.g. 30s, 5m)
+    --wait=<duration>                  Sleep between approval-wait sync invocations
+                                       (default: 1m)
+    --max-cost=<usd>                   Maximum cost in USD per run (runs are isolated; a
+                                       budget-ended run continues only with an explicit
+                                       new --max-cost)
+    --max-iter-cost=<usd>              Maximum cost per iteration in USD
+    --max-step-cost=<usd>              Cost per step in USD (warn-only when unenforceable)
+    --reserve-budget=<usd>             Budget reserved for cleanup (shifts reserve mode)
+    --sync                             Enable sync mode before each step (default)
+    --no-sync                          Disable sync mode before each step
+    --detached                         Run each step as a separate invocation
+    --no-detached                      Run steps in one continuous session (default)
+    --local                            Skip pushing to remote after each commit
+    --blind                            Subscribe to no channels
+                                       (the parent still reads this node)
+    --reset                            Delete node files and reinitialize
+    --help|-h                          Show this help message
 USAGE
     exit 0
 }
@@ -86,7 +109,9 @@ for arg in "$@"; do
         --base=*) BASE="${arg#*=}" ;;
         --scope=*) SCOPE="${SCOPE:+$SCOPE,}${arg#*=}" ;;
         --agent=*) AGENT="${arg#*=}" ;;
+        --provider=*) PROVIDER="${arg#*=}" ;;
         --model=*) MODEL="${arg#*=}" ;;
+        --effort=*) EFFORT="${arg#*=}" ;;
         --max-iters=*)
             MAX_ITERS="${arg#*=}"
             if [[ ! "$MAX_ITERS" =~ ^[1-9][0-9]*$ ]]; then
@@ -136,6 +161,21 @@ for arg in "$@"; do
             if [[ ! "$STEP_TIMEOUT" =~ ^[0-9]*\.?[0-9]+(s|m|h|d)$ ]]; then
                 echo "Error: --step-timeout requires a duration with suffix" \
                     "(e.g. 30s, 10m)" >&2
+                exit 1
+            fi
+            ;;
+        --step-retries=*)
+            STEP_RETRIES="${arg#*=}"
+            if [[ ! "$STEP_RETRIES" =~ ^[0-9]+$ ]]; then
+                echo "Error: --step-retries requires a non-negative integer" >&2
+                exit 1
+            fi
+            ;;
+        --step-retry-backoff=*)
+            STEP_RETRY_BACKOFF="${arg#*=}"
+            if [[ ! "$STEP_RETRY_BACKOFF" =~ ^[0-9]*\.?[0-9]+(s|m|h|d)$ ]]; then
+                echo "Error: --step-retry-backoff requires a duration with suffix" \
+                    "(e.g. 10s, 1m)" >&2
                 exit 1
             fi
             ;;
@@ -189,10 +229,13 @@ for arg in "$@"; do
             fi
             ;;
         --meta=*) META="${arg#*=}" ;;
+        --inherit=*) INHERIT="${INHERIT:+$INHERIT,}${arg#*=}" ;;
         --sync) SYNC=true ;;
         --no-sync) SYNC=false ;;
-        --local) LOCAL=true ;;
         --detached) DETACHED=true ;;
+        --no-detached) DETACHED=false ;;
+        --local) LOCAL=true ;;
+        --blind) BLIND=true ;;
         --reset) RESET=true ;;
         *)
             if [[ -z "$NAME" ]]; then
@@ -222,6 +265,9 @@ if [[ -z "$REPO_DIR" ]]; then
     echo "Error: path is required" >&2
     exit 1
 fi
+if [[ ! "$REPO_DIR" = /* ]]; then
+    REPO_DIR="$(cd "$REPO_DIR" && pwd)"
+fi
 if [[ -z "$PARENT" ]]; then
     echo "Error: --parent is required" >&2
     exit 1
@@ -231,12 +277,8 @@ if [[ -z "$ROOT" ]]; then
     exit 1
 fi
 
-if [[ -z "$SYNC" ]]; then
-    SYNC=true
-fi
-
 # reject a sub-1s duration: it passes the per-flag format check above but
-# _run.sh's parse_duration rejects < 1s at launch, so catch it here at the init
+# the loop's duration validation rejects < 1s at launch, so catch it here at the init
 # boundary rather than letting a bad value abort only when the loop starts
 reject_subsecond() {
     local VALUE="$1"
@@ -256,6 +298,7 @@ reject_subsecond() {
 reject_subsecond "$TIMEOUT" "--timeout"
 reject_subsecond "$ITER_TIMEOUT" "--iter-timeout"
 reject_subsecond "$STEP_TIMEOUT" "--step-timeout"
+reject_subsecond "$STEP_RETRY_BACKOFF" "--step-retry-backoff"
 reject_subsecond "$INTERVAL" "--interval"
 reject_subsecond "$SLEEP" "--sleep"
 reject_subsecond "$WAIT" "--wait"
@@ -289,7 +332,7 @@ PARENT_BRANCH="$PARENT"
 # ------ branch and worktree
 
 # match the worktree line with substr (not $2) so a path containing
-# spaces is preserved -- mirrors merge.sh and Python _find_worktree
+# spaces is preserved -- mirrors merge.sh and Python worktree_map
 PARENT_WORKTREE_DIR=$(git -C "$REPO_DIR" worktree list --porcelain \
     | awk -v branch="refs/heads/$PARENT_BRANCH" \
         'index($0,"worktree ")==1{wt=substr($0,10)} $1=="branch" && $2==branch{print wt}')
@@ -308,6 +351,53 @@ fi
 
 if [[ ! -d "$PARENT_NODE_DIR" ]]; then
     echo "Error: no fractal node at '$PARENT_BRANCH'; run 'fractal init' first" >&2
+    exit 1
+fi
+
+# ------ inheritance sources
+
+# derive the file-surface flags; 'config' is inherited by the caller
+# (Node.init fills the child's flags from the parent's config), so the
+# script consumes only the file surfaces
+INHERIT_STEPS=false
+INHERIT_SCRIPTS=false
+INHERIT_SKILLS=false
+# disable globbing around the unquoted comma split -- a surface with glob
+# metacharacters must reach the validation literally, not cwd-expanded
+set -f
+for SURFACE in ${INHERIT//,/ }; do
+    case "$SURFACE" in
+        steps) INHERIT_STEPS=true ;;
+        scripts) INHERIT_SCRIPTS=true ;;
+        skills) INHERIT_SKILLS=true ;;
+        all)
+            INHERIT_STEPS=true
+            INHERIT_SCRIPTS=true
+            INHERIT_SKILLS=true
+            ;;
+        config) ;;
+        *)
+            echo "Error: unknown --inherit surface: $SURFACE" \
+                "(valid: steps, scripts, skills, config, all)" >&2
+            exit 1
+            ;;
+    esac
+done
+set +f
+# an inherited surface requires the parent to carry it -- the user/root
+# node seeds no steps, scripts, or skills, so fail loudly (before any
+# worktree is created) rather than falling back to the package seed silently
+if [[ "$INHERIT_STEPS" == true ]] \
+    && ! compgen -G "$PARENT_NODE_DIR/steps/*.md" >/dev/null; then
+    echo "Error: --inherit=steps: parent has no step files at $PARENT_NODE_DIR/steps/" >&2
+    exit 1
+fi
+if [[ "$INHERIT_SCRIPTS" == true && ! -d "$PARENT_NODE_DIR/scripts" ]]; then
+    echo "Error: --inherit=scripts: parent has no scripts dir at $PARENT_NODE_DIR/scripts/" >&2
+    exit 1
+fi
+if [[ "$INHERIT_SKILLS" == true && ! -d "$PARENT_NODE_DIR/skills" ]]; then
+    echo "Error: --inherit=skills: parent has no skills dir at $PARENT_NODE_DIR/skills/" >&2
     exit 1
 fi
 
@@ -339,7 +429,7 @@ fi
 if [[ "$PARENT_BRANCH" != *.* ]] \
     && [[ -n "$(git -C "$PARENT_WORKTREE_DIR" status --porcelain -uno)" ]]; then
     echo "Error: branch '$PARENT_BRANCH' has uncommitted changes in $PARENT_WORKTREE_DIR" >&2
-    echo "Commit them before initializing a top-level node." >&2
+    echo "Commit them before initializing a top-level node" >&2
     exit 1
 fi
 
@@ -363,7 +453,7 @@ if [[ -d "$WORKTREE_DIR" ]]; then
     echo "Reusing existing worktree at $WORKTREE_DIR"
     if [[ "$RESET" != true ]]; then
         echo "Warning: $BRANCH already initialized; pass --reset to refresh" \
-            "seed files and config." >&2
+            "seed files and config" >&2
     fi
 else
     # clear any stale registration first: a worktree dir removed out-of-band
@@ -413,8 +503,14 @@ fi
 if [[ "$RESET" == true ]]; then
     rm -rf "$NODE_DIR/steps"
 fi
+# inherit the parent's live steps when requested, else the package seed
+if [[ "$INHERIT_STEPS" == true ]]; then
+    STEPS_SRC="$PARENT_NODE_DIR/steps"
+else
+    STEPS_SRC="$NODE_SEED_DIR/steps"
+fi
 mkdir -p "$NODE_DIR/steps"
-for FILE in "$NODE_SEED_DIR/steps/"*.md; do
+for FILE in "$STEPS_SRC/"*.md; do
     BASENAME=$(basename "$FILE")
     if [[ ! -f "$NODE_DIR/steps/$BASENAME" ]]; then
         cp "$FILE" "$NODE_DIR/steps/$BASENAME"
@@ -451,11 +547,20 @@ if [[ "$RESET" == true ]]; then
     rm -rf "$MEMORY_DIR"
 fi
 
+if [[ "$RESET" == true ]]; then
+    rm -rf "$NODE_DIR/scripts"
+fi
 # seed only the mutable, per-node scripts (setup/test/lint);
 # skip the underscore-prefixed machinery
-if [[ -d "$NODE_SEED_DIR/scripts" ]]; then
+# inherit the parent's live scripts when requested, else the package seed
+if [[ "$INHERIT_SCRIPTS" == true ]]; then
+    SCRIPTS_SRC="$PARENT_NODE_DIR/scripts"
+else
+    SCRIPTS_SRC="$NODE_SEED_DIR/scripts"
+fi
+if [[ -d "$SCRIPTS_SRC" ]]; then
     mkdir -p "$NODE_DIR/scripts"
-    for SRC in "$NODE_SEED_DIR/scripts"/*; do
+    for SRC in "$SCRIPTS_SRC"/*; do
         [[ -f "$SRC" ]] || continue
         BASENAME=$(basename "$SRC")
         [[ "$BASENAME" == _* ]] && continue
@@ -470,9 +575,18 @@ fi
 if [[ "$RESET" == true ]]; then
     rm -rf "$NODE_DIR/skills"
 fi
-if [[ -d "$NODE_SEED_DIR/skills" ]]; then
+# inherit the parent's live skill set when requested, else the package seed
+# -- the copy is wholesale (a skill absent at the source is never copied; no
+# union across sources). An existing child skill dir is never touched, so a
+# parent edit reaches an existing child only through --reset
+if [[ "$INHERIT_SKILLS" == true ]]; then
+    SKILLS_SRC="$PARENT_NODE_DIR/skills"
+else
+    SKILLS_SRC="$NODE_SEED_DIR/skills"
+fi
+if [[ -d "$SKILLS_SRC" ]]; then
     mkdir -p "$NODE_DIR/skills"
-    for SKILL_SRC in "$NODE_SEED_DIR/skills"/*/; do
+    for SKILL_SRC in "$SKILLS_SRC"/*/; do
         [[ -d "$SKILL_SRC" ]] || continue
         SKILL_NAME=$(basename "$SKILL_SRC")
         if [[ ! -d "$NODE_DIR/skills/$SKILL_NAME" ]]; then
@@ -482,64 +596,16 @@ if [[ -d "$NODE_SEED_DIR/skills" ]]; then
     done
 fi
 
-# set up each agent dir -- seed its config and symlink in skills, recreated each
-# init and gitignored; a node's base agent may be overridden per step (agent:
-# frontmatter), so any node may run either agent
-for AGENT_DIR in claude codex agents; do
-    # the single config file each agent reads from its dir
-    case "$AGENT_DIR" in
-        claude) CONFIG_FILE="settings.json" ;;
-        codex) CONFIG_FILE="config.toml" ;;
-        *) CONFIG_FILE="" ;;
-    esac
-    # prefer the parent node's config so children inherit its settings; fall
-    # back to the package seed for a top-level node (parent has no agent config)
-    CONFIG_SRC=""
-    if [[ -n "$CONFIG_FILE" ]]; then
-        if [[ -f "$PARENT_NODE_DIR/.$AGENT_DIR/$CONFIG_FILE" ]]; then
-            CONFIG_SRC="$PARENT_NODE_DIR/.$AGENT_DIR/$CONFIG_FILE"
-        elif [[ -f "$NODE_SEED_DIR/config/$AGENT_DIR/$CONFIG_FILE" ]]; then
-            CONFIG_SRC="$NODE_SEED_DIR/config/$AGENT_DIR/$CONFIG_FILE"
-        fi
-    fi
-    if [[ "$RESET" == true ]]; then
-        rm -rf "$NODE_DIR/.$AGENT_DIR"
-    fi
-    mkdir -p "$NODE_DIR/.$AGENT_DIR"
-    if [[ -n "$CONFIG_SRC" && ! -f "$NODE_DIR/.$AGENT_DIR/$CONFIG_FILE" ]]; then
-        cp "$CONFIG_SRC" "$NODE_DIR/.$AGENT_DIR/$CONFIG_FILE"
-        echo "Created $NODE_DIR/.$AGENT_DIR/$CONFIG_FILE"
-    fi
-    # symlink skills so the agent can find them
-    if [[ ! -e "$NODE_DIR/.$AGENT_DIR/skills" ]]; then
-        ln -s ../skills "$NODE_DIR/.$AGENT_DIR/skills"
-        echo "Created $NODE_DIR/.$AGENT_DIR/skills -> ../skills"
-    fi
-    # codex auth must stay global: CODEX_HOME points at this node dir, but the
-    # credential is shared via a symlink to the global codex home -- codex writes
-    # auth.json in-place through the link (token refresh updates the global file),
-    # so the secret is never copied into the node (and .codex is gitignored)
-    if [[ "$AGENT_DIR" == "codex" && ! -L "$NODE_DIR/.$AGENT_DIR/auth.json" ]]; then
-        GLOBAL_CODEX_AUTH="${CODEX_HOME:-$HOME/.codex}/auth.json"
-        # CODEX_HOME may be inherited from a parent node whose auth.json is itself
-        # a symlink to the real ~/.codex/auth.json; canonicalize to that real file
-        # so this link never dangles when an intermediate node is reset or deleted;
-        # `readlink -f` is a GNU extension absent on older macOS BSD readlink, so
-        # follow the link chain by hand and resolve the dir physically (pwd -P)
-        if [[ -e "$GLOBAL_CODEX_AUTH" ]]; then
-            while [[ -L "$GLOBAL_CODEX_AUTH" ]]; do
-                LINK_TARGET="$(readlink "$GLOBAL_CODEX_AUTH")"
-                case "$LINK_TARGET" in
-                    /*) GLOBAL_CODEX_AUTH="$LINK_TARGET" ;;
-                    *) GLOBAL_CODEX_AUTH="$(dirname "$GLOBAL_CODEX_AUTH")/$LINK_TARGET" ;;
-                esac
-            done
-            GLOBAL_CODEX_AUTH="$(cd "$(dirname "$GLOBAL_CODEX_AUTH")" && pwd -P)/$(basename "$GLOBAL_CODEX_AUTH")"
-        fi
-        ln -s "$GLOBAL_CODEX_AUTH" "$NODE_DIR/.$AGENT_DIR/auth.json"
-        echo "Created $NODE_DIR/.$AGENT_DIR/auth.json -> $GLOBAL_CODEX_AUTH"
-    fi
-done
+# set up each agent dir -- seed its config and symlink in skills, recreated
+# each init and gitignored; a node's base agent may be overridden per step
+# (agent: frontmatter), so any node may run any agent; the seeding (config
+# precedence, skills links, provider auth links) lives with each backend in
+# fractal.core.agent / fractal.impl
+SEED_ARGS=("$NODE_DIR" "--parent=$PARENT_NODE_DIR")
+if [[ "$RESET" == true ]]; then
+    SEED_ARGS+=("--reset")
+fi
+fractal node _seed "${SEED_ARGS[@]}"
 
 # ------ config and database
 
@@ -557,7 +623,9 @@ if [[ "$RESET" == true ]] || [[ ! -f "$NODE_DIR/config.json" ]]; then
         base="${BASE:-null}" \
         meta="${META:-null}" \
         agent="${AGENT:-null}" \
+        provider="${PROVIDER:-null}" \
         model="${MODEL:-null}" \
+        effort="${EFFORT:-null}" \
         max_iters="${MAX_ITERS:-null}" \
         max_depth="${MAX_DEPTH:-null}" \
         max_children="${MAX_CHILDREN:-null}" \
@@ -565,6 +633,8 @@ if [[ "$RESET" == true ]] || [[ ! -f "$NODE_DIR/config.json" ]]; then
         timeout="${TIMEOUT:-null}" \
         iter_timeout="${ITER_TIMEOUT:-null}" \
         step_timeout="${STEP_TIMEOUT:-null}" \
+        step_retries="${STEP_RETRIES:-null}" \
+        step_retry_backoff="${STEP_RETRY_BACKOFF:-null}" \
         interval="${INTERVAL:-null}" \
         sleep="${SLEEP:-null}" \
         wait="${WAIT:-null}" \
@@ -572,29 +642,37 @@ if [[ "$RESET" == true ]] || [[ ! -f "$NODE_DIR/config.json" ]]; then
         max_iter_cost="${MAX_ITER_COST:-null}" \
         max_step_cost="${MAX_STEP_COST:-null}" \
         reserve_budget="${RESERVE_BUDGET:-null}" \
-        sync="$SYNC" \
+        sync="${SYNC:-null}" \
+        detached="${DETACHED:-null}" \
         local="$LOCAL" \
-        detached="$DETACHED" \
+        blind="$BLIND" \
         --path="$WORKTREE_DIR"
     echo idle >"$NODE_DIR/.status"
 fi
 
 # the fork sha (branch creation only) rides the init event's metadata -- the
 # node's base diff anchor, resolved newest-first so a re-init of a deleted
-# branch name reads its own fork, never a dead namesake's
+# branch name reads its own fork, never a dead namesake's; declared =() so
+# the += below builds a clean array -- bash 3.2 prepends an empty element to
+# a bare-declared scalar on first +=, and the +-expansion stays set-u-safe
 EVENT_ARGS=()
 if [[ -n "$FORK_SHA" ]]; then
     EVENT_ARGS+=(--metadata="$FORK_SHA")
 fi
 EVENT_ID=$(fractal event _start init ${EVENT_ARGS[@]+"${EVENT_ARGS[@]}"} \
     --path="$WORKTREE_DIR" 2>/dev/null || true)
+[[ "$EVENT_ID" =~ ^[0-9]+$ ]] || EVENT_ID=""
 if [[ -n "$EVENT_ID" ]]; then
     fractal event _end "$EVENT_ID" --path="$WORKTREE_DIR" \
         --status=completed 2>/dev/null || true
+else
+    echo "Warning: init event for $BRANCH was not recorded" >&2
 fi
 
 if [[ ! -f "$MEMORY_DIR/_index.md" ]]; then
-    wiki init --path="$MEMORY_DIR" \
+    # --quiet: drop wiki's own "Initialized wiki at ..." line so the
+    # created-memory message below is the single user-facing line
+    wiki init --quiet --path="$MEMORY_DIR" \
         --settings='{"naming": {"validate": ["ascii", "identifier"]}}'
     echo "Created memory wiki at $MEMORY_DIR"
 fi

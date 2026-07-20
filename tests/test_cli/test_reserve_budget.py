@@ -23,14 +23,29 @@ __all__ = [
 
 
 @pytest.mark.parametrize(
-    ('value', 'max_cost', 'expected'),
-    [
+    argnames=('value', 'max_cost', 'expected'),
+    argvalues=[
         (None, None, None),  # absent + no budget -> no reserve
         (None, 10.0, 1.0),  # absent -> 10% of max_cost (the default)
         ('2.5', 10.0, 2.5),  # bare number is USD
         ('20%', 10.0, 2.0),  # percent of max_cost
         ('0', 10.0, 0.0),  # zero is allowed (reserve mode at remaining <= 0)
         ('0%', 10.0, 0.0),
+        # money materializes at display precision -- a bare 0.1 * 6.0 float
+        # product would persist binary noise (0.6000000000000001) into
+        # config.json and the retune echo
+        (None, 6.0, 0.6),
+        ('10%', 3.0, 0.3),
+    ],
+    ids=[
+        'no_budget',
+        'default_ten_percent',
+        'bare_usd',
+        'percent',
+        'zero_usd',
+        'zero_percent',
+        'precise_default',
+        'precise_percent',
     ],
 )
 def test_parse_reserve_budget_resolves(
@@ -49,14 +64,22 @@ def test_parse_reserve_budget_honors_custom_default() -> None:
 
 
 @pytest.mark.parametrize(
-    ('value', 'max_cost', 'message'),
-    [
+    argnames=('value', 'max_cost', 'message'),
+    argvalues=[
         ('2.5', None, '--max-cost'),  # requires max_cost (number form)
         ('20%', None, '--max-cost'),  # requires max_cost (percent form)
         ('99%', 10.0, '99%'),  # >= 99% of max_cost
         ('9.9', 10.0, '99%'),  # 9.9 == 0.99 * 10 (the bound is inclusive)
         ('-1', 10.0, '>= 0'),  # negative
         ('nope', 10.0, 'number'),  # non-numeric
+    ],
+    ids=[
+        'no_max_cost_usd',
+        'no_max_cost_percent',
+        'reserve_at_99_percent',
+        'inclusive_bound',
+        'negative',
+        'non_numeric',
     ],
 )
 def test_parse_reserve_budget_rejects(

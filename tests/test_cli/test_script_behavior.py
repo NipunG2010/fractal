@@ -9,12 +9,17 @@ real CLI, pinning edges the end-to-end lifecycle tests don't reach:
 - **``init.sh`` worktree-anchor guard** rejects only fractal's own worktrees
   (a ``.worktrees`` ancestor whose parent is itself a git repo), so a repo
   that merely lives under a ``.worktrees``-named path still spawns nodes.
+- **``init.sh`` skill inheritance** seeds a child's ``skills/`` from the
+  package unless the spawn passes ``--inherit=skills``, which copies the
+  parent's set wholesale; the snapshot is one-shot, so a ``--reset``
+  re-inherits only when the flag is passed again.
 - **``merge.sh`` interrupt safety** re-asserts the target worktree is clean
   immediately before the destructive squash, so an edit that lands in the
   target *during* the merge is refused -- never absorbed into the squash commit
   nor discarded by the recovery ``reset --hard``.
 - **``delete.sh`` unmerged warning** surfaces commits the parent never absorbed
-  on the automation path (the interactive prompt warns only the user).
+  on the automation path (the interactive prompt warns only the user), while
+  excluding the generated wiki state that merge-up regenerates on the target.
 
 Each test builds its own fresh repo (the merge/delete edges are destructive) and
 shells the scripts directly with the CLI env so ``fractal`` resolves.
@@ -24,6 +29,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shutil
 import subprocess
 
 import fractal
@@ -34,11 +40,15 @@ from .conftest import _cli_env, _fractal_bin, _run
 __all__ = [
     'test_init_resolves_parent_worktree_under_a_space_path',
     'test_init_allows_a_repo_under_a_worktrees_path',
+    'test_init_inherits_parent_skills_on_request',
     'test_merge_preserves_a_target_edit_that_lands_during_the_merge',
     'test_merge_re_merges_an_iterating_child_without_conflict',
+    'test_failed_merge_restore_removes_the_staged_child_additions',
     'test_delete_warns_on_unmerged_commits',
     'test_delete_does_not_warn_after_squash_merge',
     'test_delete_does_not_warn_after_squash_merge_then_target_advances',
+    'test_delete_warns_on_unmerged_wiki_page_work',
+    'test_delete_does_not_warn_on_merge_regenerated_wiki_state',
 ]
 
 
@@ -87,6 +97,107 @@ def test_init_allows_a_repo_under_a_worktrees_path(
     assert (repo / '.worktrees' / 'main.task').is_dir(), result.stdout
 
 
+# ------ init.sh: parent skill inheritance
+
+
+def test_init_inherits_parent_skills_on_request(tmp_path: pathlib.Path) -> None:
+    """``--inherit=skills`` mirrors the parent's skill set; the default is the seed.
+
+    ``init.sh`` seeds a child's skills from the package unless the spawn
+    passes ``--inherit=skills``, which copies the parent node's ``skills/``
+    wholesale: an edit reaches the child and a deleted skill stays deleted,
+    never resurrected from the seed. The snapshot is a one-shot input --
+    reaching an *existing* child requires ``--reset`` (a plain re-init is
+    refused), and a reset re-inherits only when ``--inherit`` is passed
+    again; without it the reset returns the child to the package seed.
+    """
+    repo = _init_tree(tmp_path / 'skillsrepo')
+    # the user node has no skills dir; a top-level node seeds from the package
+    init = _run(repo, 'node', 'init', 'parent', '--agent', 'claude', '--local')
+    assert init.returncode == 0, init.stderr
+    parent_wt = repo / '.worktrees' / 'main.parent'
+    parent_skills = parent_wt / '.fractal' / 'main.parent' / 'skills'
+    seed_skills = _scripts_dir().parent / '_node' / 'skills'
+    assert sorted(p.name for p in parent_skills.iterdir()) == sorted(
+        p.name for p in seed_skills.iterdir()
+    )
+
+    # the parent curates its set: appends guidance to one skill, drops another
+    sentinel = 'Parent-curated guidance.'
+    skill_md = parent_skills / 'fractal' / 'SKILL.md'
+    skill_md.write_text(
+        skill_md.read_text(encoding='utf-8') + f'\n{sentinel}\n',
+        encoding='utf-8',
+    )
+    shutil.rmtree(parent_skills / 'radio')
+
+    # a flagless child still seeds from the package -- the curated edit does
+    # not arrive and the dropped skill is present
+    stock_init = _run(parent_wt, 'node', 'init', 'kid', '--agent', 'claude', '--local')
+    assert stock_init.returncode == 0, stock_init.stderr
+    child_wt = repo / '.worktrees' / 'main.parent.kid'
+    child_skills = child_wt / '.fractal' / 'main.parent.kid' / 'skills'
+    child_md = (child_skills / 'fractal' / 'SKILL.md').read_text(encoding='utf-8')
+    assert sentinel not in child_md
+    assert (child_skills / 'radio').is_dir()
+
+    # an --inherit=skills sibling copies the curated set wholesale -- the edit
+    # arrives and the deleted skill is absent (no union with the seed)
+    kin_init = _run(
+        parent_wt,
+        'node',
+        'init',
+        'kin',
+        '--inherit',
+        'skills',
+        '--agent',
+        'claude',
+        '--local',
+    )
+    assert kin_init.returncode == 0, kin_init.stderr
+    kin_wt = repo / '.worktrees' / 'main.parent.kin'
+    kin_skills = kin_wt / '.fractal' / 'main.parent.kin' / 'skills'
+    kin_md = (kin_skills / 'fractal' / 'SKILL.md').read_text(encoding='utf-8')
+    assert sentinel in kin_md
+    assert not (kin_skills / 'radio').exists()
+
+    # the parent keeps evolving; a plain re-init is refused (the existing
+    # child stays untouched), and a --reset without --inherit returns the
+    # child to the package seed -- the snapshot never re-arms itself
+    revised = 'Revised parent guidance.'
+    skill_md.write_text(
+        skill_md.read_text(encoding='utf-8') + f'\n{revised}\n',
+        encoding='utf-8',
+    )
+    reinit = _run(parent_wt, 'node', 'init', 'kin', '--agent', 'claude', '--local')
+    assert reinit.returncode != 0, reinit.stdout
+    kin_md = (kin_skills / 'fractal' / 'SKILL.md').read_text(encoding='utf-8')
+    assert revised not in kin_md
+    reseed = _run(
+        parent_wt, 'node', 'init', 'kin', '--reset', '--agent', 'claude', '--local'
+    )
+    assert reseed.returncode == 0, reseed.stderr
+    kin_md = (kin_skills / 'fractal' / 'SKILL.md').read_text(encoding='utf-8')
+    assert sentinel not in kin_md
+    assert (kin_skills / 'radio').is_dir()
+    # --reset --inherit=skills re-inherits the parent's latest state
+    reset = _run(
+        parent_wt,
+        'node',
+        'init',
+        'kin',
+        '--reset',
+        '--inherit',
+        'skills',
+        '--agent',
+        'claude',
+        '--local',
+    )
+    assert reset.returncode == 0, reset.stderr
+    kin_md = (kin_skills / 'fractal' / 'SKILL.md').read_text(encoding='utf-8')
+    assert revised in kin_md
+
+
 # ------ merge.sh: an edit landing in the target during the merge
 
 
@@ -120,9 +231,11 @@ def test_merge_preserves_a_target_edit_that_lands_during_the_merge(
     target_file = repo / 'tracked.txt'
     shim = _fractal_shim_dirtying(tmp_path, target_file, on='event _start merge')
     env = _cli_env()
-    env['PATH'] = f'{shim}{os.pathsep}{env["PATH"]}'
+    path = env['PATH']
+    env['PATH'] = f'{shim}{os.pathsep}{path}'
+    merge_sh = _scripts_dir() / 'merge.sh'
     result = subprocess.run(
-        ['bash', f'{_scripts_dir() / "merge.sh"}', f'{worktree}'],
+        ['bash', f'{merge_sh}', f'{worktree}'],
         cwd=f'{repo}',
         capture_output=True,
         text=True,
@@ -156,8 +269,9 @@ def test_merge_re_merges_an_iterating_child_without_conflict(
     (worktree / 'f.txt').write_text('line1\n', encoding='utf-8')
     _git(worktree, 'add', '-A')
     _git(worktree, 'commit', '-m', 'child v1')
+    merge_sh = _scripts_dir() / 'merge.sh'
     first = subprocess.run(
-        ['bash', f'{_scripts_dir() / "merge.sh"}', f'{worktree}'],
+        ['bash', f'{merge_sh}', f'{worktree}'],
         cwd=f'{repo}',
         capture_output=True,
         text=True,
@@ -170,7 +284,7 @@ def test_merge_re_merges_an_iterating_child_without_conflict(
     _git(worktree, 'add', '-A')
     _git(worktree, 'commit', '-m', 'child v2')
     second = subprocess.run(
-        ['bash', f'{_scripts_dir() / "merge.sh"}', f'{worktree}'],
+        ['bash', f'{merge_sh}', f'{worktree}'],
         cwd=f'{repo}',
         capture_output=True,
         text=True,
@@ -182,6 +296,64 @@ def test_merge_re_merges_an_iterating_child_without_conflict(
     assert second.returncode == 0, (second.stdout, second.stderr)
     merged = (repo / 'f.txt').read_text(encoding='utf-8')
     assert merged == 'line1\nline2\n', second.stderr
+
+
+def test_failed_merge_restore_removes_the_staged_child_additions(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A merge that fails after staging a child's new file leaves no residue.
+
+    The squash stages (and writes to the target working tree) every file
+    the child added; a downstream failure then restores with
+    ``git reset --hard HEAD``. The restore must leave the target with no
+    trace of the abandoned merge -- the child's staged addition removed,
+    yet any pre-existing untracked file untouched -- so a later retry is
+    never blocked by an "untracked working tree files would be
+    overwritten" residue.
+
+    The downstream failure is forced deterministically by shadowing
+    ``wiki`` with a failing stub, so the post-squash index refresh fails.
+    """
+    repo = _init_tree(tmp_path / 'mergeresiduerepo')
+    init = _run(repo, 'node', 'init', 'task', '--agent', 'claude', '--local')
+    assert init.returncode == 0, init.stderr
+    worktree = repo / '.worktrees' / 'main.task'
+    # the child adds a NEW file (untracked in the parent) so a stranded
+    # residue would block the retry
+    (worktree / 'newfile.md').write_text('# new\n\nchild work.\n', encoding='utf-8')
+    _git(worktree, 'add', '-A')
+    _git(worktree, 'commit', '-m', 'child adds newfile')
+    # a pre-existing untracked file in the parent must survive the restore
+    (repo / 'keep.txt').write_text('operator scratch\n', encoding='utf-8')
+
+    # shadow wiki with a failing stub so the post-squash index refresh fails
+    stub = tmp_path / 'stub'
+    stub.mkdir()
+    wiki_stub = stub / 'wiki'
+    wiki_stub.write_text('#!/usr/bin/env bash\nexit 1\n', encoding='utf-8')
+    wiki_stub.chmod(0o755)
+    env = _cli_env()
+    path = env['PATH']
+    env['PATH'] = f'{stub}{os.pathsep}{path}'
+    merge_sh = _scripts_dir() / 'merge.sh'
+    result = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    # the merge failed and restored: the child's staged addition is gone,
+    # the pre-existing untracked scratch file survives, and the parent
+    # carries no commit for the merge
+    assert result.returncode != 0, (result.stdout, result.stderr)
+    assert not (repo / 'newfile.md').exists(), (
+        'staged child addition stranded as untracked residue',
+        result.stderr,
+    )
+    assert (repo / 'keep.txt').read_text(encoding='utf-8') == 'operator scratch\n'
+    assert _git(repo, 'log', '-1', '--format=%s').stdout.strip() != 'merge main.task'
 
 
 # ------ delete.sh: unmerged-commit warning
@@ -204,8 +376,9 @@ def test_delete_warns_on_unmerged_commits(tmp_path: pathlib.Path) -> None:
     _git(worktree, 'add', '-A')
     _git(worktree, 'commit', '-m', 'child feature work')
 
+    delete_sh = _scripts_dir() / 'delete.sh'
     result = subprocess.run(
-        ['bash', f'{_scripts_dir() / "delete.sh"}', f'{worktree}'],
+        ['bash', f'{delete_sh}', f'{worktree}'],
         cwd=f'{repo}',
         capture_output=True,
         text=True,
@@ -234,8 +407,9 @@ def test_delete_does_not_warn_after_squash_merge(tmp_path: pathlib.Path) -> None
     (worktree / 'feature.txt').write_text('child work\n', encoding='utf-8')
     _git(worktree, 'add', '-A')
     _git(worktree, 'commit', '-m', 'child feature work')
+    merge_sh = _scripts_dir() / 'merge.sh'
     merge = subprocess.run(
-        ['bash', f'{_scripts_dir() / "merge.sh"}', f'{worktree}'],
+        ['bash', f'{merge_sh}', f'{worktree}'],
         cwd=f'{repo}',
         capture_output=True,
         text=True,
@@ -243,8 +417,9 @@ def test_delete_does_not_warn_after_squash_merge(tmp_path: pathlib.Path) -> None
     )
     assert merge.returncode == 0, merge.stderr
 
+    delete_sh = _scripts_dir() / 'delete.sh'
     result = subprocess.run(
-        ['bash', f'{_scripts_dir() / "delete.sh"}', f'{worktree}'],
+        ['bash', f'{delete_sh}', f'{worktree}'],
         cwd=f'{repo}',
         capture_output=True,
         text=True,
@@ -278,8 +453,9 @@ def test_delete_does_not_warn_after_squash_merge_then_target_advances(
     (worktree / 'feature.txt').write_text('child work\n', encoding='utf-8')
     _git(worktree, 'add', '-A')
     _git(worktree, 'commit', '-m', 'child feature work')
+    merge_sh = _scripts_dir() / 'merge.sh'
     merge = subprocess.run(
-        ['bash', f'{_scripts_dir() / "merge.sh"}', f'{worktree}'],
+        ['bash', f'{merge_sh}', f'{worktree}'],
         cwd=f'{repo}',
         capture_output=True,
         text=True,
@@ -291,8 +467,9 @@ def test_delete_does_not_warn_after_squash_merge_then_target_advances(
     _git(repo, 'add', '-A')
     _git(repo, 'commit', '-m', 'target advances elsewhere')
 
+    delete_sh = _scripts_dir() / 'delete.sh'
     result = subprocess.run(
-        ['bash', f'{_scripts_dir() / "delete.sh"}', f'{worktree}'],
+        ['bash', f'{delete_sh}', f'{worktree}'],
         cwd=f'{repo}',
         capture_output=True,
         text=True,
@@ -301,6 +478,123 @@ def test_delete_does_not_warn_after_squash_merge_then_target_advances(
 
     # the child's work is in main on its own paths, so the target's later advance
     # in another path must not resurrect a false unmerged warning
+    assert result.returncode == 0, result.stderr
+    assert 'not merged' not in result.stderr, (result.stdout, result.stderr)
+    assert not worktree.exists()
+
+
+def test_delete_warns_on_unmerged_wiki_page_work(tmp_path: pathlib.Path) -> None:
+    """Unmerged wiki *pages* still warn despite the generated-state excludes.
+
+    The unmerged-work check excludes the wiki's generated indexes and
+    ``.wiki/`` state (merge-up regenerates them on the target), but a wiki
+    page is the branch's real work product. A child whose unmerged commits add
+    a page -- refreshed index and cache riding along -- must still draw the
+    warning: the excludes silence tool-owned bytes, never content.
+    """
+    repo = _init_tree(tmp_path / 'wikiwarnrepo')
+    init = _run(repo, 'node', 'init', 'task', '--agent', 'claude', '--local')
+    assert init.returncode == 0, init.stderr
+    worktree = repo / '.worktrees' / 'main.task'
+    # the child writes a wiki page and refreshes the generated index/cache
+    (worktree / 'wiki' / 'topic.md').write_text(
+        '---\nname: topic\ndesc: A topic page.\n---\n\n# topic\n\n***\n',
+        encoding='utf-8',
+    )
+    wiki_dir = worktree / 'wiki'
+    subprocess.run(
+        ['wiki', 'update', f'--path={wiki_dir}'],
+        capture_output=True,
+        check=True,
+    )
+    _git(worktree, 'add', '-A')
+    _git(worktree, 'commit', '-m', 'child wiki page')
+
+    delete_sh = _scripts_dir() / 'delete.sh'
+    result = subprocess.run(
+        ['bash', f'{delete_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+
+    # the page is unmerged work -- the generated-state excludes must not
+    # swallow the warning
+    assert result.returncode == 0, result.stderr
+    assert 'not merged into main' in result.stderr, (result.stdout, result.stderr)
+    assert not worktree.exists()
+
+
+def test_delete_does_not_warn_on_merge_regenerated_wiki_state(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Wiki state the tool regenerates never resurrects the warning.
+
+    A mid-iteration merge (dirty child worktree) skips ``merge.sh``'s
+    merge-base advance, so the branch keeps diffing from the fork point --
+    including its committed ``_index.md`` and ``.wiki/`` cache. Once the
+    target's wiki moves on, its regenerated bytes differ from the branch's
+    copies, but those paths are tool-owned state, not the branch's work --
+    the unmerged check excludes them and stays silent.
+    """
+    repo = _init_tree(tmp_path / 'wikiregenrepo')
+    init = _run(repo, 'node', 'init', 'task', '--agent', 'claude', '--local')
+    assert init.returncode == 0, init.stderr
+    worktree = repo / '.worktrees' / 'main.task'
+    # the child writes a wiki page and commits the refreshed index/cache --
+    # the branch's own copies of the generated state
+    (worktree / 'wiki' / 'topic.md').write_text(
+        '---\nname: topic\ndesc: A topic page.\n---\n\n# topic\n\n***\n',
+        encoding='utf-8',
+    )
+    wiki_dir = worktree / 'wiki'
+    subprocess.run(
+        ['wiki', 'update', f'--path={wiki_dir}'],
+        capture_output=True,
+        check=True,
+    )
+    _git(worktree, 'add', '-A')
+    _git(worktree, 'commit', '-m', 'child wiki page')
+    # a dirty worktree makes the merge skip the merge-base advance (the
+    # mid-iteration path), so the delete still diffs from the fork point
+    (worktree / 'scratch.tmp').write_text('wip\n', encoding='utf-8')
+    merge_sh = _scripts_dir() / 'merge.sh'
+    merge = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert merge.returncode == 0, merge.stderr
+    # the target's wiki moves on (a sibling page lands and refreshes the
+    # index), so its regenerated `_index.md`/`.wiki` bytes now differ from
+    # the branch's committed copies
+    (repo / 'wiki' / 'other.md').write_text(
+        '---\nname: other\ndesc: A sibling page.\n---\n\n# other\n\n***\n',
+        encoding='utf-8',
+    )
+    wiki_dir = repo / 'wiki'
+    subprocess.run(
+        ['wiki', 'update', f'--path={wiki_dir}'],
+        capture_output=True,
+        check=True,
+    )
+    _git(repo, 'add', '-A')
+    _git(repo, 'commit', '-m', 'sibling wiki page')
+
+    delete_sh = _scripts_dir() / 'delete.sh'
+    result = subprocess.run(
+        ['bash', f'{delete_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+
+    # the branch's page is in main; its index/.wiki bytes differ only because
+    # the tool regenerated them on the target -- no false unmerged warning
     assert result.returncode == 0, result.stderr
     assert 'not merged' not in result.stderr, (result.stdout, result.stderr)
     assert not worktree.exists()

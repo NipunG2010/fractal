@@ -3,15 +3,22 @@
 Composes the single-screen four-pane grid (tree / radio / node / message),
 wires the design tokens into the stylesheet, and runs the two-level focus-ring
 mode machine. The shell owns composition, theme wiring, ring navigation, key
-dispatch, the poll loop, and re-scoping; each pane module owns its interior,
+dispatch, the poll loop (a tick launches at most one off-thread snapshot
+build; results land as ``SnapshotReady`` messages, so keys never wait behind
+a build), and re-scoping; each pane module owns its interior,
 selection state, and key handlers, and renders purely from the current
-``Snapshot``.
+``Snapshot``. Anything crossed between the app and a pane is public
+(``scope_to``, ``paint_ring``, ``MessagePane.end_edit``, ...); the underscore
+prefix is reserved for object-internal state.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import os
 import sqlite3
+import subprocess
+import threading
 import time
 from collections.abc import Callable
 from typing import Optional
@@ -22,24 +29,27 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.events import Key
+from textual.events import Click, Key, MouseDown, Resize
 from textual.message import Message
 from textual.widgets import Input, OptionList, Static, TextArea
-from textual.worker import get_current_worker
+from textual.worker import Worker, get_current_worker
 
-from fractal.core.node import ChatCommand, Node
-from fractal.tui import fmt, theme
-from fractal.tui.actions import TuiActions
-from fractal.tui.chat import ChatController, ChatEvent, ChatTurn, resolve_transport
-from fractal.tui.data import TuiData
-from fractal.tui.panes import MessagePane, NodePane, RadioPane, TreePane
-from fractal.tui.poller import NodePoller
-from fractal.tui.snapshot import SnapshotBuilder
-from fractal.tui.widgets import Pane
+from fractal.core.agent import Agent, Invocation
+from fractal.core.node import Node
+
+from . import fmt, theme
+from .actions import TuiActions
+from .chat import ChatController, ChatEvent, ChatTurn, resolve_transport
+from .data import TuiData
+from .panes import MessagePane, NodePane, RadioPane, TreePane
+from .poller import NodePoller
+from .snapshot import Snapshot, SnapshotBuilder
+from .widgets import Pane
 
 __all__ = [
     'ChatDelta',
     'ChatDone',
+    'SnapshotReady',
     'FractalApp',
 ]
 
@@ -81,6 +91,24 @@ class ChatDone(Message):
         self.turn_id = turn_id
 
 
+class SnapshotReady(Message):
+    """One built ``Snapshot`` for the cockpit (from the poll worker)."""
+
+    def __init__(self: SnapshotReady, gen: int, snapshot: Snapshot) -> None:
+        """Initialize ``SnapshotReady``.
+
+        Args:
+            gen: Build generation captured at the worker's launch (a result
+                from before a user-initiated rebuild is dropped on arrival).
+            snapshot: The built snapshot (the previous object when nothing
+                changed on disk).
+
+        """
+        super().__init__()
+        self.gen = gen
+        self.snapshot = snapshot
+
+
 class FractalApp(App):
     """The fractal cockpit: a live four-pane view over a node tree."""
 
@@ -100,7 +128,7 @@ class FractalApp(App):
         branch: Optional[str] = None,
         tz: Optional[dt.tzinfo] = None,
         now: Optional[Callable[[], float]] = None,
-        turn_factory: Optional[Callable[[ChatCommand], ChatTurn]] = None,
+        turn_factory: Optional[Callable[[Invocation, Agent], ChatTurn]] = None,
     ) -> None:
         """Initialize ``FractalApp``.
 
@@ -110,11 +138,16 @@ class FractalApp(App):
             tz: Timezone for rendered timestamps; the local zone when omitted.
             now: Epoch-seconds clock for live-elapsed math; ``time.time`` when
                 omitted (injectable for deterministic tests).
-            turn_factory: Builds the chat-turn runner for an agent command;
-                ``ChatTurn`` when omitted (injectable for tests).
+            turn_factory: Builds the chat-turn runner for an agent command
+                and its backend; ``ChatTurn`` when omitted
+                (injectable for tests).
 
         """
-        super().__init__()
+        # ansi_color=True disables the ansi-to-truecolor filter so the theme's
+        # ansi_default background reaches the terminal unconverted -- the
+        # screen and panes show the terminal's own background, never a picked
+        # one (the color system itself stays truecolor: Theme.ansi is False)
+        super().__init__(ansi_color=True)
         # activate the design tokens: the structural $variables reach the first
         # stylesheet parse via get_theme_variable_defaults (read during
         # super().__init__); registering + selecting the theme here re-parses
@@ -128,20 +161,26 @@ class FractalApp(App):
         self.builder = SnapshotBuilder(self.data, poller, now=self.now)
         self.actions = TuiActions(self.data)
         self.scope = branch or self.data.root_branch
-        self.snapshot = self.builder.build(self.scope)
+        # the user (root) node opens on the descendants log view (the pane's
+        # sub_log default reads the same rule once it constructs below)
+        self.snapshot = self.builder.build(
+            self.scope,
+            want_subtree_log=self.scope == self.data.root_branch,
+        )
+        # poll machinery: a tick launches at most one off-thread build; every
+        # later builder.build call holds the lock (the worker and the
+        # synchronous user-initiated paths both route through it)
+        self._build_lock = threading.Lock()
+        self._build_gen = 0
+        self._poll_worker: Optional[Worker] = None
         self.tz = tz or dt.datetime.now().astimezone().tzinfo
         # nav / mode state
         self.focus_id = 'fractal'
         self.mode = 'ring'
-        # chat state: the controller's transcripts plus the in-flight turn
+        # chat state: transcripts, the in-flight turn, and the spinner all
+        # live on the controller -- the app owns the worker and the intervals
         self.chat = ChatController()
         self._turn_factory = turn_factory or ChatTurn
-        self._turn: Optional[ChatTurn] = None
-        self._turn_branch = ''
-        self._turn_id = 0
-        self._chat_seen = 0.0
-        self._spin_frame = 0
-        self._spin_started = 0.0
         # panes (each owns its interior, selection state, and key handlers)
         self.tree_pane = TreePane(self)
         self.radio_pane = RadioPane(self)
@@ -163,11 +202,21 @@ class FractalApp(App):
         with Horizontal(id='body'):
             with Vertical(id='leftcol'):
                 with Horizontal(id='top'):
-                    with Pane(id='fractal', classes='pane'):
+                    with Pane(
+                        id='fractal',
+                        classes='pane',
+                        resize='right',
+                        floor=theme.TREE_W_MIN,
+                    ):
                         yield from self.tree_pane.compose()
                     with Pane(id='radio', classes='pane'):
                         yield from self.radio_pane.compose()
-                with Pane(id='message', classes='pane'):
+                with Pane(
+                    id='message',
+                    classes='pane',
+                    resize='top',
+                    floor=theme.MESSAGE_H_MIN,
+                ):
                     yield from self.message_pane.compose()
             with Pane(id='node', classes='pane'):
                 yield from self.node_pane.compose()
@@ -177,7 +226,7 @@ class FractalApp(App):
         """Size the panes, render the initial state, and start the poll loop."""
         self._resize()
         self._set_header()
-        self._apply()
+        self.paint_ring()
         self.tree_pane.rebuild(self.snapshot)
         self.radio_pane.rebuild(self.snapshot)
         self.node_pane.rebuild(self.snapshot)
@@ -187,42 +236,93 @@ class FractalApp(App):
         self._spinner = self.set_interval(theme.SPIN_S, self._spin, pause=True)
 
     def _build(self: FractalApp) -> None:
-        """Build the current snapshot (lazy sections per the pane states)."""
-        self.snapshot = self.builder.build(
-            self.scope,
-            want_feed=self.radio_pane.want_feed,
-            want_archive=self.radio_pane.want_archive,
-            want_subtree_log=self.node_pane.sub_log,
-        )
+        """Build the current snapshot (lazy sections per the pane states).
+
+        The synchronous user-initiated path: bumps the build generation so an
+        in-flight poll-worker result is dropped as stale on arrival.
+        """
+        self._build_gen += 1
+        with self._build_lock:
+            self.snapshot = self.builder.build(
+                self.scope,
+                want_feed=self.radio_pane.want_feed,
+                want_archive=self.radio_pane.want_archive,
+                want_subtree_log=self.node_pane.sub_log,
+            )
 
     def _spin(self: FractalApp) -> None:
         """Advance the in-flight chat spinner (pauses itself when idle)."""
-        if self._turn is None:
+        if self.chat.turn is None:
             self._spinner.pause()
             self.message_pane.clear_pending()
             return
-        self._spin_frame += 1
+        self.chat.spin()
         self.message_pane.update_pending()
 
     def _tick(self: FractalApp) -> None:
-        """Re-render whatever changed on disk since the last tick."""
+        """Watchdog the chat turn and launch an off-thread snapshot build."""
         if not self.is_running:
             return
         # watchdog: a silent in-flight chat turn is cancelled, not waited on
-        if self._turn is not None and time.monotonic() - self._chat_seen > _CHAT_IDLE_S:
-            branch = self._turn_branch
-            self._turn.cancel()
-            self._turn = None
+        if self.chat.turn is not None and self.chat.idle() > _CHAT_IDLE_S:
+            branch = self.chat.turn_branch
+            self.chat.cancel()
             self.message_pane.clear_pending()
             self.message_pane.post(
-                branch,
-                'error',
-                f'{theme.WARN} agent silent for {fmt.dur(_CHAT_IDLE_S)} -- cancelled',
+                branch=branch,
+                who='error',
+                text=f'{theme.WARN} agent silent for {fmt.dur(_CHAT_IDLE_S)} -- cancelled',
             )
-        previous = self.snapshot
-        self._build()
-        if self.snapshot is previous:
+        # launch-if-idle: at most one poll build in flight; the result lands
+        # as a SnapshotReady message, never built on the UI thread
+        if self._poll_worker is None or self._poll_worker.is_finished:
+            self._poll_worker = self._poll(
+                self.scope,
+                want_feed=self.radio_pane.want_feed,
+                want_archive=self.radio_pane.want_archive,
+                want_subtree_log=self.node_pane.sub_log,
+                gen=self._build_gen,
+            )
+
+    @work(thread=True, exclusive=True, group='poll')
+    def _poll(
+        self: FractalApp,
+        scope: str,
+        *,
+        want_feed: bool,
+        want_archive: bool,
+        want_subtree_log: bool,
+        gen: int,
+    ) -> None:
+        """Build one snapshot off-thread and post it back to the UI thread.
+
+        Every parameter is captured at launch on the UI thread -- the worker
+        never reads pane state. The single build is uninterruptible, so there
+        is no cancellation check; a superseded result is dropped on arrival
+        by the generation guard.
+        """
+        with self._build_lock:
+            snapshot = self.builder.build(
+                scope,
+                want_feed=want_feed,
+                want_archive=want_archive,
+                want_subtree_log=want_subtree_log,
+            )
+        self.post_message(SnapshotReady(gen, snapshot))
+
+    def on_snapshot_ready(self: FractalApp, message: SnapshotReady) -> None:
+        """Land a worker-built snapshot, dropping a stale or unchanged one."""
+        if not self.is_running:
             return
+        # a result launched before a user-initiated rebuild lost to that
+        # build's newer snapshot -- its scope or want-flags may have moved
+        if message.gen != self._build_gen:
+            return
+        # the steady-tick short-circuit: an unchanged tree posts the same
+        # object, and no pane needs touching
+        if message.snapshot is self.snapshot:
+            return
+        self.snapshot = message.snapshot
         self._refresh()
 
     def _refresh(self: FractalApp) -> None:
@@ -237,7 +337,7 @@ class FractalApp(App):
         self.node_pane.set_card(self.snapshot)
         if self.mode != 'node':
             self.node_pane.rebuild_body(self.snapshot)
-        if self.mode not in ('radio', 'rdrop', 'rdetail'):
+        if self.mode not in ('radio', 'rdrop', 'rdetail', 'rreact'):
             self.radio_pane.rebuild(self.snapshot)
 
     def refresh_radio(self: FractalApp) -> None:
@@ -252,9 +352,12 @@ class FractalApp(App):
         self.node_pane.rebuild_body(self.snapshot)
         self.node_pane.paint_zone()
 
-    def _rescope(self: FractalApp, branch: str) -> None:
+    def scope_to(self: FractalApp, branch: str) -> None:
         """Re-point the cockpit at ``branch``: every pane follows."""
         self.scope = branch
+        # the user (root) node defaults to the descendants log view, every
+        # other node to its own activity (set before the log builds)
+        self.node_pane.sub_log = branch == self.data.root_branch
         self._build()
         self._resize()
         self._set_header()
@@ -266,6 +369,84 @@ class FractalApp(App):
     def fork_session(self: FractalApp, entry: dict) -> None:
         """Fork a step's session into the compose pane (chat mode)."""
         self.message_pane.fork_session(entry)
+
+    def attach_node(self: FractalApp) -> None:
+        """Suspend the cockpit and attach the scoped node's tmux session.
+
+        The attach is read-only -- the node's terminal is a window, not a
+        control surface -- so tmux ignores every key except ones bound to
+        ``detach-client``: an ``esc`` binding in a dedicated key table set
+        on the viewed session is the way out, advertised on the session's
+        status line for the duration.
+        """
+        session = self.data.tmux_session_name(self.scope)
+        if session not in self.data.live_sessions():
+            self.notify('no running session', severity='warning')
+            return
+        # the = prefix forces an exact target match (-t resolves by prefix,
+        # so a short name would false-match longer session names); set-option
+        # rejects the bare exact form, so its target carries a trailing colon
+        # (an empty window part) that keeps the exact session match
+        target = f'={session}'
+        option_target = f'{target}:'
+        if os.environ.get('TMUX'):
+            # inside tmux a nested attach refuses; switch this client instead
+            # (the outer client stays the user's own -- no read-only leash)
+            subprocess.run(
+                ['tmux', 'switch-client', '-t', target],
+                capture_output=True,
+                text=True,
+            )
+            return
+        # dress the session for viewing: the esc detach binding (in a
+        # dedicated key table set on this session only -- the root table is
+        # server-wide, so binding there would leash the user's other clients
+        # and clobber their own Escape binding; ESC-prefixed key sequences
+        # still parse as keys -- tmux's escape-time disambiguates) and a
+        # status naming the way out
+        overrides = (
+            ('key-table', 'fractal-view'),
+            ('status', 'on'),
+            ('status-left', ' esc detach '),
+            ('status-left-length', '20'),
+            ('status-right', ''),
+        )
+        # the dress/undress calls capture output so any tmux chatter never
+        # writes over the cockpit's alternate screen (best-effort: failures
+        # leave the attach itself intact)
+        subprocess.run(
+            ['tmux', 'bind-key', '-T', 'fractal-view', 'Escape', 'detach-client'],
+            capture_output=True,
+            text=True,
+        )
+        for option, value in overrides:
+            subprocess.run(
+                ['tmux', 'set-option', '-t', option_target, option, value],
+                capture_output=True,
+                text=True,
+            )
+        try:
+            with self.suspend():
+                result = subprocess.run(['tmux', 'attach-session', '-r', '-t', target])
+                # wipe the client's parting '[detached ...]' line while still
+                # on the normal screen -- left alone it would surface in the
+                # terminal's scrollback once the cockpit quits
+                if result.returncode == 0:
+                    print('\x1b[1A\x1b[2K', end='', flush=True)
+        finally:
+            # undress: drop the binding and the session-level overrides (the
+            # loop's sessions carry none of their own, so -u restores clean)
+            subprocess.run(
+                ['tmux', 'unbind-key', '-T', 'fractal-view', 'Escape'],
+                capture_output=True,
+                text=True,
+            )
+            for option, _ in overrides:
+                subprocess.run(
+                    ['tmux', 'set-option', '-u', '-t', option_target, option],
+                    capture_output=True,
+                    text=True,
+                )
 
     def compose_reply(self: FractalApp, row: dict) -> None:
         """Pre-fill the compose pane as a reply to ``row``."""
@@ -300,6 +481,7 @@ class FractalApp(App):
             live_session=live,
             session=explicit,
             own_chat=own_chat,
+            root=self.data.db_dir,
         )
         # a fallback the user should notice (an unforkable live thread
         # resolving to fresh) gets a toast on top of its meta line
@@ -310,48 +492,37 @@ class FractalApp(App):
             pane.post(branch, 'error', f'{theme.WARN} node unavailable')
             return
         # boundary guard: the node's live state can flip between resolve and
-        # build (.status/.session are external)
+        # build (.status/.session are external); the backend is resolved here
+        # too, so an unknown agent lands on this error path, never inside the
+        # turn's event stream
         try:
             command = node.chat_command(prompt, **transport.chat_kwargs)
+            agent = node.agent(command.agent)
         except ValueError as error:
             pane.post(branch, 'error', f'{theme.WARN} {error}')
             return
         pane.post(branch, 'meta', f'{theme.SEP} {transport.label}')
         self._cancel_turn()
-        turn = self._turn_factory(command)
-        self._turn = turn
-        self._turn_branch = branch
-        self._turn_id += 1
-        self._chat_seen = time.monotonic()
-        # the in-flight spinner: pinned under the transcript until the turn ends
-        self._spin_frame = 0
-        self._spin_started = time.monotonic()
+        turn = self._turn_factory(command, agent)
+        turn_id = self.chat.begin(branch, turn)
         pane.show_pending()
         self._spinner.resume()
-        self._chat_worker(turn, branch, self._turn_id)
+        self._chat_worker(turn, branch, turn_id)
 
     def _live_session(self: FractalApp, branch: str, agent: str) -> Optional[str]:
         """Look up the node's newest woven session (read-only, at send time)."""
         try:
-            connection = self.data.connect()
-            try:
+            with self.data.reader() as connection:
                 return self.data.live_session(connection, branch, agent)
-            finally:
-                connection.close()
-        except sqlite3.Error:
+        except (FileNotFoundError, sqlite3.Error):
             return None
 
     def _cancel_turn(self: FractalApp) -> None:
-        """Kill any in-flight turn.
-
-        Worker cancellation alone cannot unblock a readline; the process kill
-        is the real lever.
-        """
-        turn = self._turn
+        """Kill any in-flight turn and note the cancel in the transcript."""
+        turn = self.chat.turn
         if turn is not None and not turn.cancelled:
-            turn.cancel()
-            self.message_pane.post(self._turn_branch, 'meta', 'cancelled')
-        self._turn = None
+            self.message_pane.post(self.chat.turn_branch, 'meta', 'cancelled')
+        self.chat.cancel()
         self.message_pane.clear_pending()
 
     @work(thread=True, exclusive=True, group='chat')
@@ -372,9 +543,9 @@ class FractalApp(App):
     def on_chat_delta(self: FractalApp, message: ChatDelta) -> None:
         """Land one chat event in its branch's transcript (and the screen)."""
         # a queued delta from a superseded turn must not touch the live one
-        if message.turn_id != self._turn_id:
+        if not self.chat.is_current(message.turn_id):
             return
-        self._chat_seen = time.monotonic()
+        self.chat.touch()
         branch, event = message.branch, message.event
         pane = self.message_pane
         if event.kind == 'session':
@@ -399,21 +570,27 @@ class FractalApp(App):
         """Clear the in-flight turn (and its spinner) when its worker finishes."""
         # only the live turn's own done clears it -- a stale done from a
         # superseded turn would orphan the new turn's subprocess
-        if message.turn_id == self._turn_id:
-            self._turn = None
+        if self.chat.is_current(message.turn_id):
+            self.chat.finish(message.turn_id)
             self.message_pane.clear_pending()
 
     def on_unmount(self: FractalApp) -> None:
         """Kill any in-flight chat turn on shutdown (no orphan agents)."""
-        if self._turn is not None:
-            self._turn.cancel()
-            self._turn = None
+        self.chat.cancel()
 
     def _resize(self: FractalApp) -> None:
-        """Apply the snapshot's pane geometry."""
+        """Apply the snapshot's pane geometry (a dragged tree width wins)."""
         geometry = self.snapshot.geometry
         self.query_one('#node').styles.width = geometry.node_width
-        self.query_one('#fractal').styles.width = geometry.tree_width
+        tree = self.query_one('#fractal', Pane)
+        if tree.user_size is None:
+            # the tree opens no wider than the node pane; dragging widens it
+            tree.styles.width = min(geometry.tree_width, geometry.node_width)
+
+    def on_resize(self: FractalApp, event: Resize) -> None:
+        """Re-clamp any dragged pane size (a resize moves the 50% caps)."""
+        for pane in self.query(Pane):
+            pane.clamp_user_size(event.size)
 
     def _set_header(self: FractalApp) -> None:
         """Render the breadcrumb: brand, repository, focused branch."""
@@ -430,30 +607,106 @@ class FractalApp(App):
         grid.add_column(justify='right', no_wrap=True)
         hints = (
             f'{theme.LEFT}{theme.RIGHT} panes {theme.SEP} {theme.RET} enter'
-            f' {theme.SEP} arrows move {theme.SEP} esc back {theme.SEP} q quit'
+            f' {theme.SEP} arrows move {theme.SEP} esc back'
+            f' {theme.SEP} {theme.CTRL}a attach {theme.SEP} {theme.CTRL}q quit'
         )
         grid.add_row(
             Text.from_markup(f'[{theme.DIM}]{hints}[/]'),
-            Text.from_markup(f'[{theme.DIM}]© Plasma AI[/]'),
+            Text.from_markup(f'[{theme.DIM}]{theme.COPYRIGHT} Plasma AI[/]'),
         )
         return grid
 
     def on_key(self: FractalApp, event: Key) -> None:
         """Dispatch the key to the active mode's handler."""
-        handler = {
+        # ^a attaches the scoped node's tmux session from anywhere (it takes
+        # the whole screen, not a pane); typing surfaces keep their own ^a
+        if event.key == 'ctrl+a':
+            self.attach_node()
+            event.stop()
+            return
+        handlers = {
             'ring': self._key_ring,
             'tree': self.tree_pane.key,
             'node': self.node_pane.key,
             'radio': self.radio_pane.key,
             'rdrop': self.radio_pane.key_drop,
             'rdetail': self.radio_pane.key_detail,
+            'rreact': self.radio_pane.key_react,
             'field': self.message_pane.key_field,
             'edit': self.message_pane.key_edit,
             'combo': self.message_pane.key_combo,
             'chatscroll': self.message_pane.key_chatscroll,
-        }.get(self.mode)
+        }
+        handler = handlers.get(self.mode)
         if handler:
             handler(event)
+
+    def on_click(self: FractalApp, event: Click) -> None:
+        """Move a list's selection cursor to the clicked row (a re-click: ``enter``).
+
+        A click on a row lands the cursor there, exactly like arrowing to
+        it; a click on the already-highlighted row activates it exactly like
+        ``enter`` (re-scope, open the detail, fold, fork). Any other click falls
+        through, and the dropdown modes keep the keyboard's exclusive
+        control.
+        """
+        if self.mode in ('combo', 'rdrop', 'rreact'):
+            return
+        lists = {
+            'treebody': ('fractal', self.tree_pane.click_row),
+            'radiorows': ('radio', self.radio_pane.click_row),
+            'nodeexplore': ('node', self.node_pane.click_row),
+            'nodeevents': ('node', self.node_pane.click_row),
+        }
+        # resolve the clicked widget up to a list row (a direct child of a
+        # scroll container -- tree rows are containers, so the click lands
+        # on their children)
+        row = event.widget
+        container = None
+        while row is not None:
+            parent = row.parent
+            if parent is not None and parent.id in lists:
+                container = parent
+                break
+            row = parent
+        if container is None:
+            return
+        pane_id, select = lists[container.id]
+        previous = self.focus_id
+        leaving_message = previous == 'message' and pane_id != 'message'
+        # the focus moves before the select, so an activation that redirects
+        # it (a step re-click forking into compose) keeps the final say
+        self.focus_id = pane_id
+        if not select(row):
+            self.focus_id = previous
+            return
+        # leaving the composer: release its text-entry focus so keys reach
+        # the cockpit again (the keyboard leave path does the same)
+        if leaving_message:
+            self.set_focus(None)
+            self.message_pane.paint_fields()
+        self.paint_ring()
+
+    def on_mouse_down(self: FractalApp, event: MouseDown) -> None:
+        """Grab a resize edge from the far side of its divide.
+
+        A divide between panes is two border columns and each ``Pane`` grabs
+        only its own; a press on the neighbor's column bubbles up here
+        unclaimed and starts the same drag.
+        """
+        if event.button != 1:
+            return
+        tree = self.query_one('#fractal', Pane)
+        region = tree.region
+        on_edge = event.screen_x == region.right
+        in_rows = region.y <= event.screen_y < region.bottom
+        if on_edge and in_rows:
+            tree.grab_edge(event)
+            return
+        message = self.query_one('#message', Pane)
+        region = message.region
+        if event.screen_y == region.y - 1 and region.x <= event.screen_x < region.right:
+            message.grab_edge(event)
 
     def action_field_next(self: FractalApp) -> None:
         """Cycle the compose field cursor forward (tab)."""
@@ -470,10 +723,12 @@ class FractalApp(App):
         """Forward a dropdown pick to its owning pane."""
         if event.option_list.id == 'rdrop':
             self.radio_pane.pick_filter(str(event.option.prompt))
+        elif event.option_list.id == 'rreact':
+            self.radio_pane.pick_react(str(event.option.prompt))
 
     def on_input_changed(self: FractalApp, event: Input.Changed) -> None:
         """Re-filter an open combo as its field is typed into."""
-        if self.mode == 'combo' and event.input.id == self.message_pane._cfid:
+        if self.mode == 'combo' and event.input.id == self.message_pane.combo_field:
             self.message_pane.filter_combo()
 
     def on_input_submitted(self: FractalApp, event: Input.Submitted) -> None:
@@ -481,7 +736,7 @@ class FractalApp(App):
         if self.mode == 'combo':
             self.message_pane.combo_pick()
             return
-        self.message_pane._end_edit()
+        self.message_pane.end_edit()
 
     def on_text_area_changed(self: FractalApp, event: TextArea.Changed) -> None:
         """Track the body's slash-command highlight."""
@@ -495,21 +750,24 @@ class FractalApp(App):
             self._ring(key)
             event.stop()
         elif key == 'enter':
-            enter = {
+            enters = {
                 'fractal': self.tree_pane.enter,
                 'radio': self.radio_pane.enter,
                 'node': self.node_pane.enter,
                 'message': self.message_pane.enter,
-            }.get(self.focus_id)
+            }
+            enter = enters.get(self.focus_id)
             if enter:
                 enter()
+                # repaint the border: the focus pane is now entered (coral)
+                self.paint_ring()
             event.stop()
         elif key == 'q':
             event.stop()
             self.exit()
 
     def _ring(self: FractalApp, direction: str) -> None:
-        """Step the focus ring: ``fractal · radio · node`` up, ``message`` below."""
+        """Step the focus ring: ``fractal / radio / node`` up, ``message`` below."""
         if self.focus_id in self.TOP:
             index = self.TOP.index(self.focus_id)
             if direction == 'left':
@@ -525,10 +783,18 @@ class FractalApp(App):
                 self.focus_id = 'radio'
             elif direction == 'right':
                 self.focus_id = 'node'
-        self._apply()
+        self.paint_ring()
 
-    def _apply(self: FractalApp) -> None:
-        """Paint the focused pane's border highlight."""
+    def paint_ring(self: FractalApp) -> None:
+        """Paint the focus pane's border: ring-selected (grey) vs entered (coral).
+
+        In ``ring`` mode the focus pane is merely selected -- a body-text-grey
+        cursor; once entered (any non-ring mode) it goes coral, so the border
+        alone tells ring navigation apart from being inside a pane.
+        """
+        entered = self.mode != 'ring'
         for pane_id in [*self.TOP, 'message']:
-            focused = pane_id == self.focus_id
-            self.query_one(f'#{pane_id}').set_class(focused, 'focused')
+            active = pane_id == self.focus_id
+            pane = self.query_one(f'#{pane_id}')
+            pane.set_class(active and not entered, 'ringsel')
+            pane.set_class(active and entered, 'entered')

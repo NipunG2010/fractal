@@ -2,24 +2,25 @@
 
 Exercises the layers an operator and the node scripts lean on for
 bookkeeping: ad-hoc ``db _query`` access, the private ``config`` store,
-the run/iteration/step/event lifecycle tables, and the cost/time
-accounting commands derived from them.
+the ``event`` lifecycle commands, and the cost/time accounting commands
+derived from the row tables.
 
 Each test drives the real ``fractal`` console script as a subprocess
 against a throwaway git repo holding a user node and one worker node
-whose database has been seeded through the lifecycle commands
-themselves -- so the suite verifies observable behavior ("does the
-accounting come out right?") rather than internal table shapes.
+whose database has been seeded through the core recorder (the same
+writes the loop lands in-process) -- so the suite verifies observable
+behavior ("does the accounting come out right?") rather than internal
+table shapes.
 """
 
 from __future__ import annotations
 
 import csv
-import json
 import pathlib
 
 import pytest
 
+from fractal.core.node import Node
 from tests._helpers import _git
 
 from .conftest import _run
@@ -32,9 +33,6 @@ __all__ = [
     'test_config_set_rejects_bare_key_and_keeps_string_keys_literal',
     'test_config_set_validates_cost_and_duration_like_init',
     'test_event_lifecycle_filters_by_status',
-    'test_iteration_and_step_lifecycle_filter_by_status',
-    'test_step_list_scopes_to_an_iteration',
-    'test_run_lifecycle_records_terminal_status',
     'test_cost_spent_sums_seeded_steps',
     'test_cost_spent_max_depth_zero_excludes_children',
     'test_cost_rejects_negative_max_depth',
@@ -46,7 +44,6 @@ __all__ = [
     'test_cost_spent_scope_flags',
     'test_cost_scope_flags_reject_two_scopes',
     'test_cost_rejects_lifetime_selector',
-    'test_run_start_enforces_single_active_run',
     'test_cost_breakdown_emits_header_for_no_children',
     'test_cost_breakdown_lists_a_registered_child',
     'test_cost_breakdown_attributes_a_leaf_nodes_own_spend',
@@ -63,13 +60,15 @@ TIMEOUT = '10m'
 
 @pytest.fixture(scope='module')
 def repo(tmp_path_factory: pytest.TempPathFactory) -> dict:
-    """A repo with a user node and a worker node seeded with accounting data.
+    """Return a repo with a user node and a worker node seeded with accounting data.
 
     Built once via the real CLI: ``fractal init`` bootstraps the repo,
     a ``task`` node is created with a cost budget and run timeout,
     and a full run -> iteration -> two steps lifecycle is driven through
-    the private lifecycle commands. One step is given a cost via the
-    stream renderer so the cost/time accounting commands have real data.
+    the core recorder. One step is given a cost so the cost/time
+    accounting commands have real data. The seeded rows are READ-ONLY by
+    convention: mutating tests restore each config key's prior value or
+    init their own uniquely-named workers, so siblings never collide.
 
     Returns:
         Mapping of ``root`` (repo) and ``task`` (worker worktree) paths,
@@ -95,62 +94,23 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> dict:
     task = root / '.worktrees' / 'main.task'
     _run(task, 'config', '_set', f'max_cost={MAX_COST}')
     _run(task, 'config', '_set', f'timeout={TIMEOUT}')
-    # seed a run with one completed and one failed step under one iteration
-    run_id = int(_ok(task, 'run', '_start'))
-    iter_id = int(_ok(task, 'iter', '_start', str(run_id), '--iter', '1'))
-    plan = int(
-        _ok(
-            task,
-            'step',
-            '_start',
-            '--iter',
-            str(iter_id),
-            '--run',
-            str(run_id),
-            '--step',
-            '1',
-            '--name',
-            'PLAN',
-        )
+    # seed a run with one completed and one failed step under one iteration,
+    # written through the core recorder -- the same writes the loop lands
+    record = Node(task).record
+    run_id = record.run_start()
+    iter_id = record.iter_start(run_id=run_id, iter=1)
+    plan = record.step_start(iter_id=iter_id, run_id=run_id, step=1, step_name='PLAN')
+    record.step_cost(step_id=plan, cost=STEP_COST)
+    record.step_end(step_id=plan, status='completed', exit_code=0)
+    execute = record.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=2,
+        step_name='EXECUTE',
     )
-    # record cost on the PLAN step via the stream renderer (the only CLI path)
-    result = json.dumps(
-        {
-            'type': 'result',
-            'total_cost_usd': STEP_COST,
-            'num_turns': 1,
-            'duration_ms': 1,
-        },
-    )
-    _run(task, '_stream', str(plan), '--agent', 'claude', stdin=result + '\n')
-    _run(task, 'step', '_end', str(plan), '--status', 'completed', '--exit-code', '0')
-    execute = int(
-        _ok(
-            task,
-            'step',
-            '_start',
-            '--iter',
-            str(iter_id),
-            '--run',
-            str(run_id),
-            '--step',
-            '2',
-            '--name',
-            'EXECUTE',
-        )
-    )
-    _run(task, 'step', '_end', str(execute), '--status', 'failed', '--exit-code', '2')
-    _run(
-        task,
-        'iter',
-        '_end',
-        str(iter_id),
-        '--status',
-        'completed',
-        '--exit-code',
-        '0',
-    )
-    _run(task, 'run', '_end', str(run_id), '--status', 'completed', '--exit-code', '0')
+    record.step_end(step_id=execute, status='failed', exit_code=2)
+    record.iter_end(iter_id=iter_id, status='completed', exit_code=0)
+    record.run_end(run_id=run_id, status='completed', exit_code=0)
     return {
         'root': root,
         'task': task,
@@ -185,8 +145,8 @@ def test_db_query_csv_is_lf_terminated(repo: dict) -> None:
 
 
 @pytest.mark.parametrize(
-    'statement',
-    [
+    argnames='statement',
+    argvalues=[
         'DELETE FROM steps',
         "UPDATE runs SET status = 'wiped'",
         "INSERT INTO runs (status) VALUES ('sneaky')",
@@ -220,14 +180,20 @@ def test_config_round_trips_scalars_bools_and_json(repo: dict) -> None:
     _run(task, 'config', '_set', 'local=false')
     assert _ok(task, 'config', '_get', 'local') == 'false'
     # restore the mutated schema keys
-    _run(task, 'config', '_set', f'max_iters={orig_iters or "null"}')
-    _run(task, 'config', '_set', f'local={orig_local or "false"}')
+    max_iters = orig_iters or 'null'
+    _run(task, 'config', '_set', f'max_iters={max_iters}')
+    local = orig_local or 'false'
+    _run(task, 'config', '_set', f'local={local}')
     # an unknown key is rejected so a typo (e.g. max_iter) cannot silently persist
     bad = _run(task, 'config', '_set', 'max_iter=7')
     assert bad.returncode != 0
     assert 'Unknown config key' in (bad.stdout + bad.stderr)
-    # a missing key prints nothing
-    assert _ok(task, 'config', '_get', 'no_such_key') == ''
+    # the getter rejects the same typo rather than reading it as unset
+    bad = _run(task, 'config', '_get', 'max_iter')
+    assert bad.returncode == 2
+    assert 'Unknown config key' in (bad.stdout + bad.stderr)
+    # a valid but unset key prints nothing
+    assert _ok(task, 'config', '_get', 'meta') == ''
 
 
 def test_config_set_rejects_bare_key_and_keeps_string_keys_literal(repo: dict) -> None:
@@ -253,7 +219,8 @@ def test_config_set_rejects_bare_key_and_keeps_string_keys_literal(repo: dict) -
     assert _run(task, 'config', '_set', 'scope=123').returncode == 0
     assert _ok(task, 'config', '_get', 'scope') == '123'
     # restore the shared fixture
-    _run(task, 'config', '_set', f'scope={orig_scope or "null"}')
+    scope = orig_scope or 'null'
+    _run(task, 'config', '_set', f'scope={scope}')
 
 
 def test_config_set_validates_cost_and_duration_like_init(repo: dict) -> None:
@@ -286,10 +253,11 @@ def test_config_set_validates_cost_and_duration_like_init(repo: dict) -> None:
     orig_step = _ok(task, 'config', '_get', 'step_timeout')
     assert _run(task, 'config', '_set', 'step_timeout=30s').returncode == 0
     assert _ok(task, 'config', '_get', 'step_timeout') == '30s'
-    _run(task, 'config', '_set', f'step_timeout={orig_step or "null"}')
+    step_timeout = orig_step or 'null'
+    _run(task, 'config', '_set', f'step_timeout={step_timeout}')
 
 
-# ------ event / iteration / step / run lifecycle
+# ------ event lifecycle
 
 
 def test_event_lifecycle_filters_by_status(repo: dict) -> None:
@@ -313,35 +281,6 @@ def test_event_lifecycle_filters_by_status(repo: dict) -> None:
     assert failed in ids
     assert completed not in ids
     assert all(row['status'] == 'failed' for row in rows)
-
-
-def test_iteration_and_step_lifecycle_filter_by_status(repo: dict) -> None:
-    """Iteration and step ``_list`` honour a ``--status`` filter."""
-    task = repo['task']
-    completed_iters = _csv_rows(
-        _ok(task, 'iter', '_list', '--status', 'completed', '--csv'),
-    )
-    assert completed_iters
-    assert all(row['status'] == 'completed' for row in completed_iters)
-    failed_steps = _csv_rows(_ok(task, 'step', '_list', '--status', 'failed', '--csv'))
-    assert {row['step_name'] for row in failed_steps} == {'EXECUTE'}
-
-
-def test_step_list_scopes_to_an_iteration(repo: dict) -> None:
-    """``step _list --iter`` returns both steps of the seeded iteration."""
-    task = repo['task']
-    rows = _csv_rows(
-        _ok(task, 'step', '_list', '--iter', str(repo['iter_id']), '--csv'),
-    )
-    assert {row['step_name'] for row in rows} == {'PLAN', 'EXECUTE'}
-
-
-def test_run_lifecycle_records_terminal_status(repo: dict) -> None:
-    """The seeded run ends ``completed`` and is found by a status filter."""
-    task = repo['task']
-    rows = _csv_rows(_ok(task, 'run', '_list', '--status', 'completed', '--csv'))
-    ids = {int(row['run_id']) for row in rows}
-    assert repo['run_id'] in ids
 
 
 # ------ cost accounting
@@ -402,27 +341,11 @@ def test_cost_remaining_clamps_at_zero_when_overspent(repo: dict) -> None:
     assert spawn.returncode == 0
     broke = root / '.worktrees' / 'main.broke'
     # drive a run/iteration/step and record a cost above the budget
-    run_id = int(_ok(broke, 'run', '_start'))
-    iter_id = int(_ok(broke, 'iter', '_start', str(run_id), '--iter', '1'))
-    step = int(
-        _ok(
-            broke,
-            'step',
-            '_start',
-            '--iter',
-            str(iter_id),
-            '--run',
-            str(run_id),
-            '--step',
-            '1',
-            '--name',
-            'PLAN',
-        )
-    )
-    result = json.dumps(
-        {'type': 'result', 'total_cost_usd': 5.0, 'num_turns': 1, 'duration_ms': 1}
-    )
-    _run(broke, '_stream', str(step), '--agent', 'claude', stdin=result + '\n')
+    record = Node(broke).record
+    run_id = record.run_start()
+    iter_id = record.iter_start(run_id=run_id, iter=1)
+    step = record.step_start(iter_id=iter_id, run_id=run_id, step=1, step_name='PLAN')
+    record.step_cost(step_id=step, cost=5.0)
     remaining = _ok(broke, 'node', 'cost', 'remaining')
     assert float(remaining.removeprefix('$')) == 0.0
 
@@ -438,21 +361,10 @@ def test_cost_spent_marks_untracked_spend(repo: dict) -> None:
     # a fresh node whose only step never records a cost
     assert _run(root, 'node', 'init', 'nocost', '--agent', 'claude').returncode == 0
     nocost = root / '.worktrees' / 'main.nocost'
-    run_id = int(_ok(nocost, 'run', '_start'))
-    iter_id = int(_ok(nocost, 'iter', '_start', str(run_id), '--iter', '1'))
-    _ok(
-        nocost,
-        'step',
-        '_start',
-        '--iter',
-        str(iter_id),
-        '--run',
-        str(run_id),
-        '--step',
-        '1',
-        '--name',
-        'PLAN',
-    )
+    record = Node(nocost).record
+    run_id = record.run_start()
+    iter_id = record.iter_start(run_id=run_id, iter=1)
+    record.step_start(iter_id=iter_id, run_id=run_id, step=1, step_name='PLAN')
     assert _ok(nocost, 'node', 'cost', 'spent').strip() == 'untracked'
 
 
@@ -465,7 +377,7 @@ def test_cost_spent_and_breakdown_disclose_unpriced_count(repo: dict) -> None:
     parseable.
     """
     task, run_id = repo['task'], repo['run_id']
-    note = '1 unpriced steps (NULL cost) excluded'
+    note = '1 unpriced step (NULL cost) excluded'
     # spent: the priced step sums on stdout, the NULL row is noted aside
     spent = _run(task, 'node', 'cost', 'spent', '--run', str(run_id))
     assert spent.returncode == 0, spent.stderr
@@ -517,32 +429,6 @@ def test_cost_rejects_lifetime_selector(repo: dict) -> None:
         result = _run(task, 'node', 'cost', subcommand, '--lifetime')
         assert result.returncode == 2, result.stderr
         assert 'No such option' in (result.stdout + result.stderr)
-
-
-def test_run_start_enforces_single_active_run(repo: dict) -> None:
-    """Starting a run reconciles any stranded active run, so only one is active.
-
-    A leftover ``active`` run (a crashed loop) is stamped ``exited`` -- the
-    single-tmux-session invariant proves it dead -- so run resolution stays
-    unambiguous with exactly one active run.
-    """
-    root = repo['root']
-    assert _run(root, 'node', 'init', 'solo', '--agent', 'claude').returncode == 0
-    solo = root / '.worktrees' / 'main.solo'
-    first = int(_ok(solo, 'run', '_start'))
-    _ok(solo, 'run', '_start')
-    active = _csv_rows(
-        _ok(
-            solo,
-            'db',
-            '_query',
-            "SELECT run_id FROM runs WHERE node = 'main.solo' AND status = 'active'",
-            '--csv',
-        )
-    )
-    assert len(active) == 1
-    prior = _ok(solo, 'db', '_query', f'SELECT status FROM runs WHERE run_id = {first}')
-    assert 'exited' in prior
 
 
 def test_cost_breakdown_emits_header_for_no_children(repo: dict) -> None:
@@ -602,8 +488,9 @@ def test_time_remaining_counts_down_from_timeout(repo: dict) -> None:
     """``time remaining`` reports seconds left within the configured timeout."""
     task = repo['task']
     # an active run is required for the run-scope deadline to exist
-    run_id = int(_ok(task, 'run', '_start'))
-    _ok(task, 'iter', '_start', str(run_id), '--iter', '1')
+    record = Node(task).record
+    run_id = record.run_start()
+    record.iter_start(run_id=run_id, iter=1)
     output = _ok(task, 'node', 'time', 'remaining')
     assert output.endswith('s')
     seconds = int(output.removesuffix('s'))

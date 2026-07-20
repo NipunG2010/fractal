@@ -35,6 +35,7 @@ __all__ = [
     'test_no_separator_merges_theirs_below',
     'test_malformed_separator_degrades_to_take_below',
     'test_stray_separator_in_frontmatter_preserves_take_ours',
+    'test_bom_side_keeps_its_authored_frontmatter',
     'test_trailing_whitespace_frontmatter_delimiter_still_skips',
     'test_take_ours_above_link_drop_is_restored_by_wiki_update',
 ]
@@ -160,8 +161,8 @@ def test_empty_index_takes_ours(tmp_path: pathlib.Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ('ours_below', 'theirs_below', 'expect_clean'),
-    [
+    argnames=('ours_below', 'theirs_below', 'expect_clean'),
+    argvalues=[
         ('Note A.\n', 'Note A.\nAppended by theirs.\n', True),
         ('Ours rewrote it.\n', 'Theirs rewrote it.\n', False),
     ],
@@ -217,8 +218,8 @@ def test_many_below_conflicts_never_wrap_to_clean_exit(
 
 
 @pytest.mark.parametrize(
-    ('ours_below', 'theirs_below', 'expect_clean'),
-    [
+    argnames=('ours_below', 'theirs_below', 'expect_clean'),
+    argvalues=[
         ('Same note.\n', 'Same note.\n', True),
         ('Ours note.\n', 'Theirs note.\n', False),
     ],
@@ -270,8 +271,8 @@ def test_no_separator_merges_theirs_below(tmp_path: pathlib.Path) -> None:
 
 
 @pytest.mark.parametrize(
-    'separator',
-    ['****', '***x'],
+    argnames='separator',
+    argvalues=['****', '***x'],
     ids=['four-stars', 'trailing-char'],
 )
 def test_malformed_separator_degrades_to_take_below(
@@ -329,6 +330,37 @@ def test_stray_separator_in_frontmatter_preserves_take_ours(
     assert '[[b|b]]: beta' not in text  # theirs' above (its link) was not taken
 
 
+def test_bom_side_keeps_its_authored_frontmatter(tmp_path: pathlib.Path) -> None:
+    """A UTF-8 BOM on ours must not read as frontmatter-less.
+
+    The Python parser tolerates a leading BOM, so a BOM'd side is a legal
+    input. Frontmatter detection blind to the BOM would classify the side
+    as having no frontmatter and silently replace its authored keys with
+    base's -- exit 0, no conflict, the ``desc`` edit gone. The merged
+    output normalizes the BOM away (the wiki suite pins no-residue), but
+    never at the price of the authored keys.
+    """
+
+    def page(desc: str, below: str, *, bom: bool = False) -> str:
+        prefix = '﻿' if bom else ''
+        return (
+            f'{prefix}---\nname: w\ndesc: {desc}\n---\n\n# w\n\n'
+            f'[[a|a]]: alpha\n\n***\n{below}'
+        )
+
+    returncode, text = _run_driver(
+        tmp_path,
+        ours=page('Ours authored desc.', 'Shared note.\n', bom=True),
+        base=page('Base desc.', 'Shared note.\n'),
+        theirs=page('Base desc.', 'Theirs note.\n'),
+    )
+    assert returncode == 0
+    assert 'desc: Ours authored desc.' in text
+    assert 'desc: Base desc.' not in text
+    assert '﻿' not in text
+    assert 'Theirs note.' in text
+
+
 def test_trailing_whitespace_frontmatter_delimiter_still_skips(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -381,8 +413,13 @@ def test_take_ours_above_link_drop_is_restored_by_wiki_update(
     _init_repo_with_driver(repo)
     wiki_dir = repo / 'wiki'
     index = wiki_dir / '_index.md'
-    # base: a wiki with a single page a
-    _wiki(wiki_dir, 'init')
+    # base: a wiki with a single page a (seeded with the strict naming policy
+    # every wiki init call site carries)
+    _wiki(
+        wiki_dir,
+        'init',
+        '--settings={"naming": {"validate": ["ascii", "identifier"]}}',
+    )
     (wiki_dir / 'a.md').write_text('# a\n\nAlpha.\n', encoding='utf-8')
     _wiki(wiki_dir, 'update')
     _git(repo, 'add', '-A')
@@ -408,7 +445,7 @@ def test_take_ours_above_link_drop_is_restored_by_wiki_update(
     )
     merged = index.read_text(encoding='utf-8')
     # the driver took ours' above: theirs' link is dropped, ours' link kept...
-    assert merge.returncode == 0
+    assert merge.returncode == 0, (merge.stdout, merge.stderr)
     assert '[[b|b]]' not in merged  # theirs' link dropped at merge time
     assert '[[c|c]]' in merged  # ours' link kept
     # ...but theirs' page file merged in as an ordinary file -- the data survives
@@ -544,12 +581,13 @@ def _three_way_merge(
         text=True,
         check=False,
     )
-    status = subprocess.run(
+    result = subprocess.run(
         ['git', '-C', f'{repo}', 'status', '--porcelain', '--', path],
         capture_output=True,
         text=True,
         check=True,
-    ).stdout
+    )
+    status = result.stdout
     unmerged = bool(status.strip()) and 'U' in status.split()[0]
     return MergeResult(
         returncode=merge.returncode,

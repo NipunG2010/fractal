@@ -1,11 +1,11 @@
 """The loop's grep-anchored stdout contract.
 
-A handful of ``_run.sh`` stdout lines are load-bearing beyond logging:
-the e2e harness (``test_run_modes``) and operators watching a pane grep
-them to observe the loop's state from outside. Renaming one silently
-breaks every consumer, so this module is the single inventory of lines
-any implementation of the loop must emit verbatim, each mapped to its
-consumers.
+A handful of ``fractal/core/loop.py`` stdout lines are load-bearing
+beyond logging: the e2e harness (``test_run_modes``) and operators
+watching a pane grep them to observe the loop's state from outside.
+Renaming one silently breaks every consumer, so this module is the
+single inventory of lines any implementation of the loop must emit
+verbatim, each mapped to its consumers.
 
 The division of labor: the e2e suite pins that each line is actually
 *emitted* on its trigger (drains, budgets, parks, adoption); this module
@@ -29,7 +29,7 @@ from .conftest import _worktree_root
 
 __all__ = ['test_loop_emits_every_grep_anchor']
 
-_LOOP = _worktree_root() / 'fractal' / '_node' / 'scripts' / '_run.sh'
+_LOOP = _worktree_root() / 'fractal' / 'core' / 'loop.py'
 
 # every grep-anchored stdout line the loop must emit verbatim, mapped to
 # the consumers that grep it -- extend this table when a new consumer
@@ -50,6 +50,11 @@ _ANCHORS = {
     'Parked at boot': 'test_run_modes tree-latch assertions',
     # iteration-cap terminal
     'Reached max iterations': 'test_run_modes max-iters assertions',
+    # the boot banner's un-configured wait label: one contract with the 1m
+    # fallback in Loop.__init__, the init --wait help, and the init.sh usage
+    "wait_label = self._wait if self._wait else '1m'": (
+        'fractal node init --wait help; _scripts/init.sh usage'
+    ),
 }
 
 

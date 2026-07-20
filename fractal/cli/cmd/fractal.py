@@ -1,40 +1,38 @@
-"""Implements top-level ``fractal`` commands."""
+"""Implements ``fractal`` commands."""
 
 from __future__ import annotations
 
-import importlib.metadata
 import importlib.resources
 import pathlib
 import shutil
+from importlib.resources.abc import Traversable
 from typing import Optional
 
 import typer
 
+import fractal.core.worktree
 from fractal.cli.utils import (
     command,
-    ensure_git_repo,
-    pricing_has_model,
-    render_stream,
     resolve_init_target,
     resolve_node,
     resolve_target,
-    update_pricing,
+    resolve_user_node,
 )
+from fractal.constants import FRACTAL_FOLDER
 from fractal.core.node import Node
 
 __all__ = [
     'version',
     'install',
     'init',
+    'track',
+    'untrack',
     'commit',
     'open',
     'pause',
     'resume',
     'reset',
     'destroy',
-    'stream',
-    'pricing',
-    'status',
 ]
 
 
@@ -42,9 +40,9 @@ def version(app: typer.Typer) -> typer.Typer:
     """Register the ``--version`` flag on the root callback."""
 
     def _version_callback(value: bool) -> None:
-        """Print the installed ``plasma-fractal`` version and exit."""
+        """Print the running ``fractal`` package's version and exit."""
         if value:
-            typer.echo(importlib.metadata.version('plasma-fractal'))
+            typer.echo(fractal.__version__)
             raise typer.Exit()
 
     # version flag
@@ -67,12 +65,20 @@ def version(app: typer.Typer) -> typer.Typer:
 def install(app: typer.Typer) -> typer.Typer:
     """Register the ``install`` command."""
     # project flag
-    project_help = 'Install config in cwd rather than home directory.'
+    project_help = 'Install skills in cwd rather than home directory.'
     project = typer.Option(False, '--project', help=project_help)
+    # link flag
+    link_help = (
+        'Symlink the bundled skills instead of copying (requires the package'
+        ' files on disk, e.g. an editable install), so source edits apply'
+        ' without re-installing.'
+    )
+    link = typer.Option(False, '--link', help=link_help)
 
     @command(app, 'install')
     def _install(
         project: bool = project,
+        link: bool = link,
     ) -> None:
         """Install the fractal and wiki skills for Claude Code and Codex.
 
@@ -80,6 +86,8 @@ def install(app: typer.Typer) -> typer.Typer:
         (.agents/skills) skill directories. Targets your home directory by
         default, or the current project with --project. The wiki skill ships
         with fractal's plasma-wiki dependency and is installed alongside it.
+        --link symlinks the skills instead of copying -- the editable-install
+        dev setup, where source edits apply without re-installing.
         """
         # resolve install directory
         if project:
@@ -92,12 +100,17 @@ def install(app: typer.Typer) -> typer.Typer:
             root / '.agents' / 'skills',
         ]
         # collect skills
-        skills = []
-        for package in ('fractal', 'wiki'):
-            skills_dir = importlib.resources.files(package).joinpath('skills')
-            skills.extend(path for path in skills_dir.iterdir() if path.is_dir())
-        # copy each skill into every target (replaces any prior copy)
-        for skill in sorted(skills, key=lambda path: path.name):
+        skills = _bundled_skills()
+        # a symlink needs a real directory to point at; only an on-disk
+        # package (an editable install, not a zipped one) provides it
+        if link and not all(isinstance(skill, pathlib.Path) for skill in skills):
+            raise RuntimeError(
+                '--link requires the bundled skills to be real directories'
+                ' (an editable install); a zipped install cannot install'
+                ' the skills from the CLI.'
+            )
+        # copy or link each skill into every target (replaces any prior install)
+        for skill in skills:
             for target in targets:
                 dest = target / skill.name
                 dest.parent.mkdir(parents=True, exist_ok=True)
@@ -105,8 +118,12 @@ def install(app: typer.Typer) -> typer.Typer:
                     dest.unlink()
                 elif dest.is_dir():
                     shutil.rmtree(dest)
-                shutil.copytree(skill, dest)
-                typer.echo(f'Installed {skill.name} -> {dest}')
+                if link:
+                    dest.symlink_to(skill)
+                    typer.echo(f'Linked {skill.name} -> {dest}.')
+                else:
+                    shutil.copytree(skill, dest)
+                    typer.echo(f'Installed {skill.name} -> {dest}.')
 
     return app
 
@@ -117,24 +134,93 @@ def init(app: typer.Typer) -> typer.Typer:
     path_help = 'Repository path (or sub-project folder).'
     path = typer.Argument('.', help=path_help)
     # agent option
-    agent_help = 'Default agent command for spawned nodes (e.g. claude or codex).'
+    agent_help = (
+        'Default agent command for spawned nodes'
+        ' (e.g. claude, codex, grok, opencode, or omp).'
+    )
     agent = typer.Option(None, '--agent', help=agent_help)
-    # track flag
-    track_help = 'Track .fractal/ on the top-level branch (default: git-ignored).'
-    track = typer.Option(None, '--track/--no-track', help=track_help)
+    # provider option
+    provider_help = (
+        'Default provider route for spawned nodes (e.g. openrouter;'
+        ' default: the vendor-native endpoint).'
+    )
+    provider = typer.Option(None, '--provider', help=provider_help)
 
     @command(app, 'init')
     def _init(
         path: str = path,
         agent: Optional[str] = agent,
-        track: Optional[bool] = track,
+        provider: Optional[str] = provider,
     ) -> None:
         """Initialize fractal for this repository (or sub-project)."""
-        ensure_git_repo(path)
+        fractal.core.worktree.ensure_git_repo(path)
         node, path = resolve_init_target(path)
-        output = node.init(path=path, agent=agent, track=track, user=True)
+        output = node.init(path=path, agent=agent, provider=provider, user=True)
         if output:
             typer.echo(output)
+
+    return app
+
+
+def track(app: typer.Typer) -> typer.Typer:
+    """Register the ``track`` command."""
+    # path argument
+    path_help = 'Repository path.'
+    path = typer.Argument('.', help=path_help)
+
+    @command(app, 'track')
+    def _track(
+        path: str = path,
+    ) -> None:
+        """Track the user node's ``.fractal/`` data on the top-level branch.
+
+        Rewrites the repo-local git exclude so the user node's seed dir is
+        no longer ignored, then prints the git command that stages it -- the
+        index is never touched. Repo-wide, idempotent, and usable on any
+        initialized tree; ``fractal untrack`` is the inverse.
+        """
+        user, seed_dir = _resolve_user_seed(path)
+        fractal.core.worktree.exclude_update(
+            repo_dir=user.repo_dir,
+            track=True,
+            seed_dir=seed_dir,
+        )
+        typer.echo(
+            f'Tracking {seed_dir}/ on the top-level branch.'
+            f'\nNext: stage it with: git add -- {seed_dir}'
+        )
+
+    return app
+
+
+def untrack(app: typer.Typer) -> typer.Typer:
+    """Register the ``untrack`` command."""
+    # path argument
+    path_help = 'Repository path.'
+    path = typer.Argument('.', help=path_help)
+
+    @command(app, 'untrack')
+    def _untrack(
+        path: str = path,
+    ) -> None:
+        """Git-ignore the user node's ``.fractal/`` data (the default state).
+
+        Rewrites the repo-local git exclude so the user node's seed dir is
+        ignored on the top-level branch, then prints the git command that
+        unstages an already-committed seed -- the index is never touched.
+        Repo-wide, idempotent, and usable on any initialized tree;
+        ``fractal track`` is the inverse.
+        """
+        user, seed_dir = _resolve_user_seed(path)
+        fractal.core.worktree.exclude_update(
+            repo_dir=user.repo_dir,
+            track=False,
+            seed_dir=seed_dir,
+        )
+        typer.echo(
+            f'Ignoring {seed_dir}/ on the top-level branch.'
+            f'\nNext: unstage a committed seed with: git rm -r --cached -- {seed_dir}'
+        )
 
     return app
 
@@ -145,12 +231,12 @@ def commit(app: typer.Typer) -> typer.Typer:
     message_help = 'Short description for the commit message (required unless --check).'
     message = typer.Argument(None, help=message_help)
     # init flag
-    init_help = 'Baseline commit ("init" instead of "iteration <N>").'
+    init_help = 'Baseline commit ("init" instead of "iteration <run>.<iter>").'
     init = typer.Option(False, '--init', help=init_help)
     # check flag
     check_help = 'Error if uncommitted changes exist instead of committing.'
     check = typer.Option(False, '--check', help=check_help)
-    # ignore-scope flag
+    # ignore scope flag
     ignore_scope_help = 'Commit out-of-scope changes but still lint.'
     ignore_scope = typer.Option(False, '--ignore-scope', help=ignore_scope_help)
     # force flag
@@ -170,6 +256,21 @@ def commit(app: typer.Typer) -> typer.Typer:
         path: str = path,
     ) -> None:
         """Commit the current iteration's work."""
+        # validate arguments
+        if init and check:
+            raise typer.BadParameter('--init cannot be used with --check.')
+        if init and ignore_scope:
+            raise typer.BadParameter('--init cannot be used with --ignore-scope.')
+        if init and force:
+            raise typer.BadParameter('--init cannot be used with --force.')
+        if check and ignore_scope:
+            raise typer.BadParameter('--check cannot be used with --ignore-scope.')
+        if check and force:
+            raise typer.BadParameter('--check cannot be used with --force.')
+        if ignore_scope and force:
+            raise typer.BadParameter('--ignore-scope cannot be used with --force.')
+        if not message and not check:
+            raise typer.BadParameter('Message is required unless --check is set.')
         node = resolve_node(path)
         output = node.commit(
             message=message,
@@ -192,30 +293,43 @@ def open(app: typer.Typer) -> typer.Typer:
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
+    # light flag
+    light_help = 'Open with the light palette.'
+    light = typer.Option(False, '--light', help=light_help)
+    # dark flag
+    dark_help = 'Open with the dark palette (the default).'
+    dark = typer.Option(False, '--dark', help=dark_help)
 
     @command(app, 'open')
     def _open(
         node: Optional[str] = node,
         path: str = path,
+        light: bool = light,
+        dark: bool = dark,
     ) -> None:
         """Open the fractal TUI (the cockpit)."""
+        if light and dark:
+            raise typer.BadParameter('--light and --dark are mutually exclusive.')
         # NOTE: import textual lazily: the TUI is an
         #   optional extra and must stay off cold start
         try:
-            from fractal.tui import FractalApp
+            from fractal.tui import FractalApp, theme
         except ImportError as e:
             raise RuntimeError(
                 f'The TUI needs the optional tui extra ({e}); install it'
                 " with `pip install 'plasma-fractal[tui]'` and re-run."
             ) from None
 
+        # the palette applies before the app constructs (the theme module's
+        # tokens are read at render time, so one select re-skins everything)
+        theme.select('light' if light else 'dark')
         node = resolve_target(path, node)
-        project_dir = node._repo_dir / node._project_path
+        project_dir = node.repo_dir / node.project_path
         root = resolve_node(project_dir)
         if root.is_user:
-            FractalApp(root, branch=node._branch).run()
+            FractalApp(root, branch=node.branch).run()
         else:
-            raise RuntimeError(f'Directory is not a user node: {project_dir}')
+            raise RuntimeError(f'Directory is not a user node: {project_dir}.')
 
     return app
 
@@ -235,11 +349,11 @@ def pause(app: typer.Typer) -> typer.Typer:
         reason: Optional[str] = reason,
     ) -> None:
         """Pause the whole tree: abort in-flight agents, park every loop."""
-        # a tree-wide brake -- resolve to the repo root from any cwd inside it
-        # (mirrors destroy), so the fan-out is never scoped to one child's
-        # subtree during the exact emergency it exists for
-        repo_dir = Node(path)._repo_dir
-        node = resolve_node(repo_dir)
+        # a tree-wide brake -- anchor on the user node by config, never the
+        # current branch: on a non-init checkout resolve_node would mis-scope
+        # to a lone child (or die on two), silently narrowing the exact
+        # emergency brake it exists for
+        node = resolve_user_node(path)
         result = node.pause(reason)
         typer.echo(result)
 
@@ -257,9 +371,9 @@ def resume(app: typer.Typer) -> typer.Typer:
         path: str = path,
     ) -> None:
         """Resume the paused tree where it left off (leaf-first)."""
-        # anchored at the repo root like pause, so the release matches the brake
-        repo_dir = Node(path)._repo_dir
-        node = resolve_node(repo_dir)
+        # anchored on the user node like pause (by config, not branch), so the
+        # release matches the brake from any checkout
+        node = resolve_user_node(path)
         result = node.resume()
         typer.echo(result)
 
@@ -272,7 +386,7 @@ def reset(app: typer.Typer) -> typer.Typer:
     path_help = 'Repository path.'
     path = typer.Argument('.', help=path_help)
     # force flag
-    force_help = 'Skip confirmation prompt.'
+    force_help = 'Skip confirmation prompt (paused nodes are killed without asking).'
     force = typer.Option(False, '--force', '-f', help=force_help)
 
     @command(app, 'reset')
@@ -283,7 +397,7 @@ def reset(app: typer.Typer) -> typer.Typer:
         """Reset the fractal: remove every node worktree, keep the history."""
         # reset is a repo-wide teardown -- resolve to the repo root from any
         # cwd inside it (the agent's NODE_DIR, a worktree, or the repo root)
-        repo_dir = Node(path)._repo_dir
+        repo_dir = Node(path).repo_dir
         if not force:
             user = Node(repo_dir)
             count = len(user.child_list()) if user.exists() else 0
@@ -294,6 +408,17 @@ def reset(app: typer.Typer) -> typer.Typer:
                 ' and all history are left in place.',
                 err=True,
             )
+            # the confirmation is the authorization to kill paused nodes, so
+            # it must name them (the teardown settles their frozen work)
+            paused = len(user.list(status='paused', live=True)) if user.exists() else 0
+            if paused:
+                p = 's' if paused != 1 else ''
+                hold = 'hold' if paused != 1 else 'holds'
+                typer.echo(
+                    f'Warning: {paused} paused node{p} {hold} frozen mid-step'
+                    ' work and will be killed.',
+                    err=True,
+                )
             prompt = f'Reset the fractal at {repo_dir} ({count} node{s})?'
             typer.confirm(prompt, abort=True)
         output = Node.reset(repo_dir)
@@ -309,7 +434,7 @@ def destroy(app: typer.Typer) -> typer.Typer:
     path_help = 'Repository path.'
     path = typer.Argument('.', help=path_help)
     # force flag
-    force_help = 'Skip confirmation prompt.'
+    force_help = 'Skip confirmation prompt (paused nodes are killed without asking).'
     force = typer.Option(False, '--force', '-f', help=force_help)
 
     @command(app, 'destroy')
@@ -320,7 +445,7 @@ def destroy(app: typer.Typer) -> typer.Typer:
         """Destroy the fractal: every node, branch, and the user node's data."""
         # destroy is a repo-wide teardown -- resolve to the repo root from any
         # cwd inside it (the agent's NODE_DIR, a worktree, or the repo root)
-        repo_dir = Node(path)._repo_dir
+        repo_dir = Node(path).repo_dir
         if not force:
             user = Node(repo_dir)
             count = len(user.child_list()) if user.exists() else 0
@@ -331,6 +456,17 @@ def destroy(app: typer.Typer) -> typer.Typer:
                 ' The project wiki and commit history are left in place.',
                 err=True,
             )
+            # the confirmation is the authorization to kill paused nodes, so
+            # it must name them (the teardown settles their frozen work)
+            paused = len(user.list(status='paused', live=True)) if user.exists() else 0
+            if paused:
+                p = 's' if paused != 1 else ''
+                hold = 'hold' if paused != 1 else 'holds'
+                typer.echo(
+                    f'Warning: {paused} paused node{p} {hold} frozen mid-step'
+                    ' work and will be killed.',
+                    err=True,
+                )
             prompt = f'Destroy the fractal at {repo_dir} ({count} node{s})?'
             typer.confirm(prompt, abort=True)
         output = Node.destroy(repo_dir)
@@ -340,96 +476,34 @@ def destroy(app: typer.Typer) -> typer.Typer:
     return app
 
 
-def stream(app: typer.Typer) -> typer.Typer:
-    """Register the ``_stream`` command."""
-    # step id argument
-    step_id_help = 'Step ID for cost recording.'
-    step_id = typer.Argument(None, help=step_id_help)
-    # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
-    # agent option
-    agent_help = 'Agent type (currently claude or codex).'
-    agent = typer.Option(..., '--agent', help=agent_help)
-    # model option
-    model_help = 'Model name (for token-based cost computation).'
-    model = typer.Option(None, '--model', help=model_help)
-    # detached flag
-    detached_help = 'Run detached: do not persist the session id for resume.'
-    detached = typer.Option(False, '--detached', help=detached_help)
-
-    @command(app, '_stream')
-    def _stream(
-        step_id: Optional[int] = step_id,
-        path: str = path,
-        agent: str = agent,
-        model: Optional[str] = model,
-        detached: bool = detached,
-    ) -> None:
-        """Render agent output from stdin and record cost."""
-        node = resolve_node(path)
-        render_stream(
-            node=node,
-            agent=agent,
-            step_id=step_id,
-            model=model,
-            detached=detached,
-        )
-
-    return app
+# ------ helper functions
 
 
-def pricing(app: typer.Typer) -> typer.Typer:
-    """Register the ``_pricing`` command."""
-    # max-age option
-    max_age_help = 'Skip the fetch when the cache is newer than this (e.g. 24h).'
-    max_age = typer.Option(None, '--max-age', help=max_age_help)
-    # check option
-    check_help = 'Exit 0 if this model is present and priced, else 1 (no fetch).'
-    check = typer.Option(None, '--check', help=check_help)
+def _bundled_skills() -> list[Traversable]:
+    """Return the bundled skill dirs ``install`` ships (fractal's own plus wiki's).
 
-    @command(app, '_pricing')
-    def _pricing(
-        max_age: Optional[str] = max_age,
-        check: Optional[str] = check,
-    ) -> None:
-        """Refresh the LiteLLM pricing cache, or check a model is priced."""
-        # check mode: verify a model is priced without fetching
-        if check is not None:
-            if pricing_has_model(check):
-                return
-            raise SystemExit(1)
-        # refresh mode: fetch atomically, tolerating an offline fallback to cache
-        status = update_pricing(max_age=max_age)
-        if status == 'missing':
-            raise RuntimeError(
-                'Could not fetch pricing and no cached pricing.json exists.'
-            )
-        if status == 'stale':
-            typer.echo(
-                'Warning: could not refresh pricing; using cached pricing.json.',
-                err=True,
-            )
-
-    return app
+    Sorted by name for stable output. The entries are real directories under
+    a regular (non-zipped) install; only those can be symlink targets.
+    """
+    skills = []
+    for package in ('fractal', 'wiki'):
+        skills_dir = importlib.resources.files(package).joinpath('skills')
+        skills.extend(path for path in skills_dir.iterdir() if path.is_dir())
+    return sorted(skills, key=lambda path: path.name)
 
 
-def status(app: typer.Typer) -> typer.Typer:
-    """Register the ``_status`` command."""
-    # status argument
-    status_help = 'Status to set.'
-    status = typer.Argument(..., help=status_help)
-    # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+def _resolve_user_seed(path: str) -> tuple[Node, str]:
+    """Resolve the user node and its seed dir (shared by track/untrack).
 
-    @command(app, '_status')
-    def _status(
-        status: str = status,
-        path: str = path,
-    ) -> None:
-        """Set the node status."""
-        node = resolve_node(path)
-        node.status_set(status)
-
-    return app
+    Tracking is repo-wide, so the toggle anchors on the user node that owns
+    the exclude block by config, not the current branch (mirrors pause) --
+    the verbs stay usable on any checkout inside the repo.
+    """
+    user = resolve_user_node(path)
+    # the seed dir nests under <project>/ for a sub-project user node
+    project = user.config.get('project', '.')
+    if project == '.':
+        seed_dir = f'{FRACTAL_FOLDER}/{user.branch}'
+    else:
+        seed_dir = f'{project}/{FRACTAL_FOLDER}/{user.branch}'
+    return user, seed_dir

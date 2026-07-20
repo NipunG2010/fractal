@@ -20,5 +20,5 @@ the target's autonomous effectiveness -- invest in specificity and
 verifiability.
 
 **Commit scope.** You can only commit to `$SCOPE_DIR` (the target's
-seed) and your own node directory. Do not modify files outside these
-paths.
+seed), your own node directory, and the shared project wiki
+(`$WIKI_DIR`). Do not modify files outside these paths.

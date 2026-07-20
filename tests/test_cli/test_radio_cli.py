@@ -9,15 +9,16 @@ user (root) node and two worker nodes, exercising routing, permissions,
 read tracking, threads, reactions, the archive, and channel management as
 observable end-to-end workflows rather than internal state, including
 machine-output guarantees (an empty query emits the same header a
-populated one would).
+populated one would, and ``--json`` mirrors the CSV shape).
 """
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import pathlib
 import subprocess
-from csv import DictReader
-from io import StringIO
 from typing import Optional
 
 import pytest
@@ -27,11 +28,16 @@ from tests._helpers import _git
 from .conftest import _run
 
 __all__ = [
-    'test_send_routes_across_nodes_by_channel',
-    'test_send_rejects_write_only_and_out_of_range_priority',
+    'test_send_and_post_route_across_nodes_by_channel',
+    'test_send_and_post_reject_write_only_and_out_of_range_priority',
     'test_node_and_parent_are_mutually_exclusive',
-    'test_bare_send_lands_in_outbox',
-    'test_send_echoes_resolved_channel',
+    'test_bare_post_lands_in_outbox',
+    'test_target_keyed_channel_defaults',
+    'test_send_channel_only_defaults_to_self',
+    'test_send_crosses_classes_and_post_refuses_private',
+    'test_channel_not_found_names_the_remedy',
+    'test_missing_options_aggregate_into_one_error',
+    'test_send_and_post_echo_resolved_channel',
     'test_bare_messages_defaults_to_inbox',
     'test_read_tracking_drives_messages_filters',
     'test_read_multiple_uuids_and_shape_errors',
@@ -40,7 +46,7 @@ __all__ = [
     'test_read_refuses_cross_tree_mailbox',
     'test_read_without_reader_names_the_remedy',
     'test_listings_are_passive_and_metadata_only',
-    'test_sent_lists_outbound_mail',
+    'test_sent_command_lists_outbound_mail',
     'test_feed_fans_out_over_subscriptions',
     'test_feed_listing_passive_and_read_feed_catches_up',
     'test_reply_builds_thread_and_respects_write_only',
@@ -54,16 +60,22 @@ __all__ = [
     'test_cross_node_read_emits_receipt_without_mutating_sender',
     'test_empty_messages_query_emits_a_header',
     'test_empty_and_populated_headers_match',
+    'test_json_listings_mirror_csv_shape',
+    'test_body_column_is_json_only',
 ]
 
 
 @pytest.fixture(scope='module')
 def repo(tmp_path_factory: pytest.TempPathFactory) -> dict:
-    """A repo with a user node and two worker nodes (alpha, beta).
+    """Return a repo with a user node and two worker nodes (alpha, beta).
 
     Built once through the real CLI so the tests exercise ``init`` (and the
     ``.git/info/exclude`` it writes), default-channel seeding, and the
-    parent/child auto-subscriptions that ``Radio.init`` performs.
+    parent/child auto-subscriptions that ``Radio.init`` performs. Tests
+    append only their own messages, receipts, and reactions (addressed by
+    per-test UUIDs) and round-trip any other state they touch (channels
+    they create, subscriptions, the archive), so they never collide on the
+    shared repo.
 
     Returns:
         Mapping of ``root``, ``alpha``, and ``beta`` worktree paths.
@@ -98,30 +110,32 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 @pytest.mark.parametrize(
-    ('channel', 'subject'),
-    [
-        ('public', 'pub'),
-        ('inbox', 'inb'),
+    argnames=('verb', 'channel', 'subject'),
+    argvalues=[
+        ('post', 'public', 'pub'),
+        ('send', 'inbox', 'inb'),
     ],
 )
-def test_send_routes_across_nodes_by_channel(
+def test_send_and_post_route_across_nodes_by_channel(
     repo: dict,
+    verb: str,
     channel: str,
     subject: str,
 ) -> None:
-    """A targeted send lands in the recipient's channel-space, not the sender's.
+    """A targeted write lands in the recipient's channel-space, not the sender's.
 
-    ``inbox`` (others may write) and ``public`` (open) both accept a
-    cross-node write; the message appears in beta's own message list (and
-    alpha's ``sent``, recipient-attributed) and carries alpha as the sender
-    -- alpha's own mailbox never lists it. The listing is metadata-only;
-    the body arrives through ``read``.
+    ``send`` reaches beta's ``inbox`` (privately readable, others may
+    write) and ``post`` its open ``public`` board; the message appears in
+    beta's own message list (and alpha's ``sent``, recipient-attributed)
+    and carries alpha as the sender -- alpha's own mailbox never lists it.
+    The listing is metadata-only; the body arrives through ``read``.
     """
     alpha, beta = repo['alpha'], repo['beta']
     body = f'routed via {channel}'
-    uuid = _send(
-        alpha,
-        body,
+    writer = _post if verb == 'post' else _send
+    uuid = writer(
+        path=alpha,
+        data=body,
         channel=channel,
         subject=subject,
         node='main.beta',
@@ -140,25 +154,33 @@ def test_send_routes_across_nodes_by_channel(
     assert 'main.beta' in sent
 
 
-@pytest.mark.parametrize('channel', ['private', 'outbox'])
-def test_send_rejects_write_only_and_out_of_range_priority(
+@pytest.mark.parametrize(
+    argnames=('verb', 'channel'),
+    argvalues=[
+        ('send', 'private'),
+        ('post', 'outbox'),
+    ],
+)
+def test_send_and_post_reject_write_only_and_out_of_range_priority(
     repo: dict,
+    verb: str,
     channel: str,
 ) -> None:
     """Write-only channels and out-of-range priorities are refused cleanly.
 
-    ``private`` and ``outbox`` are write-only (owner only), so a foreign
-    send is a permission error; a priority outside 0-10 is a value error.
-    Both are domain errors raised in the core, so they must surface through
-    the ``@command`` wrapper as a clean ``Error: <message>`` (exit 1) -- never
-    the raw ``PermissionError:``/``ValueError:`` class name that reads like an
+    ``private`` (send class) and ``outbox`` (post class) are write-only
+    (owner only), so a foreign write is a permission error; a priority
+    outside 0-10 is a value error. Both are domain errors raised in the
+    core, so they must surface through the ``@command`` wrapper as a clean
+    ``Error: <message>`` (exit 1) -- never the raw
+    ``PermissionError:``/``ValueError:`` class name that reads like an
     uncaught crash.
     """
     alpha = repo['alpha']
     # foreign write into a write-only channel is rejected
     blocked = _radio(
         alpha,
-        'send',
+        verb,
         'nope',
         '--channel',
         channel,
@@ -176,10 +198,10 @@ def test_send_rejects_write_only_and_out_of_range_priority(
     # priority above the 0-10 range is rejected
     too_high = _radio(
         alpha,
-        'send',
+        verb,
         'nope',
-        '--channel',
-        'inbox',
+        '--node',
+        'main.beta',
         '--subject',
         's',
         '--priority',
@@ -204,7 +226,7 @@ def test_node_and_parent_are_mutually_exclusive(repo: dict) -> None:
         'send',
         'x',
         '--channel',
-        'public',
+        'inbox',
         '--node',
         'main.beta',
         '--parent',
@@ -220,8 +242,6 @@ def test_node_and_parent_are_mutually_exclusive(repo: dict) -> None:
         alpha,
         'send',
         'hi parent',
-        '--channel',
-        'public',
         '--parent',
         '--subject',
         'p',
@@ -230,71 +250,323 @@ def test_node_and_parent_are_mutually_exclusive(repo: dict) -> None:
     )
     assert parent_send.returncode == 0
     uuid = parent_send.stdout.strip()
-    # bare `messages` defaults to inbox; this send targeted `public`
-    root_listing = _radio(
-        repo['root'],
-        'messages',
-        '--all',
-        '--channel',
-        'public',
-    ).stdout
+    # bare `messages` defaults to inbox -- exactly where the send landed
+    root_listing = _radio(repo['root'], 'messages', '--all').stdout
     assert uuid in root_listing
 
 
-def test_bare_send_lands_in_outbox(repo: dict) -> None:
-    """A bare ``send`` (no --node/--parent/--channel) reports to the `outbox`.
+def test_bare_post_lands_in_outbox(repo: dict) -> None:
+    """A bare ``post`` (no --node/--parent/--channel) reports to the ``outbox``.
 
-    A private default would make every doc-following status report vanish
-    from the parent's feed; reporting out is the common case, so a bare
-    send lands in the sender's own `outbox`.
+    Reporting out is the common case: an untargeted post defaults to the
+    poster itself, and a self post lands in its own ``outbox``, where the
+    parent's feed picks it up.
     """
     alpha = repo['alpha']
-    sent = _radio(
+    posted = _radio(
         alpha,
-        'send',
+        'post',
         'a status report',
         '--subject',
         'report',
         '--priority',
         '5',
     )
-    assert sent.returncode == 0, sent.stderr
-    uuid = sent.stdout.strip()
+    assert posted.returncode == 0, posted.stderr
+    uuid = posted.stdout.strip()
     assert uuid in _radio(alpha, 'messages', '--all', '--channel', 'outbox').stdout
-    assert uuid not in _radio(alpha, 'messages', '--all', '--channel', 'private').stdout
+    assert uuid not in _radio(alpha, 'messages', '--all', '--channel', 'public').stdout
     assert uuid not in _radio(alpha, 'messages', '--all', '--channel', 'inbox').stdout
-    # private stays reachable as an explicit opt-in
-    note_uuid = _send(alpha, 'a private note', channel='private', subject='note')
-    assert (
-        note_uuid in _radio(alpha, 'messages', '--all', '--channel', 'private').stdout
-    )
 
 
 @pytest.mark.parametrize(
-    ('target_args', 'channel', 'target'),
-    [
-        ([], 'outbox', 'main.alpha'),
-        (['--node', 'main.beta'], 'inbox', 'main.beta'),
-        (['--parent'], 'inbox', 'main'),
+    argnames=('verb', 'node', 'host', 'channel'),
+    argvalues=[
+        ('send', 'main.alpha', 'alpha', 'private'),
+        ('send', 'main.beta', 'beta', 'inbox'),
+        ('post', 'main.beta', 'beta', 'public'),
     ],
-    ids=['bare', 'node', 'parent'],
+    ids=['send-self', 'send-other', 'post-other'],
 )
-def test_send_echoes_resolved_channel(
+def test_target_keyed_channel_defaults(
     repo: dict,
+    verb: str,
+    node: str,
+    host: str,
+    channel: str,
+) -> None:
+    """The channel default keys on the resolved target, self vs other.
+
+    A self ``send`` is a private note (not fake incoming mail), a targeted
+    ``send`` is canonical mail into the other node's ``inbox``, and a
+    targeted ``post`` lands on the other node's ``public`` board (its
+    ``outbox`` is owner-only write). The fourth default -- a bare ``post``
+    to the own ``outbox`` -- is pinned in ``test_bare_post_lands_in_outbox``.
+    """
+    alpha = repo['alpha']
+    written = _radio(
+        alpha,
+        verb,
+        f'defaults to {channel}',
+        '--node',
+        node,
+        '--subject',
+        'dflt',
+        '--priority',
+        '5',
+    )
+    assert written.returncode == 0, written.stderr
+    uuid = written.stdout.strip()
+    assert f"'{channel}' channel" in written.stderr
+    listing = _radio(repo[host], 'messages', '--all', '--channel', channel).stdout
+    assert uuid in listing
+
+
+@pytest.mark.parametrize(
+    argnames=('channel', 'notice'),
+    argvalues=[
+        (
+            'private',
+            "Node unspecified: sending to your 'private' channel.",
+        ),
+        (
+            'outbox',
+            "Node unspecified: posting to your 'outbox' channel"
+            " (consider using 'radio post').",
+        ),
+    ],
+    ids=['privately-readable', 'publicly-readable'],
+)
+def test_send_channel_only_defaults_to_self(
+    repo: dict,
+    channel: str,
+    notice: str,
+) -> None:
+    """A channel-only ``send`` lands on the sender itself, with one notice.
+
+    A channel alone is a valid routing dimension: the target defaults to
+    self and one stderr line names the resolution. The wording keys on the
+    channel's readability -- a privately readable channel is a true
+    self-send, while a publicly readable one is a post in disguise, so the
+    line nudges toward ``radio post``.
+    """
+    alpha = repo['alpha']
+    written = _radio(
+        alpha,
+        'send',
+        f'self via {channel}',
+        '--channel',
+        channel,
+        '--subject',
+        'selfd',
+        '--priority',
+        '5',
+    )
+    assert written.returncode == 0, written.stderr
+    uuid = written.stdout.strip()
+    lines = written.stderr.strip().splitlines()
+    assert lines == [notice, f"sent to main.alpha's '{channel}' channel"]
+    assert uuid in _radio(alpha, 'messages', '--all', '--channel', channel).stdout
+
+
+def test_send_crosses_classes_and_post_refuses_private(repo: dict) -> None:
+    """``send`` writes any permitted channel; ``post`` keeps its public class.
+
+    ``send`` needs only a routing dimension -- readability class is not its
+    business, so it reaches another node's ``public`` board (write
+    permission still gates: a foreign ``outbox``/``private`` stays
+    owner-only). ``post`` stays the quiet public subset and refuses a
+    privately readable channel naming the sibling verb.
+    """
+    alpha, beta = repo['alpha'], repo['beta']
+    # a fully explicit cross-class send is silent beyond the routing echo
+    crossed = _radio(
+        alpha,
+        'send',
+        'onto the board',
+        '--node',
+        'main.beta',
+        '--channel',
+        'public',
+        '--subject',
+        's',
+        '--priority',
+        '5',
+    )
+    assert crossed.returncode == 0, crossed.stderr
+    uuid = crossed.stdout.strip()
+    assert crossed.stderr.strip() == "sent to main.beta's 'public' channel"
+    assert uuid in _radio(beta, 'messages', '--all', '--channel', 'public').stdout
+    # a post into a privately readable channel is send's job
+    wrong_post = _radio(
+        alpha,
+        'post',
+        'x',
+        '--node',
+        'main.beta',
+        '--channel',
+        'inbox',
+        '--subject',
+        's',
+        '--priority',
+        '5',
+    )
+    assert wrong_post.returncode == 1
+    assert 'fractal radio send' in wrong_post.stderr
+
+
+@pytest.mark.parametrize(
+    argnames=('target_args', 'message'),
+    argvalues=[
+        (
+            [],
+            "No 'ghost' channel found: specify a target node or create it.",
+        ),
+        (
+            ['--node', 'main.alpha'],
+            "No 'ghost' channel found: create it first.",
+        ),
+        (
+            ['--node', 'main.beta'],
+            "Node main.beta has no channel 'ghost'.",
+        ),
+    ],
+    ids=['no-target', 'self-target', 'other-target'],
+)
+def test_channel_not_found_names_the_remedy(
+    repo: dict,
+    target_args: list[str],
+    message: str,
+) -> None:
+    """A missing channel names the remedy matching how it was addressed.
+
+    With no target the channel may live on a node the caller forgot to
+    name; on the caller itself the fix is creating it; on another node the
+    error names that node. The failure carries no defaulting notice --
+    those fire only on a successful write.
+    """
+    alpha = repo['alpha']
+    missing = _radio(
+        alpha,
+        'send',
+        'x',
+        *target_args,
+        '--channel',
+        'ghost',
+        '--subject',
+        's',
+        '--priority',
+        '5',
+    )
+    assert missing.returncode == 1
+    assert message in missing.stderr
+    assert 'unspecified' not in missing.stderr
+
+
+def test_missing_options_aggregate_into_one_error(repo: dict) -> None:
+    """A bare ``send <data>`` names every missing option in one round-trip.
+
+    ``--subject`` and ``--priority`` stay required (no defaults) on both
+    verbs, and ``send`` also needs a routing dimension (a target or a
+    channel) -- all reported together (exit 2, one round-trip instead of
+    one-error-at-a-time), with the reporting-out remedy named when both
+    dimensions are missing. A supplied option drops out of the aggregate.
+    """
+    alpha = repo['alpha']
+    bare = _radio(alpha, 'send', 'x')
+    assert bare.returncode == 2
+    error = ' '.join(bare.stderr.split())
+    assert 'a target or channel' in error
+    assert '--subject' in error
+    assert '--priority' in error
+    assert 'fractal radio post' in error
+    # a supplied option drops from the aggregate; the rest still report
+    partial = _radio(alpha, 'send', 'x', '--node', 'main.beta', '--subject', 's')
+    assert partial.returncode == 2
+    error = ' '.join(partial.stderr.split())
+    assert '--priority' in error
+    assert '--subject' not in error
+    assert 'a target or channel' not in error
+    assert 'fractal radio post' not in error
+    # a channel alone satisfies the routing dimension the same way
+    channeled = _radio(alpha, 'send', 'x', '--channel', 'inbox')
+    assert channeled.returncode == 2
+    error = ' '.join(channeled.stderr.split())
+    assert 'a target or channel' not in error
+    assert 'fractal radio post' not in error
+    # post needs no target; its missing options aggregate the same way
+    bare_post = _radio(alpha, 'post', 'x')
+    assert bare_post.returncode == 2
+    error = ' '.join(bare_post.stderr.split())
+    assert '--subject' in error
+    assert '--priority' in error
+    assert 'a target or channel' not in error
+
+
+@pytest.mark.parametrize(
+    argnames=('verb', 'target_args', 'channel', 'target', 'notice'),
+    argvalues=[
+        ('post', [], 'outbox', 'main.alpha', None),
+        ('post', ['--node', 'main.beta'], 'public', 'main.beta', None),
+        (
+            'send',
+            ['--node', 'main.beta'],
+            'inbox',
+            'main.beta',
+            "Channel unspecified: sending to main.beta's 'inbox' channel.",
+        ),
+        (
+            'send',
+            ['--parent'],
+            'inbox',
+            'main',
+            "Channel unspecified: sending to main's 'inbox' channel.",
+        ),
+        (
+            'send',
+            ['--node', 'main.alpha'],
+            'private',
+            'main.alpha',
+            "Channel unspecified: sending to your 'private' channel.",
+        ),
+        (
+            'send',
+            ['--node', 'main.beta', '--channel', 'inbox'],
+            'inbox',
+            'main.beta',
+            None,
+        ),
+    ],
+    ids=[
+        'bare-post',
+        'node-post',
+        'node-send',
+        'parent-send',
+        'self-send',
+        'explicit-send',
+    ],
+)
+def test_send_and_post_echo_resolved_channel(
+    repo: dict,
+    verb: str,
     target_args: list[str],
     channel: str,
     target: str,
+    notice: Optional[str],
 ) -> None:
-    """Every ``send`` echoes its resolved channel and target to stderr.
+    """Every ``send``/``post`` echoes its resolved channel and target to stderr.
 
     Misdelivery is visible immediately, for agents too (unconditional,
-    not TTY-gated). Stdout stays exactly the message UUID so scripts
-    capturing it keep working.
+    not TTY-gated). A ``send`` that left its channel implicit gets one
+    extra stderr line naming the resolution; a fully explicit ``send``
+    and every ``post`` (self-defaulting silently -- it is the quiet
+    reporting verb) add nothing beyond the echo. Stdout stays exactly
+    the message UUID so scripts capturing it keep working.
     """
     alpha = repo['alpha']
     sent = _radio(
         alpha,
-        'send',
+        verb,
         'echo check',
         *target_args,
         '--subject',
@@ -303,7 +575,10 @@ def test_send_echoes_resolved_channel(
         '5',
     )
     assert sent.returncode == 0, sent.stderr
-    assert f"sent to {target}'s '{channel}' channel" in sent.stderr
+    # stderr is exactly the defaulting notice (when one applies) plus the echo
+    expected = [notice] if notice else []
+    expected.append(f"sent to {target}'s '{channel}' channel")
+    assert sent.stderr.strip().splitlines() == expected
     # stdout is the bare UUID, nothing else
     assert sent.stdout.strip() == sent.stdout.strip().splitlines()[0]
     assert len(sent.stdout.strip()) == 8
@@ -319,16 +594,17 @@ def test_bare_messages_defaults_to_inbox(repo: dict) -> None:
     """
     alpha = repo['alpha']
     inbox_uuid = _send(alpha, 'to inbox', channel='inbox', subject='inb2')
-    # bare send -> own outbox (see test above)
-    outbox_uuid = _radio(
+    # bare post -> own outbox (see test above)
+    posted = _radio(
         alpha,
-        'send',
+        'post',
         'to outbox',
         '--subject',
         'out2',
         '--priority',
         '5',
-    ).stdout.strip()
+    )
+    outbox_uuid = posted.stdout.strip()
     bare = _radio(alpha, 'messages', '--all')
     assert inbox_uuid in bare.stdout  # inbox is shown
     assert outbox_uuid not in bare.stdout  # outbox is not (bare = inbox only)
@@ -387,7 +663,7 @@ def test_read_path_selects_mailbox_never_reader(repo: dict) -> None:
     channel can never be impersonated via ``--path``.
     """
     alpha, root = repo['alpha'], repo['root']
-    uuid = _send(alpha, 'peek body', channel='outbox', subject='peek')
+    uuid = _post(alpha, 'peek body', channel='outbox', subject='peek')
     # the operator peeks at alpha's outbox from the root worktree
     peek = _run(root, 'radio', 'read', '--channel', 'outbox', '--path', f'{alpha}')
     assert peek.returncode == 0, peek.stderr
@@ -422,7 +698,7 @@ def test_read_reader_follows_node_env(repo: dict) -> None:
     node reads.
     """
     alpha, beta, root = repo['alpha'], repo['beta'], repo['root']
-    uuid = _send(beta, 'env body', channel='public', subject='env')
+    uuid = _post(beta, 'env body', channel='public', subject='env')
     # read from the ROOT worktree with alpha's identity exported
     shown = _run(root, 'radio', 'read', uuid, _NODE=f'{alpha}')
     assert shown.returncode == 0, shown.stderr
@@ -485,8 +761,8 @@ def test_read_refuses_cross_tree_mailbox(
     _git(other, 'commit', '-m', 'init')
     assert _run(other, 'init').returncode == 0
     # each root posts to its own outbox; only --path distinguishes them
-    _send(root, 'home body', channel='outbox', subject='home')
-    _send(other, 'away body', channel='outbox', subject='away')
+    _post(root, 'home body', channel='outbox', subject='home')
+    _post(other, 'away body', channel='outbox', subject='away')
     refused = _run(root, 'radio', 'read', '--channel', 'outbox', '--path', f'{other}')
     assert refused.returncode != 0
     assert 'different fractal tree' in refused.stderr
@@ -506,7 +782,7 @@ def test_read_without_reader_names_the_remedy(
     generic advice to ``fractal init`` the operator's cwd.
     """
     alpha = repo['alpha']
-    uuid = _send(alpha, 'reader body', channel='outbox', subject='who')
+    uuid = _post(alpha, 'reader body', channel='outbox', subject='who')
     lost = _run(tmp_path, 'radio', 'read', uuid, '--path', f'{alpha}')
     assert lost.returncode != 0
     assert 'No reader node' in lost.stderr
@@ -518,7 +794,9 @@ def test_listings_are_passive_and_metadata_only(repo: dict) -> None:
 
     Every ``_radio`` call is a fresh ``fractal`` process, so each assertion
     crosses a session/run boundary; receipts move only when the reader
-    reads, and only for the rows the read selected.
+    reads, and only for the rows the read selected. A ``--json --body``
+    listing shows bodies but stays just as passive -- it never becomes a
+    read surface.
     """
     beta = repo['beta']
     marked = _send(beta, 'triaged body', channel='inbox', subject='mk1')
@@ -535,6 +813,11 @@ def test_listings_are_passive_and_metadata_only(repo: dict) -> None:
     # listings are passive: no --mark-read flag exists to force a receipt
     refused = _radio(beta, 'messages', '--mark-read')
     assert refused.returncode != 0
+    # a --json --body listing shows the body yet writes no receipt either:
+    # the row re-lists unread on the next pass
+    bodied = _radio(beta, 'messages', '--json', '--body')
+    assert 'triaged body' in bodied.stdout
+    assert marked in _radio(beta, 'messages').stdout
     # reading is the consuming act; the receipt persists across runs
     shown = _radio(beta, 'read', '--channel', 'inbox', '--unread')
     assert shown.returncode == 0, shown.stderr
@@ -545,7 +828,7 @@ def test_listings_are_passive_and_metadata_only(repo: dict) -> None:
     assert spared in _radio(beta, 'messages', '--channel', 'private').stdout
 
 
-def test_sent_lists_outbound_mail(repo: dict) -> None:
+def test_sent_command_lists_outbound_mail(repo: dict) -> None:
     """``sent`` lists own-authored messages with the recipient in ``node``.
 
     Outbound mail is invisible in the sender's own mailbox (it lives in the
@@ -586,24 +869,24 @@ def test_feed_fans_out_over_subscriptions(repo: dict) -> None:
         _radio(alpha, 'sub', '--node', 'main.beta', '--channel', 'public').returncode
         == 0
     )
-    uuid = _send(beta, 'fan-out body', channel='public', subject='feed', priority=6)
+    uuid = _post(beta, 'fan-out body', channel='public', subject='feed', priority=6)
     # the subscribed row surfaces on the default (unread) pass
     first = _radio(alpha, 'feed', '--node', 'main.beta', '--channel', 'public')
     assert first.returncode == 0
     assert uuid in first.stdout
     # listing is passive: the row re-lists unread, and no receipt exists
-    assert (
-        uuid
-        in _radio(
-            alpha,
-            'feed',
-            '--node',
-            'main.beta',
-            '--channel',
-            'public',
-        ).stdout
+    feed = _radio(
+        alpha,
+        'feed',
+        '--node',
+        'main.beta',
+        '--channel',
+        'public',
     )
+    assert uuid in feed.stdout
     assert uuid not in _radio(alpha, 'feed', '--channel', 'public', '--read').stdout
+    # remove the subscription so later tests see the seeded baseline
+    assert _radio(alpha, 'unsub', '--node', 'main.beta').returncode == 0
 
 
 def test_feed_listing_passive_and_read_feed_catches_up(repo: dict) -> None:
@@ -617,8 +900,8 @@ def test_feed_listing_passive_and_read_feed_catches_up(repo: dict) -> None:
     for channel in ('public', 'outbox'):
         sub = _radio(alpha, 'sub', '--node', 'main.beta', '--channel', channel)
         assert sub.returncode == 0
-    post = _send(beta, 'post body', channel='public', subject='fm1')
-    cast = _send(beta, 'cast body', channel='outbox', subject='fm2')
+    post = _post(beta, 'post body', channel='public', subject='fm1')
+    cast = _post(beta, 'cast body', channel='outbox', subject='fm2')
     # plain feeds are passive and metadata-only across runs
     first = _radio(alpha, 'feed', '--node', 'main.beta')
     assert post in first.stdout
@@ -638,32 +921,37 @@ def test_feed_listing_passive_and_read_feed_catches_up(repo: dict) -> None:
     assert post not in _radio(alpha, 'feed', '--node', 'main.beta').stdout
     assert cast in _radio(alpha, 'feed', '--channel', 'outbox', '--read').stdout
     assert cast in _radio(beta, 'messages', '--channel', 'outbox').stdout
+    # remove the subscriptions so later tests see the seeded baseline
+    assert _radio(alpha, 'unsub', '--node', 'main.beta').returncode == 0
 
 
 def test_reply_builds_thread_and_respects_write_only(repo: dict) -> None:
     """Replies nest under the root and cannot pierce a write-only channel.
 
     A local reply inherits the parent's subject (``Re: ...``) and shows
-    as an indented descendant in ``thread``. A foreign reply into another
+    as a descendant in ``thread``. A foreign reply into another
     node's write-only ``outbox`` never lands in it -- it reroutes to the
     owner's inbox as a conversation turn.
     """
     alpha, beta = repo['alpha'], repo['beta']
-    root_uuid = _send(alpha, 'thread root', channel='public', subject='tree')
+    root_uuid = _post(alpha, 'thread root', channel='public', subject='tree')
     reply = _radio(alpha, 'reply', root_uuid, 'a child')
-    assert reply.returncode == 0
+    assert reply.returncode == 0, reply.stderr
     child_uuid = reply.stdout.strip()
     # thread defaults to the full tree (no --all needed): both show even after
-    # the root has been read, child indented beneath the root
+    # the root has been read, child listed beneath the root
     _radio(alpha, 'read', root_uuid)
     tree = _radio(alpha, 'thread', root_uuid).stdout
     assert root_uuid in tree
     assert child_uuid in tree
     assert 'Re: tree' in tree
+    # piped (non-TTY) output is CSV -- identical to an explicit --csv; the
+    # indented tree render is TTY-only
+    assert tree == _radio(alpha, 'thread', root_uuid, '--csv').stdout
     # a reply into beta's write-only outbox cannot pierce it -- the reply
     # reroutes to beta's inbox instead of being refused (the rerouted row
     # is asserted end-to-end in test_outbox_reply_routes_to_sender_inbox)
-    out_uuid = _send(beta, 'owner only', channel='outbox', subject='ob')
+    out_uuid = _post(beta, 'owner only', channel='outbox', subject='ob')
     rerouted = _radio(alpha, 'reply', out_uuid, 'inject')
     assert rerouted.returncode == 0, rerouted.stderr
     assert "sent to main.beta's 'inbox' channel" in rerouted.stderr
@@ -722,7 +1010,7 @@ def test_outbox_reply_routes_to_sender_inbox(repo: dict) -> None:
     reply routes to the sender's inbox, mirroring the inbox counterparty case.
     """
     alpha, beta = repo['alpha'], repo['beta']
-    out_uuid = _send(beta, 'progress note', channel='outbox', subject='report')
+    out_uuid = _post(beta, 'progress note', channel='outbox', subject='report')
     reply = _radio(alpha, 'reply', out_uuid, 'ack, steer starboard')
     assert reply.returncode == 0, reply.stderr
     reply_uuid = reply.stdout.strip().splitlines()[0]
@@ -749,9 +1037,11 @@ def test_react_toggles_positive_and_negative(repo: dict) -> None:
         rows = _radio(alpha, 'messages', '--all').stdout.splitlines()
         return next(line for line in rows if uuid in line)
 
-    assert _radio(alpha, 'react', uuid, '+').returncode == 0
+    plus = _radio(alpha, 'react', uuid, '+')
+    assert plus.returncode == 0, plus.stderr
     positive = _counts()
-    assert _radio(alpha, 'react', uuid, '-').returncode == 0
+    minus = _radio(alpha, 'react', uuid, '-')
+    assert minus.returncode == 0, minus.stderr
     negative = _counts()
     # the line must change as the single vote flips sign
     assert positive != negative
@@ -769,9 +1059,11 @@ def test_save_unsave_round_trips_through_archive(repo: dict) -> None:
     """
     alpha = repo['alpha']
     uuid = _send(alpha, 'keep me', channel='inbox', subject='save')
-    assert _radio(alpha, 'save', uuid).returncode == 0
+    saved = _radio(alpha, 'save', uuid)
+    assert saved.returncode == 0, saved.stderr
     assert uuid in _radio(alpha, 'messages', '--saved').stdout
-    assert _radio(alpha, 'unsave', uuid).returncode == 0
+    unsaved = _radio(alpha, 'unsave', uuid)
+    assert unsaved.returncode == 0, unsaved.stderr
     assert uuid not in _radio(alpha, 'messages', '--saved').stdout
     # --saved cannot be combined with --read
     clash = _radio(alpha, 'messages', '--saved', '--read')
@@ -786,7 +1078,9 @@ def test_subscribe_unsubscribe_manage_subs(repo: dict) -> None:
 
     Subscribing alpha to beta's ``public`` channel adds a row naming the
     target node and channel; unsubscribing removes it while leaving the
-    auto-seeded parent subscriptions intact.
+    auto-seeded parent subscriptions intact. ``unsub`` reports the true
+    rowcount -- a zero-match unsub prints 0 and still exits 0, so a
+    mis-pathed target is visible without failing scripts.
     """
     alpha = repo['alpha']
     assert (
@@ -796,11 +1090,17 @@ def test_subscribe_unsubscribe_manage_subs(repo: dict) -> None:
     subscribed = _radio(alpha, 'subs').stdout
     assert 'main.beta' in subscribed
     assert 'public' in subscribed
-    assert _radio(alpha, 'unsub', '--node', 'main.beta').returncode == 0
+    unsubbed = _radio(alpha, 'unsub', '--node', 'main.beta')
+    assert unsubbed.returncode == 0
+    assert 'Removed 1 subscription.' in unsubbed.stdout
     after = _radio(alpha, 'subs').stdout
     assert 'main.beta' not in after
     # the parent subscriptions seeded at init survive
     assert 'main' in after
+    # nothing left to remove reports the honest zero without failing
+    rerun = _radio(alpha, 'unsub', '--node', 'main.beta')
+    assert rerun.returncode == 0
+    assert 'Removed 0 subscriptions.' in rerun.stdout
 
 
 # ------ channel management
@@ -809,7 +1109,7 @@ def test_subscribe_unsubscribe_manage_subs(repo: dict) -> None:
 def test_channel_create_and_delete_lifecycle(repo: dict) -> None:
     """Custom channels can be created, used, and deleted; defaults cannot.
 
-    A new ``team`` channel is listed and accepts a self-send; creating a
+    A new ``team`` channel is listed and accepts a self-post; creating a
     reserved default name or deleting a default channel is refused. A
     channel holding messages is refused without ``--force`` (mirroring
     ``unsend``) and removed with it, after which it no longer appears.
@@ -817,8 +1117,8 @@ def test_channel_create_and_delete_lifecycle(repo: dict) -> None:
     beta = repo['beta']
     assert _radio(beta, 'channel', 'create', 'team').returncode == 0
     assert 'team' in _radio(beta, 'channel', 'list').stdout
-    # the new channel accepts a self-send
-    posted = _send(beta, 'team body', channel='team', subject='t', priority=3)
+    # the new channel is open by default, so it accepts a self-post
+    posted = _post(beta, 'team body', channel='team', subject='t', priority=3)
     assert posted
     # default names are reserved for create and delete alike
     assert _radio(beta, 'channel', 'create', 'public').returncode != 0
@@ -841,7 +1141,7 @@ def test_cross_node_read_emits_receipt_without_mutating_sender(
     reader's, so the message stays unread in alpha's own default view.
     """
     alpha, beta = repo['alpha'], repo['beta']
-    uuid = _send(alpha, 'broadcast body', channel='outbox', subject='cast')
+    uuid = _post(alpha, 'broadcast body', channel='outbox', subject='cast')
     remote = _radio(beta, 'read', uuid)
     assert remote.returncode == 0
     assert uuid in remote.stdout
@@ -854,14 +1154,51 @@ def test_cross_node_read_emits_receipt_without_mutating_sender(
 
 
 def test_empty_messages_query_emits_a_header(repo: dict) -> None:
-    """An empty ``messages`` query should emit a header, not nothing.
+    """An empty ``messages`` query emits a header plus an unread notice.
 
-    ``node list`` passes ``columns=`` so an empty result still prints a
-    header row; radio commands must do the same -- a zero-byte empty
-    result would be indistinguishable from a failure when piped.
+    The stdout contract: ``node list`` passes ``columns=`` so an empty
+    result still prints a header row; radio commands must do the same -- a
+    zero-byte empty result would be indistinguishable from a failure when
+    piped. The stderr contract: an empty default (unread) view names the
+    uncapped total (the victims are agents, not TTY users), so "no new
+    mail" never reads as "no mail at all"; a populated view stays quiet,
+    and so do ``--all`` -- it already shows everything -- and ``--limit 0``,
+    which empties any view.
     """
-    result = _radio(repo['beta'], 'messages', '--channel', 'private')
-    assert result.stdout.strip() != ''
+    beta = repo['beta']
+    uuid = _send(beta, 'notice body', channel='private', subject='ntc')
+    # a populated default view carries no notice
+    populated = _radio(beta, 'messages', '--channel', 'private')
+    assert uuid in populated.stdout
+    assert '0 unread' not in populated.stderr
+    # consume every unread row so the default view turns empty
+    consumed = _radio(beta, 'read', '--channel', 'private', '--unread')
+    assert consumed.returncode == 0, consumed.stderr
+    shown = _radio(beta, 'messages', '--channel', 'private', '--all')
+    total = len(shown.stdout.splitlines()) - 1
+    assert total >= 1
+    # the empty view keeps the bare-header stdout and names the total on stderr
+    empty = _radio(beta, 'messages', '--channel', 'private')
+    assert empty.stdout.splitlines() == [populated.stdout.splitlines()[0]]
+    assert f'0 unread ({total} total; --all shows everything)' in empty.stderr
+    assert '0 unread' not in shown.stderr
+    # an empty --all query stays quiet too -- there is nothing more to show
+    quiet = _radio(beta, 'messages', '--all', '--since', '9999-01-01T00:00:00Z')
+    assert quiet.stdout.strip() != ''
+    assert '0 unread' not in quiet.stderr
+    # the notice's total ignores the row cap: a --limit below the channel's
+    # size still names every message
+    extra = _send(beta, 'capped body', channel='private', subject='cap')
+    assert _radio(beta, 'read', extra).returncode == 0
+    capped = _radio(beta, 'messages', '--channel', 'private', '--limit', '1')
+    assert f'0 unread ({total + 1} total; --all shows everything)' in capped.stderr
+    # --limit 0 empties any view, so it stays quiet even over unread mail
+    unread = _send(beta, 'quiet body', channel='private', subject='qt')
+    zeroed = _radio(beta, 'messages', '--channel', 'private', '--limit', '0')
+    assert zeroed.returncode == 0, zeroed.stderr
+    assert '0 unread' not in zeroed.stderr
+    # consume the seeded unread row so later tests see the all-read channel
+    assert _radio(beta, 'read', unread).returncode == 0
 
 
 def test_empty_and_populated_headers_match(repo: dict) -> None:
@@ -878,8 +1215,16 @@ def test_empty_and_populated_headers_match(repo: dict) -> None:
     # outbox post pulled through beta's seeded parent subscription (feed),
     # and an archived copy (saved)
     uuid = _send(alpha, 'parity body', subject='par', node='main.beta')
-    _send(root, 'parity feed body', channel='outbox', subject='parf')
+    _post(root, 'parity feed body', channel='outbox', subject='parf')
     assert _radio(beta, 'save', uuid).returncode == 0
+    unread_messages = (
+        _radio(beta, 'messages'),
+        _radio(beta, 'messages', '--since', far_future),
+    )
+    unread_feed = (
+        _radio(beta, 'feed'),
+        _radio(beta, 'feed', '--since', far_future),
+    )
     pairs = [
         (
             _radio(beta, 'messages', '--all'),
@@ -901,6 +1246,8 @@ def test_empty_and_populated_headers_match(repo: dict) -> None:
             _radio(beta, 'feed', '--saved'),
             _radio(beta, 'feed', '--saved', '--since', far_future),
         ),
+        unread_messages,
+        unread_feed,
     ]
     for populated, empty in pairs:
         assert populated.returncode == 0
@@ -908,10 +1255,16 @@ def test_empty_and_populated_headers_match(repo: dict) -> None:
         head, *rows = populated.stdout.splitlines()
         assert rows, 'populated capture must hold at least one data row'
         assert empty.stdout.splitlines() == [head]
+    # the empty default (unread) captures also carry the stderr notice --
+    # stdout stayed byte-identical to the populated header above -- and the
+    # total honors the query's own filters, so a far-future window counts zero
+    for populated, empty in (unread_messages, unread_feed):
+        assert '0 unread (0 total; --all shows everything)' in empty.stderr
+        assert '0 unread' not in populated.stderr
     # subs has no --since filter: empty it by removing the seeded parent
     # subscriptions, then restore them so later tests see the same state
     populated = _radio(root, 'subs')
-    subs = list(DictReader(StringIO(populated.stdout)))
+    subs = list(csv.DictReader(io.StringIO(populated.stdout)))
     assert subs, 'root holds the auto-seeded child subscriptions'
     for sub in subs:
         unsubbed = _radio(
@@ -939,6 +1292,83 @@ def test_empty_and_populated_headers_match(repo: dict) -> None:
             assert resubbed.returncode == 0
 
 
+def test_json_listings_mirror_csv_shape(repo: dict) -> None:
+    """``--json`` renders each listing as an array of CSV-shaped objects.
+
+    The JSON surface is additive -- CSV stays the piped default -- and
+    mirrors the CSV projection: one object per row, keys in the CSV
+    header's column order, ``[]`` for an empty result (never nothing).
+    ``--json`` and ``--csv`` contradict and are refused.
+    """
+    alpha, beta, root = repo['alpha'], repo['beta'], repo['root']
+    far_future = '9999-01-01T00:00:00Z'
+    # seed one row per listing: a targeted send (messages, sent,
+    # thread, saved) and a root outbox post pulled through beta's
+    # seeded parent subscription (feed)
+    uuid = _send(alpha, 'round-trip body', subject='jrt', node='main.beta')
+    _post(root, 'json feed body', channel='outbox', subject='jfd')
+    assert _radio(beta, 'save', uuid).returncode == 0
+    listings = [
+        (beta, ('messages', '--all')),
+        (alpha, ('sent',)),
+        (beta, ('feed', '--all')),
+        (beta, ('messages', '--saved')),
+        (alpha, ('thread', uuid)),
+        (alpha, ('subs',)),
+    ]
+    for node, args in listings:
+        header = _radio(node, *args, '--csv').stdout.splitlines()[0].split(',')
+        listed = _radio(node, *args, '--json')
+        assert listed.returncode == 0, listed.stderr
+        rows = json.loads(listed.stdout)
+        assert rows, 'populated capture must hold at least one row object'
+        assert all(list(row) == header for row in rows)
+    # values round-trip: the seeded row appears with its column values
+    listed = json.loads(_radio(beta, 'messages', '--all', '--json').stdout)
+    row = next(r for r in listed if r['message_uuid'] == uuid)
+    assert row['sender'] == 'main.alpha'
+    # an empty result is [] -- never zero bytes
+    empty = _radio(beta, 'messages', '--all', '--json', '--since', far_future)
+    assert json.loads(empty.stdout) == []
+    # --json contradicts --csv
+    clash = _radio(beta, 'messages', '--json', '--csv')
+    assert clash.returncode != 0
+    assert 'mutually exclusive' in clash.stderr.lower()
+
+
+def test_body_column_is_json_only(repo: dict) -> None:
+    """``--body`` widens the JSON projection to the data column, JSON only.
+
+    Monitors get bodies without consuming the watched node's unread state:
+    ``--json --body`` swaps the metadata projection for the full message
+    columns on ``messages`` and ``feed``. The flag binds to ``--json`` --
+    the CSV/table shapes never widen -- and the listing stays passive
+    (pinned in ``test_listings_are_passive_and_metadata_only``).
+    """
+    beta, root = repo['beta'], repo['root']
+    uuid = _send(beta, 'widened body', channel='private', subject='wb')
+    posted = _post(root, 'widened feed body', channel='outbox', subject='wf')
+    # --json --body carries the data column on both metadata listings
+    listed = _radio(beta, 'messages', '--channel', 'private', '--json', '--body')
+    rows = json.loads(listed.stdout)
+    row = next(r for r in rows if r['message_uuid'] == uuid)
+    assert row['data'] == 'widened body'
+    fed = _radio(beta, 'feed', '--json', '--body')
+    rows = json.loads(fed.stdout)
+    row = next(r for r in rows if r['message_uuid'] == posted)
+    assert row['data'] == 'widened feed body'
+    # without --body the JSON projection stays metadata-only
+    bare = _radio(beta, 'messages', '--channel', 'private', '--json')
+    assert all('data' not in r for r in json.loads(bare.stdout))
+    # --body binds to --json: the CSV/table shapes never widen
+    refused = _radio(beta, 'messages', '--body')
+    assert refused.returncode != 0
+    assert '--json' in refused.stderr
+    refused = _radio(beta, 'feed', '--body', '--csv')
+    assert refused.returncode != 0
+    assert '--json' in refused.stderr
+
+
 # ------ helpers
 
 
@@ -960,9 +1390,41 @@ def _send(
     priority: int = 5,
     node: Optional[str] = None,
 ) -> str:
-    """Send a message and return its 8-char UUID."""
+    """Send a message and return its 8-char UUID.
+
+    An omitted ``node`` self-targets the sending node explicitly (its
+    worktree directory is named after its branch), keeping every helper
+    send fully explicit and its stderr free of defaulting notices.
+    """
     args = [
         'send',
+        data,
+        '--node',
+        node if node is not None else path.name,
+        '--channel',
+        channel,
+        '--subject',
+        subject,
+        '--priority',
+        str(priority),
+    ]
+    result = _radio(path, *args)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def _post(
+    path: pathlib.Path,
+    data: str,
+    *,
+    channel: str = 'public',
+    subject: str = 's',
+    priority: int = 5,
+    node: Optional[str] = None,
+) -> str:
+    """Post a message and return its 8-char UUID."""
+    args = [
+        'post',
         data,
         '--channel',
         channel,

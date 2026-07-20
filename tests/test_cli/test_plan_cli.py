@@ -22,7 +22,11 @@ __all__ = ['test_plan_init_seeds_heading_and_list_finds_it']
 
 @pytest.fixture(scope='module')
 def task(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
-    """A worker node worktree, bootstrapped once via the real CLI."""
+    """Return a worker node worktree, bootstrapped once via the real CLI.
+
+    Module-scoped for the expensive bootstrap; the module's single test
+    owns the node outright, so there is no sharing to collide on.
+    """
     root = tmp_path_factory.mktemp('fractal_plan')
     _git(root, 'init', '-b', 'main')
     _git(root, 'config', 'user.email', 'plan@test.local')
@@ -54,3 +58,9 @@ def test_plan_init_seeds_heading_and_list_finds_it(task: pathlib.Path) -> None:
     listed = _run(task, 'plan', 'list', ITER_REF='3.2')
     assert listed.returncode == 0, listed.stderr
     assert listed.stdout.strip() == str(path)
+
+    # an empty iteration keeps stdout path-only; the notice goes to stderr
+    empty = _run(task, 'plan', 'list', ITER_REF='9.9')
+    assert empty.returncode == 0, empty.stderr
+    assert empty.stdout == ''
+    assert 'No plans for this iteration.' in empty.stderr

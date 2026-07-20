@@ -54,6 +54,7 @@ def radio_channel_create(app: typer.Typer) -> typer.Typer:
         """Register a custom channel."""
         node = resolve_node(path)
         node.radio.channel(channel_name, read_only=read_only, write_only=write_only)
+        typer.echo(f'Created channel {channel_name}.')
 
     return app
 
@@ -79,6 +80,7 @@ def radio_channel_delete(app: typer.Typer) -> typer.Typer:
         """Delete a channel (refused if it holds messages; use --force)."""
         node = resolve_node(path)
         node.radio.channel_delete(channel_name, force=force)
+        typer.echo(f'Deleted channel {channel_name}.')
 
     return app
 

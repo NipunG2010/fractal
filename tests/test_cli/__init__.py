@@ -1,5 +1,7 @@
 """Tests for ``fractal`` CLI."""
 
+from .test_budget_landing import *
+from .test_cmd import *
 from .test_commit_hooks import *
 from .test_config_cli import *
 from .test_cost_continue import *
@@ -12,6 +14,7 @@ from .test_iter_cost import *
 from .test_lifecycle import *
 from .test_lifecycle_shells import *
 from .test_loop_contract import *
+from .test_main import *
 from .test_node_cli import *
 from .test_plan_cli import *
 from .test_radio_cli import *
@@ -22,6 +25,6 @@ from .test_run_modes import *
 from .test_script_behavior import *
 from .test_signal_guards import *
 from .test_start import *
-from .test_stream import *
 from .test_time_remaining import *
 from .test_user_init import *
+from .test_utils import *

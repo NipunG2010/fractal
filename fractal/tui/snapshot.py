@@ -11,20 +11,23 @@ steady tick costs zero queries and panes can skip rebuilds by comparison.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
 import pathlib
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any, Optional
 
 from rich.text import Text
 
-from fractal.tui import fmt, theme
-from fractal.tui.data import TuiData, display_name_of, leaf_of, parse_ts, span, user_tag
-from fractal.tui.poller import NodePoller
-from fractal.util import parse_duration_seconds
+import fractal.core.cost
+import fractal.util
+
+from . import fmt, theme
+from .data import TuiData, display_name_of, leaf_of, parse_ts, span, user_tag
+from .poller import NodePoller
 
 __all__ = [
     'Geometry',
@@ -32,9 +35,10 @@ __all__ = [
     'SnapshotBuilder',
 ]
 
-# the sync pre-step persists as step=0 rows (_run.sh); it is excluded from the
-# displayed step numerator/denominator so the card reads step N/N over the real
-# loop steps, and renders as plain `sync` in the explorer and event log
+# the sync pre-step persists as step=0 rows (the loop's drain wait); it is
+# excluded from the displayed step numerator/denominator so the card reads
+# step N/N over the real loop steps, and renders as plain `sync` in the
+# explorer and event log
 _SYNC_NAME = 'SYNC'
 
 # the widest node-event verb floors the event-log desc column (see Geometry)
@@ -53,8 +57,24 @@ class Geometry:
     ev_run_w: int  # event-log run column (fits the longest value)
     ev_iter_w: int  # event-log iter column
     ev_step_w: int  # event-log step column
-    ev_dur_w: int  # event-log duration column
-    ev_cost_w: int  # event-log cost column
+    ev_dur_w: int  # duration column (shared by the log and the explorer)
+    ev_cost_w: int  # cost column (shared by the log and the explorer)
+
+    @classmethod
+    def empty(cls: type[Geometry]) -> Geometry:
+        """Return a zero-width geometry (the worktree-less placeholder shape)."""
+        return cls(
+            tree_width=0,
+            node_width=0,
+            label_w=0,
+            desc_w=0,
+            ev_node_w=0,
+            ev_run_w=0,
+            ev_iter_w=0,
+            ev_step_w=0,
+            ev_dur_w=0,
+            ev_cost_w=0,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -79,7 +99,7 @@ class Snapshot:
 
 
 class SnapshotBuilder:
-    """Builds snapshots from per-branch section caches keyed by poll tokens."""
+    """Snapshot builder over per-branch section caches keyed by poll tokens."""
 
     def __init__(
         self: SnapshotBuilder,
@@ -157,29 +177,32 @@ class SnapshotBuilder:
             moved |= self._poller.changed(self._watched())
         for branch in moved:
             self._drop(branch)
-        # short-circuit: nothing moved and the previous snapshot still answers
-        previous = self._snapshot
-        root = self._data.root_branch
-        if (
-            previous is not None
-            and not moved
-            and previous.scope == scope
-            and (not want_feed or self._feed_scope == scope)
-            and (not want_archive or root in self._archive)
-            and self._sublog_scope == (scope if want_subtree_log else None)
-        ):
-            return previous
         # reconcile crashed-but-active nodes for display only: a loop that died
         # leaves .status 'active' with no tmux session; fetch the live sessions
         # once and drop any brief whose session is gone so it rebuilds as the
-        # honest 'exited'; (a crash doesn't move the .status mtime, so the poller
-        # can't catch it -- liveness is checked here each build instead)
+        # honest 'exited'. A crash doesn't move the .status mtime, so the poller
+        # can't catch it -- liveness is checked here EVERY build, ahead of the
+        # short-circuit below, or a node that crashed since the last build would
+        # stay 'active' in the reused snapshot forever
         self._live_sessions = self._data.live_sessions()
+        reconciled = False
         for branch in self._topo or ():
             brief = self._brief.get(branch)
             if brief is not None and brief['status'] == 'active':
                 if self._data.tmux_session_name(branch) not in self._live_sessions:
                     self._drop(branch)
+                    reconciled = True
+        # short-circuit: nothing moved (a crash reconcile counts as movement)
+        # and the previous snapshot still answers
+        previous = self._snapshot
+        root = self._data.root_branch
+        if previous is not None:
+            unchanged = not moved and not reconciled and previous.scope == scope
+            feed_ready = not want_feed or self._feed_scope == scope
+            archive_ready = not want_archive or root in self._archive
+            sublog_ready = self._sublog_scope == (scope if want_subtree_log else None)
+            if unchanged and feed_ready and archive_ready and sublog_ready:
+                return previous
         # ensure the sections this snapshot needs
         for branch in self._topo or ():
             self._ensure_brief(branch)
@@ -204,13 +227,7 @@ class SnapshotBuilder:
             geometry = shaped['geometry']
         self._sublog_scope = scope if want_subtree_log else None
         tree = self._tree_rows(scope)
-        # the count tallies agent nodes -- the user (root) node is not one
-        total = max(0, len(self._topo or ()) - 1)
-        active = sum(
-            1
-            for branch in self._topo or ()
-            if self._brief.get(branch, {}).get('status') == 'active'
-        )
+        total, active = self._counts()
         feed = self._feed(subtree) if want_feed else ()
         snapshot = Snapshot(
             repo=self._data.repo_dir.name,
@@ -255,16 +272,15 @@ class SnapshotBuilder:
         try:
             registry = self._data.registry_branches()
             titles = self._data.registry_titles()
-        except sqlite3.Error:
+        except (FileNotFoundError, sqlite3.Error):
             self._failed.add(self._data.root_branch)
             return set()
         self._titles = titles
         live = [self._data.root_branch]
         for branch in registry:
-            if (
-                branch != self._data.root_branch
-                and self._data.node_dir(branch) is not None
-            ):
+            if branch == self._data.root_branch:
+                continue
+            if self._data.node_dir(branch) is not None:
                 live.append(branch)
         previous = set(self._topo or ())
         for branch in previous - set(live):
@@ -308,6 +324,39 @@ class SnapshotBuilder:
             if branch == scope or branch.startswith(prefix)
         ]
 
+    @contextlib.contextmanager
+    def _section(
+        self: SnapshotBuilder,
+        branch: str,
+        *,
+        placeholder: Optional[Callable[[], None]] = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """Yield a read connection for one section load, absorbing lost reads.
+
+        A lost read (busy timeout, missing database) marks the branch for
+        retry, runs the loader's failure ``placeholder``, and suppresses the
+        error. Only the connect/close/retry ceremony is centralized here --
+        failure behavior is per-loader: it is NOT uniform, and it is not
+        "leave last-good state untouched" (most loaders cache an empty
+        section on loss so the ensure-guards do not re-run within the build).
+        """
+        # a failed connect yields a closed stand-in: the loader's first read
+        # then raises into the one suppression path below (a contextmanager
+        # cannot skip its body)
+        try:
+            connection = self._data.connect()
+        except (FileNotFoundError, sqlite3.Error):
+            connection = sqlite3.connect(':memory:')
+            connection.close()
+        try:
+            yield connection
+        except (FileNotFoundError, sqlite3.Error):
+            self._failed.add(branch)
+            if placeholder is not None:
+                placeholder()
+        finally:
+            connection.close()
+
     def _ensure_brief(self: SnapshotBuilder, branch: str) -> None:
         """Cache the branch's status + pending signal.
 
@@ -327,70 +376,53 @@ class SnapshotBuilder:
                 status = 'exited'
         signal = ''
         if status == 'active':
-            try:
-                connection = self._data.connect()
-                try:
-                    signal = self._data.signal(connection, branch)
-                finally:
-                    connection.close()
-            except sqlite3.Error:
-                self._failed.add(branch)
+            # a lost read leaves the signal '' until the retry lands; the
+            # brief row below is still written (unconditional cache write)
+            with self._section(branch) as connection:
+                signal = self._data.signal(connection, branch)
         self._brief[branch] = {'status': status, 'signal': signal}
 
     def _ensure_runcost(self: SnapshotBuilder, branch: str) -> None:
         """Cache the branch's run-cost and run-step maps (the spend chase)."""
         if branch in self._runcost:
             return
-        try:
-            connection = self._data.connect()
-            try:
-                self._runcost[branch] = self._data.run_costs(connection, branch)
-                self._runsteps[branch] = self._data.run_steps(connection, branch)
-            finally:
-                connection.close()
-        except sqlite3.Error:
-            self._failed.add(branch)
+
+        def placeholder() -> None:
             self._runcost[branch] = {}
             self._runsteps[branch] = {}
+
+        with self._section(branch, placeholder=placeholder) as connection:
+            self._runcost[branch] = self._data.run_costs(connection, branch)
+            self._runsteps[branch] = self._data.run_steps(connection, branch)
 
     def _ensure_radio(self: SnapshotBuilder, branch: str) -> None:
         """Cache the branch's radio rows (with react counts, newest first)."""
         if branch in self._radio:
             return
-        try:
-            connection = self._data.connect()
-            try:
-                messages = self._data.message_rows(connection, branch)
-                reacts = self._data.react_counts(connection, branch)
-            finally:
-                connection.close()
-        except sqlite3.Error:
-            self._failed.add(branch)
+
+        def placeholder() -> None:
             self._radio[branch] = ()
-            return
-        rows = [_message(row, branch, reacts) for row in messages]
-        rows.sort(key=lambda row: row['created_at'], reverse=True)
-        self._radio[branch] = tuple(rows)
+
+        with self._section(branch, placeholder=placeholder) as connection:
+            messages = self._data.message_rows(connection, branch)
+            reacts = self._data.react_counts(connection, branch)
+            self._radio[branch] = _shape_radio(messages, branch, reacts)
 
     def _ensure_archive(self: SnapshotBuilder, branch: str) -> None:
         """Cache the branch's archived messages (newest first)."""
         if branch in self._archive:
             return
-        try:
-            connection = self._data.connect()
-            try:
-                rows = self._data.archive_rows(connection, branch)
-            finally:
-                connection.close()
-        except sqlite3.Error:
-            self._failed.add(branch)
+
+        def placeholder() -> None:
             self._archive[branch] = ()
-            return
-        # archived copies are read by definition and carry no react counts;
-        # each row keeps its source node (the `owner` column) for actions
-        shaped = [_message(row, row['owner'], {}) for row in rows]
-        shaped.sort(key=lambda row: row['created_at'], reverse=True)
-        self._archive[branch] = tuple(shaped)
+
+        with self._section(branch, placeholder=placeholder) as connection:
+            rows = self._data.archive_rows(connection, branch)
+            # archived copies are read by definition and carry no react counts;
+            # each row keeps its source node (the `owner` column) for actions
+            shaped = [_message(row, row['owner'], {}) for row in rows]
+            shaped.sort(key=lambda row: row['created_at'], reverse=True)
+            self._archive[branch] = tuple(shaped)
 
     def _ensure_focus(self: SnapshotBuilder, scope: str) -> None:
         """Build everything the scoped panes render.
@@ -424,8 +456,10 @@ class SnapshotBuilder:
                 channels = self._data.channel_rows(connection, scope)
             finally:
                 connection.close()
-        except sqlite3.Error:
-            # keep showing the stale shape (if any) until the retry lands
+        except (FileNotFoundError, sqlite3.Error):
+            # keep showing the stale shape (if any) until the retry lands --
+            # the one stale-but-shown loader, so its except path stays
+            # explicit here instead of riding a _section placeholder
             self._failed.add(scope)
             if scope not in self._shaped:
                 self._shaped[scope] = dict(
@@ -435,15 +469,25 @@ class SnapshotBuilder:
             return
         self._runcost[scope] = runcost
         self._runsteps[scope] = runsteps
-        radio_rows = [_message(row, scope, reacts) for row in messages]
-        radio_rows.sort(key=lambda row: row['created_at'], reverse=True)
-        self._radio[scope] = tuple(radio_rows)
+        self._radio[scope] = _shape_radio(messages, scope, reacts)
         # the run-cost chase spans the subtree; ensure each branch's map
         for branch in self._subtree(scope):
             self._ensure_runcost(branch)
         self._stale.discard(scope)
-        run, it, step, is_live = _context(runs, iters, steps)
-        card = _card(scope, brief, step, config)
+        run, it, step = _context(runs, iters, steps)
+        # the card's session is the currently running one -- the open
+        # iteration's newest stamped step -- never a prior step's leftover
+        if it is not None:
+            session = _iter_session(
+                it=it,
+                it_steps=[s for s in steps if s['iter_id'] == it['iter_id']],
+            )
+        else:
+            session = None
+        card = _card(scope, brief, step, config, session)
+        # one guarded connection covers the whole spend pass: the card's
+        # run-cost figure and every history run row's
+        spends = self._run_spends(scope, [run['run_id'] for run in runs])
         measures = self._measures(
             runs=runs,
             iters=iters,
@@ -453,7 +497,7 @@ class SnapshotBuilder:
             run=run,
             it=it,
             step=step,
-            is_live=is_live,
+            spends=spends,
         )
         history = _history(runs, iters, steps, runcost)
         log = _log(log_raw, [run['run_id'] for run in runs], scope)
@@ -462,18 +506,18 @@ class SnapshotBuilder:
         # card's run-cost figure when the explorer highlights it (open rows
         # read all-time: cost only accrues on step ends, which re-shape)
         for run_row in history:
-            run_row['spend'] = self._run_spend(scope, run_row['run_id'])
+            run_row['spend'] = spends[run_row['run_id']]
             for iter_row in run_row['iters']:
                 iter_row['run_spend'] = self._run_spend_at(
-                    scope,
-                    run_row['run_id'],
-                    _end_epoch(iter_row),
+                    branch=scope,
+                    run_id=run_row['run_id'],
+                    t=_end_epoch(iter_row),
                 )
                 for step_row in iter_row['steps']:
                     step_row['run_spend'] = self._run_spend_at(
-                        scope,
-                        run_row['run_id'],
-                        _end_epoch(step_row),
+                        branch=scope,
+                        run_id=run_row['run_id'],
+                        t=_end_epoch(step_row),
                     )
         geometry = self._geometry(card, history, scope, log)
         self._shaped[scope] = {
@@ -498,7 +542,7 @@ class SnapshotBuilder:
         run: Optional[dict],
         it: Optional[dict],
         step: Optional[dict],
-        is_live: bool,
+        spends: dict[int, float],
     ) -> Optional[dict]:
         """Shape the run/iter/step x time/cost matrix with every configured cap.
 
@@ -516,49 +560,81 @@ class SnapshotBuilder:
             'iter': it['iter'] if it else None,
             'iter_max': iter_max,
             'step': step['step'] if step else None,
-            'step_total': _step_total(steps),
+            'step_total': _step_total(steps, run),
             'step_name': step['step_name'] if step else None,
-            'elapsed_step': self._elapsed(step, is_live) if step else None,
-            'elapsed_iter': self._elapsed(it, is_live) if it else None,
-            'elapsed_run': self._elapsed(run, is_live),
+            'elapsed_step': self._elapsed(step) if step else None,
+            'elapsed_iter': self._elapsed(it) if it else None,
+            'elapsed_run': self._elapsed(run),
             'cost_step': step['cost'] if step else None,
             'cost_iter': sum(s['cost'] or 0 for s in it_steps) if it else None,
-            'cost_run': self._run_spend(scope, run['run_id']),
-            'cap_step_s': parse_duration_seconds(config.get('step_timeout') or ''),
-            'cap_step_cost': config.get('max_step_cost'),
-            'cap_iter_s': parse_duration_seconds(config.get('iter_timeout') or ''),
-            'cap_iter_cost': config.get('max_iter_cost'),
-            'cap_run_s': parse_duration_seconds(config.get('timeout') or ''),
-            'cap_run_cost': config.get('max_cost'),
-            'reserve_budget': config.get('reserve_budget'),
+            'cost_run': spends[run['run_id']],
+            # config.json is agent-editable, so a duration may arrive as a
+            # bare number (e.g. timeout: 3600) -- coerce to str before parsing
+            # (matching Config.validate) so a mistyped value reads as no cap,
+            # never an AttributeError that crashes the whole cockpit build
+            'cap_step_s': fractal.util.parse_duration_seconds(
+                str(config.get('step_timeout') or '')
+            ),
+            'cap_step_cost': _cost_or_none(config.get('max_step_cost')),
+            'cap_iter_s': fractal.util.parse_duration_seconds(
+                str(config.get('iter_timeout') or '')
+            ),
+            'cap_iter_cost': _cost_or_none(config.get('max_iter_cost')),
+            'cap_run_s': fractal.util.parse_duration_seconds(
+                str(config.get('timeout') or '')
+            ),
+            'cap_run_cost': _cost_or_none(config.get('max_cost')),
+            'reserve_budget': _cost_or_none(config.get('reserve_budget')),
         }
 
     def _elapsed(
         self: SnapshotBuilder,
         row: Optional[dict],
-        is_live: bool,
     ) -> Optional[float]:
         """Compute a row's elapsed seconds.
 
-        Live rows measure against the injected clock; settled rows report
-        their final wall time (``ended_at`` - ``started_at``).
+        Open rows (no end instant yet) measure against the injected clock --
+        an open iteration or run keeps ticking through SYNC steps and
+        between-step windows; settled rows report their final wall time
+        (``ended_at`` - ``started_at``).
         """
         if row is None:
             return None
-        if is_live:
+        if row['ended_at'] is None:
             started = parse_ts(row['started_at'])
             if started is None:
                 return None
             return max(0.0, self._now() - started.timestamp())
         return span(row['started_at'], row['ended_at'])
 
-    def _run_spend(self: SnapshotBuilder, branch: str, run_id: int) -> float:
-        """Compute a run's all-time subtree spend.
+    def _run_spends(
+        self: SnapshotBuilder,
+        scope: str,
+        run_ids: list[int],
+    ) -> dict[int, float]:
+        """Compute each run's all-time subtree spend via the DB walk.
 
-        Mirrors ``Node.cost_spent`` without the recursive database walk --
-        the per-branch maps are already cached.
+        Walks the persisted ``parent_run_id`` lineage (like
+        :meth:`fractal.core.cost.Cost.spent`, the figure budget enforcement
+        reads), so a deleted or orphaned descendant's spend still counts and
+        the card's total matches enforcement -- one connection for the whole
+        pass. The per-instant history math (:meth:`_run_spend_at`) keeps the
+        live-topo substrate. A lost read marks the scope for retry and
+        degrades each figure to that cached in-memory math at all-time. Only
+        runs on a rebuild -- a steady tick short-circuits before any shaping.
         """
-        return self._run_spend_at(branch, run_id, math.inf)
+        try:
+            with self._data.reader() as connection:
+                return {
+                    run_id: fractal.core.cost.subtree_spent(connection, run_id)
+                    for run_id in run_ids
+                }
+        except (FileNotFoundError, sqlite3.Error):
+            self._failed.add(scope)
+            return {
+                run_id: self._run_spend_at(scope, run_id, math.inf)
+                for run_id in run_ids
+            }
 
     def _run_spend_at(
         self: SnapshotBuilder,
@@ -568,34 +644,29 @@ class SnapshotBuilder:
     ) -> float:
         """Compute a run's subtree spend as of instant ``t``.
 
-        Its own steps ended by then, plus every descendant run chained to it
-        via ``parent_run_id``.
+        Index-building over the cached per-branch maps plus one call into
+        the pure core twin (:func:`fractal.core.cost.run_spend`), which owns
+        the ``parent_run_id`` chain math beside its SQL pairing.
         """
-        own = self._runsteps.get(branch, {}).get(run_id, ())
-        total = sum(cost for end, cost in own if end <= t)
-        for child in self._children.get(branch, ()):
-            child_runs = self._runcost.get(child, {})
-            for child_run_id, (parent_run_id, _) in child_runs.items():
-                if parent_run_id == run_id:
-                    total += self._run_spend_at(child, child_run_id, t)
-        return total
+        costs: dict[int, tuple[Optional[int], float]] = {}
+        steps: dict[int, list[tuple[float, float]]] = {}
+        for subtree_branch in self._subtree(branch):
+            costs.update(self._runcost.get(subtree_branch, {}))
+            steps.update(self._runsteps.get(subtree_branch, {}))
+        return fractal.core.cost.run_spend(costs, steps, run_id, t)
 
     def _ensure_log(self: SnapshotBuilder, branch: str) -> None:
         """Cache the branch's shaped activity log (the subtree-log ingredient)."""
         if branch in self._logs:
             return
-        try:
-            connection = self._data.connect()
-            try:
-                log_raw = self._data.log_rows(connection, (branch,))
-                run_ids = self._data.run_ids(connection, branch)
-            finally:
-                connection.close()
-        except sqlite3.Error:
-            self._failed.add(branch)
+
+        def placeholder() -> None:
             self._logs[branch] = ()
-            return
-        self._logs[branch] = _log(log_raw, run_ids, branch)
+
+        with self._section(branch, placeholder=placeholder) as connection:
+            log_raw = self._data.log_rows(connection, (branch,))
+            run_ids = self._data.run_ids(connection, branch)
+            self._logs[branch] = _log(log_raw, run_ids, branch)
 
     def _subtree_log(self: SnapshotBuilder, subtree: list[str]) -> tuple[dict, ...]:
         """Merge the subtree's activity logs, newest first (capped like one)."""
@@ -659,6 +730,16 @@ class SnapshotBuilder:
         self._tree_scope = scope
         return self._tree
 
+    def _counts(self: SnapshotBuilder) -> tuple[int, int]:
+        """Tally ``(total, active)`` agent nodes -- the user (root) node is not one."""
+        total = max(0, len(self._topo or ()) - 1)
+        active = sum(
+            1
+            for branch in self._topo or ()
+            if self._brief.get(branch, {}).get('status') == 'active'
+        )
+        return total, active
+
     def _geometry(
         self: SnapshotBuilder,
         card: Optional[dict],
@@ -674,7 +755,49 @@ class SnapshotBuilder:
         tree pane sizes to its widest line; computed once per focused-section
         refresh -- renderers never re-derive widths.
         """
-        cluster = theme.SESS_W + theme.GAP + theme.DUR_W + theme.GAP + theme.COST_W
+        # every log column sizes to its longest value (desc flexes/truncates);
+        # lineage columns carry bare ordinals floored to their header labels,
+        # and the dur/cost columns share the explorer cluster's widths so the
+        # two sections' trailing columns align
+        root = self._data.root_branch
+        ev_node_w = max(
+            (
+                len(leaf_of(row['branch']) + user_tag(row['branch'], root))
+                for row in log
+            ),
+            default=0,
+        )
+        if ev_node_w:
+            ev_node_w = max(ev_node_w, len('node'))
+        ev_run_w = max(
+            (len(str(row['run_n'])) for row in log if row['run_n']),
+            default=0,
+        )
+        if ev_run_w:
+            ev_run_w = max(ev_run_w, len('run'))
+        ev_iter_w = max(
+            (len(str(row['iter_n'])) for row in log if row['iter_n']),
+            default=0,
+        )
+        if ev_iter_w:
+            ev_iter_w = max(ev_iter_w, len('iter'))
+        ev_step_w = max(
+            (len(str(row['step_n'])) for row in log if row['step_n']),
+            default=0,
+        )
+        if ev_step_w:
+            ev_step_w = max(ev_step_w, len('step'))
+        ev_dur_w = max(
+            (len(fmt.dur(row['duration'])) for row in log if row['duration']),
+            default=0,
+        )
+        ev_dur_w = max(ev_dur_w, len('elapsed'))
+        ev_cost_w = max(
+            (len(fmt.money(row['cost'])) for row in log if row['cost'] is not None),
+            default=0,
+        )
+        ev_cost_w = max(ev_cost_w, theme.COST_W)
+        cluster = theme.SESS_W + theme.GAP + ev_dur_w + theme.GAP + ev_cost_w
         if card is not None:
             agent = card['agent'] or theme.EMPTY
             if card['detached']:
@@ -701,35 +824,6 @@ class SnapshotBuilder:
         node_width = natural + theme.NODE_CHROME
         # floor: the event-log desc column must fit its widest node-event verb
         # plus META_MIN metadata chars before the ellipsis
-        # every log column sizes to its longest value (desc flexes/truncates)
-        root = self._data.root_branch
-        ev_node_w = max(
-            (
-                len(leaf_of(row['branch']) + user_tag(row['branch'], root))
-                for row in log
-            ),
-            default=0,
-        )
-        ev_run_w = max(
-            (len(f'run {row["run_n"]}') for row in log if row['run_n']),
-            default=0,
-        )
-        ev_iter_w = max(
-            (len(f'iter {row["iter_n"]}') for row in log if row['iter_n']),
-            default=0,
-        )
-        ev_step_w = max(
-            (len(f'step {row["step_n"]}') for row in log if row['step_n']),
-            default=0,
-        )
-        ev_dur_w = max(
-            (len(fmt.dur(row['duration'])) for row in log if row['duration']),
-            default=0,
-        )
-        ev_cost_w = max(
-            (len(fmt.money(row['cost'])) for row in log if row['cost'] is not None),
-            default=0,
-        )
         event_inner = (
             theme.TIME_W
             + theme.GAP
@@ -762,15 +856,10 @@ class SnapshotBuilder:
         # the tree pane fits its widest (uncollapsed) line and its foot
         lines = fmt.tree_lines(list(self._tree_rows(scope)), set())
         widest = max(
-            (len(Text.from_markup(line).plain) for _, line in lines),
+            (len(Text.from_markup(head + label).plain) for _, head, _, label in lines),
             default=20,
         )
-        total = max(0, len(self._topo or ()) - 1)
-        active = sum(
-            1
-            for branch in self._topo or ()
-            if self._brief.get(branch, {}).get('status') == 'active'
-        )
+        total, active = self._counts()
         foot = f'{active}/{total} nodes running'
         return Geometry(
             tree_width=max(widest, len(foot)) + theme.TREE_CHROME,
@@ -794,10 +883,11 @@ class SnapshotBuilder:
         )
 
 
-# ------ helper functions (pure shaping)
+# ------ helper functions
 
 
-# the focused shape when the scope's worktree is unavailable
+# the focused shape when the scope's worktree is unavailable; the zero-width
+# geometry keeps a first build renderable (the app resizes from it)
 _EMPTY_SHAPE: dict[str, Any] = {
     'card': None,
     'measures': None,
@@ -806,7 +896,7 @@ _EMPTY_SHAPE: dict[str, Any] = {
     'log': (),
     'sessions': (),
     'channels': (),
-    'geometry': None,
+    'geometry': Geometry.empty(),
 }
 
 
@@ -814,27 +904,26 @@ def _context(
     runs: list[dict],
     iters: list[dict],
     steps: list[dict],
-) -> tuple[Optional[dict], Optional[dict], Optional[dict], bool]:
-    """Resolve the displayed (run, iter, step, is_live) from the tables.
+) -> tuple[Optional[dict], Optional[dict], Optional[dict]]:
+    """Resolve the displayed (run, iter, step) from the tables.
 
     Run and iteration are the active else newest; the step is the iteration's
-    active non-SYNC step (live) else its last numbered step (settled).
+    active non-SYNC step else its last numbered step.
     """
     run = next((r for r in runs if r['status'] == 'active'), runs[0] if runs else None)
     if run is None:
-        return None, None, None, False
+        return None, None, None
     run_iters = [i for i in iters if i['run_id'] == run['run_id']]
     it = next(
         (i for i in run_iters if i['status'] == 'active'),
         run_iters[0] if run_iters else None,
     )
     step: Optional[dict] = None
-    is_live = False
     if it is not None:
         it_steps = [s for s in steps if s['iter_id'] == it['iter_id']]
         active = next((s for s in it_steps if s['status'] == 'active'), None)
         if active is not None and active['step_name'] != _SYNC_NAME:
-            step, is_live = active, True
+            step = active
         else:
             numbered = [s for s in it_steps if s['step_name'] != _SYNC_NAME]
             step = max(
@@ -842,7 +931,7 @@ def _context(
                 key=lambda s: (s['step'], s['step_id']),
                 default=None,
             )
-    return run, it, step, is_live
+    return run, it, step
 
 
 def _end_epoch(row: dict) -> float:
@@ -852,16 +941,44 @@ def _end_epoch(row: dict) -> float:
     return row['started'].timestamp() + row['duration']
 
 
-def _step_total(steps: list[dict]) -> Optional[int]:
-    """Return the loop's pipeline length: ``MAX(step)`` excluding SYNC."""
+def _step_total(steps: list[dict], run: dict) -> Optional[int]:
+    """Return a run's pipeline length: ``MAX(step)`` over its steps, no SYNC.
+
+    Scoped to the given run so a pipeline trimmed between runs (5 -> 3)
+    reports the new run's own N rather than the stale all-run max (which never
+    shrinks), and a settled run keeps the honest max of what it actually ran.
+    """
+    scoped = [s for s in steps if s['run_id'] == run['run_id']]
     total = max(
-        (s['step'] for s in steps if s['step_name'] != _SYNC_NAME),
+        (s['step'] for s in scoped if s['step_name'] != _SYNC_NAME),
         default=0,
     )
     return total or None
 
 
-def _card(branch: str, brief: dict, step: Optional[dict], config: dict) -> dict:
+def _cost_or_none(value: object) -> Optional[float]:
+    """Coerce an agent-editable cost/budget config value to a float.
+
+    ``config.json`` is edited directly on the steering path, so a cost cap or
+    reserve may arrive as a string (the natural mistake when an agent
+    self-tunes); the node pane divides and subtracts against it, so a mistyped
+    value reads as no cap rather than a TypeError that crashes the whole
+    cockpit build -- the cost sibling of the duration coercion in
+    :meth:`SnapshotBuilder._measures`.
+    """
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _card(
+    branch: str,
+    brief: dict,
+    step: Optional[dict],
+    config: dict,
+    session: Optional[str],
+) -> dict:
     """Shape the node card's head/ident state."""
     agent = (step['agent'] if step and step['agent'] else config.get('agent')) or ''
     model = (step['model'] if step and step['model'] else config.get('model')) or ''
@@ -872,8 +989,24 @@ def _card(branch: str, brief: dict, step: Optional[dict], config: dict) -> dict:
         'agent': agent,
         'model': model,
         'detached': bool(config.get('detached')),
-        'session': step['session'] if step else None,
+        'session': session,
     }
+
+
+def _iter_session(it: dict, it_steps: list[dict]) -> Optional[str]:
+    """Return an iteration's display session.
+
+    Stamped on the row at close; an open iteration reads its newest stamped
+    step (the stream stamps it as soon as the step opens), so the currently
+    running session shows while the iteration is live.
+    """
+    if it['session']:
+        return it['session']
+    stamped = [s for s in it_steps if s['session']]
+    if not stamped:
+        return None
+    newest = max(stamped, key=lambda s: s['step_id'])
+    return newest['session']
 
 
 def _history(
@@ -911,9 +1044,10 @@ def _history(
                 it_steps[-1] if it_steps else None,
             )
             if display is not None:
-                step_disp = (
-                    f'{display["step_name"]} {display["step"]}/{_step_total(steps)}'
-                )
+                total_steps = _step_total(steps, run)
+                step_name = display['step_name']
+                step_num = display['step']
+                step_disp = f'{step_name} {step_num}/{total_steps}'
             else:
                 step_disp = 'done'
             # each numbered step absorbs the sync passes that precede it: by
@@ -947,7 +1081,9 @@ def _history(
                     label = 'sync'
                     syncs = []
                 else:
-                    label = f'step {step["step"]}: {step["step_name"]}'
+                    step_num = step['step']
+                    step_name = step['step_name']
+                    label = f'step {step_num}: {step_name}'
                     syncs = folded.get(step['step'], [])
                 costs = [
                     cost
@@ -983,14 +1119,15 @@ def _history(
                 iter_spend += row['cost_raw'] or 0
                 row['iter_spend'] = iter_spend
             iter_cost = sum(s['cost'] or 0 for s in it_steps)
+            iter_num = it['iter']
             iter_rows.append(
                 {
-                    'label': f'iter {it["iter"]}',
+                    'label': f'iter {iter_num}',
                     'status': it['status'],
                     'iter': it['iter'],
                     'cost': fmt.money(iter_cost),
                     'cost_raw': iter_cost,
-                    'session': it['session'],
+                    'session': _iter_session(it, it_steps),
                     'step': step_disp,
                     'started': parse_ts(it['started_at']),
                     'duration': span(it['started_at'], it['ended_at']),
@@ -1000,12 +1137,15 @@ def _history(
                 }
             )
         own_cost = runcost.get(run['run_id'], (None, 0.0))[1]
+        # the run's display session is its newest iteration's
+        session = next((row['session'] for row in iter_rows if row['session']), None)
         result.append(
             {
                 'label': f'run {total - index}',
                 'status': run['status'],
                 'number': total - index,
                 'cost': fmt.money(own_cost),
+                'session': session,
                 'started': parse_ts(run['started_at']),
                 'duration': span(run['started_at'], run['ended_at']),
                 'iters': tuple(iter_rows),
@@ -1036,11 +1176,12 @@ def _log(rows: list[dict], run_ids: list[int], branch: str) -> tuple[dict, ...]:
             kind = 'iter'
         else:
             kind = 'run'
-        number = {
+        numbers = {
             'step': row['step_n'],
             'iter': row['iter_n'],
             'run': run_numbers.get(row['run_id']),
-        }.get(kind)
+        }
+        number = numbers.get(kind)
         result.append(
             {
                 'kind': kind,
@@ -1060,6 +1201,7 @@ def _log(rows: list[dict], run_ids: list[int], branch: str) -> tuple[dict, ...]:
                 'run_id': row['run_id'],
                 'iter_id': row['iter_id'],
                 'step_id': row['step_id'],
+                'event_id': row['event_id'],
             }
         )
     return tuple(result)
@@ -1078,6 +1220,17 @@ def _sessions(steps: list[dict]) -> tuple[str, ...]:
         if session and session not in seen:
             seen.append(session)
     return tuple(seen)
+
+
+def _shape_radio(
+    messages: list[dict],
+    owner: str,
+    reacts: dict[int, tuple[int, int]],
+) -> tuple[dict, ...]:
+    """Shape raw message rows into the radio pane contract, newest first."""
+    rows = [_message(row, owner, reacts) for row in messages]
+    rows.sort(key=lambda row: row['created_at'], reverse=True)
+    return tuple(rows)
 
 
 def _message(

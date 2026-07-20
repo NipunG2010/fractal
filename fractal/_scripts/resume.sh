@@ -52,9 +52,9 @@ if COMMON_DIR=$(git -C "$WORKTREE_DIR" rev-parse --git-common-dir 2>/dev/null); 
     fi
     REPO_NAME=${REPO_ROOT##*/}
 fi
-TMUX_SESSION_NAME="$REPO_NAME"
+TMUX_SESSION_NAME="${REPO_NAME//[.:]/-}"
 if BRANCH=$(git -C "$WORKTREE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null); then
-    TMUX_SESSION_NAME="$REPO_NAME (${BRANCH//./-})"
+    TMUX_SESSION_NAME="${REPO_NAME//[.:]/-} (${BRANCH//./-})"
 fi
 # grep -qxF (exact match), not tmux -t: -t resolves targets by
 # prefix/fnmatch, so a short name false-matches longer session names

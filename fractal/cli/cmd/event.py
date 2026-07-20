@@ -43,8 +43,8 @@ def event_start(app: typer.Typer) -> typer.Typer:
     # metadata option
     metadata_help = 'Metadata string.'
     metadata = typer.Option('', '--metadata', help=metadata_help)
-    # run id option (explicit lineage wins; omitted resolves the active context)
-    run_id_help = 'Run the event belongs to.'
+    # run id option
+    run_id_help = 'Run the event belongs to (default: the active context).'
     run_id = typer.Option(None, '--run', help=run_id_help)
     # iteration id option
     iter_id_help = 'Iteration the event belongs to.'
@@ -67,7 +67,7 @@ def event_start(app: typer.Typer) -> typer.Typer:
     ) -> None:
         """Log an event. Prints event_id."""
         node = resolve_node(path)
-        event_id = node.event_start(
+        event_id = node.record.event_start(
             event,
             metadata=metadata,
             run_id=run_id,
@@ -88,7 +88,7 @@ def event_end(app: typer.Typer) -> typer.Typer:
     # status option
     status_help = 'Final status.'
     status = typer.Option(..., '--status', help=status_help)
-    # exit code option (optional -- for events the status carries the outcome)
+    # exit code option
     exit_code_help = 'Exit code (optional).'
     exit_code = typer.Option(None, '--exit-code', help=exit_code_help)
     # path option
@@ -104,7 +104,7 @@ def event_end(app: typer.Typer) -> typer.Typer:
     ) -> None:
         """End an event."""
         node = resolve_node(path)
-        node.event_end(
+        node.record.event_end(
             event_id=event_id,
             status=status,
             exit_code=exit_code,
@@ -146,14 +146,12 @@ def event_list(app: typer.Typer) -> typer.Typer:
         """List events."""
         require_non_negative(limit=limit)
         node = resolve_node(path)
-        where = {'node': node._branch}
-        if run_id is not None:
-            where['run_id'] = run_id
-        if event is not None:
-            where['event'] = event
-        if status is not None:
-            where['status'] = status
-        rows = node.db.read('events', where=where, limit=limit)
+        rows = node.record.events(
+            run_id=run_id,
+            event=event,
+            status=status,
+            limit=limit,
+        )
         print_rows(rows, csv=csv, columns=_EVENT_COLUMNS)
 
     return app

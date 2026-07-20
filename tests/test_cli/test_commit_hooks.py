@@ -9,27 +9,31 @@ restores the staged bytes and fails with actionable guidance -- and
 ``--force`` bypasses hooks entirely so the loop's save-the-work backstop
 cannot be defeated by a failing hook. Also pinned: ``fractal init`` names
 the formatter-safe lanes when a host hook config exists, and a commit whose
-event insert fails says so on stderr instead of losing the record silently.
+event insert fails names the lost record in its returned notices instead of
+losing it silently.
 """
 
 from __future__ import annotations
 
 import pathlib
+import subprocess
 from typing import Optional
 
 import pytest
 
+from fractal.core import commit
+from fractal.core.node import Node
 from tests._helpers import _git
 
 from .conftest import _run
 
 __all__ = [
-    'test_commit_hints_when_ignore_rules_skip_files',
     'test_commit_never_recommits_hook_mutated_wiki_pages',
     'test_commit_retries_hook_formatted_code_paths',
-    'test_commit_warns_on_large_staged_files',
-    'test_commit_warns_when_the_commit_event_is_not_recorded',
     'test_force_commit_bypasses_a_failing_hook',
+    'test_commit_warns_when_the_commit_event_is_not_recorded',
+    'test_commit_hints_when_ignore_rules_skip_files',
+    'test_commit_warns_on_large_staged_files',
     'test_user_init_commit_restores_hook_mutated_pages',
     'test_user_init_names_the_formatter_lanes',
 ]
@@ -69,7 +73,7 @@ exit 0
 _AUTHORED_PAGE = '---\nname: wiki\n---\n# wiki\n\nunformatted [[a/_index|a/]]\n\n***\n'
 
 
-# ------ worker commits (scripts/_commit.sh)
+# ------ worker commits (commit.commit)
 
 
 def test_commit_never_recommits_hook_mutated_wiki_pages(
@@ -87,6 +91,15 @@ def test_commit_never_recommits_hook_mutated_wiki_pages(
     task = repo / '.worktrees' / 'main.task'
     page = task / 'wiki' / '_index.md'
     page.write_text(_AUTHORED_PAGE, encoding='utf-8')
+    # the pipeline refreshes the page before staging, so the bytes the guard
+    # must round-trip are the wiki tooling's own refreshed output
+    wiki_dir = task / 'wiki'
+    subprocess.run(
+        ['wiki', 'update', f'--path={wiki_dir}'],
+        capture_output=True,
+        check=True,
+    )
+    authored = page.read_text(encoding='utf-8')
     head = _git(task, 'rev-parse', 'HEAD').stdout.strip()
     result = _run(task, 'commit', 'wiki work')
     # the mutation fails the commit with actionable guidance, not corruption
@@ -99,7 +112,7 @@ def test_commit_never_recommits_hook_mutated_wiki_pages(
     assert 'off the wiki paths' in result.stderr
     assert 'exclude:' not in result.stderr
     # the page round-trips byte-identical and no commit landed
-    assert page.read_text(encoding='utf-8') == _AUTHORED_PAGE
+    assert page.read_text(encoding='utf-8') == authored
     assert _git(task, 'rev-parse', 'HEAD').stdout.strip() == head
 
 
@@ -143,7 +156,7 @@ def test_force_commit_bypasses_a_failing_hook(tmp_path: pathlib.Path) -> None:
 def test_commit_warns_when_the_commit_event_is_not_recorded(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A commit whose event insert fails warns on stderr and still lands.
+    """A commit whose event insert fails still lands and names the lost record.
 
     Event emission is deliberately non-fatal (telemetry must never block the
     save path), but a swallowed insert failure erases the commit from the
@@ -157,19 +170,19 @@ def test_commit_warns_when_the_commit_event_is_not_recorded(
     clean = _run(task, 'commit', 'recorded work')
     assert clean.returncode == 0, clean.stderr
     assert 'commit event not recorded' not in clean.stdout + clean.stderr
-    # the CLI surfaces the script's stderr notices on either stream, so the
-    # contract pinned here is visibility, not the pipe
+    # only explicit (loop-passed) lineage can poison the insert --
+    # ambient env carries no weight -- so drive the pipeline directly
+    # with foreign ids; the commit still lands and the returned
+    # notices say the record was lost
     (task / 'work.txt').write_text('unrecorded\n', encoding='utf-8')
-    poisoned = _run(
-        task,
-        'commit',
-        'unrecorded work',
-        RUN_ID='9999',
-        ITER_ID='9999',
-        STEP_ID='9999',
+    output = commit.commit(
+        node=Node(task),
+        message='unrecorded work',
+        run_id=9999,
+        iter_id=9999,
+        step_id=9999,
     )
-    assert poisoned.returncode == 0, poisoned.stderr
-    assert 'commit event not recorded' in poisoned.stdout + poisoned.stderr
+    assert 'commit event not recorded' in output
 
 
 def test_commit_hints_when_ignore_rules_skip_files(tmp_path: pathlib.Path) -> None:
@@ -241,7 +254,7 @@ def test_commit_warns_on_large_staged_files(tmp_path: pathlib.Path) -> None:
     assert 'blob.bin' in _git(task, 'ls-files').stdout
 
 
-# ------ user-node baseline commits (Node._commit_user_init)
+# ------ user-node baseline commits (commit.commit_user_init)
 
 
 def test_user_init_commit_restores_hook_mutated_pages(
@@ -288,7 +301,7 @@ repos:
         additional_dependencies: [mdformat-wiki]
 """
 # a host hook config already keeping its formatter off the generated paths
-# (the second lane; an ``exclude:`` filter is its common shape)
+# (the second lane; an exclude: filter is its common shape)
 _OFF_PATHS_CONFIG = """\
 repos:
   - repo: https://github.com/hukkin/mdformat
@@ -300,8 +313,8 @@ repos:
 
 
 @pytest.mark.parametrize(
-    ('config', 'informs'),
-    [
+    argnames=('config', 'informs'),
+    argvalues=[
         pytest.param('repos: []\n', True, id='hooks-without-plugin'),
         pytest.param(_PLUGIN_CONFIG, False, id='plugin-present'),
         pytest.param(_OFF_PATHS_CONFIG, False, id='formatters-off-paths'),

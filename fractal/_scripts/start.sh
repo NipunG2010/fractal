@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Launch a node in a tmux session (propagates environment, execs _run.sh on re-entry)
-# -----------------------------------------------------------------------------------
+# Launch a node in a tmux session (propagates environment, execs the loop on re-entry)
+# ------------------------------------------------------------------------------------
 
 usage() {
     cat <<USAGE
@@ -11,7 +11,8 @@ Usage: start.sh <path> [options]
 Launch a node in a tmux session.
 
 Options:
-    --continue    Continue a stopped/exited node (clean worktree, further iterations)
+    --continue    Continue a stopped/exited node (clean worktree, further iterations;
+                  a budget-ended run relaunches only with an explicit new --max-cost)
     --resume      Resume a paused node (adopt its open run where the pause left it)
     --help|-h     Show this help message
 
@@ -20,14 +21,16 @@ USAGE
     exit 0
 }
 
+# only --help is parsed here -- the full argv (path at $1) is forwarded
+# verbatim to the tmux re-entry exec, so flags like --continue/--resume
+# pass through to the loop
 for arg in "$@"; do
     case "$arg" in
         --help | -h) usage ;;
     esac
 done
 
-PACKAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-SCRIPT_DIR="$PACKAGE_DIR/_scripts"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 if [[ -z "${1:-}" ]]; then
     echo "Error: path is required" >&2
@@ -60,7 +63,7 @@ fi
 # this node execs -- a child spawned from a running parent has
 # a different _NODE and won't match
 if [[ "${_NODE:-}" == "$NODE_DIR" ]]; then
-    exec bash "$PACKAGE_DIR/_node/scripts/_run.sh" "$@"
+    exec fractal node _loop --path="$WORKTREE_DIR" "${@:2}"
 fi
 
 # ------ launch in tmux
@@ -70,8 +73,8 @@ if ! command -v tmux &>/dev/null; then
     exit 1
 fi
 
-REPO_NAME=$(basename "$REPO_DIR")
-TMUX_SESSION_NAME="$REPO_NAME (${BRANCH//./-})"
+REPO_NAME=${REPO_DIR##*/}
+TMUX_SESSION_NAME="${REPO_NAME//[.:]/-} (${BRANCH//./-})"
 
 # propagate env into the tmux session; _NODE also drives
 # the re-entry exec above
@@ -84,14 +87,36 @@ else
     ENV_PREFIX="$ENV_PREFIX PATH=$(printf '%q' "$PATH")"
     [[ -n "${VIRTUAL_ENV:-}" ]] \
         && ENV_PREFIX="$ENV_PREFIX VIRTUAL_ENV=$(printf '%q' "$VIRTUAL_ENV")"
-    [[ -n "${PYENV_VERSION:-}" ]] \
-        && ENV_PREFIX="$ENV_PREFIX PYENV_VERSION=$(printf '%q' "$PYENV_VERSION")"
 fi
 
 TMUX_CMD="$ENV_PREFIX bash $(printf '%q' "$SCRIPT_DIR/start.sh")"
 for arg in "$@"; do
     TMUX_CMD="$TMUX_CMD $(printf '%q' "$arg")"
 done
+
+# provider route keys must reach the loop without landing in ps(1) argv.
+# A cold new-session BECOMES the tmux server and keeps any -e KEY=VALUE
+# in the server's argv for its whole lifetime; a warm new-session is a
+# transient client whose argv is gone in milliseconds. So forward with
+# -e only when a server already runs -- with none, the exported keys are
+# inherited into the new server's (argv-invisible) global environment.
+# An unset key is never forwarded, so grok OAuth and opencode
+# auto-detection still see it absent rather than empty. The probe races
+# the launch: a server transition in between either cold-starts with the
+# keys in argv or warm-starts without them -- accepted, the window is
+# milliseconds wide. new-session -e needs tmux >= 3.2, so older tmux
+# skips the forwarding and the loop's key preflight reports the missing
+# key instead of tmux erroring on the flag.
+TMUX_ARGS=(-d -s "$TMUX_SESSION_NAME")
+TMUX_VERSION=$(tmux -V)
+TMUX_VERSION=${TMUX_VERSION#tmux }
+if tmux list-sessions >/dev/null 2>&1 \
+    && [[ "$(printf '3.2\n%s\n' "$TMUX_VERSION" | sort -V | head -n1)" == "3.2" ]]; then
+    [[ -n "${OPENROUTER_API_KEY:-}" ]] \
+        && TMUX_ARGS+=(-e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY")
+    [[ -n "${XAI_API_KEY:-}" ]] \
+        && TMUX_ARGS+=(-e "XAI_API_KEY=$XAI_API_KEY")
+fi
 
 # grep -qxF (exact match), not tmux -t: -t resolves targets by
 # prefix/fnmatch, so a short name false-matches longer session names
@@ -100,5 +125,5 @@ if tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$TMUX_SESSIO
     echo "Kill it first with: fractal node kill --path=<path>" >&2
     exit 1
 fi
-tmux new-session -d -s "$TMUX_SESSION_NAME" "$TMUX_CMD"
+tmux new-session "${TMUX_ARGS[@]}" "$TMUX_CMD"
 echo "Started tmux session: $TMUX_SESSION_NAME"

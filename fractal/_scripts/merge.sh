@@ -69,6 +69,8 @@ fi
 
 # ------ find parent worktree
 
+# match the worktree line with substr (not $2) so a path containing
+# spaces is preserved -- mirrors init.sh and Python worktree_map
 PARENT_WORKTREE_DIR=$(git -C "$REPO_DIR" worktree list --porcelain \
     | awk -v b="refs/heads/$PARENT_BRANCH" \
         'index($0,"worktree ")==1{wt=substr($0,10)} $1=="branch" && $2==b{print wt}')
@@ -92,6 +94,10 @@ fi
 EVENT_ID=$(fractal event _start merge \
     --metadata="$BRANCH -> $PARENT_BRANCH" \
     --path="$PARENT_WORKTREE_DIR" 2>/dev/null || true)
+[[ "$EVENT_ID" =~ ^[0-9]+$ ]] || EVENT_ID=""
+if [[ -z "$EVENT_ID" ]]; then
+    echo "Warning: merge event for $BRANCH -> $PARENT_BRANCH was not recorded" >&2
+fi
 end_merge_event() {
     if [[ -n "$EVENT_ID" ]]; then
         fractal event _end "$EVENT_ID" --status="$1" \
@@ -123,32 +129,48 @@ trap '
     exit 1
 ' INT TERM
 
-# squash-merge; reset on conflict
-if ! git -C "$PARENT_WORKTREE_DIR" merge --squash "$BRANCH"; then
-    # distinguish a real content conflict (unmerged index entries) from an
-    # untracked-file collision (the merge aborts before staging, leaving none)
+# squash-merge; reset on conflict (stdout silenced so the merge summary
+# below stays the single user-facing line; conflict diagnostics ride stderr)
+if ! git -C "$PARENT_WORKTREE_DIR" merge --squash "$BRANCH" >/dev/null; then
+    # distinguish a real content conflict (unmerged index entries) from a
+    # merge that aborted before staging anything (an untracked-file collision,
+    # or a racing writer holding the parent index); only the conflict resets
+    # -- a blanket reset --hard would wipe whatever a concurrent sibling
+    # merge had staged in the shared parent worktree
     CONFLICTED=$(git -C "$PARENT_WORKTREE_DIR" ls-files -u)
-    git -C "$PARENT_WORKTREE_DIR" reset --hard HEAD
     end_merge_event failed
     if [[ -n "$CONFLICTED" ]]; then
+        git -C "$PARENT_WORKTREE_DIR" reset --hard HEAD
         echo "Error: merging $BRANCH into $PARENT_BRANCH produced conflicts;" \
             "the parent worktree has been restored; resolve and merge manually" >&2
     else
-        echo "Error: merging $BRANCH into $PARENT_BRANCH failed (untracked files" \
-            "in the parent would be overwritten); restored -- move them and retry" >&2
+        echo "Error: merging $BRANCH into $PARENT_BRANCH failed before staging" \
+            "anything (untracked files in the parent would be overwritten, or" \
+            "another git process holds its index); resolve and retry" >&2
     fi
     exit 1
 fi
 
 # strip the node's seed from the staged merge to avoid orphaning it in parent
+# (--quiet: drop git rm's per-file "rm '...'" lines so the merge summary
+# below stays the single user-facing line)
 PROJECT_PATH=$(cat "$REPO_DIR/.worktrees/.project/$BRANCH" 2>/dev/null || echo ".")
 if [[ "$PROJECT_PATH" == "." ]]; then
     SEED_PREFIX=".fractal"
 else
     SEED_PREFIX="$PROJECT_PATH/.fractal"
 fi
-git -C "$PARENT_WORKTREE_DIR" rm -rf --quiet --ignore-unmatch -- \
-    "$SEED_PREFIX/$BRANCH" ":(glob)$SEED_PREFIX/$BRANCH.*/**"
+# guarded like every armed-window command: a set -e exit here (index.lock
+# contention, disk full) would bypass the reset and leave the squash staged
+# for the parent's next commit to absorb silently
+if ! git -C "$PARENT_WORKTREE_DIR" rm -rf --quiet --ignore-unmatch -- \
+    "$SEED_PREFIX/$BRANCH" ":(glob)$SEED_PREFIX/$BRANCH.*/**"; then
+    git -C "$PARENT_WORKTREE_DIR" reset --hard HEAD
+    end_merge_event failed
+    echo "Error: stripping $BRANCH's seed from the staged merge failed;" \
+        "the parent worktree has been restored" >&2
+    exit 1
+fi
 
 # nothing staged after seed strip means no-op merge
 if git -C "$PARENT_WORKTREE_DIR" diff --cached --quiet; then
@@ -158,8 +180,51 @@ if git -C "$PARENT_WORKTREE_DIR" diff --cached --quiet; then
     exit 0
 fi
 
-# commit the squash-merge and report success
-if ! git -C "$PARENT_WORKTREE_DIR" commit -m "merge $BRANCH"; then
+# the _index.md merge driver keeps ours per link block, dropping the merged
+# branch's rows, so regenerate each tracked wiki's indexes from the merged
+# filesystem and stage the refreshed bytes to ride the squash commit (an
+# untracked wiki -- the git-excluded default seed -- carries no merge changes,
+# and adding it would fail); the add is scoped to what the refresh owns --
+# tracked-file updates plus any new _index.md and tool-owned .wiki/ state --
+# so an untracked draft under the wiki never rides the merge commit; stdout
+# is silenced so the merge summary below stays the single user-facing line;
+# a failed refresh restores the parent exactly like a conflict
+if command -v wiki &>/dev/null; then
+    PARENT_PROJECT=$(fractal config _get project --path="$PARENT_WORKTREE_DIR" 2>/dev/null || echo ".")
+    if [[ "$PARENT_PROJECT" == "." ]]; then
+        WIKI_DIR="$PARENT_WORKTREE_DIR/wiki"
+        MEMORY_DIR="$PARENT_WORKTREE_DIR/.fractal/$PARENT_BRANCH/memory"
+    else
+        WIKI_DIR="$PARENT_WORKTREE_DIR/$PARENT_PROJECT/wiki"
+        MEMORY_DIR="$PARENT_WORKTREE_DIR/$PARENT_PROJECT/.fractal/$PARENT_BRANCH/memory"
+    fi
+    for INDEX_DIR in "$WIKI_DIR" "$MEMORY_DIR"; do
+        # guarded: a set -e exit from a failed ls-files would strand the
+        # staged squash without the reset below
+        if ! TRACKED=$(git -C "$PARENT_WORKTREE_DIR" ls-files -- "$INDEX_DIR/_index.md"); then
+            git -C "$PARENT_WORKTREE_DIR" reset --hard HEAD
+            end_merge_event failed
+            echo "Error: reading the tracked wiki index under $INDEX_DIR after merging" \
+                "$BRANCH failed; the parent worktree has been restored" >&2
+            exit 1
+        fi
+        [[ -n "$TRACKED" ]] || continue
+        if ! wiki update --path="$INDEX_DIR" >/dev/null \
+            || ! git -C "$PARENT_WORKTREE_DIR" add -u -- "$INDEX_DIR" \
+            || ! git -C "$PARENT_WORKTREE_DIR" add -- \
+                ":(glob)$INDEX_DIR/**/_index.md" "$INDEX_DIR/.wiki"; then
+            git -C "$PARENT_WORKTREE_DIR" reset --hard HEAD
+            end_merge_event failed
+            echo "Error: refreshing the wiki indexes under $INDEX_DIR after merging" \
+                "$BRANCH failed; the parent worktree has been restored" >&2
+            exit 1
+        fi
+    done
+fi
+
+# commit the squash-merge and report success (-q: drop git's own commit
+# summary so the merge line below stays the single user-facing line)
+if ! git -C "$PARENT_WORKTREE_DIR" commit -q -m "merge $BRANCH"; then
     git -C "$PARENT_WORKTREE_DIR" reset --hard HEAD
     end_merge_event failed
     echo "Error: failed to commit the squash-merge of $BRANCH;" \
@@ -176,13 +241,15 @@ trap - INT TERM
 # a mid-iteration child is left untouched (the parent merge already succeeded)
 CHILD_HEAD=$(git -C "$WORKTREE_DIR" rev-parse --abbrev-ref HEAD)
 if [[ "$CHILD_HEAD" != "$BRANCH" ]]; then
-    echo "Note: skipped advancing $BRANCH's merge-base (its worktree is on" \
+    echo "Warning: skipped advancing $BRANCH's merge-base (its worktree is on" \
         "$CHILD_HEAD, not $BRANCH); a later re-merge may re-diff from the fork point" >&2
 elif [[ -n "$(git -C "$WORKTREE_DIR" status --porcelain)" ]]; then
-    echo "Note: skipped advancing $BRANCH's merge-base (its worktree has" \
+    echo "Warning: skipped advancing $BRANCH's merge-base (its worktree has" \
         "uncommitted changes); a later re-merge may re-diff from the fork point" >&2
 else
-    git -C "$WORKTREE_DIR" merge -s ours --no-edit "$PARENT_BRANCH"
+    # -q: drop git's own "Merge made by ..." line so the merge summary
+    # below stays the single user-facing line
+    git -C "$WORKTREE_DIR" merge -q -s ours --no-edit "$PARENT_BRANCH"
 fi
 
 end_merge_event completed

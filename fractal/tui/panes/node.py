@@ -9,6 +9,7 @@ explorer, row-selected), and ``rows`` (the event log, row-selected).
 
 from __future__ import annotations
 
+import json
 import typing
 from typing import Any, Optional, Union
 
@@ -16,14 +17,17 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
-from textual.events import Key
+from textual.events import Click, Enter, Key, Leave
 from textual.widgets import Rule as Divider, Static
 
-from fractal.tui import fmt, theme
+import fractal.tui.fmt
+import fractal.tui.theme
 from fractal.tui.data import leaf_of, user_tag
 from fractal.tui.widgets import PaneScroll
 
 if typing.TYPE_CHECKING:
+    from textual.widget import Widget
+
     from fractal.tui.app import FractalApp
     from fractal.tui.snapshot import Snapshot
 
@@ -50,7 +54,9 @@ _CONFIG_ORDER = (
     'base',
     'meta',
     'agent',
+    'provider',
     'model',
+    'effort',
     'max_iters',
     'max_depth',
     'max_children',
@@ -58,6 +64,8 @@ _CONFIG_ORDER = (
     'timeout',
     'iter_timeout',
     'step_timeout',
+    'step_retries',
+    'step_retry_backoff',
     'interval',
     'sleep',
     'wait',
@@ -68,6 +76,7 @@ _CONFIG_ORDER = (
     'sync',
     'local',
     'detached',
+    'blind',
 )
 _SPOKEN_CONFIG = frozenset(
     {
@@ -80,6 +89,22 @@ _SPOKEN_CONFIG = frozenset(
         'max_step_cost',
     }
 )
+
+
+class LogScopeToggle(Static):
+    """The node/descendants log-scope switch: brightens on mouse hover."""
+
+    def on_enter(self: LogScopeToggle, event: Enter) -> None:
+        """Brighten on hover."""
+        self.app.node_pane.set_log_hover(True)
+
+    def on_leave(self: LogScopeToggle, event: Leave) -> None:
+        """Dim when the pointer leaves."""
+        self.app.node_pane.set_log_hover(False)
+
+    def on_click(self: LogScopeToggle, event: Click) -> None:
+        """Flip the log scope."""
+        self.app.node_pane.toggle_log_scope()
 
 
 class NodePane:
@@ -97,8 +122,10 @@ class NodePane:
         self.ex_sel = 0
         self.ex_expanded: set[tuple] = set()
         self.ev_sel = 0
-        # include descendants in the event log (session-wide, survives rescope)
-        self.sub_log = False
+        # include descendants in the event log; the user (root) node defaults
+        # to the descendants view, every other node to its own activity
+        self.sub_log = app.scope == app.data.root_branch
+        self.log_hover = False
 
     def compose(self: NodePane) -> ComposeResult:
         """Compose the pane interior (content mounts on the first rebuild)."""
@@ -115,6 +142,8 @@ class NodePane:
             yield PaneScroll(id='nodeexplore')
             with Vertical(id='nodeactivity'):
                 yield Divider(id='nodeevdiv')
+                yield LogScopeToggle('', id='nodelogscope')
+                yield Static('', id='nodeevcols')
                 yield PaneScroll(id='nodeevents')
         with Vertical(classes='footwrap'):
             yield Divider()
@@ -138,8 +167,8 @@ class NodePane:
         self.app.query_one('#nodemeasures', Static).update(self._measures(measures))
         config = self.app.query_one('#nodeconfig', Static)
         config.update(self._config_chips(snap))
-        # hovering the chips shows the full config
-        config.tooltip = Text.from_markup(self._config_text(snap))
+        # hovering the chips shows the whole config file as pretty JSON
+        config.tooltip = self._config_text(snap)
 
     def _context_view(
         self: NodePane,
@@ -246,7 +275,9 @@ class NodePane:
     def _content_w(self: NodePane) -> int:
         """Return the node pane's content width (inside border + padding)."""
         node_width = self.app.snapshot.geometry.node_width
-        return node_width - 2 * (theme.BORDER_W + theme.PANE_PAD)
+        return node_width - 2 * (
+            fractal.tui.theme.BORDER_W + fractal.tui.theme.PANE_PAD
+        )
 
     def _head(self: NodePane, card: Optional[dict]) -> str:
         """Render card row 1.
@@ -255,9 +286,10 @@ class NodePane:
         signal (present participle) hard right in grey.
         """
         if not card:
-            return f'[{theme.DIM}]no node[/]'
-        glyph, color = fmt.status_style(card['status'], card['signal'])
-        label = f'{glyph} {card["status"]}'
+            return f'[{fractal.tui.theme.DIM}]no node[/]'
+        glyph, color = fractal.tui.fmt.status_style(card['status'], card['signal'])
+        status = card['status']
+        label = f'{glyph} {status}'
         signal = (
             _SIGNAL_ING.get(card['signal'], card['signal']) if card['signal'] else ''
         )
@@ -267,56 +299,70 @@ class NodePane:
         # between the status (left) and the signal (right), one space clear
         room = width - len(label) - len(signal) - 2
         if len(branch) > room:
-            branch = branch[: max(1, room - 1)] + theme.ELLIPSIS
+            branch = branch[: max(1, room - 1)] + fractal.tui.theme.ELLIPSIS
         start = (width - len(branch)) // 2
         if signal:
             start = min(start, width - len(signal) - 1 - len(branch))
         start = max(start, len(label) + 1)
         lead = start - len(label)
-        result = f'[{color}]{label}[/]{" " * lead}[{theme.CHROME}]{branch}[/]'
+        gap = ' ' * lead
+        result = f'[{color}]{label}[/]{gap}[{fractal.tui.theme.CHROME}]{branch}[/]'
         if signal:
             mid = max(1, width - len(signal) - start - len(branch))
-            result += f'{" " * mid}[{theme.CHROME}]{signal}[/]'
+            gap = ' ' * mid
+            result += f'{gap}[{fractal.tui.theme.CHROME}]{signal}[/]'
         return result
 
     def _run_line(self: NodePane, m: Optional[dict]) -> str:
-        """Render card row 2: run · iter · step, centered, dim separators.
+        """Render card row 2: run / iter / step, centered, dim separators.
 
         A selected SYNC pre-step reads as plain ``sync``, like the explorer.
         """
         if not m or m['run'] is None:
             return ''
-        if m['iter_max']:
-            it = f'{m["iter"]}/{m["iter_max"]}'
+        iter_num = m['iter']
+        iter_max = m['iter_max']
+        if iter_max:
+            it = f'{iter_num}/{iter_max}'
         else:
-            it = f'{m["iter"]}'
-        parts = [f'run {m["run"]}', f'iter {it}']
+            it = f'{iter_num}'
+        run_num = m['run']
+        parts = [f'run {run_num}', f'iter {it}']
         if m['step'] == 0:
             parts.append('sync')
         elif m['step'] is not None:
-            parts.append(f'step {m["step"]}/{m["step_total"]} ({m["step_name"]})')
-        plain = f' {theme.SEP} '.join(parts)
+            step_num = m['step']
+            step_total = m['step_total']
+            step_name = fractal.tui.fmt.esc(m['step_name'])
+            parts.append(f'step {step_num}/{step_total} ({step_name})')
+        plain = f' {fractal.tui.theme.SEP} '.join(parts)
         pad = max(0, (self._content_w() - len(plain)) // 2)
-        joiner = f' [{theme.DIM}]{theme.SEP}[/] '
+        joiner = f' [{fractal.tui.theme.DIM}]{fractal.tui.theme.SEP}[/] '
         return ' ' * pad + joiner.join(parts)
 
     def _ident(self: NodePane, card: Optional[dict]) -> str:
         """Render the agent / model / full session id block.
 
-        The session is the current step's; the chips show the node defaults
-        -- they can differ.
+        The session is the currently running one (the open iteration's
+        newest); the chips show the node defaults -- they can differ.
         """
         if not card:
-            return f'[{theme.DIM}]no node[/]'
-        agent = card['agent'] or theme.EMPTY
+            return f'[{fractal.tui.theme.DIM}]no node[/]'
+        # agent/model/session are agent-editable config values -- escape them
+        # (like _config_chips/_ev_desc) so a stray '[/]' can't MarkupError the
+        # pane rebuild; the surrounding style tags are added after escaping
+        agent = fractal.tui.fmt.esc(card['agent'] or fractal.tui.theme.EMPTY)
         if card['detached']:
-            agent += f' [{theme.DIM}](detached)[/]'
-        model = card['model'] or theme.EMPTY
-        session = card['session'] or theme.EMPTY
+            agent += f' [{fractal.tui.theme.DIM}](detached)[/]'
+        model = fractal.tui.fmt.esc(card['model'] or fractal.tui.theme.EMPTY)
+        session = fractal.tui.fmt.esc(card['session'] or fractal.tui.theme.EMPTY)
+        agent_col = fractal.tui.fmt.col('agent', fractal.tui.theme.IDENT_W)
+        model_col = fractal.tui.fmt.col('model', fractal.tui.theme.IDENT_W)
+        session_col = fractal.tui.fmt.col('session', fractal.tui.theme.IDENT_W)
         return (
-            f'[{theme.DIM}]{fmt.col("agent", theme.IDENT_W)}[/]{agent}\n'
-            f'[{theme.DIM}]{fmt.col("model", theme.IDENT_W)}[/]{model}\n'
-            f'[{theme.DIM}]{fmt.col("session", theme.IDENT_W)}[/]{session}'
+            f'[{fractal.tui.theme.DIM}]{agent_col}[/]{agent}\n'
+            f'[{fractal.tui.theme.DIM}]{model_col}[/]{model}\n'
+            f'[{fractal.tui.theme.DIM}]{session_col}[/]{session}'
         )
 
     def _measures(self: NodePane, m: Optional[dict]) -> Union[Text, str]:
@@ -347,37 +393,44 @@ class NodePane:
         ]
         # render the figures first: each gauge column starts three columns
         # past its column's longest figure, and the two gauges split the
-        # leftover width; an over-long figure truncates (…) rather than
+        # leftover width; an over-long figure truncates (ellipsis) rather than
         # squeezing the gauges out
         figs = []
         for scope, elapsed, elapsed_cap, cost, cost_cap in scopes:
             figs.append(
                 (
                     scope,
-                    _figure(elapsed, elapsed_cap, fmt.dur),
+                    _figure(elapsed, elapsed_cap, fractal.tui.fmt.dur),
                     (elapsed or 0) / elapsed_cap if elapsed_cap else 0.0,
-                    _figure(cost, cost_cap, fmt.money),
+                    _figure(cost, cost_cap, fractal.tui.fmt.money),
                     (cost or 0) / cost_cap if cost_cap else 0.0,
                 )
             )
         # both gauges share one fixed width and trail their text (the row
         # ends ragged-right rather than stretching to the pane edge)
-        gap = theme.GAUGE_GAP
-        avail = self._content_w() - theme.MEAS_W - 2 * theme.GAP
+        gap = fractal.tui.theme.GAUGE_GAP
+        avail = self._content_w() - fractal.tui.theme.MEAS_W - 2 * fractal.tui.theme.GAP
         el_fig = max(len(fig[1][1]) for fig in figs)
         co_fig = max(len(fig[3][1]) for fig in figs)
-        bar_w = theme.BAR_W
+        bar_w = fractal.tui.theme.BAR_W
         budget = max(8, avail - 2 * gap - 2 * bar_w)
         if el_fig + co_fig > budget:
-            # over-long figures truncate (…) rather than pushing the gauges out
+            # over-long figures truncate (ellipsis) rather than pushing the
+            # gauges out
             el_fig = min(el_fig, max(4, budget // 3))
             co_fig = max(4, budget - el_fig)
         # header: blank corner over the scope labels, then the metric columns
         rows = [
-            fmt.row(
-                fmt.cell('', theme.MEAS_W),
-                fmt.cell(f'[{theme.DIM}]time[/]', el_fig + gap + bar_w),
-                fmt.cell(f'[{theme.DIM}]cost[/]', co_fig + gap + bar_w),
+            fractal.tui.fmt.row(
+                fractal.tui.fmt.cell('', fractal.tui.theme.MEAS_W),
+                fractal.tui.fmt.cell(
+                    markup=f'[{fractal.tui.theme.DIM}]time[/]',
+                    width=el_fig + gap + bar_w,
+                ),
+                fractal.tui.fmt.cell(
+                    markup=f'[{fractal.tui.theme.DIM}]cost[/]',
+                    width=co_fig + gap + bar_w,
+                ),
             )
         ]
         # the run-cost gauge warns once spend enters the configured reserve
@@ -389,17 +442,22 @@ class NodePane:
                 and m['cap_run_cost']
                 and m['cap_run_cost'] - (m['cost_run'] or 0) <= reserve
             )
+            el_bar = fractal.tui.fmt.cap_bar(el_frac, width=bar_w)
+            co_bar = fractal.tui.fmt.cap_bar(co_frac, width=bar_w, warn=warn)
             rows.append(
-                fmt.row(
-                    fmt.cell(f'[{theme.DIM}]{scope}[/]', theme.MEAS_W),
-                    fmt.row(
-                        fmt.cell(el_markup, el_fig),
-                        fmt.cell(fmt.cap_bar(el_frac, width=bar_w), bar_w),
+                fractal.tui.fmt.row(
+                    fractal.tui.fmt.cell(
+                        markup=f'[{fractal.tui.theme.DIM}]{scope}[/]',
+                        width=fractal.tui.theme.MEAS_W,
+                    ),
+                    fractal.tui.fmt.row(
+                        fractal.tui.fmt.cell(el_markup, el_fig),
+                        fractal.tui.fmt.cell(markup=el_bar, width=bar_w),
                         gap=gap,
                     ),
-                    fmt.row(
-                        fmt.cell(co_markup, co_fig),
-                        fmt.cell(fmt.cap_bar(co_frac, width=bar_w, warn=warn), bar_w),
+                    fractal.tui.fmt.row(
+                        fractal.tui.fmt.cell(co_markup, co_fig),
+                        fractal.tui.fmt.cell(markup=co_bar, width=bar_w),
                         gap=gap,
                     ),
                 )
@@ -437,42 +495,52 @@ class NodePane:
                 break
         result = []
         for index, row in enumerate(rows):
-            # muted grey chips (a box like the unselected kind-toggle option)
-            cells = [f'[{theme.DIM} on {theme.SURFACE}] {text} [/]' for text in row]
+            # muted grey chips (a box like the unselected kind-toggle option);
+            # the chip text embeds agent-writable config values, so escape it
+            cells = [
+                f'[{fractal.tui.theme.DIM} on {fractal.tui.theme.SURFACE}]'
+                f' {fractal.tui.fmt.esc(text)} [/]'
+                for text in row
+            ]
             if leftover and index == len(rows) - 1:
-                cells.append(f'[{theme.DIM}]...[/]')
+                cells.append(f'[{fractal.tui.theme.DIM}]...[/]')
             result.append(' '.join(cells))
         return '\n'.join(result)
 
-    def _config_text(self: NodePane, snap: Snapshot) -> str:
-        """Render the full config as muted JSON lines (the chips' tooltip)."""
-        config = snap.config
-        lines = [
-            f'"{key}": {_json_val(config.get(key))}'
-            for key in _CONFIG_ORDER
-            if config.get(key) is not None
-        ]
-        body = '\n'.join(lines)
-        return f'[{theme.DIM}]{body}[/]'
+    def _config_text(self: NodePane, snap: Snapshot) -> Text:
+        """Render the config file as pretty-printed JSON (the chips' tooltip)."""
+        return Text(json.dumps(snap.config, indent=2), style=fractal.tui.theme.DIM)
 
     def _foot(self: NodePane) -> str:
         """Render the foot hints for the active zone."""
         if self.app.mode == 'node' and self.zone == 'top':
             return (
-                f'[{theme.DIM}]{theme.RET} chat this session {theme.SEP}'
-                f' {theme.DOWN} runs {theme.SEP} esc back[/]'
+                f'[{fractal.tui.theme.DIM}]{fractal.tui.theme.RET} chat this session'
+                f' {fractal.tui.theme.SEP} {fractal.tui.theme.DOWN} runs'
+                f' {fractal.tui.theme.SEP} esc back[/]'
+            )
+        if self.app.mode == 'node' and self.zone == 'scope':
+            return (
+                f'[{fractal.tui.theme.DIM}]{fractal.tui.theme.LEFT}'
+                f'{fractal.tui.theme.RIGHT}/{fractal.tui.theme.RET} flip scope'
+                f' {fractal.tui.theme.SEP} {fractal.tui.theme.DOWN} log'
+                f' {fractal.tui.theme.SEP} esc back[/]'
             )
         if self.app.mode == 'node' and self.zone == 'rows':
             return (
-                f'[{theme.DIM}]{theme.UP}{theme.DOWN} select {theme.SEP}'
-                f' {theme.RET} open in runs'
-                f' {theme.SEP} t subtree {theme.SEP} esc back[/]'
+                f'[{fractal.tui.theme.DIM}]{fractal.tui.theme.UP}'
+                f'{fractal.tui.theme.DOWN} select {fractal.tui.theme.SEP}'
+                f' {fractal.tui.theme.RET} open in runs'
+                f' {fractal.tui.theme.SEP} t subtree'
+                f' {fractal.tui.theme.SEP} esc back[/]'
             )
         return (
-            f'[{theme.DIM}]{theme.UP}{theme.DOWN} select {theme.SEP}'
-            f' {theme.RIGHT}/{theme.RET} expand'
-            f' {theme.SEP} {theme.LEFT} collapse {theme.SEP} {theme.DOWN} event log'
-            f' {theme.SEP} esc[/]'
+            f'[{fractal.tui.theme.DIM}]{fractal.tui.theme.UP}'
+            f'{fractal.tui.theme.DOWN} select {fractal.tui.theme.SEP}'
+            f' {fractal.tui.theme.RIGHT}/{fractal.tui.theme.RET} expand'
+            f' {fractal.tui.theme.SEP} {fractal.tui.theme.LEFT} collapse'
+            f' {fractal.tui.theme.SEP} {fractal.tui.theme.DOWN} event log'
+            f' {fractal.tui.theme.SEP} esc back[/]'
         )
 
     def _ex_rows(self: NodePane, snap: Snapshot) -> list[tuple]:
@@ -504,29 +572,40 @@ class NodePane:
         entry = self._ex_entry(snap, ref)
         level = len(ref) - 1
         if level < 2:
-            caret = theme.CARET_OPEN if ref in self.ex_expanded else theme.CARET_CLOSED
+            if ref in self.ex_expanded:
+                caret = fractal.tui.theme.CARET_OPEN
+            else:
+                caret = fractal.tui.theme.CARET_CLOSED
             marker = f'{caret} '
         else:
             marker = '  '
-        # a status dot leads the label; session · dur · cost columns follow,
+        # a status dot leads the label; session / dur / cost columns follow,
         # built markup-safe via fmt.cell/row so the dot never drifts alignment
-        label = (
-            f'{"  " * level}{marker}'
-            f'{fmt.dot(entry.get("status") or "")} {entry["label"]}'
+        indent = '  ' * level
+        dot = fractal.tui.fmt.dot(entry.get('status') or '')
+        text = fractal.tui.fmt.esc(entry['label'])
+        label = f'{indent}{marker}{dot} {text}'
+        duration = (
+            fractal.tui.fmt.dur(entry['duration']) if entry.get('duration') else ''
         )
-        duration = fmt.dur(entry['duration']) if entry.get('duration') else ''
+        session = fractal.tui.fmt.esc(entry.get('session') or '-')
+        cost = entry.get('cost') or ''
         return Static(
-            fmt.row(
-                fmt.cell(label, snap.geometry.label_w),
-                fmt.cell(
-                    f'[{theme.DIM}]{entry.get("session") or "-"}[/]',
-                    theme.SESS_W,
+            fractal.tui.fmt.row(
+                fractal.tui.fmt.cell(label, snap.geometry.label_w),
+                fractal.tui.fmt.cell(
+                    markup=f'[{fractal.tui.theme.DIM}]{session}[/]',
+                    width=fractal.tui.theme.SESS_W,
                 ),
-                fmt.cell(f'[{theme.DIM}]{duration}[/]', theme.DUR_W, 'right'),
-                fmt.cell(
-                    f'[{theme.DIM}]{entry.get("cost") or ""}[/]',
-                    theme.COST_W,
-                    'right',
+                fractal.tui.fmt.cell(
+                    markup=f'[{fractal.tui.theme.DIM}]{duration}[/]',
+                    width=snap.geometry.ev_dur_w,
+                    justify='right',
+                ),
+                fractal.tui.fmt.cell(
+                    markup=f'[{fractal.tui.theme.DIM}]{cost}[/]',
+                    width=snap.geometry.ev_cost_w,
+                    justify='right',
                 ),
             ),
             classes='exrow',
@@ -534,11 +613,47 @@ class NodePane:
 
     def _ex_cols(self: NodePane, snap: Snapshot) -> Text:
         """Render the explorer column header (aligned with the rows)."""
-        return fmt.row(
-            fmt.cell('', snap.geometry.label_w),
-            fmt.cell(f'[{theme.DIM}]session[/]', theme.SESS_W),
-            fmt.cell(f'[{theme.DIM}]time[/]', theme.DUR_W, 'right'),
-            fmt.cell(f'[{theme.DIM}]cost[/]', theme.COST_W, 'right'),
+        return fractal.tui.fmt.row(
+            fractal.tui.fmt.cell('', snap.geometry.label_w),
+            fractal.tui.fmt.cell(
+                markup=f'[{fractal.tui.theme.DIM}]session[/]',
+                width=fractal.tui.theme.SESS_W,
+            ),
+            fractal.tui.fmt.cell(
+                markup=f'[{fractal.tui.theme.DIM}]elapsed[/]',
+                width=snap.geometry.ev_dur_w,
+                justify='right',
+            ),
+            fractal.tui.fmt.cell(
+                markup=f'[{fractal.tui.theme.DIM}]cost[/]',
+                width=snap.geometry.ev_cost_w,
+                justify='right',
+            ),
+        )
+
+    def _ev_cols(self: NodePane, snap: Snapshot) -> Text:
+        """Render the activity column header (aligned with the rows)."""
+        g = snap.geometry
+        return fractal.tui.fmt.row(
+            fractal.tui.fmt.cell(
+                markup=f'[{fractal.tui.theme.DIM}]time[/]',
+                width=fractal.tui.theme.TIME_W,
+            ),
+            fractal.tui.fmt.cell(f'[{fractal.tui.theme.DIM}]node[/]', g.ev_node_w),
+            fractal.tui.fmt.cell(f'[{fractal.tui.theme.DIM}]run[/]', g.ev_run_w),
+            fractal.tui.fmt.cell(f'[{fractal.tui.theme.DIM}]iter[/]', g.ev_iter_w),
+            fractal.tui.fmt.cell(f'[{fractal.tui.theme.DIM}]step[/]', g.ev_step_w),
+            fractal.tui.fmt.cell(f'[{fractal.tui.theme.DIM}]event[/]', g.desc_w),
+            fractal.tui.fmt.cell(
+                markup=f'[{fractal.tui.theme.DIM}]elapsed[/]',
+                width=g.ev_dur_w,
+                justify='right',
+            ),
+            fractal.tui.fmt.cell(
+                markup=f'[{fractal.tui.theme.DIM}]cost[/]',
+                width=g.ev_cost_w,
+                justify='right',
+            ),
         )
 
     def _ex_rebuild(self: NodePane, snap: Snapshot) -> None:
@@ -569,12 +684,14 @@ class NodePane:
         """Pick the event's past-tense word.
 
         Entities read ``started`` or their end status; node events read the
-        past tense of the event name (spawn -> spawned).
+        past tense of the event name (spawn -> spawned). A NULL ``event_id``
+        marks the view-synthesized entity-start rows -- a real ``start``
+        event renders as an ordinary node event.
         """
-        if event['event'] == 'start':
+        if event['event'] == 'start' and event['event_id'] is None:
             return 'started'
         if event['kind'] == 'node':
-            return fmt.NODE_VERB.get(event['event'], event['event'])
+            return fractal.tui.fmt.NODE_VERB.get(event['event'], event['event'])
         return event['status']
 
     def _ev_color(self: NodePane, event: dict) -> str:
@@ -582,28 +699,34 @@ class NodePane:
 
         One rule: a status word takes its status color, every other verb
         (starts, node events) is muted -- the node column carries the ink.
+        Sync passes are routine chrome and stay muted throughout.
         """
         if event['event'] == 'start' or event['kind'] == 'node':
-            return theme.DIM
-        _, color = fmt.status_style(event['status'])
+            return fractal.tui.theme.DIM
+        if event['kind'] == 'step' and event['name'] == 'SYNC':
+            return fractal.tui.theme.DIM
+        _, color = fractal.tui.fmt.status_style(event['status'])
         return color
 
     def _ev_desc(self: NodePane, event: dict) -> str:
         """Render the desc cell: step name + colored verb + metadata.
 
         The cell truncates to the desc width, so the metadata tail is what
-        loses chars to the ``…``.
+        loses chars to the ellipsis.
         """
         verb = f'[{self._ev_color(event)}]{self._ev_verb(event)}[/]'
         if event['kind'] == 'step' and event['name'] == 'SYNC':
-            verb = f'sync {verb}'
+            verb = f'[{fractal.tui.theme.DIM}]sync[/] {verb}'
         elif event['kind'] == 'step' and event['name']:
-            verb = f'{event["name"]} {verb}'
+            name = fractal.tui.fmt.esc(event['name'])
+            verb = f'{name} {verb}'
         meta = event.get('metadata') or ''
-        if event['event'] == 'start':
+        # entity-start rows only (NULL event_id) -- a start *event* keeps its
+        # metadata (the continue marker)
+        if event['event'] == 'start' and event['event_id'] is None:
             meta = ''
         if meta:
-            return f'{verb} [{theme.DIM}]{meta}[/]'
+            return f'{verb} [{fractal.tui.theme.DIM}]{fractal.tui.fmt.esc(meta)}[/]'
         return verb
 
     def _ev_line(
@@ -614,58 +737,98 @@ class NodePane:
         expanded: bool = False,
     ) -> Union[Text, Table]:
         """Render one activity row; ``expanded`` unfolds it to full text."""
-        duration = fmt.dur(event['duration']) if event['duration'] else ''
-        cost = fmt.money(event['cost']) if event['cost'] is not None else ''
-        # time · node · run · iter · step · desc · dur · cost -- every column
+        duration = fractal.tui.fmt.dur(event['duration']) if event['duration'] else ''
+        cost = fractal.tui.fmt.money(event['cost']) if event['cost'] is not None else ''
+        # time / node / run / iter / step / desc / dur / cost -- every column
         # sized to its longest value (the geometry), two columns of air
-        # between; absent lineage renders as empty cells, and a sync pass
-        # leaves the step cell empty
-        clock = fmt.clock(event['created_at'], self.app.tz)
-        run = f'run {event["run_n"]}' if event['run_n'] else ''
-        it = f'iter {event["iter_n"]}' if event['iter_n'] else ''
-        step = f'step {event["step_n"]}' if event['step_n'] else ''
+        # between; lineage cells carry bare ordinals (the header row names
+        # the columns), absent lineage renders empty, and a sync pass leaves
+        # the step cell empty
+        clock = fractal.tui.fmt.clock(event['created_at'], self.app.tz)
+        run = str(event['run_n']) if event['run_n'] else ''
+        it = str(event['iter_n']) if event['iter_n'] else ''
+        step = str(event['step_n']) if event['step_n'] else ''
         tag = user_tag(event['branch'], self.app.data.root_branch)
         node_name = leaf_of(event['branch']) + tag
         g = snap.geometry
         if expanded:
             # the selected row unfolds: the lineage columns drop out (the
             # full branch takes their span) and the full metadata folds
-            span = g.ev_node_w + g.ev_run_w + g.ev_iter_w + g.ev_step_w + 3 * theme.GAP
+            span = (
+                g.ev_node_w
+                + g.ev_run_w
+                + g.ev_iter_w
+                + g.ev_step_w
+                + 3 * fractal.tui.theme.GAP
+            )
             desc_w = g.desc_w
             # fixed columns (no expand): the grid must end where the folded
             # rows do, not stretch into the pane's breathing column
             grid = Table.grid()
-            grid.add_column(width=theme.TIME_W)
-            grid.add_column(width=theme.GAP)
+            grid.add_column(width=fractal.tui.theme.TIME_W)
+            grid.add_column(width=fractal.tui.theme.GAP)
             grid.add_column(width=span, overflow='fold')
-            grid.add_column(width=theme.GAP)
+            grid.add_column(width=fractal.tui.theme.GAP)
             grid.add_column(width=desc_w, overflow='fold')
-            grid.add_column(width=theme.GAP)
+            grid.add_column(width=fractal.tui.theme.GAP)
             grid.add_column(justify='right', width=g.ev_dur_w)
-            grid.add_column(width=theme.GAP)
+            grid.add_column(width=fractal.tui.theme.GAP)
             grid.add_column(justify='right', width=g.ev_cost_w)
+            branch_name = event['branch'] + tag
             grid.add_row(
-                Text.from_markup(f'[{theme.DIM}]{clock}[/]'),
+                Text.from_markup(f'[{fractal.tui.theme.DIM}]{clock}[/]'),
                 Text(),
-                Text.from_markup(f'[{theme.INK}]{event["branch"] + tag}[/]'),
+                Text.from_markup(f'[{fractal.tui.theme.INK}]{branch_name}[/]'),
                 Text(),
                 _fill(Text.from_markup(self._ev_desc(event)), desc_w),
                 Text(),
-                Text.from_markup(f'[{theme.DIM}]{duration}[/]'),
+                Text.from_markup(f'[{fractal.tui.theme.DIM}]{duration}[/]'),
                 Text(),
-                Text.from_markup(f'[{theme.DIM}]{cost}[/]'),
+                Text.from_markup(f'[{fractal.tui.theme.DIM}]{cost}[/]'),
             )
             return grid
-        return fmt.row(
-            fmt.cell(f'[{theme.DIM}]{clock}[/]', theme.TIME_W),
-            fmt.cell(f'[{theme.INK}]{node_name}[/]', g.ev_node_w),
-            fmt.cell(f'[{theme.DIM}]{run}[/]', g.ev_run_w),
-            fmt.cell(f'[{theme.DIM}]{it}[/]', g.ev_iter_w),
-            fmt.cell(f'[{theme.DIM}]{step}[/]', g.ev_step_w),
-            fmt.cell(self._ev_desc(event), g.desc_w),
-            fmt.cell(f'[{theme.DIM}]{duration}[/]', g.ev_dur_w, 'right'),
-            fmt.cell(f'[{theme.DIM}]{cost}[/]', g.ev_cost_w, 'right'),
+        return fractal.tui.fmt.row(
+            fractal.tui.fmt.cell(
+                markup=f'[{fractal.tui.theme.DIM}]{clock}[/]',
+                width=fractal.tui.theme.TIME_W,
+            ),
+            fractal.tui.fmt.cell(
+                markup=f'[{fractal.tui.theme.INK}]{node_name}[/]',
+                width=g.ev_node_w,
+            ),
+            fractal.tui.fmt.cell(f'[{fractal.tui.theme.DIM}]{run}[/]', g.ev_run_w),
+            fractal.tui.fmt.cell(f'[{fractal.tui.theme.DIM}]{it}[/]', g.ev_iter_w),
+            fractal.tui.fmt.cell(f'[{fractal.tui.theme.DIM}]{step}[/]', g.ev_step_w),
+            fractal.tui.fmt.cell(self._ev_desc(event), g.desc_w),
+            fractal.tui.fmt.cell(
+                markup=f'[{fractal.tui.theme.DIM}]{duration}[/]',
+                width=g.ev_dur_w,
+                justify='right',
+            ),
+            fractal.tui.fmt.cell(
+                markup=f'[{fractal.tui.theme.DIM}]{cost}[/]',
+                width=g.ev_cost_w,
+                justify='right',
+            ),
         )
+
+    def set_log_hover(self: NodePane, hover: bool) -> None:
+        """Track the log-scope toggle's mouse hover state."""
+        self.log_hover = hover
+        self.paint_log_scope()
+
+    def toggle_log_scope(self: NodePane) -> None:
+        """Flip the activity log between the node and its descendants."""
+        self.sub_log = not self.sub_log
+        self.ev_sel = 0
+        self.app.refresh_log()
+
+    def paint_log_scope(self: NodePane) -> None:
+        """Repaint the log-scope toggle (lit on hover or as the active zone)."""
+        lit = self.log_hover or (self.app.mode == 'node' and self.zone == 'scope')
+        active = 'descendants' if self.sub_log else 'node'
+        markup = fractal.tui.fmt.toggle(('node', 'descendants'), active, lit)
+        self.app.query_one('#nodelogscope', LogScopeToggle).update(markup)
 
     def _ev_rebuild(self: NodePane, snap: Snapshot) -> None:
         """Re-mount the activity rows.
@@ -673,25 +836,28 @@ class NodePane:
         A centered date row closes each day's group (newest first, so
         everything above a date row happened on that date).
         """
+        self.paint_log_scope()
+        self.app.query_one('#nodeevcols', Static).update(self._ev_cols(snap))
         widgets: list[Static] = []
         for index, event in enumerate(snap.log):
             widgets.append(Static(self._ev_line(snap, event), classes='evrow'))
-            date = fmt.timestamp(event['created_at'], self.app.tz).split(' ')[0]
+            stamp = fractal.tui.fmt.timestamp(event['created_at'], self.app.tz)
+            date = stamp.split(' ')[0]
             following = snap.log[index + 1] if index + 1 < len(snap.log) else None
-            next_date = (
-                fmt.timestamp(following['created_at'], self.app.tz).split(' ')[0]
-                if following
-                else None
-            )
+            next_date = None
+            if following:
+                stamp = fractal.tui.fmt.timestamp(following['created_at'], self.app.tz)
+                next_date = stamp.split(' ')[0]
             if date != next_date:
                 # a centered date flanked by rules, spanning the row
-                inner = snap.geometry.node_width - theme.NODE_CHROME
+                inner = snap.geometry.node_width - fractal.tui.theme.NODE_CHROME
                 side = max(0, inner - len(date) - 2)
                 left = side // 2
                 marker = (
-                    f'[{theme.RULE}]{theme.LINE * left}[/]'
-                    f'[{theme.CHROME}] {date} [/]'
-                    f'[{theme.RULE}]{theme.LINE * (side - left)}[/]'
+                    f'[{fractal.tui.theme.RULE}]{fractal.tui.theme.LINE * left}[/]'
+                    f'[{fractal.tui.theme.CHROME}] {date} [/]'
+                    f'[{fractal.tui.theme.RULE}]'
+                    f'{fractal.tui.theme.LINE * (side - left)}[/]'
                 )
                 widgets.append(Static(marker, classes='evdate'))
         box = self.app.query_one('#nodeevents', PaneScroll)
@@ -716,6 +882,40 @@ class NodePane:
                 # settles, or the view jumps while the highlight sits still
                 self.app.call_after_refresh(widget.scroll_visible, animate=False)
 
+    def click_row(self: NodePane, row: Widget) -> bool:
+        """Move the zone cursor to the clicked row; a re-click activates.
+
+        The first click lands the cursor, like arrowing there; a click on
+        the already-highlighted row acts like ``enter`` (fold/fork an explorer row,
+        reveal a log row's entity above).
+
+        Returns:
+            Whether ``row`` is a selectable explorer or event row.
+
+        """
+        exrows = list(self.app.query('#nodeexplore .exrow'))
+        evrows = list(self.app.query('#nodeevents .evrow'))
+        snap = self.app.snapshot
+        if row in exrows:
+            index = exrows.index(row)
+            if self.app.mode == 'node' and self.zone == 'mid' and self.ex_sel == index:
+                self._ex_activate(snap)
+                return True
+            self.zone = 'mid'
+            self.ex_sel = index
+        elif row in evrows:
+            index = evrows.index(row)
+            if self.app.mode == 'node' and self.zone == 'rows' and self.ev_sel == index:
+                self._open_event(snap)
+                return True
+            self.zone = 'rows'
+            self.ev_sel = index
+        else:
+            return False
+        self.app.mode = 'node'
+        self.paint_zone()
+        return True
+
     def enter(self: NodePane) -> None:
         """Enter the pane: land on the runs tree."""
         self.app.mode = 'node'
@@ -728,17 +928,21 @@ class NodePane:
         """Return to ring mode."""
         self.app.mode = 'ring'
         self.paint_zone()
-        self.app._apply()
+        self.app.paint_ring()
 
     def paint_zone(self: NodePane) -> None:
-        """Paint the zone tints, the zone-aware foot, and the highlights."""
-        focused = self.app.mode == 'node' and self.zone == 'rows'
-        self.app.query_one('#nodeevents').set_class(focused, 'zonefocus')
+        """Paint the card tint, the zone-aware foot, and the row highlights."""
         top = self.app.mode == 'node' and self.zone == 'top'
         self.app.query_one('#nodecard').set_class(top, 'zonefocus')
         self.app.query_one('#nodefoot', Static).update(self._foot())
+        self.paint_log_scope()
         self._ex_paint()
         self._ev_paint()
+
+    def _goto_scope(self: NodePane) -> None:
+        """Land on the log-scope toggle between the runs and the log."""
+        self.zone = 'scope'
+        self.paint_zone()
 
     def _goto_rows(self: NodePane) -> None:
         """Leave the runs tree for the event log's row cursor."""
@@ -774,6 +978,21 @@ class NodePane:
                 return
             event.stop()
             return
+        # scope zone: the node/descendants toggle over the activity log
+        if self.zone == 'scope':
+            if key == 'escape':
+                self.leave()
+            elif key == 'up':
+                self._goto_mid(at_end=True)
+            elif key == 'down':
+                if snap.log:
+                    self._goto_rows()
+            elif key in ('left', 'right', 'enter', 't'):
+                self.toggle_log_scope()
+            else:
+                return
+            event.stop()
+            return
         # log rows: a selection cursor over the activity timeline (the view
         # scrolls only when the cursor crosses the viewport edge); enter jumps the
         # explorer (and the card) to the row's run/iter/step
@@ -782,7 +1001,7 @@ class NodePane:
                 self.leave()
             elif key == 'up':
                 if self.ev_sel <= 0:
-                    self._goto_mid(at_end=True)
+                    self._goto_scope()
                 else:
                     self.ev_sel -= 1
                     self._ev_paint()
@@ -793,9 +1012,7 @@ class NodePane:
                 self._open_event(snap)
             elif key == 't':
                 # toggle the subtree log (descendants merged into the timeline)
-                self.sub_log = not self.sub_log
-                self.ev_sel = 0
-                self.app.refresh_log()
+                self.toggle_log_scope()
             else:
                 return
             event.stop()
@@ -808,8 +1025,8 @@ class NodePane:
             elif key == 'up':
                 self.zone = 'top'
                 self.paint_zone()
-            elif key == 'down' and snap.log:
-                self._goto_rows()
+            elif key == 'down':
+                self._goto_scope()
             else:
                 return
             event.stop()
@@ -826,8 +1043,7 @@ class NodePane:
                 self._ex_paint()
         elif key == 'down':
             if self.ex_sel >= len(rows) - 1:
-                if snap.log:
-                    self._goto_rows()  # past the last row -> the log cursor
+                self._goto_scope()  # past the last row -> the log-scope toggle
             else:
                 self.ex_sel += 1
                 self._ex_paint()
@@ -838,16 +1054,24 @@ class NodePane:
             self.ex_expanded.discard(ref)
             self._ex_rebuild(snap)
         elif key == 'enter':
-            if len(ref) < 3:
-                self.ex_expanded.symmetric_difference_update({ref})
-                self._ex_rebuild(snap)
-            else:
-                # enter on a step: fork-chat its session in the compose pane
-                self.app.fork_session(self._ex_entry(snap, ref))
-                self._ex_paint()
+            self._ex_activate(snap)
         else:
             return
         event.stop()
+
+    def _ex_activate(self: NodePane, snap: Snapshot) -> None:
+        """Activate the selected explorer row: fold a run/iter, fork a step."""
+        rows = self._ex_rows(snap)
+        if not rows:
+            return
+        ref = rows[min(self.ex_sel, len(rows) - 1)]
+        if len(ref) < 3:
+            self.ex_expanded.symmetric_difference_update({ref})
+            self._ex_rebuild(snap)
+        else:
+            # enter on a step: fork-chat its session in the compose pane
+            self.app.fork_session(self._ex_entry(snap, ref))
+            self._ex_paint()
 
     def _open_event(self: NodePane, snap: Snapshot) -> None:
         """Jump the explorer (and the card) to the event's entity.
@@ -876,7 +1100,7 @@ class NodePane:
 def _figure(value: Any, cap: Any, fmt_fn: Any) -> tuple[str, str]:
     """Build a measures figure: its markup and its plain form (for sizing)."""
     ceiling = fmt_fn(cap) if cap else '-'
-    markup = f'{fmt_fn(value)}[{theme.DIM}]/{ceiling}[/]'
+    markup = f'{fmt_fn(value)}[{fractal.tui.theme.DIM}]/{ceiling}[/]'
     plain = f'{fmt_fn(value)}/{ceiling}'
     return markup, plain
 

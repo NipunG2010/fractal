@@ -2,40 +2,41 @@
 
 The loop records why a run ended (``runs.metadata``) and posts a notice
 to the node's own outbox at the run-end recording point, keyed on the
-exact status/reason just recorded (never re-derived) -- every abnormal
-end is legible from the parent's feed, and clean ends stay quiet.
+status just recorded and the recorded reason's stem -- the notice's
+only figure is a fresh final spend read, while the full trip-time
+reason stays on the run row -- so every abnormal end is legible from
+the parent's feed, and clean ends stay quiet.
 
-``_run.sh``'s exit paths are unreachable except through the loop and the
-script cannot be sourced (interleaved module-scope git/config/validation
-that ``exit``s), so this drives the real ``_run.sh`` as a subprocess
-against a real node with a **stubbed ``claude``** -- the smallest
-hermetic harness. The stub emits a ``stream-json`` ``result`` event
-carrying a fixed cost so ``fractal _stream`` records each step's spend,
+The loop's exit paths are observable only through a real launch, so
+this drives the real ``fractal node _loop`` as a subprocess against a
+real node with a **stubbed ``claude``** -- the smallest hermetic
+harness. The stub emits a ``stream-json`` ``result`` event carrying a
+fixed cost so the loop's stream driver records each step's spend,
 exactly as a real run would.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import os
 import shutil
+from typing import Optional
 
 import pytest
 
 from tests._helpers import _git
 
-from .conftest import _cli_env, _run, _run_reaped, _worktree_root
+from .conftest import _cli_env, _loop_cmd, _run, _run_reaped
 
 __all__ = [
     'test_abnormal_end_posts_outbox_notice',
     'test_clean_end_posts_no_notice',
 ]
 
-# the loop machinery runs from the package, not a per-node copy -- invoke the dev
-# _run.sh directly (it resolves _agent.sh/_commit.sh/modes from the package)
-_LOOP = _worktree_root() / 'fractal' / '_node' / 'scripts' / '_run.sh'
 
 # fake claude on PATH: capture the -p prompt per invocation, then emit a
-# stream-json result carrying $STUB_COST so fractal _stream records the cost
+# stream-json result carrying $STUB_COST so the loop records the cost
 _CLAUDE_STUB = """#!/usr/bin/env bash
 # test stub for claude: capture the -p prompt to a per-call file and emit a
 # stream-json result event so the loop records this step's cost
@@ -53,7 +54,7 @@ done
 PROMPT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -p) PROMPT="${2:-}"; shift 2 ;;
+        --) PROMPT="${2:-}"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -61,6 +62,10 @@ done
 N=$(( $(cat "$CAPTURE_DIR/counter" 2>/dev/null || echo 0) + 1 ))
 echo "$N" > "$CAPTURE_DIR/counter"
 printf '%s' "$PROMPT" > "$CAPTURE_DIR/prompt_$N.txt"
+
+# an injected per-step delay makes wall-clock cases deterministic (the loop
+# itself is too fast to overrun a timeout on its own overhead)
+sleep "${STUB_SLEEP:-0}"
 
 [[ -n "$SID" ]] || SID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 printf '{"type":"system","subtype":"init","session_id":"%s"}\\n' "$SID"
@@ -74,7 +79,7 @@ STUB_COST = 0.10
 
 @pytest.fixture
 def node_env(tmp_path_factory: pytest.TempPathFactory) -> dict:
-    """A fresh worker node wired for one deterministic loop launch.
+    """Return a fresh worker node wired for one deterministic loop launch.
 
     Function-scoped so each case starts with an empty database -- the run and
     message tables must reflect only this case's launch. Builds ``fractal
@@ -120,7 +125,7 @@ def node_env(tmp_path_factory: pytest.TempPathFactory) -> dict:
         step.unlink()
     (steps_dir / '01-alpha.md').write_text('# Alpha\n\nFirst step.\n', encoding='utf-8')
     (steps_dir / '02-beta.md').write_text('# Beta\n\nSecond step.\n', encoding='utf-8')
-    # the loop runs from the package (see _LOOP), not a per-node copy
+    # the loop runs from the package (see _loop_cmd), not a per-node copy
     # stub claude on a private bindir
     bindir = root / 'bin'
     bindir.mkdir()
@@ -134,21 +139,24 @@ def node_env(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 @pytest.mark.parametrize(
-    ('config', 'reason'),
-    [
+    argnames=('config', 'reason', 'stub_env'),
+    argvalues=[
         # budget abort: $0.20 spend >= the $0.15 cap (neither step alone trips the
         # mid-iteration ceiling, so both run); the reserve boundary ends the run
         pytest.param(
             {'max_cost': '0.15'},
             'cost budget reserve reached',
+            {},
             id='budget',
         ),
-        # run timeout: iteration 1's loop overhead alone overruns the 1s wall,
-        # so the boundary check stops the run before iteration 2 (max_iters=2
-        # keeps the max-iters break from firing first)
+        # run timeout: the stub sleeps 0.6s per step, so iteration 1
+        # (two steps) overruns the 1s wall and the boundary check
+        # stops the run before iteration 2 (max_iters=2 keeps the
+        # max-iters break from firing first)
         pytest.param(
             {'max_iters': '2', 'timeout': '1s'},
             'Timed out at iteration',
+            {'STUB_SLEEP': '0.6'},
             id='timeout',
         ),
     ],
@@ -157,31 +165,55 @@ def test_abnormal_end_posts_outbox_notice(
     node_env: dict,
     config: dict[str, str],
     reason: str,
+    stub_env: dict[str, str],
 ) -> None:
     """An abnormal run end posts an outbox notice naming the recorded reason.
 
-    The notice must carry the exact reason the run row recorded (never a
-    locally re-derived cause), so both are pinned -- plus the spend
-    figures when a cost cap tripped.
+    The notice must carry the recorded reason's stem, so both are pinned
+    -- plus a fresh final spend read when a cost cap is armed, the
+    notice's only figure (the frozen trip-time figures stay on the run
+    row). The activity feed's start rows keep their launch snapshot: the
+    abnormal outcome never bleeds into them.
     """
     worktree = node_env['worktree']
     for key, value in config.items():
         assert _run(worktree, 'config', '_set', f'{key}={value}').returncode == 0
     _git(worktree, 'add', '-A')
     _git(worktree, 'commit', '-m', 'setup exit-notice node')
-    _run_loop(node_env, capture_name='run1')
+    _run_loop(node_env, capture_name='run1', stub_env=stub_env)
     # the run row records the abnormal end and its reason
     activity = _run(worktree, 'node', 'activity').stdout
     assert 'exited' in activity
     assert reason in activity
-    # the notice reached the node's own outbox, naming the recorded reason
+    # start rows snapshot the launch across all three levels: 'active'
+    # status everywhere, with no metadata on the iter/step start rows
+    # (the run-start row's metadata belongs to the run's own arming)
+    csv_out = _run(worktree, 'node', 'activity', '--csv').stdout
+    starts = [
+        row
+        for row in csv.DictReader(io.StringIO(csv_out))
+        if row['event'] == 'start' and not row['event_id']
+    ]
+    run_starts = [row for row in starts if not row['iter_id']]
+    iter_starts = [row for row in starts if row['iter_id'] and not row['step_id']]
+    step_starts = [row for row in starts if row['step_id']]
+    assert run_starts
+    assert iter_starts
+    assert step_starts
+    assert all(row['status'] == 'active' for row in starts)
+    assert all(row['metadata'] == '' for row in iter_starts + step_starts)
+    # the notice reached the node's own outbox, naming the recorded
+    # reason's stem -- never the frozen trip-time parenthetical, whose
+    # figures stay on the run row (the fresh read is the notice's only one)
     sent = _run(worktree, 'radio', 'sent').stdout
     rows = [line for line in sent.splitlines() if ',outbox,' in line]
     assert len(rows) == 1, f'expected one outbox notice, got:\n{sent}'
     assert reason in rows[0]
-    # a tripped cost cap reports the figures alongside the reason
+    assert '(spent $' not in rows[0]
+    # a cost-capped node reports the fresh spend figures alongside the stem
     if 'max_cost' in config:
-        assert f'${config["max_cost"]}' in rows[0]
+        max_cost = config['max_cost']
+        assert f'${max_cost}' in rows[0]
 
 
 def test_clean_end_posts_no_notice(node_env: dict) -> None:
@@ -199,11 +231,17 @@ def test_clean_end_posts_no_notice(node_env: dict) -> None:
 # ------ helpers
 
 
-def _run_loop(node_env: dict, *, capture_name: str) -> None:
+def _run_loop(
+    node_env: dict,
+    *,
+    capture_name: str,
+    stub_env: Optional[dict[str, str]] = None,
+) -> None:
     """Run one loop launch to completion with the stub ``claude`` on ``PATH``.
 
-    Runs the real ``_run.sh`` with a fresh capture dir. The captured prompts
+    Runs the real loop entry with a fresh capture dir. The captured prompts
     go unused here -- the capture dir exists because the stub requires it.
+    ``stub_env`` adds case-specific stub knobs (e.g. ``STUB_SLEEP``).
     """
     root = node_env['root']
     worktree = node_env['worktree']
@@ -214,10 +252,16 @@ def _run_loop(node_env: dict, *, capture_name: str) -> None:
     capture.mkdir()
     # run the loop directly (no tmux): stub claude shadows PATH, the loop's own
     # fractal calls resolve to this worktree (PYTHONPATH via _cli_env)
-    env = _cli_env(CAPTURE_DIR=f'{capture}', STUB_COST=str(STUB_COST))
-    env['PATH'] = f'{node_env["bindir"]}{os.pathsep}{env["PATH"]}'
+    env = _cli_env(
+        CAPTURE_DIR=f'{capture}',
+        STUB_COST=str(STUB_COST),
+        **(stub_env or {}),
+    )
+    bindir = node_env['bindir']
+    path = env['PATH']
+    env['PATH'] = f'{bindir}{os.pathsep}{path}'
     result = _run_reaped(
-        ['bash', f'{_LOOP}', f'{worktree}'],
+        _loop_cmd(worktree),
         cwd=f'{worktree}',
         env=env,
         timeout=180,

@@ -7,6 +7,7 @@ throwaway repo with ``git check-ignore``, hermetic from any host excludes.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import re
@@ -16,10 +17,15 @@ import tomllib
 
 from packaging.specifiers import SpecifierSet
 
+import fractal
+
 __all__ = [
-    'test_ci_python_version_is_latest_supported',
-    'test_gitignore_packaging_ignores_bind_at_root_only',
     'test_gitignore_spares_node_artifact_names',
+    'test_gitignore_packaging_ignores_bind_at_root_only',
+    'test_ci_python_version_is_latest_supported',
+    'test_seeded_skills_do_not_deny_wiki_walk_up',
+    'test_seeded_skills_do_not_call_stale_links_non_blocking',
+    'test_version_strings_agree',
 ]
 
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
@@ -142,3 +148,87 @@ def test_ci_python_version_is_latest_supported() -> None:
         f'.python-version {pinned!r} != latest supported 3.{latest} '
         '(CI must exercise the newest interpreter requires-python claims)'
     )
+
+
+def test_seeded_skills_do_not_deny_wiki_walk_up() -> None:
+    """Seeded skill docs must not deny the wiki CLI's walk-up resolution.
+
+    A bare wiki command resolves the enclosing wiki by walking up from
+    the cwd, else ``{cwd}/wiki`` -- from a node's cwd the project wiki at
+    best and never memory, which is why the seeded wiki skill demands an
+    explicit ``--path``. A doc claiming the CLI "does not walk up"
+    misstates that mechanism and hides the wrong-wiki hazard, and ships
+    verbatim to every new node.
+    """
+    skills = sorted((_REPO_ROOT / 'fractal' / '_node' / 'skills').rglob('*.md'))
+    assert skills, 'no seeded skill files found'
+    for skill in skills:
+        text = skill.read_text(encoding='utf-8')
+        assert 'does not walk up' not in text, (
+            f'{skill.relative_to(_REPO_ROOT)} denies the wiki CLI walk-up; '
+            'bare commands do walk up -- name the real mechanism instead'
+        )
+
+
+def test_seeded_skills_do_not_call_stale_links_non_blocking() -> None:
+    """Seeded skill docs must state stale-link severity in lint's terms.
+
+    ``wiki lint`` reports a stale link in index or page prose as an
+    advisory note (exit 0), while a broken row in the generated index
+    link block stays a hard issue. A doc waving stale links off as
+    "non-blocking" blurs that split -- hiding the one surface that does
+    block -- and ships verbatim to every new node.
+    """
+    skills = sorted((_REPO_ROOT / 'fractal' / '_node' / 'skills').rglob('*.md'))
+    assert skills, 'no seeded skill files found'
+    for skill in skills:
+        text = skill.read_text(encoding='utf-8')
+        assert 'non-blocking' not in text, (
+            f'{skill.relative_to(_REPO_ROOT)} calls stale links non-blocking; '
+            'name the real severity split -- prose stale links are advisory '
+            'notes, broken index link-block rows are hard issues'
+        )
+
+
+def test_version_strings_agree() -> None:
+    """The hand-maintained version literals ship in lockstep.
+
+    ``fractal.__version__`` and the pyproject version are the CI-parsed
+    pair, each plugin manifest repeats the literal for its marketplace
+    listing, and the shim dist carries it three more times -- its own
+    version plus the exact ``plasma-fractal`` pins. The build workflow
+    re-checks all of them at tag time; catching a drift here surfaces it
+    on the PR instead of a failed release.
+    """
+    # the build metadata must carry the package literal
+    pyproject = tomllib.loads(
+        (_REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8')
+    )
+    assert pyproject['project']['version'] == fractal.__version__, (
+        'pyproject.toml [project] version must match fractal.__version__ '
+        '(both are hand-maintained release literals)'
+    )
+    # each plugin manifest repeats the release version for its marketplace
+    for folder in ('.claude-plugin', '.codex-plugin'):
+        manifest = json.loads(
+            (_REPO_ROOT / folder / 'plugin.json').read_text(encoding='utf-8')
+        )
+        assert manifest['version'] == fractal.__version__, (
+            f'{folder}/plugin.json version must match fractal.__version__ '
+            '(plugin releases ship the same literal as the package)'
+        )
+    # the shim bumps in lockstep: its own version and its exact pins
+    manifest = tomllib.loads(
+        (_REPO_ROOT / 'shim' / 'pyproject.toml').read_text(encoding='utf-8')
+    )
+    shim = manifest['project']
+    assert shim['version'] == fractal.__version__, (
+        'shim/pyproject.toml [project] version must match fractal.__version__ '
+        '(the pointer dist releases beside the package)'
+    )
+    shim_pins = shim['dependencies'] + shim['optional-dependencies']['tui']
+    for pin in shim_pins:
+        assert pin.endswith(f'=={fractal.__version__}'), (
+            f'shim pin {pin!r} must pin plasma-fractal=={fractal.__version__} '
+            '(the shim resolves to exactly the release it ships with)'
+        )

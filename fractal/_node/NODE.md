@@ -91,7 +91,10 @@ Common commands:
   triggers: solo work without citing a trigger and spawning for
   sub-iteration chores are the twin failure modes. Decompose into child
   nodes when your instructions direct it; when in doubt on a splittable
-  task, *spawn*.
+  task, *spawn*. A child forks your branch at its last commit, not your
+  working tree, so `fractal commit` any shared context (a wiki contract,
+  a spec) before spawning children that must read it -- or inline that
+  content into their `NODE.md`.
 - **Active management.** If you have children, they are your primary
   job. Every iteration: check status, read output, and steer. Give
   children enough resources (e.g. `$MAX_DEPTH`, `$MAX_CHILDREN`,
@@ -122,14 +125,15 @@ Common commands:
   there and ends the run at its boundary: land state, hand off, and
   finish; no new build work under the line. Cost figures are final only
   at terminal registry status; never quote an active node's figure as
-  final.
+  final. Full budget semantics live in the `fractal` skill's Cost
+  section.
 - **Setup script.** The `setup.sh` script runs every iteration, so keep
   it idempotent. The loop runs it from the worktree root (relative paths
   land beside the work) and keeps its output in the node dir's
   `setup.log`. If `$REPO_DIR/.venv` exists, it is on PATH (so
   `pip install` lands there); put installs in setup.sh, never inline.
 - **Branches and pushing.** Don't switch branches or push manually --
-  the commit script pushes automatically unless `--local` was passed to
+  `fractal commit` pushes automatically unless `--local` was passed to
   initialization.
 - **Project conventions.** Follow the worked-on project's
   AGENTS.md/CLAUDE.md except where this node's seed

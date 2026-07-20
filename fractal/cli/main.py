@@ -21,16 +21,14 @@ def cli(**kwargs: Any) -> None:
     # fractal commands (public)
     cmd.install(app)
     cmd.init(app)
+    cmd.track(app)
+    cmd.untrack(app)
     cmd.commit(app)
     cmd.open(app)
     cmd.pause(app)
     cmd.resume(app)
     cmd.reset(app)
     cmd.destroy(app)
-    # fractal commands (private)
-    cmd.stream(app)
-    cmd.pricing(app)
-    cmd.status(app)
     # node sub-apps (public)
     node_app = typer.Typer(
         name='node',
@@ -67,9 +65,8 @@ def cli(**kwargs: Any) -> None:
     cmd.node_pending(node_app)
     cmd.node_chat(node_app)
     cmd.node_update(node_app)
-    cmd.node_reconcile_caps(node_app)
-    cmd.node_latched(node_app)
-    cmd.node_prompt(node_app)
+    cmd.node_loop(node_app)
+    cmd.node_seed(node_app)
     cmd.time_remaining(time_app)
     cmd.cost_remaining(cost_app)
     cmd.cost_spent(cost_app)
@@ -93,6 +90,7 @@ def cli(**kwargs: Any) -> None:
         **kwargs,
     )
     cmd.radio_send(radio_app)
+    cmd.radio_post(radio_app)
     cmd.radio_unsend(radio_app)
     cmd.radio_save(radio_app)
     cmd.radio_unsave(radio_app)
@@ -143,38 +141,6 @@ def cli(**kwargs: Any) -> None:
     cmd.config_get(config_app)
     cmd.config_set(config_app)
     app.add_typer(config_app, hidden=True)
-    # session sub-app (private)
-    session_app = typer.Typer(
-        name='session',
-        help='Manage per-iteration agent sessions.',
-        **kwargs,
-    )
-    cmd.session_get(session_app)
-    cmd.session_set(session_app)
-    cmd.session_clear(session_app)
-    app.add_typer(session_app, hidden=True)
-    # signal sub-app (private)
-    signal_app = typer.Typer(
-        name='signal',
-        help='Manage inter-node signals.',
-        **kwargs,
-    )
-    cmd.signal_set(signal_app)
-    cmd.signal_get(signal_app)
-    cmd.signal_clear(signal_app)
-    cmd.signal_list(signal_app)
-    app.add_typer(signal_app, hidden=True)
-    # run sub-app (private)
-    run_app = typer.Typer(
-        name='run',
-        help='Track agent runs.',
-        **kwargs,
-    )
-    cmd.run_start(run_app)
-    cmd.run_end(run_app)
-    cmd.run_open(run_app)
-    cmd.run_list(run_app)
-    app.add_typer(run_app, hidden=True)
     # event sub-app (private)
     event_app = typer.Typer(
         name='event',
@@ -185,29 +151,6 @@ def cli(**kwargs: Any) -> None:
     cmd.event_end(event_app)
     cmd.event_list(event_app)
     app.add_typer(event_app, hidden=True)
-    # iter sub-app (private)
-    iter_app = typer.Typer(
-        name='iter',
-        help='Track agent iterations.',
-        **kwargs,
-    )
-    cmd.iter_start(iter_app)
-    cmd.iter_end(iter_app)
-    cmd.iter_list(iter_app)
-    app.add_typer(iter_app, hidden=True)
-    # step sub-app (private)
-    step_app = typer.Typer(
-        name='step',
-        help='Track iteration steps.',
-        **kwargs,
-    )
-    cmd.step_start(step_app)
-    cmd.step_end(step_app)
-    cmd.step_session(step_app)
-    cmd.step_list(step_app)
-    cmd.step_pending(step_app)
-    cmd.step_approved(step_app)
-    app.add_typer(step_app, hidden=True)
     # run app
     app()
 

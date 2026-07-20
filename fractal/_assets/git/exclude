@@ -1,3 +1,7 @@
+# NOTE: the marker-file lines below mirror the loop marker constants in
+#   fractal/constants.py -- retire or add markers in both places in the
+#   same change (the exclude<->markers lockstep)
+
 # Git worktrees
 /.worktrees/
 
@@ -25,28 +29,34 @@
 .agents/
 .claude/
 .codex/
+.grok/
+.opencode/
+.omp/
 
 # Agent stderr
 claude.err
 codex.err
+grok.err
+opencode.err
+omp.err
 
 # Setup log
 setup.log
 
-# Scratch directory
-tmp/
+# Config write lock
+config.json.lock
 
 # Agent session IDs
 .session
 
-# Failure reason marker
-.fail_reason
-
-# Budget exceeded marker
-.budget_exceeded
-
 # Pause abort marker
 .pause_abort
+
+# Scratch directory
+tmp/
+
+# Write-atomic temp files
+.*-*.tmp
 
 # Bytecode
 __pycache__/

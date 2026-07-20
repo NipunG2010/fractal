@@ -4,7 +4,7 @@ Builds a real repository -- ``git init`` + ``fractal init`` + ``Node.init``
 per branch -- then seeds run/iteration/step history, signals, events, and
 radio traffic exclusively through the core APIs, so any core drift breaks the
 fixture loudly. Three devices make every byte deterministic: a frozen core
-clock (:func:`deterministic_core` patches ``_utc_now`` so timestamps are
+clock (:func:`deterministic_core` patches ``utc_now`` so timestamps are
 written correctly the first time), a counting radio-uuid mint, and one generic
 :func:`pin` for the few SQL-DEFAULT columns the clock cannot reach.
 """
@@ -18,13 +18,13 @@ import hashlib
 import os
 import pathlib
 import sqlite3
-import subprocess
 from collections.abc import Iterator
 from typing import Any
 from unittest import mock
 
 from fractal.core.node import Node
 from fractal.core.radio import Radio
+from tests._helpers import _git
 
 __all__ = [
     'REF',
@@ -66,7 +66,7 @@ _CODEX_CONFIG = {'model': 'gpt-5.1', 'max_iters': 10}
 
 
 class Clock:
-    """A settable stand-in for core's ``_utc_now`` (one instant per call site)."""
+    """A settable stand-in for ``utc_now`` (one instant per call site)."""
 
     def __init__(self: Clock) -> None:
         """Initialize at the reference instant."""
@@ -77,7 +77,7 @@ class Clock:
         self._at = REF_DT - dt.timedelta(seconds=seconds_ago)
 
     def __call__(self: Clock) -> str:
-        """Return the current instant in core's ``_utc_now`` format."""
+        """Return the current instant in ``utc_now`` format."""
         return self._at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
 
@@ -91,7 +91,7 @@ def deterministic_core() -> Iterator[Clock]:
         return f'{next(counter):0{2 * nbytes}x}'
 
     with (
-        mock.patch('fractal.core.node._utc_now', clock),
+        mock.patch('fractal.util.time.utc_now', clock),
         mock.patch('fractal.core.radio.secrets.token_hex', mint),
     ):
         yield clock
@@ -187,7 +187,7 @@ def build_tree(root: pathlib.Path) -> None:
             parent_branch, spec = pending.pop(0)
             branch = f'{parent_branch}.{spec.name}'
             config = dict(_CODEX_CONFIG if spec.agent == 'codex' else _CLAUDE_CONFIG)
-            caller = {'_NODE': str(nodes[parent_branch]._node_dir)}
+            caller = {'_NODE': str(nodes[parent_branch].node_dir)}
             with mock.patch.dict(os.environ, caller):
                 user.init(
                     name=spec.name,
@@ -205,7 +205,7 @@ def build_tree(root: pathlib.Path) -> None:
                 _seed_runs(nodes[branch], branch, spec, clock)
             nodes[branch].status_set(spec.status)
             if spec.signal:
-                nodes[branch].signal_set(spec.signal)
+                nodes[branch].record.signal_set(spec.signal)
         _seed_radio(nodes, clock)
 
 
@@ -232,7 +232,7 @@ def _stamp(seconds_ago: float) -> str:
 
 def _central_db(node: Node) -> pathlib.Path:
     """The tree's central database (at the user node; the fixture root is main)."""
-    return node._repo_dir / '.fractal' / 'main' / '.db'
+    return node.repo_dir / '.fractal' / 'main' / '.db'
 
 
 def _pin_setup_events(nodes: dict[str, Node]) -> None:
@@ -245,16 +245,15 @@ def _pin_setup_events(nodes: dict[str, Node]) -> None:
     db_path = _central_db(nodes['main'])
     connection = sqlite3.connect(db_path)
     try:
-        rows = connection.execute(
-            'SELECT event_id FROM events ORDER BY event_id'
-        ).fetchall()
+        cursor = connection.execute('SELECT event_id FROM events ORDER BY event_id')
+        rows = cursor.fetchall()
     finally:
         connection.close()
     for index, (event_id,) in enumerate(rows):
         pin(
-            db_path,
-            'events',
-            {'event_id': event_id},
+            db_path=db_path,
+            table='events',
+            where={'event_id': event_id},
             created_at=_stamp(7200.0 - index),
         )
 
@@ -262,10 +261,9 @@ def _pin_setup_events(nodes: dict[str, Node]) -> None:
 def _git_repo(root: pathlib.Path) -> None:
     """A minimal committed repository (``fractal init`` requires a clean tree)."""
     root.mkdir(parents=True, exist_ok=True)
-    run = ['git', 'init', '-q', '-b', 'main']
-    subprocess.run(run, cwd=root, check=True)
-    subprocess.run(['git', 'config', 'user.email', 'tui@test'], cwd=root, check=True)
-    subprocess.run(['git', 'config', 'user.name', 'tui'], cwd=root, check=True)
+    _git(root, 'init', '-q', '-b', 'main')
+    _git(root, 'config', 'user.email', 'tui@test')
+    _git(root, 'config', 'user.name', 'tui')
     (root / 'README.md').write_text('# cockpit tree\n', encoding='utf-8')
     wiki = root / 'wiki'
     wiki.mkdir()
@@ -273,8 +271,8 @@ def _git_repo(root: pathlib.Path) -> None:
         '---\nname: wiki\n---\n# wiki\n\n***\n',
         encoding='utf-8',
     )
-    subprocess.run(['git', 'add', '-A'], cwd=root, check=True)
-    subprocess.run(['git', 'commit', '-qm', 'init'], cwd=root, check=True)
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-qm', 'init')
 
 
 def _walk(
@@ -298,10 +296,10 @@ def _seed_runs(node: Node, branch: str, spec: NodeSpec, clock: Clock) -> None:
     """
     if spec.status == 'active':
         _seed_run(
-            node,
-            branch,
-            spec,
-            clock,
+            node=node,
+            branch=branch,
+            spec=spec,
+            clock=clock,
             run_number=1,
             iters=1,
             start_ago=7000.0,
@@ -313,10 +311,10 @@ def _seed_runs(node: Node, branch: str, spec: NodeSpec, clock: Clock) -> None:
     status = spec.status
     exit_code = 1 if status in ('exited', 'killed', 'failed') else 0
     _seed_run(
-        node,
-        branch,
-        spec,
-        clock,
+        node=node,
+        branch=branch,
+        spec=spec,
+        clock=clock,
         run_number=1,
         iters=1,
         start_ago=5400.0,
@@ -327,13 +325,13 @@ def _seed_runs(node: Node, branch: str, spec: NodeSpec, clock: Clock) -> None:
     # an SQL DEFAULT the frozen clock cannot reach, so pin it
     event = {'stopped': 'stop', 'killed': 'kill', 'completed': 'finish'}.get(status)
     if event is not None:
-        event_id = node.event_start(event)
+        event_id = node.record.event_start(event)
         if event_id is not None:
-            node.event_end(event_id=event_id, status='completed')
+            node.record.event_end(event_id=event_id, status='completed')
             pin(
-                _central_db(node),
-                'events',
-                {'event_id': event_id},
+                db_path=_central_db(node),
+                table='events',
+                where={'event_id': event_id},
                 created_at=_stamp(3000.0),
             )
 
@@ -352,11 +350,11 @@ def _seed_run(
 ) -> None:
     """Seed one closed run: ``iters`` settled iterations ending in ``status``."""
     clock.at(start_ago)
-    run_id = node.run_start()
+    run_id = node.record.run_start()
     at = start_ago
     for iteration in range(1, iters + 1):
         clock.at(at)
-        iter_id = node.iter_start(run_id=run_id, iter=iteration)
+        iter_id = node.record.iter_start(run_id=run_id, iter=iteration)
         # a settled SYNC pre-step (step=0) precedes the numbered pipeline
         at = _seed_step(
             node=node,
@@ -390,20 +388,20 @@ def _seed_run(
             )
         clock.at(at)
         iter_status = 'killed' if cut else 'completed'
-        node.iter_end(iter_id=iter_id, status=iter_status, exit_code=exit_code)
+        node.record.iter_end(iter_id=iter_id, status=iter_status, exit_code=exit_code)
         _pin_iter_session(node, iter_id, branch, run_number, iteration, spec)
         at -= 30.0
     clock.at(at)
-    node.run_end(run_id=run_id, status=status, exit_code=exit_code)
+    node.record.run_end(run_id=run_id, status=status, exit_code=exit_code)
 
 
 def _seed_live_run(node: Node, branch: str, spec: NodeSpec, clock: Clock) -> None:
     """The live run: iteration 1 settled, iteration 2 open at step 3 (EXECUTE)."""
     clock.at(3600.0)
-    run_id = node.run_start()
+    run_id = node.record.run_start()
     at = 3600.0
     clock.at(at)
-    iter_id = node.iter_start(run_id=run_id, iter=1)
+    iter_id = node.record.iter_start(run_id=run_id, iter=1)
     for step in range(0, len(_STEP_NAMES) + 1):
         at = _seed_step(
             node=node,
@@ -418,11 +416,11 @@ def _seed_live_run(node: Node, branch: str, spec: NodeSpec, clock: Clock) -> Non
             at=at,
         )
     clock.at(at)
-    node.iter_end(iter_id=iter_id, status='completed', exit_code=0)
+    node.record.iter_end(iter_id=iter_id, status='completed', exit_code=0)
     _pin_iter_session(node, iter_id, branch, 2, 1, spec)
     # the open iteration: steps 1-2 settled, step 3 active since `at`
     clock.at(at - 10.0)
-    live_iter = node.iter_start(run_id=run_id, iter=2)
+    live_iter = node.record.iter_start(run_id=run_id, iter=2)
     at -= 10.0
     for step in (1, 2):
         at = _seed_step(
@@ -438,14 +436,14 @@ def _seed_live_run(node: Node, branch: str, spec: NodeSpec, clock: Clock) -> Non
             at=at,
         )
     clock.at(at)
-    step_id = node.step_start(
+    step_id = node.record.step_start(
         iter_id=live_iter,
         run_id=run_id,
         step=3,
         step_name=_STEP_NAMES[2],
     )
     if spec.agent == 'claude':
-        node.step_session(
+        node.record.step_session(
             'claude',
             step_id=step_id,
             model=_CLAUDE_CONFIG['model'],
@@ -476,27 +474,27 @@ def _seed_step(
     clock.at(at)
     name = 'SYNC' if step == 0 else _STEP_NAMES[step - 1]
     stored = 1 if step == 0 else step
-    step_id = node.step_start(
+    step_id = node.record.step_start(
         iter_id=iter_id,
         run_id=run_id,
         step=stored,
         step_name=name,
     )
     if spec.agent == 'claude':
-        node.step_session(
+        node.record.step_session(
             'claude',
             step_id=step_id,
             model=_CLAUDE_CONFIG['model'],
             session=session_for(branch, run_number, iteration),
         )
-        node.step_cost(step_id=step_id, cost=round(0.02 + 0.02 * step, 2))
+        node.record.step_cost(step_id=step_id, cost=round(0.02 + 0.02 * step, 2))
     seconds = 20.0 if step == 0 else _STEP_SECONDS[step - 1]
     at -= seconds
     clock.at(at)
     if killed:
-        node.step_end(step_id=step_id, status='killed', exit_code=1)
+        node.record.step_end(step_id=step_id, status='killed', exit_code=1)
     else:
-        node.step_end(step_id=step_id, status='completed', exit_code=0)
+        node.record.step_end(step_id=step_id, status='completed', exit_code=0)
     return at - 5.0
 
 
@@ -516,9 +514,9 @@ def _pin_iter_session(
     if spec.agent != 'claude':
         return
     pin(
-        _central_db(node),
-        'iters',
-        {'iter_id': iter_id},
+        db_path=_central_db(node),
+        table='iters',
+        where={'iter_id': iter_id},
         session=session_for(branch, run_number, iteration),
     )
 
@@ -536,22 +534,22 @@ def _seed_radio(nodes: dict[str, Node], clock: Clock) -> None:
     alpha_radio = Radio(alpha)
     # alpha's posts carry the live session that wrote them (the root weaves
     # no session, so its sends stamp NULL)
-    alpha.session_set('claude', session_for('main.alpha', 2, 2))
-    steer = root_radio.send(
+    alpha.sessions.set('claude', session_for('main.alpha', 2, 2))
+    steer, _, _ = root_radio.send(
         node='main.alpha',
         channel='inbox',
         subject='steer',
         data='prioritize the auth work',
         priority=8,
     )
-    note = root_radio.send(
+    note, _, _ = root_radio.send(
         node='main.alpha',
         channel='inbox',
         subject='note',
         data='budget approved',
         priority=4,
     )
-    status = alpha_radio.send(
+    status, _, _ = alpha_radio.send(
         channel='outbox',
         subject='status',
         data='iteration 2 underway',

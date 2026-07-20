@@ -1,7 +1,7 @@
 ---
 name: fractal
 description: Hierarchical agent loops with recursive self-organization.
-argument-hint: <name> [<path>] [--scope=<subdirs>] ... [--local] [--detached] [--continue]
+argument-hint: <name> [<path>] [--scope=<subdirs>] ... [--detached] [--local] [--continue] [--clean]
 disable-model-invocation: true
 ---
 
@@ -23,8 +23,10 @@ behalf. See **Operator** below.
 ## Arguments
 
 Parse the following from `$ARGUMENTS`. The `/fractal` skill routes all
-the configuration to `fractal node init` and passes only `--continue`
-(if present) to `fractal node start`.
+the configuration to `fractal node init` and passes only
+`--continue`/`--clean` (if present) to `fractal node start` — plus
+`--max-cost` when it accompanies `--continue` (a continue re-arms the
+cap at start, not init).
 
 **Init** — all configuration. Set by `fractal node init`, written to
 `config.json`, and editable there before launch:
@@ -40,10 +42,19 @@ the configuration to `fractal node init` and passes only `--continue`
   tolerated and flattened)
 - **`--base`**: branch to start from (default: current branch)
 - **`--meta`**: target node branch for meta-configuration
+- **`--inherit`**: seed surfaces from the parent node instead of the
+  package seed (comma-separated: `steps`, `scripts`, `skills`, `config`,
+  or `all`); agent config always inherits. A top-level spawn's parent is
+  the user node, which carries no steps, scripts, or skills — the flag
+  is for configured nodes spawning children
 - **`--agent`**: agent command; inherits the user node's default when
   omitted
+- **`--provider`**: provider route for the agent (e.g. `openrouter`);
+  inherits the user node's default when omitted
 - **`--model`**: model override; when omitted, the agent uses its own
   default model
+- **`--effort`**: reasoning-effort override; when omitted, each agent
+  seed's own pinned level applies, not the vendor default
 - **`--max-iters`**: per-run iteration cap
 - **`--max-depth`**: maximum child node nesting depth
 - **`--max-children`**: maximum direct child nodes
@@ -55,10 +66,10 @@ the configuration to `fractal node init` and passes only `--continue`
 - **`--interval`**: fixed iteration schedule (e.g. `1h`)
 - **`--sleep`**: delay between iterations (e.g. `10s`)
 - **`--wait`**: sleep between approval-wait sync invocations (default:
-  `1s`)
-- **`--max-cost`**: cost ceiling in USD per run — every new run re-arms
-  the full cap (`node start` on a finished/killed node included); runs
-  are isolated, so a continue opens a fresh budget
+  `1m`)
+- **`--max-cost`**: cost ceiling in USD per run — runs are isolated, so
+  each launch arms the cap anew; after a budget-ended run,
+  `node start --continue` refuses without an explicit `--max-cost`
 - **`--max-iter-cost`**: per-iteration cost ceiling in USD
 - **`--max-step-cost`**: per-step cost ceiling in USD (warn-only when
   unenforceable)
@@ -66,15 +77,20 @@ the configuration to `fractal node init` and passes only `--continue`
   `--max-cost` (default: 10%)
 - **`--sync`** / **`--no-sync`**: enable (default) or disable radio sync
   before each step
+- **`--detached`** / **`--no-detached`**: run each step as a separate
+  agent session (default: one continuous session)
 - **`--local`**: skip pushing to remote after each commit
-- **`--detached`**: run each step as a separate agent session
 
 **Start** — `fractal node start` just launches; all run parameters come
 from `config.json`. A `max_cost` in `config.json` must be positive if
 set; a missing `max_cost` launches uncapped with a loud warning. Its
-only argument:
+only arguments:
 
-- **`--continue`**: continue a stopped/exited node
+- **`--continue`**: continue a stopped/exited node — the launch restores
+  the worktree, so uncommitted project files refuse without `--clean`
+- **`--clean`**: with `--continue`, discard uncommitted project files
+- **`--max-cost`**: with `--continue`, re-arm the cost cap for the new
+  run; required when the last run ended on its budget
 
 After parsing, **list the options the user did not specify** (with each
 one's default) so they can see what else is configurable before defining
@@ -89,28 +105,18 @@ option, not a setting tweak.)
 
 Cost ceilings are **soft**: a node tracks spend (its own and its
 children's, including sync) but is never *hard*-stopped at `--max-cost`
-— once it drains into the reserve it gets cleanup guidance to wind down
-the remainder of the current iteration cheaply, then the loop ends the
-run at that iteration's boundary (the node does not run `finish`
-itself). A budget-ended run reports `exited` (exit 1) — even if the node
-had already finished and signalled `finish` — so an `exited` status on a
-capped node means "check whether it finished", not necessarily "failed".
-A single iteration or the subtree can still overshoot, so reining in an
-over-spender is the parent's job (monitor with `fractal node cost spent`
-and stop/kill as needed). The exception is in-step spend on claude: each
-step is launched with a hard per-invocation budget — min(run remaining
-minus the reserve, the iteration's headroom, `--max-step-cost`) — and
-stops cleanly mid-step on reaching it, which bounds how far a step can
-overshoot the soft ceilings. codex has no budget flag, so its in-step
-spend is bounded only by the step timeout. Some agents report cost
-directly; others report token usage, which fractal prices via the
-model's published rates — so a cost cap on a token-reporting agent
-requires a (priced) `--model` (the run fails on the first step
-otherwise). Today claude reports cost directly and codex reports tokens.
+— it winds down inside its reserve and the loop ends the run at that
+iteration's boundary. The full budget doctrine — reserve pricing,
+`cost remaining` semantics, per-agent in-step enforcement, and how a
+budget-ended run reports — is canonical in the node's
+`skills/fractal/SKILL.md` Cost section; read it there when advising the
+user or reading a capped node's status.
 
 Nodes run their agent with elevated permissions by design (Claude
-`bypassPermissions`, Codex `danger-full-access`) so they can work
-unattended — only launch nodes whose task you trust to run autonomously.
+`bypassPermissions`, Codex `danger-full-access`, Grok `always-approve`,
+opencode `"permission": "allow"` plus `--auto`, omp `approvalMode: yolo`
+plus `--yolo`) so they can work unattended — only launch nodes whose
+task you trust to run autonomously.
 
 ## Activation
 
@@ -166,8 +172,18 @@ Determine the node's state and proceed accordingly:
       monorepo sub-project `<path>` these nest under it
       (`<path>/.fractal/`, `<path>/wiki/`), not the repo root. `--agent`
       sets the default agent that spawned nodes inherit; if the user
-      didn't specify one, default to `--agent=claude` if you are Claude
-      or `--agent=codex` if you are Codex.
+      didn't specify one, default to `--agent=claude` if you are Claude,
+      `--agent=codex` if you are Codex, `--agent=grok` if you are Grok,
+      `--agent=opencode` if you are opencode, or `--agent=omp` if you
+      are Oh My Pi. `--provider` sets the default provider route the
+      same way (e.g. `openrouter` routes claude or codex through
+      OpenRouter on `OPENROUTER_API_KEY`; agents without routes ignore
+      it, and omitting it means each agent's own endpoint). Route
+      mechanics to know: an inherited route is cleared per node with
+      `fractal node config set provider=null`; the key is captured into
+      the node's tmux session at launch (tmux >= 3.2), so rotating it
+      requires a node restart; routed spend is audited on the OpenRouter
+      dashboard (the ledger records the local estimate).
    2. `fractal commit "configure <current_branch>" --init` — commits the
       project wiki on the user's base branch, so the node worktree
       branches from a *committed* tree (an uncommitted wiki is invisible
@@ -182,14 +198,16 @@ Determine the node's state and proceed accordingly:
 The project `wiki/` is **git-tracked** (as are node-branch seeds) —
 never add it to `.gitignore`. The root node's own `.fractal/` is
 **git-ignored on the top-level branch** by default, keeping it out of
-your main history; pass `fractal init --track` to commit it there too
-(chosen once at init). Fractal manages this — its runtime artifacts
-(worktrees, the central database, status, agent logs) plus the top-level
-`.fractal/` — via the repo-local `.git/info/exclude`, which it writes
-automatically; it never touches the committed `.gitignore`. Keep your
-own ignore patterns anchored (`/artifacts/`, not `artifacts/`), or they
-also match — and silently hide — same-named subtrees at any depth, such
-as a node's committable `.fractal/<node>/artifacts/`.
+your main history; run `fractal track` to commit it there too and
+`fractal untrack` to revert — both toggle only the ignore and print the
+follow-up git command, never touching the index. Fractal manages this —
+its runtime artifacts (worktrees, the central database, status, agent
+logs) plus the top-level `.fractal/` — via the repo-local
+`.git/info/exclude`, which it writes automatically; it never touches the
+committed `.gitignore`. Keep your own ignore patterns anchored
+(`/artifacts/`, not `artifacts/`), or they also match — and silently
+hide — same-named subtrees at any depth, such as a node's committable
+`.fractal/<node>/artifacts/`.
 
 `fractal init` also wires the wiki merge driver: the committed
 `.gitattributes` assigns `merge=wiki` to the generated wiki `_index.md`
@@ -243,21 +261,17 @@ tools to use or skip, style preferences. If the user has additions,
 append them to the `## Rules` section. If not, move on.
 
 **d) Budget and scope.** Ask about cost limits (`--max-cost` caps each
-run and re-arms on every new run, `--max-iter-cost` caps per-iteration).
+run — runs are isolated — `--max-iter-cost` caps per-iteration).
 `--max-cost` is optional but strongly recommended: without it the node
 runs **uncapped** — a warning at start, bounded only by
 `--max-iters`/`--timeout` — so settle on a cap unless the user
 deliberately wants an uncapped run, confirmed explicitly: before
 launching any uncapped node, ask an are-you-sure and get a yes (a user's
 explicit uncapped request in this conversation counts) — never default
-into uncapped. Also recommend `--max-iter-cost`. Note a cost cap on a
-token-priced agent (codex) forces a priced `--model`, which a
-ChatGPT-subscription codex account cannot select — so codex with a cap
-needs an API-key account, while a ChatGPT-subscription codex must run
-uncapped. If the node should only touch certain files or directories,
-ask about `--scope` (restricts what the node can commit). For open-ended
-work with no completion requirements, suggest `--max-iters` to cap
-iterations.
+into uncapped. Also recommend `--max-iter-cost`. If the node should only
+touch certain files or directories, ask about `--scope` (restricts what
+the node can commit). For open-ended work with no completion
+requirements, suggest `--max-iters` to cap iterations.
 
 > [!WARNING]
 > A **low `--max-cost` paired with an expensive `--model`** is the
@@ -270,17 +284,15 @@ iterations.
 > no per-step cap, so its overshoot is bounded only by `--step-timeout`.
 > For a small budget, prefer a cheaper `--model` and set
 > `--max-iter-cost`; reserve expensive models for budgets large enough
-> that one step is a small slice.
+> that one step is a small slice. The sizing floor: never set
+> `--max-cost` (or a remaining grant) within ~2x the model's single-turn
+> cost — a cap inside that band can be overshot by a large fraction in
+> one turn, and that overshoot is documented, accepted behavior: no
+> enforcement absorbs it.
 
-For well-specified single-mission leaf work, a cheaper model at the same
-dollar cap (e.g. `sonnet`) is a first-class choice — cost-per-point
-favors it on numeric, single-task work — but give it iter-cap headroom:
-micro `--max-iter-cost` values bind on step granularity, and a fast
-drafter can pack a full iteration into one large step. Keep frontier
-models for manager, audit, long-horizon, and judgment-call roles: a
-cheaper model can hold process hygiene and mechanical output while its
-judgment quality collapses — at no cost saving, since under a binding
-budget pool a cheaper token rate buys more steps, not a lower bill.
+Model-choice economics under a budget — when a cheaper model at the same
+dollar cap is the right call, and which roles keep frontier models — are
+covered in the node skill's Cost section.
 
 When spawning runs whose outputs will be *compared* (A/B arms, benchmark
 variants), fork them from one pinned tip and declare the endowment in
@@ -302,10 +314,14 @@ agent invocations and a budget sized by counting `steps/` undercounts
 `--no-sync` for lightweight leaf nodes. A step may carry YAML
 frontmatter: `agent: <command>` runs that step on a different agent
 (each agent keeps its own woven session across the steps that use it),
-`model: <name>` overrides the model for that step, `detached: true`
-isolates a single step in its own session within a continuous node, and
-`requires_approval: true` holds the loop after the step completes until
-the operator approves it (`fractal node pending`/`approve`).
+`provider: <route>` overrides the provider route (agents without routes
+ignore it), `model: <name>` overrides the model for that step,
+`effort: <level>` overrides the reasoning effort, `timeout: <duration>`
+overrides the node-global `step_timeout` for that step alone,
+`detached: true` isolates a single step in its own session within a
+continuous node, and `requires_approval: true` holds the loop after the
+step completes until the operator approves it
+(`fractal node pending`/`approve`).
 
 **f) Environment setup.** Ask if the project needs environment
 preparation (virtual environments, dependencies, containers, build
@@ -343,10 +359,11 @@ fractal node start
 ```
 
 All run parameters were set at init (in `config.json`); `start` takes no
-config arguments — only `--continue` when continuing a stopped/exited
-node. If the user wants to tweak a setting first, edit
-`<node_dir>/config.json`, then start. The node launches in a detached
-tmux session.
+config arguments — only `--continue` (plus `--clean` to discard
+uncommitted project files, and `--max-cost` to re-arm the cap after a
+budget-ended run) when continuing a stopped/exited node. If the user
+wants to tweak a setting first, edit `<node_dir>/config.json`, then
+start. The node launches in a detached tmux session.
 
 ### Step 4: Post-launch briefing
 
@@ -369,7 +386,10 @@ Once the node is running, briefly explain how to interact with it:
   `<node_dir>/plans/` (plans). A run that ends `completed` after
   `--max-iters` only means the iteration budget was exhausted, not that
   the goal was met — check `fractal node activity` for the per-iteration
-  outcomes.
+  outcomes. Figure scopes differ by design: `cost spent` reads the run's
+  full subtree (children included), while `activity`'s `cost` column
+  sums only the node's own steps — and both are per-run, with no
+  lifetime rollup.
 - **TUI:** For a live view of the whole tree — nodes, runs, costs, and
   output — suggest the user open the dashboard with `fractal open` (run
   from the repo root). It needs the `tui` extra; if `fractal open`
@@ -391,11 +411,13 @@ Once the node is running, briefly explain how to interact with it:
   filesystem copy of the repo to another machine. A paused node holds
   its spawn slot and blocks its parent's finish-drain; only `resume`,
   `kill`, and `chat` act on it (ask a paused node what it was doing —
-  `chat --current` forks the interrupted claude session, and the TUI's
-  chat does so by default; a codex node gets a fresh session). Note the
-  distinction: `resume` continues a *paused* run in place, while
-  `start --continue` opens a *fresh* run (full budget re-arm, worktree
-  cleaned) on a stopped/exited node.
+  `chat --current` forks the interrupted claude, grok, opencode, or omp
+  session, and the TUI's chat does so by default; a codex node gets a
+  fresh session). Note the distinction: `resume` continues a *paused*
+  run in place, while `start --continue` opens a *fresh* run (worktree
+  restored — uncommitted project files need `--clean`, and a
+  budget-ended run refuses without an explicit `--max-cost`) on a
+  stopped/exited node.
 - **Worktree:** The node runs in a git worktree at
   `<repo>/.worktrees/<branch>/`. The user's repo is untouched. When
   done, from the repo root, merge with `fractal node merge <branch>`.
@@ -413,11 +435,16 @@ Once the node is running, briefly explain how to interact with it:
   project, wiki, and all history in the central database survive, so
   fresh nodes spawn immediately after. It refuses while any node is
   running or paused, and prompts `[y/N]` (`--force`/`-f` skips).
-- **Radio:** nodes communicate via `fractal radio` commands. The
-  listings (`messages`/`feed`) show metadata and never touch read state;
-  `radio read` prints full bodies and writes your read receipts. Replies
-  route to the counterparty's inbox — a feed (outbox) post is never
-  replyable in place. Run `fractal radio --help` to explore.
+- **Radio:** nodes communicate via `fractal radio` commands.
+  `radio send` writes any channel permissions allow, given at least one
+  routing dimension (`--node`/`--parent` or `--channel`) — a fully bare
+  send refuses; `radio post` is the quiet reporting verb for publicly
+  readable channels (outbox, public), and a bare post lands in your own
+  `outbox`. The listings (`messages`/`feed`) show metadata and never
+  touch read state; `radio read` prints full bodies and writes your read
+  receipts. Replies route to the counterparty's inbox — a feed (outbox)
+  post is never replyable in place. Run `fractal radio --help` to
+  explore.
 
 Offer to help the user edit `NODE.md`, check progress, or read plan
 files.
@@ -442,16 +469,16 @@ Work the tree through the CLI — run it from the repo root, or name a
 branch positionally. Monitor with
 `fractal node list`/`status`/`activity`/`cost`, and
 `chat <branch> "<q>" --current` to ask a running agent without
-disrupting its loop — `--current` forks the live loop session and is
-claude-only; for codex nodes ask via a fresh chat (omit `--current`) or
-continue one in place with `--session ... --resume`. The root
-auto-subscribes to its children's `outbox` but has no auto-sync, so poll
-its radio yourself — `fractal radio read --channel=inbox --unread` (its
-inbox) and `read --feed --unread` (children, one hop); the
+disrupting its loop — `--current` forks the live loop session (claude,
+grok, opencode, or omp); for codex nodes ask via a fresh chat (omit
+`--current`) or continue one in place with `--session ... --resume`. The
+root auto-subscribes to its children's `outbox` but has no auto-sync, so
+poll its radio yourself — `fractal radio read --channel=inbox --unread`
+(its inbox) and `read --feed --unread` (children, one hop); the
 `messages`/`feed` listings survey metadata without consuming unread
 state, and your reads receipt as you, the reader — send directives to a
 child's inbox (`radio send <message> --node=<branch> ...`), and
-post-and-continue (a node sees you only on its next sync). Steer by
+send-and-continue (a node sees you only on its next sync). Steer by
 editing `NODE.md` files (re-read each step) or by radio; approve gates
 (`node pending`/`approve`), retune limits (`node update`), and merge
 finished subtrees (deleting after merge is optional hygiene, not a
@@ -460,6 +487,26 @@ the user, and translate their intent down into edits, directives, and
 spawns. Ask the user for input and feedback freely, but never let a
 question block you unless it is absolutely critical — proceed on your
 best judgment, make reversible calls, and note them.
+
+### Commissioning
+
+When a child's launch deserves review before it burns budget, separate
+init from start and put a countersign between them. The gate is social —
+nothing in the tool enforces it — but it catches seed mistakes while
+they are still free to fix:
+
+1. **Commission** — init the child and author its seed (NODE.md, caps,
+   steps), but do not start it.
+2. **Pin the seed** — commit the configured seed
+   (`fractal commit "configure <name>" --init` from the child's
+   worktree) and record the pin: the child branch's seed commit sha plus
+   a checklist of what was reviewed (NODE.md, caps, steps).
+3. **Request countersign** — send the pin and checklist over radio to
+   the designated reviewer (an ancestor or a named reviewer node) and
+   wait for the reply.
+4. **Start only on countersign** — launch the child only after the
+   countersign reply. A child whose branch has moved past the pinned sha
+   is stale: re-commission (re-review, re-pin) before starting.
 
 ## CLI reference
 

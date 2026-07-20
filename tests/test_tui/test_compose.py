@@ -73,7 +73,7 @@ async def test_kind_toggle_flips_visible_fields(
 async def test_field_grid_navigation_walks_rows_and_body(
     cockpit_app: Callable[..., FractalApp],
 ) -> None:
-    """←→ walk the row of fields; ↓ drops to the middle and body; ↑ at the top leaves."""
+    """Left/right walk the fields; down drops to the middle and body; up leaves."""
     app = cockpit_app(branch='main.alpha')
     async with app.run_test(size=(150, 48)) as pilot:
         pane = app.message_pane
@@ -96,7 +96,7 @@ async def test_field_grid_navigation_walks_rows_and_body(
         assert pane.cursor == 'm_subject'
         await pilot.press('up')  # subject -> the row (rows[0] = m_kind)
         assert pane.cursor == 'm_kind'
-        await pilot.press('up')  # ↑ at the top row leaves to the ring
+        await pilot.press('up')  # up at the top row leaves to the ring
         assert app.mode == 'ring'
 
 
@@ -213,7 +213,7 @@ async def test_combo_filters_by_typed_text(
 async def test_chatscroll_mode_scrolls_the_transcript(
     cockpit_app: Callable[..., FractalApp],
 ) -> None:
-    """Activating the convo zone enters chat-scroll; ↑↓ pan only the transcript."""
+    """Activating the convo zone enters chat-scroll; up/down pan the transcript."""
     app = cockpit_app(branch='main.alpha')
     async with app.run_test(size=(150, 48)) as pilot:
         # seed enough transcript that it can actually scroll
@@ -238,7 +238,7 @@ async def test_chatscroll_mode_scrolls_the_transcript(
 async def test_enter_sends_and_shift_enter_inserts_newline(
     cockpit_app: Callable[..., FractalApp],
 ) -> None:
-    """On a send-key terminal ``⏎`` sends the body, ``⇧⏎`` inserts a newline.
+    """On a send-key terminal ``enter`` sends, ``shift+enter`` inserts a newline.
 
     The fixture pins ``_ENTER_SENDS`` true, so the composer treats plain
     ``enter`` as send and ``shift+enter`` as the literal newline.
@@ -255,7 +255,7 @@ async def test_enter_sends_and_shift_enter_inserts_newline(
         await pilot.press('enter')  # send: the body clears, lands in the convo
         await pilot.pause()
         assert body.text == ''
-        assert ('you', 'hi\nthere') in app.chat.convo('main.alpha')
+        assert ('you', 'hi\nthere') in app.chat.transcript('main.alpha')
 
 
 async def test_slash_commands_set_radio_fields(
@@ -305,8 +305,8 @@ async def test_radio_send_writes_a_message(pair_tree: pathlib.Path) -> None:
     connection = data.connect()
     try:
         rows = data.rows(
-            connection,
-            'SELECT node, channel, sender, subject, data FROM messages',
+            connection=connection,
+            query='SELECT node, channel, sender, subject, data FROM messages',
         )
     finally:
         connection.close()
@@ -324,7 +324,7 @@ async def test_radio_send_writes_a_message(pair_tree: pathlib.Path) -> None:
 async def test_radio_reply_threads_under_the_parent(pair_tree: pathlib.Path) -> None:
     """A send with the thread field set replies under that uuid, not a new row."""
     root = resolve_node(pair_tree)
-    parent = Radio(root).send(
+    parent, _, _ = Radio(root).send(
         node='main.alpha',
         channel='public',
         subject='topic',
@@ -348,9 +348,9 @@ async def test_radio_reply_threads_under_the_parent(pair_tree: pathlib.Path) -> 
     connection = data.connect()
     try:
         replies = data.rows(
-            connection,
-            'SELECT data FROM messages WHERE parent_message_uuid = ?',
-            (parent,),
+            connection=connection,
+            query='SELECT data FROM messages WHERE parent_message_uuid = ?',
+            params=(parent,),
         )
     finally:
         connection.close()

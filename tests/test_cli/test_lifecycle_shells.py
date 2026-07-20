@@ -34,7 +34,9 @@ __all__ = [
     'test_destroy_is_idempotent',
     'test_destroy_rejects_non_repo_path',
     'test_destroy_does_not_orphan_a_locked_worktree',
+    'test_destroy_pre_flights_locks_before_any_removal',
     'test_destroy_refuses_a_running_tmux_session',
+    'test_destroy_refuses_a_paused_node',
     'test_hook_stub_accepts_path_and_is_a_noop',
     'test_hook_stub_requires_a_path',
 ]
@@ -134,6 +136,27 @@ def test_destroy_does_not_orphan_a_locked_worktree(
     assert worktree.name in _git_out(repo, 'worktree', 'list')
 
 
+def test_destroy_pre_flights_locks_before_any_removal(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A locked worktree aborts the destroy before any sibling is removed.
+
+    The teardown is non-atomic, so a lock discovered mid-tear would strand
+    a half-destroyed tree; the script must pre-flight every worktree's lock
+    and leave the whole tree intact.
+    """
+    repo = _make_repo(tmp_path / 'repo')
+    sibling = _add_worktree(repo, 'main.aaa')
+    locked = _add_worktree(repo, 'main.zzz')
+    _git(repo, 'worktree', 'lock', str(locked))
+    result = _bash('destroy.sh', str(repo))
+    assert result.returncode == 1
+    assert 'locked' in result.stderr
+    # the unlocked sibling was not removed -- no half-destroyed tree
+    assert sibling.is_dir()
+    assert locked.is_dir()
+
+
 def test_destroy_refuses_a_running_tmux_session(tmp_path: pathlib.Path) -> None:
     """A node with a live tmux session blocks the destroy before any removal."""
     _require_tmux()
@@ -154,6 +177,36 @@ def test_destroy_refuses_a_running_tmux_session(tmp_path: pathlib.Path) -> None:
             ['tmux', 'kill-session', '-t', f'={session}'],
             capture_output=True,
         )
+
+
+@pytest.mark.parametrize('project', ['.', 'sub'])
+def test_destroy_refuses_a_paused_node(
+    tmp_path: pathlib.Path,
+    project: str,
+) -> None:
+    """A paused node blocks the bare script before any removal.
+
+    The script's ``.status`` re-check (through the ``.project`` cache) is
+    the race backstop behind the caller's kill sweep: a pause landing after
+    the sweep, mid-teardown, must still refuse rather than discard the
+    parked worktree.
+    """
+    repo = _make_repo(tmp_path / 'repo')
+    worktree = _add_worktree(repo, 'main.foo')
+    base = worktree if project == '.' else worktree / project
+    node_dir = base / '.fractal' / 'main.foo'
+    node_dir.mkdir(parents=True)
+    (node_dir / '.status').write_text('paused\n', encoding='utf-8')
+    # a sub-project node dir is located through the .worktrees/.project cache
+    if project != '.':
+        cache = repo / '.worktrees' / '.project'
+        cache.mkdir(parents=True)
+        (cache / 'main.foo').write_text(f'{project}\n', encoding='utf-8')
+    result = _bash('destroy.sh', str(repo))
+    assert result.returncode == 1
+    assert 'paused' in result.stderr
+    # nothing was removed
+    assert worktree.is_dir()
 
 
 # ------ attach.sh / retire.sh / unretire.sh: no-op hook contract

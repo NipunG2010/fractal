@@ -38,7 +38,7 @@ def plan_init(app: typer.Typer) -> typer.Typer:
     ) -> None:
         """Create a plan file seeded with its H1. Prints the path."""
         node = resolve_node(path)
-        result = node.plan_init(
+        result = node.plans.init(
             iter_ref=iter_ref,
             name=name,
             title=title,
@@ -64,7 +64,12 @@ def plan_list(app: typer.Typer) -> typer.Typer:
     ) -> None:
         """List this iteration's plan files, one per line."""
         node = resolve_node(path)
-        plans = node.plan_list(iter_ref=iter_ref)
+        plans = node.plans.list(iter_ref=iter_ref)
+        # the notice goes to stderr: stdout is a path-per-line surface, so a
+        # piped consumer must never receive the sentence as a path
+        if not plans:
+            typer.echo('No plans for this iteration.', err=True)
+            return
         for plan in plans:
             typer.echo(plan)
 

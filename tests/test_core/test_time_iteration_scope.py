@@ -1,11 +1,11 @@
 """``--iter-timeout`` scopes to the single *active* iteration -- never a sum.
 
 The per-iteration time budget is ``--iter-timeout``:
-``time_remaining(scope='iter')`` reports ``iter_timeout`` minus the wall-clock
+``Time.remaining(scope='iter')`` reports ``iter_timeout`` minus the wall-clock
 elapsed of the **one** ``status='active'`` iteration in the resolved run. It must
 never roll up elapsed across *several iterations of a run* nor across *runs* (the
 way the cost budget legitimately sums per-run cost). The method-level
-``test_time_accounting.py`` and CLI ``test_time_remaining.py`` suites only ever
+``test_time.py`` and CLI ``test_time_remaining.py`` suites only ever
 place a single iteration in a single run, so neither exercises the
 multi-iteration cases where a partial rollup bug would hide. This file is that
 stressor, pinning the active-iteration scoping with two sharply discriminating
@@ -18,7 +18,7 @@ scenarios:
 
 Uses the in-process ``node_with_db`` fixture and back-dates ``started_at`` to
 simulate elapsed time deterministically (no sleeps), mirroring
-``test_time_accounting.py``.
+``test_time.py``.
 """
 
 from __future__ import annotations
@@ -50,16 +50,16 @@ def test_remaining_scopes_to_active_iteration_within_run(node_with_db: Node) -> 
     iterations" bug would report ``600 - (580 + 20) = 0``.
     """
     node = node_with_db
-    node.config_set(iter_timeout=ITER_TIMEOUT)
-    run_id = node.run_start()
+    node.config.set('iter_timeout', ITER_TIMEOUT)
+    run_id = node.record.run_start()
     # iter 1: long-lived, then completed -- its elapsed must not be charged
-    iter1 = node.iter_start(run_id=run_id, iter=1)
+    iter1 = node.record.iter_start(run_id=run_id, iter=1)
     _age_iter(node, iter1, 580.0)
-    node.iter_end(iter_id=iter1, status='completed', exit_code=0)
+    node.record.iter_end(iter_id=iter1, status='completed', exit_code=0)
     # iter 2: the active iteration in the same run, freshly started
-    iter2 = node.iter_start(run_id=run_id, iter=2)
+    iter2 = node.record.iter_start(run_id=run_id, iter=2)
     _age_iter(node, iter2, 20.0)
-    remaining = node.time_remaining(scope='iter')
+    remaining = node.time.remaining(scope='iter')
     # only iter 2 counts: ~580s left, never the run-summed 0
     assert remaining is not None
     assert 578.0 < remaining <= ITER_TIMEOUT_SECONDS - 20.0
@@ -76,19 +76,19 @@ def test_remaining_does_not_accumulate_across_continues(node_with_db: Node) -> N
     and clamp the continue to ``0``.
     """
     node = node_with_db
-    node.config_set(iter_timeout=ITER_TIMEOUT)
+    node.config.set('iter_timeout', ITER_TIMEOUT)
     # two prior runs, each nearly exhausted then cleanly ended
     for iter in (1, 2):
-        run_id = node.run_start()
-        iter_id = node.iter_start(run_id=run_id, iter=iter)
+        run_id = node.record.run_start()
+        iter_id = node.record.iter_start(run_id=run_id, iter=iter)
         _age_iter(node, iter_id, 590.0)
-        node.iter_end(iter_id=iter_id, status='completed', exit_code=0)
-        node.run_end(run_id=run_id, status='completed', exit_code=0)
+        node.record.iter_end(iter_id=iter_id, status='completed', exit_code=0)
+        node.record.run_end(run_id=run_id, status='completed', exit_code=0)
     # continue: a fresh run + iteration, only ~15s elapsed
-    continued = node.run_start()
-    iter3 = node.iter_start(run_id=continued, iter=3)
+    continued = node.record.run_start()
+    iter3 = node.record.iter_start(run_id=continued, iter=3)
     _age_iter(node, iter3, 15.0)
-    remaining = node.time_remaining(scope='iter')
+    remaining = node.time.remaining(scope='iter')
     # the continue gets the full budget back, not the across-run-summed 0
     assert remaining is not None
     assert 583.0 < remaining <= ITER_TIMEOUT_SECONDS - 15.0

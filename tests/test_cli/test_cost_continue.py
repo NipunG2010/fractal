@@ -1,18 +1,19 @@
-"""Per-run cost budget (``max_cost``) re-arms each launch: runs are isolated.
+"""Per-run cost budget (``max_cost``) arms each launch: runs are isolated.
 
-``--max-cost`` is a node's *per-run* spend ceiling: every launch re-arms
-the full cap, and no cumulative reading exists anywhere.
+``--max-cost`` is a node's *per-run* spend ceiling: every launched run
+arms the cap, and no cumulative reading exists anywhere.
 
-The launch-time twin (``node start --continue`` re-arming the cap) is covered
-in ``test_core/test_node.py`` -- this module drives ``_run.sh`` directly,
-pinning the loop's own budget guard.
+The launch-time twin (``node start --continue``'s budget gate: a
+budget-ended run refuses a bare continue and re-arms only with an
+explicit ``--max-cost``) is covered in ``test_core/test_lifecycle.py``
+-- this module drives ``fractal node _loop`` directly, pinning the
+loop's own budget guard, which the start-side gate never fronts.
 
-``_run.sh``'s budget logic is unreachable except through the loop and the
-script cannot be sourced (interleaved module-scope git/config/validation that
-``exit``s), so this drives the real ``_run.sh`` as a subprocess against a real
-node with a **stubbed ``claude``** -- the smallest hermetic harness. The stub
-emits a ``stream-json`` ``result`` event carrying a fixed cost so ``fractal
-_stream`` records each step's spend, exactly as a real run would.
+The loop's budget guard is observable only through a real launch, so this
+drives the real ``fractal node _loop`` as a subprocess against a real node
+with a **stubbed ``claude``** -- the smallest hermetic harness. The stub
+emits a ``stream-json`` ``result`` event carrying a fixed cost so the loop's
+stream driver records each step's spend, exactly as a real run would.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import pytest
 
 from tests._helpers import _git
 
-from .conftest import _cli_env, _run, _run_reaped, _worktree_root
+from .conftest import _cli_env, _loop_cmd, _run, _run_reaped
 
 __all__ = ['test_continue_re_arms_per_run_budgets']
 
@@ -32,12 +33,9 @@ __all__ = ['test_continue_re_arms_per_run_budgets']
 # when the loop has flipped the node into reserve (budget) mode
 RESERVE_MARKER = 'Reserve Mode'
 
-# the loop machinery runs from the package, not a per-node copy -- invoke the dev
-# _run.sh directly (it resolves _agent.sh/_commit.sh/modes from the package)
-_LOOP = _worktree_root() / 'fractal' / '_node' / 'scripts' / '_run.sh'
 
 # fake claude on PATH: capture the -p prompt per invocation, then emit a
-# stream-json result carrying $STUB_COST so fractal _stream records the cost
+# stream-json result carrying $STUB_COST so the loop records the cost
 _CLAUDE_STUB = """#!/usr/bin/env bash
 # test stub for claude: capture the -p prompt to a per-call file and emit a
 # stream-json result event so the loop records this step's cost
@@ -55,7 +53,7 @@ done
 PROMPT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -p) PROMPT="${2:-}"; shift 2 ;;
+        --) PROMPT="${2:-}"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -76,7 +74,7 @@ STUB_COST = 0.10
 
 @pytest.fixture
 def node_env(tmp_path_factory: pytest.TempPathFactory) -> dict:
-    """A fresh worker node wired for two deterministic loop launches.
+    """Return a fresh worker node wired for two deterministic loop launches.
 
     Function-scoped so each case starts with an empty database -- the spend
     reading must reflect only this case's runs. Builds ``fractal init`` + a
@@ -122,7 +120,7 @@ def node_env(tmp_path_factory: pytest.TempPathFactory) -> dict:
         step.unlink()
     (steps_dir / '01-alpha.md').write_text('# Alpha\n\nFirst step.\n', encoding='utf-8')
     (steps_dir / '02-beta.md').write_text('# Beta\n\nSecond step.\n', encoding='utf-8')
-    # the loop runs from the package (see _LOOP), not a per-node copy
+    # the loop runs from the package (see _loop_cmd), not a per-node copy
     # stub claude on a private bindir
     bindir = root / 'bin'
     bindir.mkdir()
@@ -173,7 +171,7 @@ def _run_loop(
 ) -> dict:
     """Run one loop launch and return the captured per-step prompts.
 
-    Runs the real ``_run.sh`` (optionally with ``--continue``) with the stub
+    Runs the real loop entry (optionally with ``--continue``) with the stub
     ``claude`` on ``PATH`` and a fresh capture dir, returning
     ``{step_number: prompt_text}`` for this launch only. Asserts the launch
     executed both steps -- a budget-skipped step leaves no capture.
@@ -189,8 +187,10 @@ def _run_loop(
     # run the loop directly (no tmux): stub claude shadows PATH, the loop's own
     # fractal calls resolve to this worktree (PYTHONPATH via _cli_env)
     env = _cli_env(CAPTURE_DIR=f'{capture}', STUB_COST=str(STUB_COST))
-    env['PATH'] = f'{node_env["bindir"]}{os.pathsep}{env["PATH"]}'
-    cmd = ['bash', f'{_LOOP}', f'{worktree}']
+    bindir = node_env['bindir']
+    path = env['PATH']
+    env['PATH'] = f'{bindir}{os.pathsep}{path}'
+    cmd = _loop_cmd(worktree)
     if continue_:
         cmd.append('--continue')
     result = _run_reaped(cmd, cwd=f'{worktree}', env=env, timeout=180)

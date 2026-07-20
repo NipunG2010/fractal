@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Reset the repo's fractal: every worktree and branch; keep the user node
-# ------------------------------------------------------------------------
+# -----------------------------------------------------------------------
 
 usage() {
     cat <<USAGE
@@ -70,7 +70,7 @@ done
 if [[ ${#WORKTREES[@]} -gt 0 ]]; then
     for WORKTREE in "${WORKTREES[@]}"; do
         BRANCH=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-        TMUX_SESSION_NAME="$REPO_NAME (${BRANCH//./-})"
+        TMUX_SESSION_NAME="${REPO_NAME//[.:]/-} (${BRANCH//./-})"
         if tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$TMUX_SESSION_NAME"; then
             echo "Error: node is still running in tmux ($TMUX_SESSION_NAME)" >&2
             echo "Kill it first with: fractal node kill $BRANCH" >&2
@@ -80,15 +80,15 @@ if [[ ${#WORKTREES[@]} -gt 0 ]]; then
 fi
 
 # ------ refuse while any node is paused
-# a parked loop has no tmux session for the guard above to catch, but its
-# worktree holds frozen mid-step work; .status is authoritative (the loop
-# stamps it before parking), so this re-check under the caller's lock closes
-# the window a pause landing mid-reset would slip through
+# a parked loop has no tmux session for the guard above to catch; the caller
+# settles paused nodes (kill sweep) before taking the lock, so this re-check
+# under the caller's lock is the race backstop -- it closes the window a
+# pause landing after the sweep, mid-reset, would slip through
 if [[ ${#WORKTREES[@]} -gt 0 ]]; then
     for WORKTREE in "${WORKTREES[@]}"; do
         BRANCH=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
         # the node dir nests under the .worktrees/.project/<branch> project
-        # prefix (mirrors Node._node_dir)
+        # prefix (mirrors Node.node_dir)
         PROJECT="."
         PROJECT_FILE="$WORKTREES_DIR/.project/$BRANCH"
         if [[ -f "$PROJECT_FILE" ]]; then
@@ -101,7 +101,8 @@ if [[ ${#WORKTREES[@]} -gt 0 ]]; then
         fi
         if [[ -f "$STATUS_FILE" && "$(cat "$STATUS_FILE")" == "paused" ]]; then
             echo "Error: node is paused ($BRANCH)" >&2
-            echo "Resume or kill it first with: fractal node resume $BRANCH" >&2
+            echo "Resume it first with: fractal node resume $BRANCH" >&2
+            echo "  (or kill it with: fractal node kill $BRANCH)" >&2
             exit 1
         fi
     done
@@ -113,7 +114,7 @@ fi
 if [[ ${#WORKTREES[@]} -gt 0 ]]; then
     for WORKTREE in "${WORKTREES[@]}"; do
         GIT_DIR=$(git -C "$WORKTREE" rev-parse --absolute-git-dir 2>/dev/null || true)
-        if [[ -n "$GIT_DIR" && -e "$GIT_DIR/locked" ]]; then
+        if [[ -n "$GIT_DIR" && -f "$GIT_DIR/locked" ]]; then
             echo "Error: worktree is locked: $WORKTREE" >&2
             echo "  (unlock with: git -C \"$REPO\" worktree unlock \"$WORKTREE\")" >&2
             exit 1
@@ -130,7 +131,7 @@ if [[ ${#WORKTREES[@]} -gt 0 ]]; then
         # unreadable config counts as local, an unreachable origin reports
         # nothing -- the note must never claim a branch that was never pushed)
         LOCAL=$(fractal config _get local --path="$WORKTREE" 2>/dev/null || echo true)
-        if [[ $LOCAL != true ]]; then
+        if [[ "$LOCAL" != true ]]; then
             if git -C "$REPO" ls-remote --exit-code --heads origin "$BRANCH" \
                 >/dev/null 2>&1; then
                 REMOTE_BRANCHES+=("$BRANCH")
@@ -143,7 +144,9 @@ if [[ ${#WORKTREES[@]} -gt 0 ]]; then
             echo "Error: failed to remove worktree: $WORKTREE" >&2
             exit 1
         fi
-        git -C "$REPO" branch -D "$BRANCH" 2>/dev/null || true
+        # >/dev/null: drop git's own "Deleted branch ... (was <sha>)"
+        # so only the script's message below shows (no duplicate line)
+        git -C "$REPO" branch -D "$BRANCH" >/dev/null 2>&1 || true
         rm -f "$WORKTREES_DIR/.project/$BRANCH"
         echo "Deleted $WORKTREE ($BRANCH)"
     done

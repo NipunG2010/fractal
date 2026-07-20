@@ -6,7 +6,14 @@ import json
 
 import typer
 
-from fractal.cli.utils import command, resolve_node, validate_config_values
+from fractal.cli.utils import SQLITE_INT_MAX, command, resolve_node
+from fractal.core.config import (
+    BOOL_KEYS,
+    COST_KEYS,
+    IMMUTABLE_KEYS,
+    INT_KEYS,
+    KEYS,
+)
 
 __all__ = [
     'config_get',
@@ -15,65 +22,10 @@ __all__ = [
     'node_config_set',
 ]
 
-_CONFIG_KEYS = (
-    'title',
-    'user',
-    'project',
-    'root',
-    'track',
-    'scope',
-    'base',
-    'meta',
-    'agent',
-    'model',
-    'max_iters',
-    'max_depth',
-    'max_children',
-    'max_descendants',
-    'timeout',
-    'iter_timeout',
-    'step_timeout',
-    'interval',
-    'sleep',
-    'wait',
-    'max_cost',
-    'max_iter_cost',
-    'max_step_cost',
-    'reserve_budget',
-    'sync',
-    'local',
-    'detached',
-)
-
-# keys whose JSON-coerced value must be a plain bool (true/false/null)
-_BOOL_KEYS = (
-    'user',
-    'sync',
-    'local',
-    'detached',
-)
-
-# keys whose JSON-coerced value must be a non-negative integer cap
-_INT_KEYS = (
-    'max_iters',
-    'max_depth',
-    'max_children',
-    'max_descendants',
-)
-
-# keys whose JSON-coerced value must be a non-negative USD amount
-_COST_KEYS = (
-    'max_cost',
-    'max_iter_cost',
-    'max_step_cost',
-    'reserve_budget',
-)
-
 # NOTE: keys whose values are JSON-coerced (numbers, booleans);
 #   every other key holds a literal string, so e.g. scope=123
-#   stays the string "123" rather than int 123; ``track`` coerces too
-#   but is rejected before the type check, so it joins no typed group
-_COERCED_KEYS = ('track', *_BOOL_KEYS, *_INT_KEYS, *_COST_KEYS)
+#   stays the string "123" rather than int 123
+_COERCED_KEYS = (*BOOL_KEYS, *INT_KEYS, *COST_KEYS)
 
 
 def config_get(app: typer.Typer) -> typer.Typer:
@@ -117,7 +69,7 @@ def config_set(app: typer.Typer) -> typer.Typer:
 
 
 def node_config_get(app: typer.Typer) -> typer.Typer:
-    """Register the public ``config get`` command."""
+    """Register the ``get`` command."""
     # key argument
     key_help = 'Config key to read.'
     key = typer.Argument(..., help=key_help)
@@ -137,7 +89,7 @@ def node_config_get(app: typer.Typer) -> typer.Typer:
 
 
 def node_config_set(app: typer.Typer) -> typer.Typer:
-    """Register the public ``config set`` command."""
+    """Register the ``set`` command."""
     # values argument
     values_help = 'Key=value pairs to write (e.g. max_cost=5).'
     values = typer.Argument(..., help=values_help)
@@ -161,15 +113,20 @@ def node_config_set(app: typer.Typer) -> typer.Typer:
 
 def _config_get(key: str, path: str) -> None:
     """Resolve the node and print one config value (shared by get/_get)."""
+    # reject unknown keys like the setter -- a typo'd or removed key reading
+    # as unset (empty output, exit 0) would silently misdirect a script
+    if key not in KEYS:
+        valid = ', '.join(KEYS)
+        raise typer.BadParameter(f'Unknown config key: {key!r}. Valid keys: {valid}.')
     # resolve node and read value
     node = resolve_node(path)
-    value = node.config_get(key)
+    value = node.config.get(key)
     if value is not None:
         # emit booleans as lowercase true/false for shell consumers
         if isinstance(value, bool):
             typer.echo('true' if value else 'false')
-        # emit list values one item per line so shell consumers can read
-        # them without a JSON parser (the COMMIT_SCOPES boundary check)
+        # emit list values one item per line -- the operator read surface
+        # (e.g. `config get scope`) consumes them without a JSON parser
         elif isinstance(value, list):
             typer.echo('\n'.join(str(item) for item in value))
         # emit structured values as JSON so they round-trip with set
@@ -203,17 +160,10 @@ def _config_set(
             raise typer.BadParameter(f'Expected key=value, got {entry!r}.')
         key, _, value = entry.partition('=')
         # reject unknown keys so a typo does not persist
-        if key not in _CONFIG_KEYS:
-            valid = ', '.join(_CONFIG_KEYS)
+        if key not in KEYS:
+            valid = ', '.join(KEYS)
             raise typer.BadParameter(
                 f'Unknown config key: {key!r}. Valid keys: {valid}.'
-            )
-        # track is repo-wide (the exclude block is shared across worktrees),
-        # so it is fixed at init -- reject a set that would desync it (still
-        # readable via get and every internal read)
-        if key == 'track':
-            raise typer.BadParameter(
-                'Tracking is fixed at init and cannot be changed with config set.'
             )
         # an empty value is a mistake; 'null' is the explicit way to clear
         if value == '':
@@ -235,9 +185,9 @@ def _config_set(
             except ValueError:
                 # phrase the parse-failure message like the downstream type
                 # checks so e.g. sync=maybe and sync=5 agree on what's expected
-                if key in _BOOL_KEYS:
+                if key in BOOL_KEYS:
                     expected = 'true, false, or null'
-                elif key in _INT_KEYS:
+                elif key in INT_KEYS:
                     expected = 'an integer or null'
                 else:
                     expected = 'a number or null'
@@ -248,12 +198,12 @@ def _config_set(
             # any well-formed JSON (list, float cap, bool cost, int flag)
             # stores and corrupts the loop; bool is an int subclass so it is
             # excluded from the numerics
-            if key in _BOOL_KEYS:
+            if key in BOOL_KEYS:
                 if not isinstance(parsed, bool):
                     raise typer.BadParameter(
                         f'{key} expects true, false, or null; got {value!r}.'
                     )
-            elif key in _INT_KEYS:
+            elif key in INT_KEYS:
                 if not isinstance(parsed, int) or isinstance(parsed, bool):
                     raise typer.BadParameter(
                         f'{key} expects an integer or null; got {value!r}.'
@@ -264,12 +214,18 @@ def _config_set(
                     raise typer.BadParameter('max_iters must be greater than 0.')
                 if parsed < 0:
                     raise typer.BadParameter(f'{key} must be >= 0.')
+                # an integer cap is written to a SQLite INTEGER column; one
+                # that overflows a signed 64-bit int raises a raw adapter
+                # error at the registry cap-sync, so reject it here like the
+                # init/update flags do
+                if parsed >= SQLITE_INT_MAX:
+                    raise typer.BadParameter(f'{key} must be < {SQLITE_INT_MAX}.')
             elif isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
                 raise typer.BadParameter(
                     f'{key} expects a number or null; got {value!r}.'
                 )
             # cost caps allow 0 but never negative (like the integer caps above)
-            if key in _COST_KEYS and parsed < 0:
+            if key in COST_KEYS and parsed < 0:
                 raise typer.BadParameter(f'{key} must be >= 0.')
             config[key] = parsed
         else:
@@ -278,39 +234,33 @@ def _config_set(
     # private `config _set` passes check=False because it writes the very
     # config.json the guard checks, so it must resolve a not-yet-init node
     node = resolve_node(path, check=check)
-    # 'root' anchors the central database for the whole tree and is fixed at
-    # init: allow the initial write (init.sh's `config _set root=` runs before
-    # the node has a root) but reject a later change that would silently
-    # repoint the node at a different database
-    if 'root' in config:
-        current_root = node.config_get('root')
-        if current_root is not None and config['root'] != current_root:
-            raise typer.BadParameter(
-                'root is fixed at init and cannot be changed with config set.'
-            )
-    # 'user' marks the root (user) node and gates `node start` (a user node has
-    # no loop of its own); like 'root' it is fixed at init -- allow the initial
-    # write but reject a later change that would flip a node's identity and let a
-    # root branch be started as a loop
-    if 'user' in config:
-        current_user = node.config_get('user')
-        if current_user is not None and config['user'] != current_user:
-            raise typer.BadParameter(
-                'user is fixed at init and cannot be changed with config set.'
-            )
-    # validate the resulting config the way init does -- this setter must not
-    # store a value init would reject (a non-positive ceiling, an out-of-range
-    # reserve, a broken step<=iter<=run ordering, or a bare-number duration that
-    # bricks the loop); merge the new values over the current config so cross-key
-    # checks (e.g. reserve vs the stored max_cost) hold
+    # validate the resulting config the way init does (the one merged
+    # validator) -- this setter must not store a value init would reject (a
+    # non-positive ceiling, an out-of-range reserve, a broken step<=iter<=run
+    # ordering, or a bare-number duration that bricks the loop); merge the new
+    # values over the current config so cross-key checks (e.g. reserve vs the
+    # stored max_cost) hold
     merged = {
-        key: config[key] if key in config else node.config_get(key)
-        for key in _CONFIG_KEYS
+        key: config[key] if key in config else node.config.get(key) for key in KEYS
     }
-    validate_config_values(merged)
+    node.config.validate(merged)
+    # init-fixed keys (root/user/project). The operator path (`node config
+    # set`, check=True) may never write one -- reject its first write too, so
+    # `config set user=true` can't brick a child (which carries no `user`) into
+    # a root node and latch the tree-wide pause. Init/internal writes (`config
+    # _set`, check=False) set these once at bootstrap, so they keep the
+    # first-write exemption but still can't change a set value. Checked upfront
+    # so a multi-key set stays atomic (no earlier key lands when a later one is
+    # rejected)
+    for key, value in config.items():
+        if key in IMMUTABLE_KEYS:
+            current = node.config.get(key)
+            if value != current and (check or current is not None):
+                raise typer.BadParameter(f'{key} is fixed at init and cannot be set.')
     # the confirmation echo needs each key's stored value from before the write
-    priors = {key: node.config_get(key) for key in config} if echo else {}
-    node.config_set(**config)
+    priors = {key: node.config.get(key) for key in config} if echo else {}
+    for key, value in config.items():
+        node.config.set(key, value)
     # confirm each write, old -> new -- a silent mid-run retune is
     # indistinguishable from a dropped one
     if echo:

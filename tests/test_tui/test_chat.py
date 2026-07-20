@@ -1,46 +1,53 @@
 """Test the ``fractal.tui.chat`` module.
 
-The transport decision table and both stream parsers are pure and run on
-canned input; ``ChatTurn`` is exercised against real tiny subprocesses (python
-one-liners standing in for an agent). The app-level tests pin the chat
-contract on the writable pair tree: every turn spawns a real agent and writes
-nothing to any node database -- radio included.
+The transport decision table is pure and runs on canned input; ``ChatTurn``
+is exercised against real tiny subprocesses (python one-liners standing in
+for an agent) through the registry's real claude backend -- the per-provider
+wire protocols themselves are pinned in ``test_impl``. The
+app-level tests pin the chat contract on the writable pair tree: every turn
+spawns a real agent and writes nothing to any node database -- radio
+included.
 """
 
 from __future__ import annotations
 
-import json
 import pathlib
 import sys
 from typing import Optional
 
 import pytest
 
+import fractal.core.agent
 from fractal.cli.utils import resolve_node
-from fractal.core.node import ChatCommand, Node
+from fractal.core.agent import Invocation, StreamEvent, StreamParser
+from fractal.core.node import Node
+from fractal.impl.claude import ClaudeAgent
+from fractal.impl.codex import CodexAgent
+from fractal.impl.opencode import OpencodeAgent
 from fractal.tui.app import ChatDone, FractalApp
 from fractal.tui.chat import (
+    ChatController,
     ChatEvent,
     ChatTurn,
-    ClaudeStreamParser,
-    CodexStreamParser,
-    FakeTurn,
     resolve_transport,
 )
 from fractal.tui.data import TuiData
 
+from ._doubles import MockTurn
+
 __all__ = [
     'test_resolve_transport_decision_table',
-    'test_claude_parser_canned_stream',
-    'test_claude_parser_error_result',
-    'test_codex_parser_canned_stream',
-    'test_parsers_tolerate_garbage',
-    'test_claude_parser_null_duration',
-    'test_chat_turn_degrades_a_raising_parser',
+    'test_resolve_transport_consults_the_deployment_hook',
     'test_chat_turn_streams_a_real_subprocess',
+    'test_chat_turn_closes_error_results_with_detail',
+    'test_chat_turn_summarizes_only_the_final_opencode_step',
+    'test_chat_turn_codex_result_closes_the_turn_once',
     'test_chat_turn_surfaces_nonzero_exit_with_stderr_tail',
     'test_chat_turn_cancel_kills_without_error',
-    'test_chat_turn_launch_failure',
+    'test_chat_turn_surfaces_launch_failure_as_an_error_event',
+    'test_chat_turn_degrades_a_raising_parser',
+    'test_chat_controller_owns_the_turn_lifecycle',
+    'test_chat_controller_clocks_the_watchdog',
     'test_sessionless_chat_spawns_fresh_never_radio',
     'test_live_chat_writes_nothing',
     'test_stale_done_does_not_clear_the_new_turn',
@@ -48,8 +55,8 @@ __all__ = [
 
 
 @pytest.mark.parametrize(
-    ('kwargs', 'kind', 'session', 'resume', 'warn'),
-    [
+    argnames=('kwargs', 'kind', 'session', 'resume', 'warn'),
+    argvalues=[
         pytest.param(
             {'session': 'mine01', 'own_chat': True},
             'resume',
@@ -130,6 +137,14 @@ __all__ = [
             False,
             id='idle-node-gets-a-fresh-session',
         ),
+        pytest.param(
+            {'agent': '   '},
+            'fresh',
+            None,
+            False,
+            False,
+            id='whitespace-agent-reads-as-unconfigured',
+        ),
     ],
 )
 def test_resolve_transport_decision_table(
@@ -160,156 +175,70 @@ def test_resolve_transport_decision_table(
         assert transport.chat_kwargs == {'session': session, 'resume': resume}
 
 
-def test_claude_parser_canned_stream() -> None:
-    """The claude parser emits session once, tools, deltas, and the summary."""
-    lines = [
-        json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'sess-1'}),
-        json.dumps(
-            {
-                'type': 'stream_event',
-                'session_id': 'sess-1',
-                'event': {
-                    'type': 'content_block_start',
-                    'content_block': {'type': 'tool_use', 'name': 'Bash'},
-                },
-            }
-        ),
-        json.dumps(
-            {
-                'type': 'stream_event',
-                'session_id': 'sess-1',
-                'event': {
-                    'type': 'content_block_delta',
-                    'delta': {'type': 'text_delta', 'text': 'Hel'},
-                },
-            }
-        ),
-        json.dumps(
-            {
-                'type': 'stream_event',
-                'session_id': 'sess-1',
-                'event': {
-                    'type': 'content_block_delta',
-                    'delta': {'type': 'text_delta', 'text': 'lo'},
-                },
-            }
-        ),
-        json.dumps(
-            {
-                'type': 'result',
-                'subtype': 'success',
-                'num_turns': 2,
-                'duration_ms': 1500,
-                'total_cost_usd': 0.0432,
-            }
-        ),
-    ]
-    parser = ClaudeStreamParser()
-    events = [event for line in lines for event in parser.feed(line)]
-    assert events == [
-        ChatEvent(kind='session', text='sess-1'),
-        ChatEvent(kind='tool', text='Bash'),
-        ChatEvent(kind='text', text='Hel'),
-        ChatEvent(kind='text', text='lo'),
-        ChatEvent(kind='meta', text='done · 2 turns · 1.5s · $0.04'),
-    ]
-    assert parser.closed
+# a deployment hook file registering a forking backend under a new command
+_HOOK_SOURCE = '''\
+from fractal.impl.claude import ClaudeAgent
+
+__all__ = ['CloudyAgent']
 
 
-def test_claude_parser_error_result() -> None:
-    """An error result yields the error detail before the closing summary."""
-    line = json.dumps(
-        {
-            'type': 'result',
-            'subtype': 'error_during_execution',
-            'is_error': True,
-            'num_turns': 1,
-            'duration_ms': 100,
-            'result': 'boom',
-        }
-    )
-    parser = ClaudeStreamParser()
-    events = parser.feed(line)
-    assert events == [
-        ChatEvent(kind='error', text='boom'),
-        ChatEvent(kind='meta', text='done · 1 turns · 0.1s · $?'),
-    ]
-    assert parser.closed
+class CloudyAgent(ClaudeAgent):
+    """A forking backend registered only by the deployment hook file."""
+
+    name = 'cloudy'
+'''
 
 
-def test_codex_parser_canned_stream() -> None:
-    """The codex parser maps thread/commands/messages; closes on wall clock."""
-    lines = [
-        json.dumps({'type': 'thread.started', 'thread_id': 'thr-1'}),
-        json.dumps(
-            {
-                'type': 'item.started',
-                'item': {'type': 'command_execution', 'command': 'ls -la'},
-            }
-        ),
-        json.dumps(
-            {
-                'type': 'item.completed',
-                'item': {'type': 'agent_message', 'text': 'All done'},
-            }
-        ),
-        json.dumps({'type': 'error', 'message': 'rate limited'}),
-        json.dumps({'type': 'turn.completed', 'usage': {}}),
-    ]
-    parser = CodexStreamParser()
-    events = [event for line in lines for event in parser.feed(line)]
-    assert [event.kind for event in events] == [
-        'session',
-        'tool',
-        'text',
-        'error',
-        'meta',
-    ]
-    assert events[0].text == 'thr-1'
-    assert events[1].text == 'ls -la'
-    assert events[2].text == 'All done\n'
-    assert events[3].text == 'rate limited'
-    assert events[4].text.startswith('done · ')
-    assert parser.closed
+def test_resolve_transport_consults_the_deployment_hook(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hook-registered forking agent's live session forks, never fresh.
 
-
-@pytest.mark.parametrize('parser_cls', [ClaudeStreamParser, CodexStreamParser])
-def test_parsers_tolerate_garbage(parser_cls: type) -> None:
-    """Malformed, non-object, and unknown lines yield nothing and never raise."""
-    parser = parser_cls()
-    junk = ['', '   ', 'not json', '[1, 2]', '"text"', '{}', '{"type": "mystery"}']
-    events = [event for line in junk for event in parser.feed(line)]
-    assert events == []
-    assert not parser.closed
-
-
-def test_claude_parser_null_duration() -> None:
-    """A present-but-null ``duration_ms`` reads as 0.0 rather than crashing.
-
-    The key can be explicitly ``null`` on a result frame; ``0.001 * None`` would
-    raise (and take down the chat worker), so it must coalesce to 0.0s.
+    The registry alone does not know hook-file agents, so the transport
+    decision must resolve through the tree's data dir -- otherwise a forking
+    agent registered only there reads as non-forking and its live session
+    refuses the flagship pause-and-interrogate fork.
     """
-    line = json.dumps(
-        {
-            'type': 'result',
-            'subtype': 'success',
-            'num_turns': 1,
-            'duration_ms': None,
-            'total_cost_usd': 0.01,
-        }
+    # isolate the registry and hook-file state from the process
+    monkeypatch.setattr(fractal.core.agent, '_AGENTS', dict(fractal.core.agent._AGENTS))
+    monkeypatch.setattr(fractal.core.agent, '_LOADED', {})
+    (tmp_path / 'agents.py').write_text(_HOOK_SOURCE, encoding='utf-8')
+    transport = resolve_transport(
+        agent='cloudy',
+        status='active',
+        detached=False,
+        live_session='live01',
+        root=tmp_path,
     )
-    parser = ClaudeStreamParser()
-    events = parser.feed(line)
-    assert events == [ChatEvent(kind='meta', text='done · 1 turns · 0.0s · $0.01')]
-    assert parser.closed
+    assert (transport.kind, transport.session) == ('fork', 'live01')
 
 
 # ------ ChatTurn against real subprocesses
 
 
-def _command(code: str) -> ChatCommand:
+class _RaisingParser(StreamParser):
+    """A parser whose ``feed`` raises on any line (the never-raise guard)."""
+
+    def feed(self: _RaisingParser, line: str) -> list[StreamEvent]:
+        """Raise on any line."""
+        raise ValueError('unexpected shape')
+
+
+class _RaisingAgent(ClaudeAgent):
+    """A backend whose parser raises on any line."""
+
+    __parser__ = _RaisingParser
+
+
+def _agent(node_dir: pathlib.Path) -> ClaudeAgent:
+    """A real claude backend bound to a throwaway node."""
+    return ClaudeAgent(Node(node_dir), 'claude')
+
+
+def _command(code: str) -> Invocation:
     """A python one-liner standing in for the agent binary."""
-    return ChatCommand(
+    return Invocation(
         agent='claude',
         argv=(sys.executable, '-c', code),
         cwd=pathlib.Path.cwd(),
@@ -317,8 +246,8 @@ def _command(code: str) -> ChatCommand:
     )
 
 
-def test_chat_turn_streams_a_real_subprocess() -> None:
-    """A clean stream yields session, deltas, and the parser's summary."""
+def test_chat_turn_streams_a_real_subprocess(tmp_path: pathlib.Path) -> None:
+    """A clean stream yields session, deltas, and the closing summary."""
     code = (
         'import json\n'
         "print(json.dumps({'type': 'system', 'session_id': 's-123'}))\n"
@@ -328,14 +257,74 @@ def test_chat_turn_streams_a_real_subprocess() -> None:
         "print(json.dumps({'type': 'result', 'subtype': 'success',"
         " 'num_turns': 1, 'duration_ms': 500, 'total_cost_usd': 0.0432}))\n"
     )
-    events = list(ChatTurn(_command(code)).events())
+    events = list(ChatTurn(_command(code), _agent(tmp_path)).events())
     assert [event.kind for event in events] == ['session', 'text', 'meta']
     assert events[0].text == 's-123'
     assert events[1].text == 'hi'
     assert events[2].text == 'done · 1 turns · 0.5s · $0.04'
 
 
-def test_chat_turn_surfaces_nonzero_exit_with_stderr_tail() -> None:
+def test_chat_turn_closes_error_results_with_detail(tmp_path: pathlib.Path) -> None:
+    """An error result yields the failure detail before the closing summary."""
+    code = (
+        'import json\n'
+        "print(json.dumps({'type': 'result', 'subtype': 'error_during_execution',"
+        " 'is_error': True, 'num_turns': 1, 'duration_ms': 100,"
+        " 'result': 'boom'}))\n"
+    )
+    events = list(ChatTurn(_command(code), _agent(tmp_path)).events())
+    assert [event.kind for event in events] == ['error', 'meta']
+    assert events[0].text == 'boom'
+    assert events[1].text == 'done · 1 turns · 0.1s · $?'
+
+
+def test_chat_turn_summarizes_only_the_final_opencode_step(
+    tmp_path: pathlib.Path,
+) -> None:
+    """OpenCode's mid-run step_finish frames add no closing line; the last does.
+
+    OpencodeParser emits a result per step_finish (final only when the reason
+    is ``stop``), so without the final gate a multi-tool turn would print a
+    ``done`` line per step -- all but the last false.
+    """
+    code = (
+        'import json\n'
+        "print(json.dumps({'type': 'step_finish',"
+        " 'part': {'cost': 0.01, 'reason': 'tool-calls'}}))\n"
+        "print(json.dumps({'type': 'step_finish',"
+        " 'part': {'cost': 0.01, 'reason': 'tool-calls'}}))\n"
+        "print(json.dumps({'type': 'step_finish',"
+        " 'part': {'cost': 0.02, 'reason': 'stop'}}))\n"
+    )
+    agent = OpencodeAgent(Node(tmp_path), 'opencode')
+    events = list(ChatTurn(_command(code), agent).events())
+    # exactly one closing line, from the final step -- not one per step_finish
+    assert [event.kind for event in events].count('meta') == 1
+    assert events[-1].kind == 'meta'
+
+
+def test_chat_turn_codex_result_closes_the_turn_once(tmp_path: pathlib.Path) -> None:
+    """Codex's terminal result (final=False) closes the turn once, cleanly.
+
+    Codex omits ``final`` on its result (no authoritative cost rides its
+    stream), so the close gate treats a non-opencode result as terminal --
+    the turn closes on its own result, not the kill/truncated-stream
+    fallback, and renders exactly one closing line.
+    """
+    code = (
+        'import json\n'
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 't1'}))\n"
+        "print(json.dumps({'type': 'turn.completed', 'usage': {}}))\n"
+    )
+    events = list(
+        ChatTurn(_command(code), CodexAgent(Node(tmp_path), 'codex')).events()
+    )
+    assert [event.kind for event in events].count('meta') == 1
+
+
+def test_chat_turn_surfaces_nonzero_exit_with_stderr_tail(
+    tmp_path: pathlib.Path,
+) -> None:
     """A failed turn ends with the exit error (stderr tail) plus a meta close."""
     code = (
         'import sys, json\n'
@@ -343,20 +332,20 @@ def test_chat_turn_surfaces_nonzero_exit_with_stderr_tail() -> None:
         "sys.stderr.write('kaboom: missing credentials\\n')\n"
         'sys.exit(3)\n'
     )
-    events = list(ChatTurn(_command(code)).events())
+    events = list(ChatTurn(_command(code), _agent(tmp_path)).events())
     assert [event.kind for event in events] == ['session', 'error', 'meta']
     assert events[1].text == 'claude exited 3: kaboom: missing credentials'
     assert events[2].text.startswith('done · ')
 
 
-def test_chat_turn_cancel_kills_without_error() -> None:
+def test_chat_turn_cancel_kills_without_error(tmp_path: pathlib.Path) -> None:
     """Cancelling kills the process; the turn closes clean (no error event)."""
     code = (
         'import json, sys, time\n'
         "print(json.dumps({'type': 'system', 'session_id': 's-1'}), flush=True)\n"
         'time.sleep(30)\n'
     )
-    turn = ChatTurn(_command(code))
+    turn = ChatTurn(_command(code), _agent(tmp_path))
     events = turn.events()
     first = next(events)
     assert first.kind == 'session'
@@ -366,37 +355,84 @@ def test_chat_turn_cancel_kills_without_error() -> None:
     assert [event.kind for event in rest] == ['meta']
 
 
-def test_chat_turn_launch_failure() -> None:
+def test_chat_turn_surfaces_launch_failure_as_an_error_event(
+    tmp_path: pathlib.Path,
+) -> None:
     """A missing agent binary becomes a terminal error event, not a raise."""
-    command = ChatCommand(
+    command = Invocation(
         agent='claude',
         argv=('/nonexistent/agent-binary',),
         cwd=pathlib.Path.cwd(),
         env=None,
     )
-    events = list(ChatTurn(command).events())
+    events = list(ChatTurn(command, _agent(tmp_path)).events())
     assert [event.kind for event in events] == ['error', 'meta']
     assert events[0].text.startswith('claude failed to launch: ')
 
 
-def test_chat_turn_degrades_a_raising_parser(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_chat_turn_degrades_a_raising_parser(tmp_path: pathlib.Path) -> None:
     """A parser that raises on a line degrades to an error event, never a raise.
 
     ``events`` promises it never raises, so a line shape the parser doesn't
     expect (one that makes ``feed`` throw) must become a terminal error event
     rather than crashing the worker thread.
     """
-
-    def boom(self: ClaudeStreamParser, line: str) -> list:
-        raise ValueError('unexpected shape')
-
-    monkeypatch.setattr(ClaudeStreamParser, 'feed', boom)
     code = "print('one line')\n"
-    events = list(ChatTurn(_command(code)).events())
+    agent = _RaisingAgent(Node(tmp_path), 'claude')
+    events = list(ChatTurn(_command(code), agent).events())
     assert [event.kind for event in events] == ['error', 'meta']
     assert 'stream parse error: unexpected shape' in events[0].text
+
+
+# ------ ChatController (framework-free turn state)
+
+
+def test_chat_controller_owns_the_turn_lifecycle() -> None:
+    """``begin`` supersedes (and kills) the prior turn; only the live stamp clears.
+
+    The controller is the single owner of "one chat turn at a time": ``begin``
+    cancels whatever is in flight, mints a fresh staleness stamp, and restarts
+    the spinner; a stale ``finish`` is a no-op, so a superseded turn's late
+    done can never orphan the live turn's subprocess.
+    """
+    chat = ChatController(now=lambda: 100.0)
+    first = MockTurn([])
+    first_id = chat.begin('main.alpha', first)
+    assert (chat.turn, chat.turn_branch) == (first, 'main.alpha')
+    assert chat.is_current(first_id)
+    chat.spin()
+    assert chat.spin_frame == 1
+    # a second begin kills and supersedes the first turn (and its stamp)
+    second = MockTurn([])
+    second_id = chat.begin('main.beta', second)
+    assert first.cancelled
+    assert (chat.turn, chat.turn_branch) == (second, 'main.beta')
+    assert not chat.is_current(first_id)
+    assert chat.spin_frame == 0  # the spinner restarts with the turn
+    # a stale finish is a no-op; the live finish clears the turn
+    chat.finish(first_id)
+    assert chat.turn is second
+    chat.finish(second_id)
+    assert (chat.turn, chat.turn_branch) == (None, '')
+    # cancel is idempotent -- with or without a live turn
+    chat.cancel()
+    third = MockTurn([])
+    chat.begin('main.alpha', third)
+    chat.cancel()
+    assert third.cancelled
+    assert chat.turn is None
+
+
+def test_chat_controller_clocks_the_watchdog() -> None:
+    """``idle`` measures the injected clock since ``begin``; ``touch`` re-arms it."""
+    clock = {'at': 0.0}
+    chat = ChatController(now=lambda: clock['at'])
+    chat.begin('main.alpha', MockTurn([]))
+    clock['at'] = 30.0
+    assert chat.idle() == 30.0
+    chat.touch()  # a delta arrived
+    clock['at'] = 42.0
+    assert chat.idle() == 12.0
 
 
 # ------ the app-level chat contract (the writable pair tree)
@@ -416,15 +452,15 @@ async def test_sessionless_chat_spawns_fresh_never_radio(
     app = FractalApp(
         resolve_node(pair_tree),
         branch='main.alpha',
-        turn_factory=lambda command: FakeTurn(events),
+        turn_factory=lambda command, agent: MockTurn(events),
     )
     async with app.run_test(size=(150, 48)) as pilot:
         app.start_chat('prioritize the flaky test')
         for _ in range(100):  # the worker thread streams in the background
             await pilot.pause(0.05)
-            if app._turn is None:
+            if app.chat.turn is None:
                 break
-        convo = app.chat.convo('main.alpha')
+        convo = app.chat.transcript('main.alpha')
     assert convo[0] == ('you', 'prioritize the flaky test')
     # the transport went fresh (with its reason) and a real turn streamed
     metas = [text for who, text in convo if who == 'meta']
@@ -456,17 +492,17 @@ async def test_live_chat_writes_nothing(pair_tree: pathlib.Path) -> None:
     app = FractalApp(
         resolve_node(pair_tree),
         branch='main.alpha',
-        turn_factory=lambda command: FakeTurn(events),
+        turn_factory=lambda command, agent: MockTurn(events),
     )
     async with app.run_test(size=(150, 48)) as pilot:
         before = _dump(app.data)
         app.start_chat('how is it going?')
         for _ in range(100):  # the worker thread streams in the background
             await pilot.pause(0.05)
-            if app._turn is None:
+            if app.chat.turn is None:
                 break
         after = _dump(app.data)
-        convo = app.chat.convo('main.alpha')
+        convo = app.chat.transcript('main.alpha')
     assert after == before
     # the stream really ran: deltas coalesced into one bubble, session captured
     assert [text for who, text in convo if who == 'auth'] == ['Hello world']
@@ -492,23 +528,23 @@ async def test_stale_done_does_not_clear_the_new_turn(
     app = FractalApp(
         resolve_node(pair_tree),
         branch='main.alpha',
-        turn_factory=lambda command: FakeTurn(events, pause=0.05),
+        turn_factory=lambda command, agent: MockTurn(events, pause=0.05),
     )
     async with app.run_test(size=(150, 48)) as pilot:
         # a turn is in flight on the branch; a prior turn's done is still queued
         app.start_chat('second')
-        live_turn = app._turn
-        stale_id = app._turn_id - 1
-        # the prior turn's queued done arrives late
-        app.on_chat_done(ChatDone(stale_id))
-        assert app._turn is live_turn  # the live turn is untouched
+        live_turn = app.chat.turn
+        # a done stamped before the live turn's mint (ids mint from 1, so 0
+        # is never the live turn's) arrives late
+        app.on_chat_done(ChatDone(0))
+        assert app.chat.turn is live_turn  # the live turn is untouched
         assert app.query('#m_chatpending')  # its spinner is still pinned
         # the live turn finishes on its own and clears cleanly
         for _ in range(100):
             await pilot.pause(0.05)
-            if app._turn is None:
+            if app.chat.turn is None:
                 break
-        assert app._turn is None
+        assert app.chat.turn is None
         assert not app.query('#m_chatpending')
 
 

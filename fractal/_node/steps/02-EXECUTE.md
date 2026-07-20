@@ -16,7 +16,7 @@ Verify with `bash $NODE_DIR/scripts/test.sh` if configured (exit 0 or
 no-op = proceed) -- the loop never runs test.sh for you, and it runs in
 your ambient CWD, so invoke it from the worktree root. Run
 `bash $NODE_DIR/scripts/lint.sh` as you go to catch issues early and fix
-what you introduce; the commit script enforces it at COMMIT. Under fleet
+what you introduce; `fractal commit` enforces it at COMMIT. Under fleet
 load a test suite can run far slower than its solo baseline (concurrent
 nodes' test workers compound) -- budget step time for it, and read
 slowness *with progressing output* as load; slowness with no new output
@@ -24,8 +24,7 @@ is a hang, not load.
 
 The full memory update happens in REVIEW. But if you discover something
 that would be lost if the session ended (a finding, blocker, or
-convention), write it to memory now and run
-`wiki update --path=$MEMORY_DIR` after so the index stays valid.
+convention), write it to memory now.
 
 If you hit a blocker someone else owns, raise it on the radio now rather
 than waiting for the next sync -- send it to your parent's inbox

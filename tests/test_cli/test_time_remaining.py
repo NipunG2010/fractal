@@ -1,13 +1,13 @@
 """User-facing contract of ``fractal node time remaining`` (the CLI display).
 
-The method-level math (``Node.time_remaining`` run/iter countdown, clamp,
-soonest-of-both) is pinned in ``tests/test_core/test_time_accounting.py`` and
+The method-level math (``Time.remaining`` run/iter countdown, clamp,
+soonest-of-both) is pinned in ``tests/test_core/test_time.py`` and
 ``test_time_iteration_scope.py``. This file pins the **CLI command** layer
 (``fractal/cli/cmd/time.py``) that ``test_core`` never exercises: which of the
 three user-facing strings the command prints, and the ``int()`` truncation of the
 displayed seconds.
 
-``time_remaining`` returns ``None`` (no timeout / nothing running) or a float;
+``Time.remaining`` returns ``None`` (no timeout / nothing running) or a float;
 the command turns that into exactly one of:
 
 - ``"no limit"`` -- no ``timeout``/``iter_timeout``/``step_timeout`` configured;
@@ -54,7 +54,7 @@ TIMEOUT_SECONDS = 600
 
 @pytest.fixture
 def time_node(tmp_path: pathlib.Path) -> dict:
-    """A minimal initialized node (config + DB) resolvable by ``--path``.
+    """Return a minimal initialized node (config + DB) resolvable by ``--path``.
 
     Mirrors the ``node_with_db`` core fixture but stands alone for test_cli: a
     git repo with a root node (``config.json`` + initialized ``.db``), no
@@ -97,8 +97,8 @@ def time_node(tmp_path: pathlib.Path) -> dict:
 def test_remaining_reports_no_limit_without_timeout(time_node: dict) -> None:
     """No configured timeout -> ``"no limit"`` even with an active iteration."""
     node = time_node['node']
-    run_id = node.run_start()
-    node.iter_start(run_id=run_id, iter=1)
+    run_id = node.record.run_start()
+    node.record.iter_start(run_id=run_id, iter=1)
     assert _remaining(time_node['repo']) == 'no limit'
 
 
@@ -109,7 +109,7 @@ def test_remaining_reports_not_running_without_active_run(time_node: dict) -> No
     iteration to count down.
     """
     node = time_node['node']
-    node.config_set(timeout=TIMEOUT)
+    node.config.set('timeout', TIMEOUT)
     assert _remaining(time_node['repo']) == 'not running'
 
 
@@ -120,7 +120,7 @@ def test_remaining_reports_not_running_with_only_step_timeout(time_node: dict) -
     nothing active to count down against.
     """
     node = time_node['node']
-    node.config_set(step_timeout=TIMEOUT)
+    node.config.set('step_timeout', TIMEOUT)
     assert _remaining(time_node['repo']) == 'not running'
 
 
@@ -132,9 +132,9 @@ def test_remaining_counts_down_for_the_run(time_node: dict) -> None:
     must be an integer (the command truncates the float with ``int()``).
     """
     node = time_node['node']
-    node.config_set(timeout=TIMEOUT)
-    run_id = node.run_start()
-    node.iter_start(run_id=run_id, iter=1)
+    node.config.set('timeout', TIMEOUT)
+    run_id = node.record.run_start()
+    node.record.iter_start(run_id=run_id, iter=1)
     _age_run(node, run_id, 100.0)
     seconds = _remaining_seconds(time_node['repo'])
     # aged 100s of a 600s budget -> remaining provably <= 500; generous lower
@@ -149,9 +149,9 @@ def test_remaining_counts_down_for_the_active_iteration(time_node: dict) -> None
     soonest deadline, here the only configured one.
     """
     node = time_node['node']
-    node.config_set(iter_timeout=TIMEOUT)
-    run_id = node.run_start()
-    iter_id = node.iter_start(run_id=run_id, iter=1)
+    node.config.set('iter_timeout', TIMEOUT)
+    run_id = node.record.run_start()
+    iter_id = node.record.iter_start(run_id=run_id, iter=1)
     _age_iter(node, iter_id, 100.0)
     seconds = _remaining_seconds(time_node['repo'])
     assert TIMEOUT_SECONDS - 150 <= seconds <= TIMEOUT_SECONDS - 100
@@ -164,10 +164,10 @@ def test_remaining_counts_down_for_the_active_step(time_node: dict) -> None:
     deadline must render as a countdown like the run and iteration scopes.
     """
     node = time_node['node']
-    node.config_set(step_timeout=TIMEOUT)
-    run_id = node.run_start()
-    iter_id = node.iter_start(run_id=run_id, iter=1)
-    step_id = node.step_start(
+    node.config.set('step_timeout', TIMEOUT)
+    run_id = node.record.run_start()
+    iter_id = node.record.iter_start(run_id=run_id, iter=1)
+    step_id = node.record.step_start(
         iter_id=iter_id,
         run_id=run_id,
         step=1,

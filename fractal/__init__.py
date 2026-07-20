@@ -3,8 +3,20 @@
 Hierarchical agent loops with recursive self-organization.
 """
 
-from . import cli, core, util
+from . import cli, constants, core, exceptions, impl, typing, util
 from .cli import *
+from .constants import *
 from .core import *
 
-__version__ = '0.0.0'
+__version__ = '1.0.0'
+
+
+def __getattr__(name):
+    if name == 'tui':
+        import importlib
+
+        try:
+            return importlib.import_module('fractal.tui')
+        except ModuleNotFoundError as e:
+            raise AttributeError from e
+    raise AttributeError(name)

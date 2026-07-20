@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
+import pathlib
 import sys
 from typing import Optional
 
 import typer
 
 from fractal.cli.utils import (
+    StreamRenderer,
     command,
     parse_reserve_budget,
-    pricing_has_model,
+    print_json,
     print_rows,
     require_non_negative,
     resolve_init_target,
     resolve_node,
     resolve_target,
-    validate_config_values,
 )
+from fractal.core.agent import seed_agents
+from fractal.core.loop import Loop
+from fractal.core.node import Node
 
 __all__ = [
     'node_init',
@@ -40,11 +44,22 @@ __all__ = [
     'node_pending',
     'node_chat',
     'node_update',
-    'node_reconcile_caps',
-    'node_latched',
-    'node_prompt',
+    'node_loop',
+    'node_seed',
 ]
 
+_LIST_COLUMNS = [
+    'status',
+    'node',
+    'title',
+    'max_cost',
+    'max_depth',
+    'max_children',
+    'max_descendants',
+    'last',
+]
+
+# consumers bind activity columns by header name, never by position
 _ACTIVITY_COLUMNS = [
     'timestamp',
     'node',
@@ -53,6 +68,10 @@ _ACTIVITY_COLUMNS = [
     'iter_id',
     'run_id',
     'event',
+    'actor',
+    'step_name',
+    'step',
+    'iter',
     'status',
     'exit_code',
     'metadata',
@@ -88,33 +107,59 @@ def node_init(app: typer.Typer) -> typer.Typer:
     # meta option
     meta_help = 'Target node branch for meta-configuration.'
     meta = typer.Option(None, '--meta', help=meta_help)
+    # inherit option
+    inherit_help = (
+        'Seed surfaces from the parent node instead of the package seed'
+        ' (comma-separated; repeatable): steps, scripts, skills, config,'
+        ' or all.'
+    )
+    inherit = typer.Option(None, '--inherit', help=inherit_help)
     # agent option
     agent_help = 'Agent command (default: inherited from the nearest ancestor).'
     agent = typer.Option(None, '--agent', help=agent_help)
+    # provider option
+    provider_help = (
+        'Provider route for the agent (e.g. openrouter; default: the'
+        ' vendor-native endpoint, inherited from the nearest ancestor).'
+    )
+    provider = typer.Option(None, '--provider', help=provider_help)
     # model option
     model_help = 'Model override (passed to agent CLI via --model).'
     model = typer.Option(None, '--model', help=model_help)
-    # max-iters option
+    # effort option
+    effort_help = 'Reasoning-effort override (passed to agent CLI).'
+    effort = typer.Option(None, '--effort', help=effort_help)
+    # max iters option
     max_iters_help = 'Per-run iteration cap (default: unlimited).'
     max_iters = typer.Option(None, '--max-iters', help=max_iters_help)
-    # max-depth option
+    # max depth option
     max_depth_help = 'Maximum child node nesting depth (default: unlimited).'
     max_depth = typer.Option(None, '--max-depth', help=max_depth_help)
-    # max-children option
+    # max children option
     max_children_help = 'Maximum direct child nodes (default: unlimited).'
     max_children = typer.Option(None, '--max-children', help=max_children_help)
-    # max-descendants option
+    # max descendants option
     max_descendants_help = 'Maximum total descendant nodes (default: unlimited).'
     max_descendants = typer.Option(None, '--max-descendants', help=max_descendants_help)
     # timeout option
     timeout_help = 'Whole-run time budget (e.g. 30s, 10m, 1.5h).'
     timeout = typer.Option(None, '--timeout', help=timeout_help)
-    # iter-timeout option
+    # iter timeout option
     iter_timeout_help = 'Per-iteration time budget (e.g. 30s, 10m, 1.5h).'
     iter_timeout = typer.Option(None, '--iter-timeout', help=iter_timeout_help)
-    # step-timeout option
+    # step timeout option
     step_timeout_help = 'Per-step time budget (e.g. 30s, 10m); caps each step.'
     step_timeout = typer.Option(None, '--step-timeout', help=step_timeout_help)
+    # step retries option
+    step_retries_help = 'Retries per failed step (default: 1; 0 disables).'
+    step_retries = typer.Option(None, '--step-retries', help=step_retries_help)
+    # step retry backoff option
+    step_retry_backoff_help = 'Delay before each step retry (default: 10s).'
+    step_retry_backoff = typer.Option(
+        None,
+        '--step-retry-backoff',
+        help=step_retry_backoff_help,
+    )
     # interval option
     interval_help = 'Fixed iteration schedule (e.g. 30m, 1h).'
     interval = typer.Option(None, '--interval', help=interval_help)
@@ -122,22 +167,22 @@ def node_init(app: typer.Typer) -> typer.Typer:
     sleep_help = 'Delay between iterations (e.g. 10s, 5m).'
     sleep = typer.Option(None, '--sleep', help=sleep_help)
     # wait option
-    wait_help = 'Sleep between approval-wait sync invocations (default: 1s).'
+    wait_help = 'Sleep between approval-wait sync invocations (default: 1m).'
     wait = typer.Option(None, '--wait', help=wait_help)
-    # max-cost option
+    # max cost option
     max_cost_help = (
-        'Maximum cost in USD per run: every new run RE-ARMS the full cap'
-        ' (`node start` on a finished/killed node included) -- runs are'
-        ' isolated, so a continue opens a fresh budget.'
+        'Maximum cost in USD per run -- runs are isolated, so each launch'
+        ' arms the cap anew; after a budget-ended run, `node start'
+        ' --continue` refuses without an explicit --max-cost.'
     )
     max_cost = typer.Option(None, '--max-cost', help=max_cost_help)
-    # max-iter-cost option
+    # max iter cost option
     max_iter_cost_help = 'Maximum cost per iteration in USD.'
     max_iter_cost = typer.Option(None, '--max-iter-cost', help=max_iter_cost_help)
-    # max-step-cost option
+    # max step cost option
     max_step_cost_help = 'Maximum cost per step in USD (warn-only when unenforceable).'
     max_step_cost = typer.Option(None, '--max-step-cost', help=max_step_cost_help)
-    # reserve-budget option
+    # reserve budget option
     reserve_budget_help = (
         'Budget reserved for cleanup; USD or N% of --max-cost (default: 10%).'
     )
@@ -145,12 +190,15 @@ def node_init(app: typer.Typer) -> typer.Typer:
     # sync flag
     sync_help = 'Run sync mode before each step (default: enabled).'
     sync = typer.Option(None, '--sync/--no-sync', help=sync_help)
+    # detached flag
+    detached_help = 'Run each step as a separate invocation (default: continuous).'
+    detached = typer.Option(None, '--detached/--no-detached', help=detached_help)
     # local flag
     local_help = "Skip pushing to remote after each iteration's commit."
     local = typer.Option(None, '--local/--no-local', help=local_help)
-    # detached flag
-    detached_help = 'Run each step as a separate invocation (default: continuous).'
-    detached = typer.Option(False, '--detached', help=detached_help)
+    # blind flag
+    blind_help = 'Subscribe to no channels (the parent still reads this node).'
+    blind = typer.Option(False, '--blind', help=blind_help)
     # reset flag
     reset_help = 'Delete node files and reinitialize.'
     reset = typer.Option(False, '--reset', help=reset_help)
@@ -163,8 +211,11 @@ def node_init(app: typer.Typer) -> typer.Typer:
         scope: Optional[list[str]] = scope,
         base: Optional[str] = base,
         meta: Optional[str] = meta,
+        inherit: Optional[list[str]] = inherit,
         agent: Optional[str] = agent,
+        provider: Optional[str] = provider,
         model: Optional[str] = model,
+        effort: Optional[str] = effort,
         max_iters: Optional[int] = max_iters,
         max_depth: Optional[int] = max_depth,
         max_children: Optional[int] = max_children,
@@ -172,6 +223,8 @@ def node_init(app: typer.Typer) -> typer.Typer:
         timeout: Optional[str] = timeout,
         iter_timeout: Optional[str] = iter_timeout,
         step_timeout: Optional[str] = step_timeout,
+        step_retries: Optional[int] = step_retries,
+        step_retry_backoff: Optional[str] = step_retry_backoff,
         interval: Optional[str] = interval,
         sleep: Optional[str] = sleep,
         wait: Optional[str] = wait,
@@ -180,8 +233,9 @@ def node_init(app: typer.Typer) -> typer.Typer:
         max_step_cost: Optional[float] = max_step_cost,
         reserve_budget: Optional[str] = reserve_budget,
         sync: Optional[bool] = sync,
+        detached: Optional[bool] = detached,
         local: Optional[bool] = local,
-        detached: bool = detached,
+        blind: bool = blind,
         reset: bool = reset,
     ) -> None:
         """Create an agent node.
@@ -204,22 +258,10 @@ def node_init(app: typer.Typer) -> typer.Typer:
             max_depth=max_depth,
             max_children=max_children,
             max_descendants=max_descendants,
+            step_retries=step_retries,
             max_cost=max_cost,
             max_iter_cost=max_iter_cost,
             max_step_cost=max_step_cost,
-        )
-        validate_config_values(
-            {
-                'max_cost': max_cost,
-                'max_iter_cost': max_iter_cost,
-                'max_step_cost': max_step_cost,
-                'timeout': timeout,
-                'iter_timeout': iter_timeout,
-                'step_timeout': step_timeout,
-                'interval': interval,
-                'sleep': sleep,
-                'wait': wait,
-            }
         )
         reserve_budget = parse_reserve_budget(reserve_budget, max_cost)
         node, path = resolve_init_target(path)
@@ -230,8 +272,11 @@ def node_init(app: typer.Typer) -> typer.Typer:
             scope=scope,
             base=base,
             meta=meta,
+            inherit=inherit,
             agent=agent,
+            provider=provider,
             model=model,
+            effort=effort,
             max_iters=max_iters,
             max_depth=max_depth,
             max_children=max_children,
@@ -239,6 +284,8 @@ def node_init(app: typer.Typer) -> typer.Typer:
             timeout=timeout,
             iter_timeout=iter_timeout,
             step_timeout=step_timeout,
+            step_retries=step_retries,
+            step_retry_backoff=step_retry_backoff,
             interval=interval,
             sleep=sleep,
             wait=wait,
@@ -247,34 +294,48 @@ def node_init(app: typer.Typer) -> typer.Typer:
             max_step_cost=max_step_cost,
             reserve_budget=reserve_budget,
             sync=sync,
-            local=local,
             detached=detached,
+            local=local,
+            blind=blind,
             reset=reset,
         )
         if output:
             typer.echo(output)
         # an uncapped node runs and spends without bound -- warn on stderr
-        # (advisory, never a block); codex without a priced model has no
-        # tracked spend to meter, so it stays quiet
+        # (advisory, never a block); an agent with no tracked spend to meter
+        # (codex without a priced model) stays quiet
         if max_cost is None and max_iters is None:
-            # resolve the effective agent the way init does: the flag, else
-            # the nearest ancestor's configured default
-            effective_agent = agent
-            if effective_agent is None:
-                for ancestor in node._self_and_ancestors():
-                    if ancestor_agent := ancestor.config_get('agent'):
-                        effective_agent = ancestor_agent
-                        break
-            base_command = effective_agent.split()[0] if effective_agent else ''
-            unpriced = base_command == 'codex' and (
-                model is None or not pricing_has_model(model)
-            )
-            if not unpriced:
+            # resolve the effective agent the way init does: the flag, else the
+            # nearest ancestor's default walked from the calling node (_NODE)
+            # the child nests under -- not the repo-root target resolve_init
+            # returned (they differ once an agent spawns its own children)
+            parent = Node.resolve_caller()
+            if parent is None or parent.repo_dir != node.repo_dir:
+                parent = node
+            effective_agent = agent or parent.agent_effective()
+            tracked = True
+            if effective_agent:
+                # an unregistered backend reads as tracked -- unknown
+                # spend earns the warning, never a block
+                try:
+                    tracked = parent.agent(effective_agent).tracks_cost(model)
+                except ValueError:
+                    tracked = True
+            if tracked:
                 typer.echo(
                     'Warning: no --max-cost/--max-iters -- this node can run'
                     ' and spend without bound.',
                     err=True,
                 )
+        # a single-word name de-slugs to itself capitalized, leaving the
+        # default title indistinguishable from the slug -- warn on stderr
+        # (advisory, never a block); core stays quiet for programmatic callers
+        if title is None and '-' not in name and '_' not in name:
+            typer.echo(
+                'Warning: single-word name without --title; set one later'
+                ' with fractal node update --title=<title>.',
+                err=True,
+            )
 
     return app
 
@@ -286,10 +347,21 @@ def node_start(app: typer.Typer) -> typer.Typer:
     node = typer.Argument(None, help=node_help)
     # continue flag
     continue_help = (
-        'Continue a stopped/exited node (further iterations); the new run'
-        ' RE-ARMS the full --max-cost.'
+        'Continue a stopped/exited node (further iterations): the launch'
+        ' restores the worktree -- uncommitted project files refuse without'
+        ' --clean -- and a budget-ended run refuses without an explicit'
+        ' --max-cost.'
     )
     continue_ = typer.Option(False, '--continue', help=continue_help)
+    # clean flag
+    clean_help = 'With --continue: discard uncommitted project files.'
+    clean = typer.Option(False, '--clean', help=clean_help)
+    # max cost option
+    max_cost_help = (
+        'With --continue: retune the cost cap before relaunch, echoed'
+        ' old -> new; required when the last run ended on its budget.'
+    )
+    max_cost = typer.Option(None, '--max-cost', help=max_cost_help)
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
@@ -298,17 +370,26 @@ def node_start(app: typer.Typer) -> typer.Typer:
     def _start(
         node: Optional[str] = node,
         continue_: bool = continue_,
+        clean: bool = clean,
+        max_cost: Optional[float] = max_cost,
         path: str = path,
     ) -> None:
         """Launch a node in a tmux session.
 
         Run parameters come from ``config.json`` (set at init or
-        edited before launch); only ``--continue`` is set here. Every
-        launch opens a fresh run with the full budget re-armed -- runs
-        are isolated, so budget a continue like a fresh launch.
+        edited before launch); only ``--continue``/``--clean``/
+        ``--max-cost`` are set here. Runs are isolated -- each launch
+        arms the cap anew -- but a run that ended on its cost budget
+        refuses a bare ``--continue``: pass ``--max-cost`` to arm the
+        next run explicitly.
         """
+        require_non_negative(max_cost=max_cost)
+        if clean and not continue_:
+            raise typer.BadParameter('--clean requires --continue.')
+        if max_cost is not None and not continue_:
+            raise typer.BadParameter('--max-cost requires --continue.')
         node = resolve_target(path, node)
-        output = node.start(continue_run=continue_)
+        output = node.start(continue_run=continue_, clean=clean, max_cost=max_cost)
         if output:
             typer.echo(output)
 
@@ -499,30 +580,26 @@ def node_delete(app: typer.Typer) -> typer.Typer:
             # with --force, deregister it from the registry by branch or bare name
             if force and node:
                 caller = resolve_node(path)
-                matches = []
-                if rows := caller.child_list():
-                    for row in rows:
-                        *_, name = row['node'].rsplit('.', 1)
-                        if row['node'] == node or name == node:
-                            matches.append(row['node'])
-                if len(matches) == 1:
-                    output = caller.deregister(matches[0])
-                    typer.echo(output)
-                    return
+                output = caller.deregister(node)
+                typer.echo(output)
+                return
             raise
         if not force:
             descendants = len(node.child_list())
             if descendants:
                 s = 's' if descendants != 1 else ''
                 prompt = (
-                    f'Delete node {node._branch} and its {descendants} descendant{s}?'
+                    f'Delete node {node.branch} and its {descendants} descendant{s}?'
                 )
             else:
-                prompt = f'Delete node {node._branch}?'
+                prompt = f'Delete node {node.branch}?'
+            # the node and each descendant hold one worktree and one branch
+            s = 's' if descendants else ''
+            es = 'es' if descendants else ''
             typer.echo(
-                'Warning: This permanently removes the worktree(s) and deletes'
-                ' the branch(es).\nConsider retiring the node to hide it while'
-                ' preserving its branch(es).',
+                f'Warning: This permanently removes the worktree{s} and deletes'
+                f' the branch{es}.\nConsider retiring the node to hide it while'
+                f' preserving its branch{es}.',
                 err=True,
             )
             typer.confirm(prompt, abort=True)
@@ -572,6 +649,9 @@ def node_retire(app: typer.Typer) -> typer.Typer:
     # node argument
     node_help = 'Target node branch (default: this node).'
     node = typer.Argument(None, help=node_help)
+    # reason option
+    reason_help = 'Optional reason for retiring.'
+    reason = typer.Option(None, '--reason', help=reason_help)
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
@@ -579,11 +659,12 @@ def node_retire(app: typer.Typer) -> typer.Typer:
     @command(app, 'retire')
     def _retire(
         node: Optional[str] = node,
+        reason: Optional[str] = reason,
         path: str = path,
     ) -> None:
         """Park a node: hidden from list, unstartable; branch and history kept."""
         node = resolve_target(path, node)
-        result = node.retire()
+        result = node.retire(reason)
         typer.echo(result)
 
     return app
@@ -653,10 +734,7 @@ def node_status(app: typer.Typer) -> typer.Typer:
     ) -> None:
         """Show a node's current status."""
         node = resolve_target(path, node)
-        # reconcile a crashed-but-active node first: reads are where staleness
-        # is observed, and the probe is a no-op unless the stored status
-        # is 'active'
-        node._reconcile_status()
+        # self-reconciling: a crashed-but-active node reads settled
         display = node.status_display()
         typer.echo(display)
 
@@ -668,13 +746,13 @@ def node_list(app: typer.Typer) -> typer.Typer:
     # node argument
     node_help = "Target node branch (default: this node's descendants)."
     node = typer.Argument(None, help=node_help)
-    # all flag
-    all_help = 'Include retired nodes.'
-    all_nodes = typer.Option(False, '--all', help=all_help)
+    # all nodes flag
+    all_nodes_help = 'Include retired nodes.'
+    all_nodes = typer.Option(False, '--all', help=all_nodes_help)
     # retired flag
     retired_help = 'Show only retired nodes.'
     retired = typer.Option(False, '--retired', help=retired_help)
-    # max-depth option
+    # max depth option
     max_depth_help = 'Maximum child depth to include (1 = direct children only).'
     max_depth = typer.Option(None, '--max-depth', help=max_depth_help)
     # status option
@@ -711,22 +789,14 @@ def node_list(app: typer.Typer) -> typer.Typer:
         """List a node's descendants with status (blank limit columns mean unlimited).
 
         Lists descendants only -- it never includes the target row; use
-        ``fractal node status`` for the node's own status.
+        ``fractal node status`` for the node's own status. ``last`` is
+        the age of each node's newest activity; ``!`` flags an active
+        node quiet past ``max(step_timeout, 5m)``.
         """
         # validate arguments
         require_non_negative(max_depth=max_depth)
         if status == '':
             raise typer.BadParameter('--status cannot be empty.')
-        # stable user-facing column set
-        columns = [
-            'status',
-            'node',
-            'title',
-            'max_cost',
-            'max_depth',
-            'max_children',
-            'max_descendants',
-        ]
         # a whole-tree listing (no explicit branch) of a path with no
         # fractal root is "no nodes", not an error; must report an empty
         # list (exit 0) on the uninitialized case rather than hard-failing
@@ -737,7 +807,7 @@ def node_list(app: typer.Typer) -> typer.Typer:
                 if count:
                     typer.echo(0)
                 else:
-                    print_rows([], csv=csv, columns=columns)
+                    print_rows([], csv=csv, columns=_LIST_COLUMNS)
                 return
         else:
             node = resolve_target(path, node)
@@ -754,14 +824,14 @@ def node_list(app: typer.Typer) -> typer.Typer:
         if count:
             typer.echo(len(rows))
             return
-        rows = [{column: row.get(column) for column in columns} for row in rows]
+        rows = [{column: row.get(column) for column in _LIST_COLUMNS} for row in rows]
         # bracket the status for terminal display only
         # (machine output stays unbracketed for clean parsing)
         if rows and not csv and sys.stdout.isatty():
             for row in rows:
                 status = row['status']
                 row['status'] = f'[{status}]'
-        print_rows(rows, csv=csv, columns=columns)
+        print_rows(rows, csv=csv, columns=_LIST_COLUMNS)
 
     return app
 
@@ -777,6 +847,9 @@ def node_activity(app: typer.Typer) -> typer.Typer:
     # csv flag
     csv_help = 'Force CSV output (already the default when piped / non-TTY).'
     csv = typer.Option(False, '--csv', help=csv_help)
+    # json flag
+    json_help = 'Output a JSON array of row objects (mutex with --csv).'
+    json = typer.Option(False, '--json', help=json_help)
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
@@ -786,29 +859,37 @@ def node_activity(app: typer.Typer) -> typer.Typer:
         node: Optional[str] = node,
         limit: Optional[int] = limit,
         csv: bool = csv,
+        json: bool = json,
         path: str = path,
     ) -> None:
-        """Show the node's lifecycle activity, most recent first."""
+        """Show the node's lifecycle activity, most recent first.
+
+        The ``cost`` column is the row's own-node step cost (end rows
+        sum only this node's steps); subtree spend, children included,
+        is ``fractal node cost spent``.
+        """
         require_non_negative(limit=limit)
+        if json and csv:
+            raise typer.BadParameter('--json is mutually exclusive with --csv.')
         node = resolve_target(path, node)
-        query = (
-            'SELECT * FROM activity WHERE node = ?'
-            ' ORDER BY timestamp DESC, run_id DESC, iter_id DESC, step_id DESC'
-        )
-        if limit is not None:
-            query += f' LIMIT {limit}'
-        rows = node.db.read(query=query, params=(node._branch,))
-        print_rows(rows, csv=csv, columns=_ACTIVITY_COLUMNS)
+        rows = node.record.activity(limit=limit)
+        rows = [
+            {column: row.get(column) for column in _ACTIVITY_COLUMNS} for row in rows
+        ]
+        if json:
+            print_json(rows, columns=_ACTIVITY_COLUMNS)
+        else:
+            print_rows(rows, csv=csv, columns=_ACTIVITY_COLUMNS)
 
     return app
 
 
 def node_approve(app: typer.Typer) -> typer.Typer:
     """Register the ``approve`` command."""
-    # node argument (required -- approval is always about a child)
+    # node argument
     node_help = 'Child node branch whose step to approve.'
     node = typer.Argument(..., help=node_help)
-    # step id argument (optional -- defaults to the child's active step)
+    # step id argument
     step_id_help = "Step ID to approve (default: the child's active step)."
     step_id = typer.Argument(None, help=step_id_help)
     # path option
@@ -825,7 +906,7 @@ def node_approve(app: typer.Typer) -> typer.Typer:
         parent = resolve_node(path)
         child = resolve_target(path, node)
         approved = parent.child_approve(child, step_id=step_id)
-        typer.echo(f'Step {approved} on {child._branch} approved.')
+        typer.echo(f'Step {approved} on {child.branch} approved.')
 
     return app
 
@@ -899,14 +980,18 @@ def node_chat(app: typer.Typer) -> typer.Typer:
             )
         # resolve target node
         node = resolve_target(path, node)
-        # fork session and stream reply
+        # fork session and stream reply through the CLI renderer
+        render = StreamRenderer()
         result = node.chat(
             prompt=prompt,
             session=session,
             current=current,
             resume=resume,
             model=model,
+            render=render,
         )
+        # a truncated stream (no result frame) ends mid-line with no summary
+        render.close()
         # surface the resulting session id so the thread can be continued
         if result:
             typer.echo(f'session: {result}', err=True)
@@ -922,33 +1007,36 @@ def node_update(app: typer.Typer) -> typer.Typer:
     # title option
     title_help = 'Child display name.'
     title = typer.Option(None, '--title', help=title_help)
-    # max-cost option
+    # max cost option
     max_cost_help = (
-        'Child maximum cost in USD per run: every new run RE-ARMS the full'
-        ' cap (`node start` on a finished/killed node included) -- runs are'
-        ' isolated, so a continue opens a fresh budget.'
+        'Child maximum cost in USD per run -- runs are isolated, so each'
+        ' launch arms the cap anew; after a budget-ended run, `node start'
+        ' --continue` refuses without an explicit --max-cost.'
     )
     max_cost = typer.Option(None, '--max-cost', help=max_cost_help)
-    # max-iter-cost option
+    # max iter cost option
     max_iter_cost_help = 'Child maximum cost per iteration in USD.'
     max_iter_cost = typer.Option(None, '--max-iter-cost', help=max_iter_cost_help)
-    # max-step-cost option
+    # max step cost option
     max_step_cost_help = (
         'Child maximum cost per step in USD (warn-only when unenforceable).'
     )
     max_step_cost = typer.Option(None, '--max-step-cost', help=max_step_cost_help)
-    # reserve-budget option
+    # reserve budget option
     reserve_budget_help = (
         'Budget reserved for cleanup; USD or N% of the effective --max-cost.'
     )
     reserve_budget = typer.Option(None, '--reserve-budget', help=reserve_budget_help)
-    # max-depth option
+    # step timeout option
+    step_timeout_help = 'Child per-step time budget (e.g. 30s, 10m); caps each step.'
+    step_timeout = typer.Option(None, '--step-timeout', help=step_timeout_help)
+    # max depth option
     max_depth_help = 'Child maximum nesting depth.'
     max_depth = typer.Option(None, '--max-depth', help=max_depth_help)
-    # max-children option
+    # max children option
     max_children_help = 'Child maximum direct child nodes.'
     max_children = typer.Option(None, '--max-children', help=max_children_help)
-    # max-descendants option
+    # max descendants option
     max_descendants_help = 'Child maximum total descendant nodes.'
     max_descendants = typer.Option(None, '--max-descendants', help=max_descendants_help)
     # path option
@@ -963,6 +1051,7 @@ def node_update(app: typer.Typer) -> typer.Typer:
         max_iter_cost: Optional[float] = max_iter_cost,
         max_step_cost: Optional[float] = max_step_cost,
         reserve_budget: Optional[str] = reserve_budget,
+        step_timeout: Optional[str] = step_timeout,
         max_depth: Optional[int] = max_depth,
         max_children: Optional[int] = max_children,
         max_descendants: Optional[int] = max_descendants,
@@ -985,178 +1074,120 @@ def node_update(app: typer.Typer) -> typer.Typer:
             'max_descendants': max_descendants,
         }
         require_non_negative(**kwargs)
-        if (
-            title is None
-            and reserve_budget is None
-            and all(v is None for v in kwargs.values())
-        ):
-            raise typer.BadParameter(
-                'Specify at least one of --title/--max-cost/--max-iter-cost'
-                '/--max-step-cost/--reserve-budget/--max-depth/--max-children'
-                '/--max-descendants.'
-            )
+        if title is None and reserve_budget is None and step_timeout is None:
+            if all(v is None for v in kwargs.values()):
+                raise typer.BadParameter(
+                    'Specify at least one of --title/--max-cost/--max-iter-cost'
+                    '/--max-step-cost/--reserve-budget/--step-timeout/--max-depth'
+                    '/--max-children/--max-descendants.'
+                )
         # resolve the target tree-wide (short names too) like every other node
         # command, then derive its parent -- only the parent can rewrite a child
         target = resolve_target(path, node)
-        parent_branch, _, name = target._branch.rpartition('.')
-        if parent_branch:
-            parent = resolve_target(path, parent_branch)
-        else:
-            raise typer.BadParameter(f'Cannot update the user node: {target._branch}.')
-        # resolve the reserve before validating; a default-mode reserve (equal
-        # to what init's 10% default materialized for the old cap) retunes to
-        # track a new cap instead of going stale
-        old_max_cost = target.config_get('max_cost')
-        old_reserve = target.config_get('reserve_budget')
-        effective_max_cost = max_cost if max_cost is not None else old_max_cost
+        if '.' not in target.branch:
+            raise typer.BadParameter(f'Cannot update the user node: {target.branch}.')
+        # parent is None when its worktree is gone (pruned out of band)
+        parent = target.parent
+        if parent is None:
+            raise typer.BadParameter(f'Parent worktree not found: {target.branch}.')
+        # resolve an explicit reserve to USD against the effective cap -- the
+        # N% grammar is CLI surface and never enters core; the default-mode
+        # reserve retune is core's (child_retune)
         new_reserve = None
         if reserve_budget is not None:
+            effective_max_cost = (
+                max_cost if max_cost is not None else target.config.get('max_cost')
+            )
             new_reserve = parse_reserve_budget(reserve_budget, effective_max_cost)
-        elif max_cost is not None and max_cost > 0 and old_reserve is not None:
-            # a degenerate cap skips the retune -- the merged-config validation
-            # below owns that rejection and its wording
-            if old_reserve == parse_reserve_budget(None, old_max_cost):
-                new_reserve = parse_reserve_budget(None, max_cost)
-        # a per-iter/step cap on an effectively uncapped child mirrors init's
-        # rejection -- unenforceable once the per-iter budget drains
-        if effective_max_cost is None:
-            if max_iter_cost is not None:
-                raise typer.BadParameter('--max-iter-cost requires --max-cost.')
-            if max_step_cost is not None:
-                raise typer.BadParameter('--max-step-cost requires --max-cost.')
-        # validate the merged config the way init/config _set do -- a bare
-        # require_non_negative still admits max_cost==0 and step<=iter<=run
-        # orderings broken from either side (a lowered cap or a raised sub-cap)
-        merged = {
-            'max_cost': effective_max_cost,
-            'max_iter_cost': (
-                max_iter_cost
-                if max_iter_cost is not None
-                else target.config_get('max_iter_cost')
-            ),
-            'max_step_cost': (
-                max_step_cost
-                if max_step_cost is not None
-                else target.config_get('max_step_cost')
-            ),
-            'reserve_budget': new_reserve if new_reserve is not None else old_reserve,
-        }
-        validate_config_values(merged)
-        # the confirmation echo needs each provided key's stored value from
-        # before the write -- a retuned reserve counts even without its flag
-        updates = {'title': title, **kwargs}
-        if new_reserve is not None:
-            updates['reserve_budget'] = new_reserve
-        priors = {
-            key: target.config_get(key)
-            for key, value in updates.items()
-            if value is not None
-        }
-        # update node configuration
-        parent.child_update(
-            name=name,
+        # retune through core -- it owns the reserve retune, the effective-cap
+        # guards, the merged validation, and the prior capture
+        _, _, name = target.branch.rpartition('.')
+        changes = parent.child_retune(
+            name,
             title=title,
             max_cost=max_cost,
             max_iter_cost=max_iter_cost,
             max_step_cost=max_step_cost,
             reserve_budget=new_reserve,
+            step_timeout=step_timeout,
             max_depth=max_depth,
             max_children=max_children,
             max_descendants=max_descendants,
         )
         # confirm each change, old -> new -- a silent mid-run retune is
         # indistinguishable from a dropped one
-        for key, value in updates.items():
-            if value is None:
-                continue
-            prior = priors[key] if priors[key] is not None else 'unset'
+        for key, values in changes.items():
+            prior, value = values
+            prior = prior if prior is not None else 'unset'
             typer.echo(f'{key}: {prior} -> {value}')
 
     return app
 
 
-def node_reconcile_caps(app: typer.Typer) -> typer.Typer:
-    """Register the ``_reconcile_caps`` command."""
+def node_loop(app: typer.Typer) -> typer.Typer:
+    """Register the ``_loop`` command."""
+    # agent command argument
+    agent_command_help = (
+        'Agent invocation (e.g. "claude"); default: the configured agent.'
+    )
+    agent_command = typer.Argument(None, help=agent_command_help)
+    # continue flag
+    continue_help = (
+        'Continue a stopped/exited node (further iterations); the worktree'
+        ' restore discards uncommitted project files.'
+    )
+    continue_ = typer.Option(False, '--continue', help=continue_help)
+    # resume flag
+    resume_help = 'Resume a paused node (adopt its open run where the pause left it).'
+    resume = typer.Option(False, '--resume', help=resume_help)
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
 
-    @command(app, '_reconcile_caps')
-    def _reconcile_caps(
+    @command(app, '_loop')
+    def _loop(
+        agent_command: Optional[str] = agent_command,
+        continue_: bool = continue_,
+        resume: bool = resume,
         path: str = path,
     ) -> None:
-        """Heal the registry cap row from ``config.json``, one warning per drift."""
+        """Run the node's iteration loop (invoked by start.sh inside tmux)."""
         node = resolve_node(path)
-        drifted = node.caps_reconcile()
-        # scream per drifted key -- a silent heal would hide that enforcement
-        # and the registry ever disagreed
-        for key, values in drifted.items():
-            config_value, registry_value = values
-            typer.echo(
-                f'WARNING: config {key}={config_value} != registry'
-                f' {registry_value} -- registry updated to match config'
-                f" (retune with 'fractal node update')"
-            )
+        loop = Loop(
+            node,
+            agent_command=agent_command,
+            continue_=continue_,
+            resume=resume,
+            render=StreamRenderer(),
+        )
+        code = loop.run()
+        if code:
+            raise SystemExit(code)
 
     return app
 
 
-def node_latched(app: typer.Typer) -> typer.Typer:
-    """Register the ``_latched`` command."""
-    # tree flag
-    tree_help = 'Check only the tree-wide latch (skip the ancestor walk).'
-    tree = typer.Option(False, '--tree', help=tree_help)
-    # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+def node_seed(app: typer.Typer) -> typer.Typer:
+    """Register the ``node _seed`` command."""
+    # node-dir argument (raw path, not a resolved node: init.sh
+    # seeds the agent dirs before the node is registered)
+    node_dir_help = 'Node data directory to seed under.'
+    node_dir = typer.Argument(..., help=node_dir_help)
+    # parent flag
+    parent_help = "Parent node's data directory, when one exists."
+    parent = typer.Option(None, '--parent', help=parent_help)
+    # reset flag
+    reset_help = 'Wipe each agent dir before seeding.'
+    reset = typer.Option(False, '--reset', help=reset_help)
 
-    @command(app, '_latched')
-    def _latched(
-        tree: bool = tree,
-        path: str = path,
+    @command(app, '_seed')
+    def _seed(
+        node_dir: str = node_dir,
+        parent: Optional[str] = parent,
+        reset: bool = reset,
     ) -> None:
-        """Print the pausing/paused node at-or-above. Exits 1 if clear."""
-        node = resolve_node(path)
-        latched = node.pause_latched(tree_only=tree)
-        if latched is None:
-            raise SystemExit(1)
-        typer.echo(latched)
-
-    return app
-
-
-def node_prompt(app: typer.Typer) -> typer.Typer:
-    """Register the ``_prompt`` command."""
-    # step argument
-    step_help = 'Step markdown file to assemble the prompt for.'
-    step = typer.Argument(..., help=step_help)
-    # var option
-    vars_help = 'Override a template variable as KEY=VALUE (repeatable).'
-    vars = typer.Option([], '--var', help=vars_help)
-    # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
-
-    @command(app, '_prompt')
-    def _prompt(
-        step: str = step,
-        vars: list[str] = vars,
-        path: str = path,
-    ) -> None:
-        """Assemble and render a step's full prompt (the loop's builder).
-
-        The ``NODE.md`` charter, the step body (frontmatter stripped), and
-        the active mode docs, joined and substituted in one pass;
-        ``_run.sh`` builds every step prompt through this.
-        """
-        # parse KEY=VALUE overrides (split on the first '=' so a value may hold '=')
-        overrides = {}
-        for item in vars:
-            key, _, value = item.partition('=')
-            overrides[key] = value
-        # render and print verbatim (no added newline -- byte-faithful like envsubst)
-        node = resolve_node(path)
-        rendered = node.build_prompt(step, overrides=overrides)
-        typer.echo(rendered, nl=False)
+        """Seed the node's agent config dirs (invoked by init.sh)."""
+        parent_dir = pathlib.Path(parent) if parent else None
+        seed_agents(pathlib.Path(node_dir), parent_dir=parent_dir, reset=reset)
 
     return app

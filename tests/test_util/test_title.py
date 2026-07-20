@@ -10,8 +10,8 @@ __all__ = ['test_name_to_title']
 
 
 @pytest.mark.parametrize(
-    ('name', 'expected'),
-    [
+    argnames=('name', 'expected'),
+    argvalues=[
         ('backend', 'Backend'),
         ('data_pipeline', 'Data Pipeline'),
         ('aloff_wallach_nu_invariant', 'Aloff Wallach Nu Invariant'),

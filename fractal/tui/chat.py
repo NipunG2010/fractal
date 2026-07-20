@@ -2,36 +2,35 @@
 
 Everything chat and textual-free: the transport decision
 (``resolve_transport`` -- fork the live loop session, resume a thread,
-or start fresh), the stream parsers that turn agent
-output lines into ``ChatEvent`` deltas, the ``ChatTurn`` subprocess
-runner the app drives from a worker thread, and the ``ChatController``
-transcript buffers the message pane renders. The agent invocation itself comes
-from ``fractal.core.node.Node.chat_command``, so validation and prompt
-seeding can never drift from ``Node.chat``.
+or start fresh), the ``ChatTurn`` subprocess runner the app drives from
+a worker thread, and the ``ChatController`` owning the per-branch
+transcripts plus the single in-flight turn. The agent invocation, the
+spawn, and the stream parser all come from the agent seam
+(``Node.chat_command`` and the registry backend), so validation, prompt
+seeding, process placement, and the wire protocols can never drift from
+``Node.chat``.
 """
 
 from __future__ import annotations
 
 import collections
 import dataclasses
-import json
+import pathlib
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import IO, Optional
 
-from fractal.core.node import ChatCommand
-from fractal.tui import theme
+from fractal.core.agent import Agent, Invocation, StreamEvent, resolve
+
+from . import fmt
 
 __all__ = [
     'ChatEvent',
     'Transport',
     'resolve_transport',
-    'ClaudeStreamParser',
-    'CodexStreamParser',
     'ChatTurn',
-    'FakeTurn',
     'ChatController',
 ]
 
@@ -64,7 +63,7 @@ class Transport:
 
     @property
     def chat_kwargs(self: Transport) -> dict:
-        """The kwargs for ``Node.chat_command`` this decision implies."""
+        """Return the kwargs for ``Node.chat_command`` this decision implies."""
         if self.session is None:
             return {}
         return {'session': self.session, 'resume': self.resume}
@@ -78,33 +77,50 @@ def resolve_transport(
     live_session: Optional[str],
     session: Optional[str] = None,
     own_chat: bool = False,
+    root: Optional[pathlib.Path] = None,
 ) -> Transport:
     """Resolve how a chat turn reaches a node.
 
     Chat always reaches a real agent -- no node state diverts a turn
     anywhere else. An explicit ``session`` wins: the cockpit's own chat
-    thread resumes in place, a claude session forks, a settled codex thread
-    resumes in place -- but a codex node's *live or paused* thread cannot be
-    forked (and resuming it in place would perturb the running loop, or the
-    session a paused run resumes with), so it falls back to a fresh session
-    with a warning. With no explicit session, an active or paused claude
-    node's woven session forks -- "pause it, then ask what it was doing" is
-    the flagship interrogation flow; every other active/paused shape (codex,
-    detached, or no session woven yet) and anything settled or idle gets a
-    fresh seeded session.
+    thread resumes in place, a forking agent's session forks, a settled
+    non-forking thread resumes in place -- but a non-forking node's *live
+    or paused* thread cannot be forked (and resuming it in place would
+    perturb the running loop, or the session a paused run resumes with),
+    so it falls back to a fresh session with a warning. With no explicit
+    session, an active or paused forking node's woven session forks --
+    "pause it, then ask what it was doing" is the flagship interrogation
+    flow; every other active/paused shape (non-forking, detached, or no
+    session woven yet) and anything settled or idle gets a fresh seeded
+    session.
 
     Args:
-        agent: The node's agent (``'claude'``/``'codex'``).
+        agent: The node's agent command (e.g. ``'claude'``/``'codex'``).
         status: The node's live status.
         detached: Whether the node runs detached (no woven session).
         live_session: The node's newest woven session, when active.
         session: An explicitly selected session (compose field / step fork).
         own_chat: Whether ``session`` is the cockpit's own prior chat thread.
+        root: Tree data dir whose deployment hook file the backend lookup
+            consults (hook-registered agents must resolve here too).
 
     Returns:
         The resolved transport.
 
     """
+    # the fork capability is the backend's class-level fact; a node with no
+    # agent configured yet (config is agent-editable: blank counts) reads as
+    # forking (there is nothing to refuse), an unregistered one as
+    # non-forking (never fork what cannot be forked)
+    parts = agent.split()
+    if parts:
+        base = parts[0]
+        try:
+            can_fork = resolve(base, root=root).can_fork
+        except ValueError:
+            can_fork = False
+    else:
+        base, can_fork = '', True
     if session is not None:
         if own_chat:
             return Transport(
@@ -113,12 +129,12 @@ def resolve_transport(
                 session=session,
                 resume=True,
             )
-        if agent == 'codex':
+        if not can_fork:
             if status in ('active', 'paused') and session == live_session:
                 shape = 'live' if status == 'active' else 'paused'
                 return Transport(
                     kind='fresh',
-                    label=f"codex {shape} thread can't fork -- fresh session",
+                    label=f"{base} {shape} thread can't fork -- fresh session",
                     warn=True,
                 )
             return Transport(
@@ -133,142 +149,21 @@ def resolve_transport(
             session=session,
         )
     if status in ('active', 'paused'):
-        if agent == 'claude' and live_session:
+        if can_fork and live_session:
             shape = 'live' if status == 'active' else 'paused'
             return Transport(
                 kind='fork',
                 label=f'forked {shape} session {live_session}',
                 session=live_session,
             )
-        if agent == 'codex':
-            reason = "codex can't fork"
+        if not can_fork:
+            reason = f"{base} can't fork"
         elif detached:
             reason = 'detached node'
         else:
             reason = 'no live session yet'
         return Transport(kind='fresh', label=f'fresh session ({reason})')
     return Transport(kind='fresh', label='fresh session')
-
-
-# ------ stream parsers
-
-
-class ClaudeStreamParser:
-    """Parses claude ``stream-json`` lines into ``ChatEvent`` items."""
-
-    def __init__(self: ClaudeStreamParser) -> None:
-        """Initialize ``ClaudeStreamParser``."""
-        self._session_seen = False
-        self._closed = False
-
-    @property
-    def closed(self: ClaudeStreamParser) -> bool:
-        """Whether a ``result`` line closed the turn."""
-        return self._closed
-
-    def feed(self: ClaudeStreamParser, line: str) -> list[ChatEvent]:
-        """Parse one stream line (malformed/unknown lines yield nothing)."""
-        line = line.strip()
-        if not line:
-            return []
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            return []
-        if not isinstance(message, dict):
-            return []
-        result: list[ChatEvent] = []
-        # the resumable session id rides on every event; emit it once
-        if not self._session_seen:
-            session = message.get('session_id')
-            if session:
-                self._session_seen = True
-                result.append(ChatEvent(kind='session', text=session))
-        message_type = message.get('type')
-        if message_type == 'stream_event':
-            event = message.get('event', {})
-            event_type = event.get('type')
-            if event_type == 'content_block_start':
-                block = event.get('content_block', {})
-                if block.get('type') == 'tool_use':
-                    result.append(ChatEvent(kind='tool', text=block.get('name', '?')))
-            elif event_type == 'content_block_delta':
-                delta = event.get('delta', {})
-                if delta.get('type') == 'text_delta':
-                    text = delta.get('text', '')
-                    if text:
-                        result.append(ChatEvent(kind='text', text=text))
-        elif message_type == 'result':
-            self._closed = True
-            turns = message.get('num_turns', 0)
-            # coalesce a present-but-null duration_ms to 0.0 -- the key can be
-            # explicitly null on some result frames, and `0.001 * None` raises
-            duration = 0.001 * (message.get('duration_ms') or 0.0)
-            cost = message.get('total_cost_usd')
-            cost_str = f'${cost:.2f}' if cost is not None else '$?'
-            summary = (
-                f'done {theme.SEP} {turns} turns {theme.SEP} {duration:.1f}s'
-                f' {theme.SEP} {cost_str}'
-            )
-            if message.get('is_error') or message.get('subtype') != 'success':
-                detail = message.get('result') or message.get('subtype') or 'error'
-                result.append(ChatEvent(kind='error', text=str(detail)))
-            result.append(ChatEvent(kind='meta', text=summary))
-        return result
-
-
-class CodexStreamParser:
-    """Parses codex ``--json`` JSONL lines into ``ChatEvent`` items."""
-
-    def __init__(self: CodexStreamParser) -> None:
-        """Initialize ``CodexStreamParser``."""
-        self._started = time.monotonic()
-        self._closed = False
-
-    @property
-    def closed(self: CodexStreamParser) -> bool:
-        """Whether a ``turn.completed`` line closed the turn."""
-        return self._closed
-
-    def feed(self: CodexStreamParser, line: str) -> list[ChatEvent]:
-        """Parse one stream line (malformed/unknown lines yield nothing)."""
-        line = line.strip()
-        if not line:
-            return []
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            return []
-        if not isinstance(event, dict):
-            return []
-        event_type = event.get('type')
-        if event_type == 'thread.started':
-            session = event.get('thread_id')
-            if session:
-                return [ChatEvent(kind='session', text=session)]
-        elif event_type == 'item.started':
-            item = event.get('item', {})
-            if item.get('type') == 'command_execution':
-                return [ChatEvent(kind='tool', text=item.get('command', '?'))]
-        elif event_type == 'item.completed':
-            item = event.get('item', {})
-            if item.get('type') == 'agent_message' and item.get('text'):
-                # codex sends whole messages; the pane's coalescing still applies
-                return [ChatEvent(kind='text', text=item['text'] + '\n')]
-        elif event_type == 'turn.completed':
-            # codex reports no per-turn cost on the stream; close on wall time
-            self._closed = True
-            wall = time.monotonic() - self._started
-            return [ChatEvent(kind='meta', text=f'done {theme.SEP} {wall:.1f}s')]
-        elif event_type in ('error', 'turn.failed'):
-            error = event.get('error')
-            detail = (
-                event.get('message')
-                or (error.get('message') if isinstance(error, dict) else error)
-                or 'unknown error'
-            )
-            return [ChatEvent(kind='error', text=str(detail))]
-        return []
 
 
 # ------ turn runners
@@ -284,14 +179,20 @@ class ChatTurn:
     callable from any thread); a cancelled turn ends without an error event.
     """
 
-    def __init__(self: ChatTurn, command: ChatCommand) -> None:
+    def __init__(self: ChatTurn, command: Invocation, agent: Agent) -> None:
         """Initialize ``ChatTurn``.
 
         Args:
             command: The agent invocation to spawn (``Node.chat_command``).
+            agent: The node-bound backend (``node.agent(command.agent)``)
+                supplying the stream parser and the spawn route --
+                resolved at construction, so an unknown agent surfaces
+                on the caller's error path, never inside ``events``.
 
         """
         self._command = command
+        self._agent = agent
+        self._parser = agent.parser()
         self._process: Optional[subprocess.Popen[str]] = None
         self._cancelled = False
         self._stderr: collections.deque[str] = collections.deque(
@@ -300,7 +201,7 @@ class ChatTurn:
 
     @property
     def cancelled(self: ChatTurn) -> bool:
-        """Whether ``cancel`` was called."""
+        """Return whether ``cancel`` was called."""
         return self._cancelled
 
     def cancel(self: ChatTurn) -> None:
@@ -313,22 +214,17 @@ class ChatTurn:
     def events(self: ChatTurn) -> Iterator[ChatEvent]:
         """Yield the turn's events; spawns on first iteration, never raises."""
         started = time.monotonic()
+        # launch through the seam's spawn triad (a host's _spawn override
+        # covers this surface too); the base hook wires argv/cwd/env,
+        # stdin=DEVNULL, and stdout=PIPE in text mode -- the TUI pipes stderr
         try:
-            process = subprocess.Popen(
-                self._command.argv,
-                cwd=str(self._command.cwd),
-                env=self._command.env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            process = self._agent.spawn(self._command, stderr=subprocess.PIPE)
         except OSError as error:
             yield ChatEvent(
                 kind='error',
                 text=f'{self._command.agent} failed to launch: {error}',
             )
-            yield ChatEvent(kind='meta', text=f'done {theme.SEP} 0.0s')
+            yield ChatEvent(kind='meta', text=fmt.chat_meta(0.0))
             return
         self._process = process
         if self._cancelled:
@@ -341,18 +237,28 @@ class ChatTurn:
             daemon=True,
         )
         drain.start()
-        if self._command.agent == 'claude':
-            parser = ClaudeStreamParser()
-        else:
-            parser = CodexStreamParser()
+        closed = False
         for line in process.stdout:
-            # a malformed line must never abort the turn -- the parsers swallow
-            # bad JSON, but a shape they don't expect could still raise, so
+            # a malformed line must never abort the turn -- the parser swallows
+            # bad JSON, but a shape it doesn't expect could still raise, so
             # degrade it to an error event rather than crashing the worker
             try:
-                yield from parser.feed(line)
+                parsed = self._parser.feed(line)
             except Exception as error:
                 yield ChatEvent(kind='error', text=f'stream parse error: {error}')
+                continue
+            for event in parsed:
+                # a result closes the turn unless it is a mid-run step_finish
+                # frame from a results-per-step backend (opencode; its final
+                # frame sets final=True). Every other backend emits one
+                # terminal result; codex's carries final=False for cost reasons
+                # but is still the turn's end
+                is_result = event.kind == 'result'
+                is_final = event.final or not self._agent.results_per_step
+                terminal = is_result and is_final
+                if terminal:
+                    closed = True
+                yield from _chat_events(event, terminal=terminal)
         returncode = process.wait()
         drain.join(timeout=1.0)
         if returncode != 0 and not self._cancelled:
@@ -364,80 +270,67 @@ class ChatTurn:
             )
         # every turn closes with a meta line (wall clock when the stream
         # carried no summary -- e.g. a kill or a truncated stream)
-        if not parser.closed:
+        if not closed:
             wall = time.monotonic() - started
-            yield ChatEvent(kind='meta', text=f'done {theme.SEP} {wall:.1f}s')
+            yield ChatEvent(kind='meta', text=fmt.chat_meta(wall))
 
 
-class FakeTurn:
-    """A ``ChatTurn``-shaped canned event stream (tests and demos)."""
-
-    def __init__(
-        self: FakeTurn,
-        events: list[ChatEvent],
-        *,
-        pause: float = 0.0,
-    ) -> None:
-        """Initialize ``FakeTurn``.
-
-        Args:
-            events: The events to replay.
-            pause: Optional inter-event sleep (simulates streaming pace).
-
-        """
-        self._events = list(events)
-        self._pause = pause
-        self._cancelled = False
-
-    @property
-    def cancelled(self: FakeTurn) -> bool:
-        """Whether ``cancel`` was called."""
-        return self._cancelled
-
-    def cancel(self: FakeTurn) -> None:
-        """Stop the replay."""
-        self._cancelled = True
-
-    def events(self: FakeTurn) -> Iterator[ChatEvent]:
-        """Replay the canned events."""
-        for event in self._events:
-            if self._cancelled:
-                return
-            if self._pause:
-                time.sleep(self._pause)
-            yield event
-
-
-# ------ transcripts
+# ------ controller
 
 
 class ChatController:
-    """Per-branch chat transcripts + the cockpit's own chat session ids."""
+    """Per-branch chat transcripts plus the single in-flight turn.
 
-    def __init__(self: ChatController) -> None:
-        """Initialize ``ChatController``."""
-        self._convos: dict[str, list[tuple[str, str]]] = {}
+    Owns everything about "one chat turn at a time": the live ``ChatTurn``,
+    its branch, the monotonically incremented turn id (staleness stamp),
+    the last-delta instant (watchdog input), and the spinner counters.
+    The app owns only the worker and the intervals.
+    """
+
+    def __init__(
+        self: ChatController,
+        *,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Initialize ``ChatController``.
+
+        Args:
+            now: Monotonic-seconds clock for the idle watchdog and the
+                spinner (injectable for deterministic tests).
+
+        """
+        self._now = now
+        self._transcripts: dict[str, list[tuple[str, str]]] = {}
         self._sessions: dict[str, str] = {}
+        # the in-flight turn (ids mint from 1, so 0 is never a live stamp)
+        self._turn: Optional[ChatTurn] = None
+        self._turn_branch = ''
+        self._turn_id = 0
+        self._seen = 0.0
+        self._spin_frame = 0
+        self._spin_started = 0.0
 
-    def convo(self: ChatController, branch: str) -> list[tuple[str, str]]:
+    # transcripts + cockpit sessions
+
+    def transcript(self: ChatController, branch: str) -> list[tuple[str, str]]:
         """Return a branch's transcript (created empty on first access).
 
         Lines are ``(who, text)`` with ``who`` one of ``'you'`` / ``'auth'``
         (the agent) / ``'meta'`` / ``'error'``.
         """
-        return self._convos.setdefault(branch, [])
+        return self._transcripts.setdefault(branch, [])
 
     def append(self: ChatController, branch: str, who: str, text: str) -> None:
         """Append a ``(who, text)`` line to a branch's transcript."""
-        self.convo(branch).append((who, text))
+        self.transcript(branch).append((who, text))
 
     def append_delta(self: ChatController, branch: str, text: str) -> None:
         """Grow the trailing agent line, or start one (token coalescing)."""
-        convo = self.convo(branch)
-        if convo and convo[-1][0] == 'auth':
-            convo[-1] = ('auth', convo[-1][1] + text)
+        transcript = self.transcript(branch)
+        if transcript and transcript[-1][0] == 'auth':
+            transcript[-1] = ('auth', transcript[-1][1] + text)
         else:
-            convo.append(('auth', text))
+            transcript.append(('auth', text))
 
     def session(self: ChatController, branch: str) -> Optional[str]:
         """Return the cockpit's own chat session for a branch, if any."""
@@ -447,8 +340,111 @@ class ChatController:
         """Record the cockpit's chat session for a branch (multi-turn resume)."""
         self._sessions[branch] = session
 
+    # in-flight turn
+
+    @property
+    def turn(self: ChatController) -> Optional[ChatTurn]:
+        """Return the in-flight turn; ``None`` when idle."""
+        return self._turn
+
+    @property
+    def turn_branch(self: ChatController) -> str:
+        """Return the branch the in-flight turn chats on (``''`` when idle)."""
+        return self._turn_branch
+
+    def begin(self: ChatController, branch: str, turn: ChatTurn) -> int:
+        """Cancel any prior turn, adopt this one, and return its fresh turn id."""
+        self.cancel()
+        self._turn = turn
+        self._turn_branch = branch
+        self._turn_id += 1
+        self._seen = self._now()
+        # the in-flight spinner: pinned under the transcript until the turn ends
+        self._spin_frame = 0
+        self._spin_started = self._now()
+        return self._turn_id
+
+    def is_current(self: ChatController, turn_id: int) -> bool:
+        """Return whether a message stamp belongs to the live turn."""
+        return turn_id == self._turn_id
+
+    def touch(self: ChatController) -> None:
+        """Record delta arrival (re-arms the idle watchdog)."""
+        self._seen = self._now()
+
+    def idle(self: ChatController) -> float:
+        """Return seconds since the last delta (watchdog input)."""
+        return self._now() - self._seen
+
+    def finish(self: ChatController, turn_id: int) -> None:
+        """Clear the turn iff the stamp is current.
+
+        A stale done from a superseded turn must not orphan the new turn's
+        subprocess.
+        """
+        if turn_id == self._turn_id:
+            self._turn = None
+            self._turn_branch = ''
+
+    def cancel(self: ChatController) -> None:
+        """Kill and clear the in-flight turn; idempotent.
+
+        Worker cancellation alone cannot unblock a readline; the process
+        kill is the real lever.
+        """
+        turn = self._turn
+        if turn is not None:
+            turn.cancel()
+        self._turn = None
+        self._turn_branch = ''
+
+    # spinner
+
+    @property
+    def spin_frame(self: ChatController) -> int:
+        """Return the spinner's current frame counter."""
+        return self._spin_frame
+
+    def spin_elapsed(self: ChatController) -> float:
+        """Return seconds since the in-flight spinner started (its clock)."""
+        return self._now() - self._spin_started
+
+    def spin(self: ChatController) -> None:
+        """Advance the spinner frame."""
+        self._spin_frame += 1
+
 
 # ------ helper functions
+
+
+def _chat_events(event: StreamEvent, *, terminal: bool = True) -> list[ChatEvent]:
+    """Translate one seam stream event into transcript vocabulary.
+
+    Session/text/tool/error facts map one-to-one; cost facts and tool
+    results are recorded or rendered elsewhere and stay out of the
+    transcript. Only a ``terminal`` result closes the turn with its
+    summary line -- opencode emits a result per step_finish, so its
+    mid-run frames arrive non-terminal and render nothing but any failure
+    detail. A turn-counting result (claude) closes on turns/duration/cost,
+    a wall-time result (codex) on duration alone.
+    """
+    if event.kind == 'session':
+        return [ChatEvent(kind='session', text=event.session)]
+    if event.kind == 'text':
+        return [ChatEvent(kind='text', text=event.text)]
+    if event.kind == 'tool':
+        return [ChatEvent(kind='tool', text=event.tool)]
+    if event.kind == 'error':
+        return [ChatEvent(kind='error', text=event.message)]
+    if event.kind == 'result':
+        result: list[ChatEvent] = []
+        if event.failed and event.message:
+            result.append(ChatEvent(kind='error', text=event.message))
+        if terminal:
+            summary = fmt.chat_summary(event.turns, event.duration, event.cost)
+            result.append(ChatEvent(kind='meta', text=summary))
+        return result
+    return []
 
 
 def _drain(stream: Optional[IO[str]], sink: collections.deque[str]) -> None:

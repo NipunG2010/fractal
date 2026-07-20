@@ -5,9 +5,6 @@ from __future__ import annotations
 import os
 import pathlib
 import subprocess
-import threading
-
-import pytest
 
 import fractal.core
 from fractal.core.node import Node
@@ -17,10 +14,7 @@ __all__ = [
     'test_init_writes_git_excludes',
     'test_init_excludes_subproject_user_seed',
     'test_git_exclude_anchors_workspace_dirs',
-    'test_track_is_fixed_after_init',
-    'test_git_exclude_preserves_content_and_collapses_blocks',
-    'test_git_exclude_orphan_begin_preserves_tail',
-    'test_git_exclude_concurrent_writers_preserve_custom',
+    'test_track_untrack_toggle_survives_exclude_rewrites',
     'test_git_exclude_skips_user_seed_without_commit',
 ]
 
@@ -40,7 +34,16 @@ def test_exclude_template_ships_as_package_data() -> None:
         'non-editable install _git_exclude would raise FileNotFoundError'
     )
     patterns = template.read_text(encoding='utf-8')
-    for pattern in ('.worktrees/', '.db', '.status', 'claude.err', 'codex.err'):
+    for pattern in (
+        '.worktrees/',
+        '.db',
+        '.status',
+        'claude.err',
+        'codex.err',
+        'grok.err',
+        'opencode.err',
+        'omp.err',
+    ):
         assert pattern in patterns, f'excludes template must contain {pattern!r}'
 
 
@@ -156,125 +159,33 @@ def test_git_exclude_anchors_workspace_dirs(tmp_path: pathlib.Path) -> None:
     assert 'info/exclude' in _check_ignore(repo, 'src/tmp/scratch.txt')
 
 
-def test_track_is_fixed_after_init(tmp_path: pathlib.Path) -> None:
-    """``track`` is repo-wide, so it is fixed at init -- a re-init that flips it raises.
+def test_track_untrack_toggle_survives_exclude_rewrites(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``fractal track``/``untrack`` is the only toggle; block rewrites preserve it.
 
-    Re-running ``init`` with the same value (or no flag) is an idempotent no-op.
+    Tracking truth lives in the exclude block's own seed-dir ignore line, so
+    the block writer (re-run on every child init and start) re-reads and
+    preserves the current state instead of resetting it to the untracked
+    default. A fresh init is untracked; a re-init is an idempotent no-op.
     """
     repo = _committed_repo(tmp_path)
     node = Node(repo)
     node.init(user=True)
+    # a fresh init is untracked: the seed dir is ignored, re-init included
     assert 'info/exclude' in _check_ignore(repo, '.fractal/main')
-    # same value or no flag: idempotent no-op, still ignored
-    node.init(track=False, user=True)
     node.init(user=True)
     assert 'info/exclude' in _check_ignore(repo, '.fractal/main')
-    # flipping it is rejected
-    with pytest.raises(ValueError, match='cannot be changed'):
-        node.init(track=True, user=True)
+    # fractal track lifts the seed-dir ignore; a block rewrite preserves it
+    _toggle(repo, 'track')
+    assert not _check_ignore(repo, '.fractal/main')
+    node._git_exclude()
+    assert not _check_ignore(repo, '.fractal/main')
+    # fractal untrack restores the ignore, surviving a rewrite the same way
+    _toggle(repo, 'untrack')
     assert 'info/exclude' in _check_ignore(repo, '.fractal/main')
-
-
-@pytest.mark.parametrize(
-    ('seed', 'keep', 'drop'),
-    [
-        # custom lines before AND after a real block survive; block stays one
-        (
-            'keep_before\n# >>> fractal >>>\nstale_inner\n# <<< fractal <<<\nkeep_after\n',
-            ['keep_before', 'keep_after'],
-            ['stale_inner'],
-        ),
-        # two stacked blocks collapse to exactly one
-        (
-            '# >>> fractal >>>\nstale_one\n# <<< fractal <<<\n'
-            '# >>> fractal >>>\nstale_two\n# <<< fractal <<<\nkeep_outer\n',
-            ['keep_outer'],
-            ['stale_one', 'stale_two'],
-        ),
-        # a custom line that merely mentions the markers is left untouched
-        (
-            'doc mentions # >>> fractal >>> and # <<< fractal <<< inline\nkeep_plain\n',
-            [
-                'doc mentions # >>> fractal >>> and # <<< fractal <<< inline',
-                'keep_plain',
-            ],
-            [],
-        ),
-    ],
-)
-def test_git_exclude_preserves_content_and_collapses_blocks(
-    tmp_path: pathlib.Path,
-    seed: str,
-    keep: list[str],
-    drop: list[str],
-) -> None:
-    """``_git_exclude`` preserves non-fractal content and keeps exactly one block.
-
-    Whole-line marker matching means a custom line that *mentions* the markers is
-    never treated as a delimiter, and stacked blocks collapse to one -- so a
-    re-init never duplicates the block or mangles user lines.
-    """
-    repo = _git_repo(tmp_path)
-    exclude = repo / '.git' / 'info' / 'exclude'
-    exclude.write_text(seed, encoding='utf-8')
-    Node(repo)._git_exclude()
-    out = exclude.read_text(encoding='utf-8')
-    for line in keep:
-        assert line in out
-    for line in drop:
-        assert line not in out
-    blocks = sum(1 for ln in out.splitlines() if ln.strip() == '# >>> fractal >>>')
-    assert blocks == 1
-
-
-def test_git_exclude_orphan_begin_preserves_tail(tmp_path: pathlib.Path) -> None:
-    """An unmatched begin marker is left as content, not swallowing the tail.
-
-    A ``find()``-based strip would delete everything from a lone begin marker to
-    EOF; the whole-line walk leaves the orphan in place and still appends a fresh
-    block, so content after the orphan survives.
-    """
-    repo = _git_repo(tmp_path)
-    exclude = repo / '.git' / 'info' / 'exclude'
-    exclude.write_text('top_custom\n# >>> fractal >>>\nkeep_tail\n', encoding='utf-8')
-    Node(repo)._git_exclude()
-    out = exclude.read_text(encoding='utf-8')
-    assert 'top_custom' in out
-    assert 'keep_tail' in out
-    # a complete fresh block is still written
-    assert '# >>> fractal >>>' in out
-    assert '# <<< fractal <<<' in out
-
-
-def test_git_exclude_concurrent_writers_preserve_custom(tmp_path: pathlib.Path) -> None:
-    """Concurrent ``_git_exclude`` writers never drop the user's custom lines.
-
-    The common-dir ``info/exclude`` is shared by every worktree, so sibling
-    ``init``/``start`` fan-out races on it. The atomic unique-temp ``os.replace``
-    keeps a racing writer from observing a truncated file and overwriting custom
-    content -- a non-atomic ``write_text`` loses ``CUSTOM_KEEP`` under contention.
-    """
-    repo = _git_repo(tmp_path)
-    exclude = repo / '.git' / 'info' / 'exclude'
-    exclude.write_text('CUSTOM_KEEP\n', encoding='utf-8')
-    node = Node(repo)
-    workers = 8
-    barrier = threading.Barrier(workers)
-
-    def hammer() -> None:
-        barrier.wait(timeout=30)
-        for _ in range(15):
-            node._git_exclude()
-
-    threads = [threading.Thread(target=hammer) for _ in range(workers)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    out = exclude.read_text(encoding='utf-8')
-    assert 'CUSTOM_KEEP' in out
-    blocks = sum(1 for ln in out.splitlines() if ln.strip() == '# >>> fractal >>>')
-    assert blocks == 1
+    node._git_exclude()
+    assert 'info/exclude' in _check_ignore(repo, '.fractal/main')
 
 
 def test_git_exclude_skips_user_seed_without_commit(tmp_path: pathlib.Path) -> None:
@@ -346,3 +257,14 @@ def _check_ignore(cwd: pathlib.Path, path: str) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def _toggle(repo: pathlib.Path, verb: str) -> None:
+    """Run ``fractal track``/``untrack`` against ``repo`` via the real CLI."""
+    subprocess.run(
+        ['fractal', verb],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )

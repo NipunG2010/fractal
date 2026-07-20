@@ -1,10 +1,11 @@
-"""Tests for ``Node.chat`` command construction and streaming.
+"""Tests for ``Node.chat`` validation, seeding, and streaming.
 
 ``chat`` is exercised with only the subprocess boundary mocked: a fake
-``Popen`` captures the argv/cwd/env and feeds a canned agent stream, while the
-real ``render_stream`` parses it. So the tests pin the observable contract --
-which command is launched for each (state, flags) and the session id returned --
-without spawning a real agent.
+``Popen`` captures the spawn and feeds a canned agent stream, while the real
+backend parser and CLI renderer consume it. So the tests pin the observable
+chat contract -- the guard matrix, the prompt seeding rules, and the session
+id returned -- without spawning a real agent. The per-provider argv pins live
+with the backends in ``test_impl``.
 """
 
 from __future__ import annotations
@@ -12,19 +13,21 @@ from __future__ import annotations
 import io
 import json
 import subprocess
+import threading
+from typing import Any, Optional
 
 import pytest
 
+from fractal.cli.utils import StreamRenderer
 from fractal.core.node import Node
 
 __all__ = [
-    'test_chat_modes_build_expected_command',
-    'test_chat_without_node_settings_omits_the_flag',
-    'test_chat_prompt_seeding',
-    'test_chat_honors_agent_command_and_model',
-    'test_chat_codex_fresh_and_resume',
+    'test_chat_streams_and_returns_the_captured_session',
+    'test_chat_seeds_prompt_docs_per_fresh_fork_and_resume',
     'test_chat_guards_reject_invalid_requests',
     'test_chat_nonzero_exit_raises',
+    'test_chat_reaps_a_blocked_writer_when_streaming_raises',
+    'test_chat_applies_the_configured_effort',
 ]
 
 # minimal agent streams carrying a session id for capture
@@ -40,104 +43,42 @@ _CODEX_STREAM = json.dumps({'type': 'thread.started', 'thread_id': 'thr_new'}) +
 
 
 @pytest.mark.parametrize(
-    ('active', 'stored', 'kwargs', 'expect', 'absent'),
-    [
-        # idle node, no session -> fresh
-        (False, None, {}, ['--session-id'], ['--resume', '--fork-session']),
-        # running node WITH a live session but no flags -> still fresh (no inference)
-        (True, 'live-9', {}, ['--session-id'], ['--resume', '--fork-session']),
-        # --current forks the live loop session
-        (
-            True,
-            'live-1',
-            {'current': True},
-            ['--resume', 'live-1', '--fork-session'],
-            [],
-        ),
-        # explicit --session, default -> fork that id
-        (
-            False,
-            None,
-            {'session': 'past-9'},
-            ['--resume', 'past-9', '--fork-session'],
-            [],
-        ),
-        # explicit --session + resume -> continue in place (no fork)
-        (
-            False,
-            None,
-            {'session': 'past-9', 'resume': True},
-            ['--resume', 'past-9'],
-            ['--fork-session'],
-        ),
-    ],
-    ids=[
-        'fresh-idle',
-        'fresh-despite-live',
-        'current',
-        'explicit-fork',
-        'resume-in-place',
+    argnames=('agent', 'stream', 'expected'),
+    argvalues=[
+        pytest.param('claude', _CLAUDE_STREAM, 'sess_new', id='claude'),
+        pytest.param('codex', _CODEX_STREAM, 'thr_new', id='codex'),
     ],
 )
-def test_chat_modes_build_expected_command(
+def test_chat_streams_and_returns_the_captured_session(
     node_with_db: Node,
     monkeypatch: pytest.MonkeyPatch,
-    active: bool,
-    stored: str,
-    kwargs: dict,
-    expect: list,
-    absent: list,
+    agent: str,
+    stream: str,
+    expected: Optional[str],
 ) -> None:
-    """``chat`` builds the right claude command per (state, flags) and returns the id."""
-    node = node_with_db
-    settings = node._node_dir / '.claude' / 'settings.json'
-    settings.parent.mkdir()
-    settings.write_text('{}\n', encoding='utf-8')
-    if active:
-        (node._node_dir / '.status').write_text('active\n', encoding='utf-8')
-    if stored is not None:
-        node.session_set('claude', stored)
-    captured = _patch_popen(monkeypatch)
+    """A chat spawns the backend invocation and returns the stream's id.
 
-    result = node.chat('hello', **kwargs)
-
-    argv = captured['argv']
-    assert argv[0] == 'claude'
-    # the prompt is the seed (CHAT.md, etc.) followed by the user message
-    assert argv[1] == '-p'
-    assert argv[2].endswith('hello')
-    for token in expect:
-        assert token in argv
-    for token in absent:
-        assert token not in argv
-    # the resulting session id is captured from the stream
-    assert result == 'sess_new'
-    # claude chats run in the worktree on the user's own config home and env
-    # (matching the loop's launch shape, so loop sessions stay forkable),
-    # with the node's settings riding --settings, stdin detached
-    assert captured['cwd'] == str(node._root)
-    assert captured['env'] is None
-    assert argv[argv.index('--settings') + 1] == str(settings)
-    assert captured['stdin'] == subprocess.DEVNULL
-
-
-def test_chat_without_node_settings_omits_the_flag(
-    node_with_db: Node,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A node with no seeded ``.claude/settings.json`` chats on user defaults.
-
-    The root (user) node seeds no agent config, so its chats must not point
-    ``--settings`` at a missing file.
+    The fake ``Popen`` feeds the canned stream through the real backend
+    parser and the real CLI renderer; the captured session id is the
+    return value the ``session:`` echo prints.
     """
-    captured = _patch_popen(monkeypatch)
-    node_with_db.chat('hello')
-    assert '--settings' not in captured['argv']
+    node = node_with_db
+    node.config.set('agent', agent)
+    captured = _patch_popen(monkeypatch, stdout_text=stream)
+
+    result = node.chat('hello', render=StreamRenderer())
+
+    # the real backend invocation was spawned, stdin detached (the prompt,
+    # an argument, is the only input channel)
+    assert captured['argv'][0] == agent
+    assert captured['stdin'] == subprocess.DEVNULL
+    # the resulting session id is captured from the stream
+    assert result == expected
 
 
 @pytest.mark.parametrize(
-    ('kwargs', 'active', 'has_node', 'has_chat'),
-    [
+    argnames=('kwargs', 'active', 'has_node', 'has_chat'),
+    argvalues=[
         ({}, False, True, True),  # fresh -> NODE.md + CHAT.md
         ({'current': True}, True, False, True),  # fork live session -> CHAT.md
         ({'session': 'past-1'}, False, False, True),  # fork a given id -> CHAT.md
@@ -145,7 +86,7 @@ def test_chat_without_node_settings_omits_the_flag(
     ],
     ids=['fresh', 'fork-current', 'fork-session', 'resume'],
 )
-def test_chat_prompt_seeding(
+def test_chat_seeds_prompt_docs_per_fresh_fork_and_resume(
     node_with_db: Node,
     monkeypatch: pytest.MonkeyPatch,
     kwargs: dict,
@@ -155,74 +96,23 @@ def test_chat_prompt_seeding(
 ) -> None:
     """Fresh chats seed NODE.md + CHAT.md; forks seed CHAT.md; resumes seed nothing."""
     node = node_with_db
-    (node._node_dir / 'NODE.md').write_text('NODE_CHARTER_MARKER\n', encoding='utf-8')
+    (node.node_dir / 'NODE.md').write_text('NODE_CHARTER_MARKER\n', encoding='utf-8')
     if active:
         _activate(node, 'live-1')
     captured = _patch_popen(monkeypatch)
 
     node.chat('the user question', **kwargs)
 
-    prompt = captured['argv'][captured['argv'].index('-p') + 1]
+    prompt = captured['argv'][captured['argv'].index('--') + 1]
     assert ('NODE_CHARTER_MARKER' in prompt) is has_node
     # 'Chat Mode' is the heading of the package CHAT.md (seeded from there now)
     assert ('Chat Mode' in prompt) is has_chat
     assert prompt.endswith('the user question')
 
 
-def test_chat_honors_agent_command_and_model(
-    node_with_db: Node,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The full configured agent command and model flow into the argv."""
-    node = node_with_db
-    node.config_set(agent='claude --foo', model='claude-opus-4-8')
-    captured = _patch_popen(monkeypatch)
-    node.chat('hi')
-    assert captured['argv'][:2] == ['claude', '--foo']  # full command honored
-    assert '--model' in captured['argv']
-    assert 'claude-opus-4-8' in captured['argv']
-    # an explicit model overrides the configured default
-    node.chat('hi', model='sonnet')
-    assert 'sonnet' in captured['argv']
-    assert 'claude-opus-4-8' not in captured['argv']
-
-
 @pytest.mark.parametrize(
-    ('kwargs', 'expect'),
-    [
-        ({}, ['exec', '-C']),
-        ({'session': 'thr-7', 'resume': True}, ['exec', 'resume', 'thr-7']),
-        ({'model': 'gpt-5-codex'}, ['exec', '-C', '-m', 'gpt-5-codex']),
-    ],
-    ids=['fresh', 'resume', 'model'],
-)
-def test_chat_codex_fresh_and_resume(
-    node_with_db: Node,
-    monkeypatch: pytest.MonkeyPatch,
-    kwargs: dict,
-    expect: list,
-) -> None:
-    """A codex chat builds the right fresh/resume/model command, under CODEX_HOME."""
-    node = node_with_db
-    node.config_set(agent='codex')
-    captured = _patch_popen(monkeypatch, stdout_text=_CODEX_STREAM)
-
-    result = node.chat('hi', **kwargs)
-
-    argv = captured['argv']
-    assert argv[0] == 'codex'
-    for token in expect:
-        assert token in argv
-    assert argv[-1].endswith('hi')  # the prompt is the final positional
-    assert result == 'thr_new'
-    # codex runs in the worktree with CODEX_HOME at the node's .codex
-    assert captured['cwd'] == str(node._root)
-    assert captured['env']['CODEX_HOME'].endswith('.codex')
-
-
-@pytest.mark.parametrize(
-    ('setup', 'kwargs', 'match'),
-    [
+    argnames=('setup', 'kwargs', 'match'),
+    argvalues=[
         (None, {'resume': True}, '--resume requires --session'),
         ('live', {'session': 'live-1', 'resume': True}, 'loop session'),
         ('codex', {'session': 'x'}, 'codex cannot fork'),
@@ -255,9 +145,9 @@ def test_chat_guards_reject_invalid_requests(
     if setup == 'live':
         _activate(node, 'live-1')
     elif setup == 'codex':
-        node.config_set(agent='codex')
+        node.config.set('agent', 'codex')
     elif setup == 'no-agent':
-        (node._node_dir / 'config.json').write_text(
+        (node.node_dir / 'config.json').write_text(
             json.dumps({'project': '.'}),
             encoding='utf-8',
         )
@@ -272,11 +162,88 @@ def test_chat_nonzero_exit_raises(
     node_with_db: Node,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A non-zero agent exit surfaces as a ``RuntimeError`` after rendering."""
+    """A non-zero agent exit surfaces as a ``RuntimeError`` after streaming."""
     node = node_with_db
     _patch_popen(monkeypatch, returncode=1)
     with pytest.raises(RuntimeError, match='non-zero'):
         node.chat('hi')
+
+
+def test_chat_reaps_a_blocked_writer_when_streaming_raises(
+    node_with_db: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-drain stream raise kills the agent's group instead of deadlocking.
+
+    The spawned agent leads its own session and never sees the terminal's
+    signals, so when the stream consumer dies mid-drain (a parser fault, a
+    Ctrl-C in the parent) the child keeps writing into the now-unread pipe,
+    fills it, and blocks -- and an unguarded ``proc.wait()`` then waits
+    forever. The group kill ahead of the wait reaps the blocked writer so
+    the original failure surfaces promptly.
+
+    The chat runs on a bounded daemon thread: a regression makes it block,
+    and the ``join`` timeout fails this test fast instead of wedging the
+    whole suite (the daemon thread cannot keep the interpreter alive).
+    """
+    node = node_with_db
+    node.config.set('agent', 'claude')
+    # a real child that overfills the ~64KB pipe and blocks mid-write --
+    # never reaped, it cannot exit and wait() deadlocks
+    blocker = [
+        'python3',
+        '-c',
+        "import sys; sys.stdout.write('x' * 10_000_000); sys.stdout.flush()",
+    ]
+    real_popen = subprocess.Popen
+
+    def fake_popen(argv: list, **kwargs: object) -> object:
+        if argv and argv[0] == 'git':
+            return real_popen(argv, **kwargs)
+        # spawn exactly as chat does -- no start_new_session, so the child is
+        # NOT a process-group leader; a killpg(pid) would miss it and only a
+        # direct proc.kill() reaps the blocked writer
+        return real_popen(blocker, stdout=subprocess.PIPE, text=True)
+
+    monkeypatch.setattr(subprocess, 'Popen', fake_popen)
+
+    def raise_mid_drain(self: object, stdout: object, **kwargs: object) -> None:
+        raise ValueError('parser died mid-drain')
+
+    backend_cls = type(node.agent())
+    monkeypatch.setattr(backend_cls, 'stream', raise_mid_drain)
+
+    captured: dict[str, Any] = {}
+
+    def run_chat() -> None:
+        try:
+            node.chat('hi')
+        except BaseException as error:
+            captured['error'] = error
+
+    worker = threading.Thread(target=run_chat, daemon=True)
+    worker.start()
+    worker.join(timeout=15)
+    # a deadlock leaves the thread alive past the join -- fail fast, never hang
+    assert not worker.is_alive(), 'chat deadlocked: the blocked writer was not reaped'
+    # the original mid-drain fault surfaces, not swallowed by the reap
+    assert isinstance(captured.get('error'), ValueError)
+    assert 'parser died mid-drain' in str(captured['error'])
+
+
+def test_chat_applies_the_configured_effort(node_with_db: Node) -> None:
+    """A chat turn runs at the node's configured effort, like its loop steps.
+
+    The loop threads the node-config effort into every invocation, so a chat
+    turn must too -- otherwise chatting a node runs shallower than the node
+    itself, with no indication why.
+    """
+    node = node_with_db
+    node.config.set('agent', 'claude')
+    node.config.set('effort', 'xhigh')
+    argv = node.chat_command('hi').argv
+    assert '--effort' in argv
+    assert argv[argv.index('--effort') + 1] == 'xhigh'
 
 
 # ------ helpers
@@ -286,10 +253,12 @@ class _FakeProc:
     """Stand-in for ``subprocess.Popen`` with canned stdout and exit code."""
 
     def __init__(self: _FakeProc, stdout_text: str, returncode: int) -> None:
+        """Initialize ``_FakeProc``."""
         self.stdout = io.StringIO(stdout_text)
         self._returncode = returncode
 
     def wait(self: _FakeProc) -> int:
+        """Return the canned exit code."""
         return self._returncode
 
 
@@ -321,5 +290,5 @@ def _patch_popen(
 
 def _activate(node: Node, session: str) -> None:
     """Mark the node active with a live claude session (as a running loop would)."""
-    (node._node_dir / '.status').write_text('active\n', encoding='utf-8')
-    node.session_set('claude', session)
+    (node.node_dir / '.status').write_text('active\n', encoding='utf-8')
+    node.sessions.set('claude', session)

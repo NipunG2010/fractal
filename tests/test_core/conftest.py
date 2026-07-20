@@ -16,19 +16,19 @@ from fractal.core.radio import Radio
 
 @pytest.fixture
 def git_repo(tmp_path: pathlib.Path) -> pathlib.Path:
-    """Create a git repo with an initial commit."""
+    """Return a fresh git repo with an initial commit."""
     return _make_git_repo(tmp_path)
 
 
 @pytest.fixture
 def schema() -> pathlib.Path:
-    """Path to the packaged node database schema."""
+    """Return the path to the packaged node database schema."""
     return pathlib.Path(fractal.core.__file__).parent / 'schema.sql'
 
 
 @pytest.fixture
 def database(tmp_path: pathlib.Path, schema: pathlib.Path) -> Database:
-    """Create an initialized database."""
+    """Return a fresh initialized database."""
     db = Database(tmp_path / '.db', schema)
     db.init()
     return db
@@ -36,20 +36,21 @@ def database(tmp_path: pathlib.Path, schema: pathlib.Path) -> Database:
 
 @pytest.fixture
 def node_with_db(git_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Node:
-    """Node with initialized DB (no worktree, no init script).
+    """Return a node with an initialized DB (no worktree, no init script).
 
     Creates ``.fractal/<branch>/`` with a minimal ``config.json``
     (so ``node.exists()`` returns True) and an initialized ``.db``
     directly. Fast (~50ms). For tests that only need DB operations.
     """
     node = Node(git_repo)
-    branch = subprocess.run(
+    result = subprocess.run(
         ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
         cwd=git_repo,
         capture_output=True,
         text=True,
         check=True,
-    ).stdout.strip()
+    )
+    branch = result.stdout.strip()
     node_dir = git_repo / '.fractal' / branch
     node_dir.mkdir(parents=True)
     config = {
@@ -75,7 +76,7 @@ def node_with_db(git_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Nod
 
 @pytest.fixture
 def radio(node_with_db: Node) -> Radio:
-    """Radio initialized with default channels on a node with DB."""
+    """Return a radio initialized with default channels on a node with DB."""
     radio = Radio(node_with_db)
     radio.init()
     return radio
@@ -83,15 +84,15 @@ def radio(node_with_db: Node) -> Radio:
 
 @pytest.fixture
 def radio_pair(radio: Radio) -> tuple[Radio, Radio]:
-    """Two radios over the central DB: the root plus a registered peer.
+    """Return two radios over the central DB: the root plus a registered peer.
 
     The peer gets a real worktree (so its branch resolves) and a hand-built
     config -- no init script. Mirrors production order: the peer's channels
     seed before the root subscribes to it (``child_add``).
     """
     root = radio.node
-    repo = root._root
-    branch = root._branch
+    repo = root.worktree
+    branch = root.branch
     peer_branch = f'{branch}.peer'
     worktree = repo / '.worktrees' / peer_branch
     subprocess.run(
@@ -125,7 +126,7 @@ def radio_pair(radio: Radio) -> tuple[Radio, Radio]:
 
 @pytest.fixture(scope='session')
 def initialized_node(tmp_path_factory: pytest.TempPathFactory) -> dict:
-    """Session-scoped fixture: a fully initialized node.
+    """Return a fully initialized node (built once per session).
 
     Creates a git repo, runs ``node init``, and returns a dict
     with ``output``, ``project_dir``, ``node_dir``, ``branch``,
@@ -149,6 +150,102 @@ def initialized_node(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 # ------ helpers
+
+
+def _active_run(node: Node) -> int:
+    """The node's active run id (the central DB holds every node's runs)."""
+    where = {'node': node.branch, 'status': 'active'}
+    return node.db.read('runs', where=where, limit=1)[0]['run_id']
+
+
+def _record_step_cost(
+    node: Node,
+    *,
+    run_id: int,
+    cost: float,
+    iter: int = 1,
+) -> None:
+    """Record one completed step of ``cost`` USD in ``run_id`` (for cost rollups)."""
+    iter_id = node.record.iter_start(run_id=run_id, iter=iter)
+    step_id = node.record.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='PLAN',
+    )
+    node.record.step_cost(step_id=step_id, cost=cost)
+    node.record.step_end(step_id=step_id, status='completed', exit_code=0)
+
+
+def _spawn_parent_child(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Node, Node]:
+    """Build a user -> parent -> child tree of real worktrees.
+
+    Returns the parent and child ``Node`` objects, each set ``active`` with a
+    started run -- mirroring a running node, so signals attach to a live run.
+    """
+    Node(git_repo).init(agent='claude', user=True)
+    Node(git_repo).init(name='parent')
+    parent_wt = git_repo / '.worktrees' / 'main.parent'
+    # spawn the child under the parent (_NODE makes it the resolved caller)
+    node_dir = parent_wt / '.fractal' / 'main.parent'
+    monkeypatch.setenv('_NODE', f'{node_dir}')
+    Node(git_repo).init(name='kid')
+    monkeypatch.delenv('_NODE')
+    child_wt = git_repo / '.worktrees' / 'main.parent.kid'
+    parent = Node(parent_wt)
+    child = Node(child_wt)
+    # bring both up like running nodes -- present live tmux sessions, so the
+    # reject-active/reconcile probe and list --live both read the loops alive
+    # (else mutating signals reconcile to exited and --live relabels them)
+    sessions = frozenset({parent.tmux_session, child.tmux_session})
+    monkeypatch.setattr('fractal.util.tmux.probe', lambda: sessions)
+    for node in (parent, child):
+        node.status_set('active')
+        node.record.run_start()
+    return parent, child
+
+
+def _spawn_chain(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Node, Node, Node]:
+    """Build a user -> p (active) -> c (completed) -> g (active) chain of worktrees.
+
+    Returns the ``(p, c, g)`` nodes three levels deep. ``p`` and the grandchild
+    ``g`` are ``active`` with started runs; the intermediate ``c`` is
+    ``completed``, so the only live-active descendant of ``p`` sits below a
+    non-active node -- exercising the flat-registry walk reaching a deep one.
+    """
+    Node(git_repo).init(agent='claude', user=True)
+    Node(git_repo).init(name='p')
+    p_wt = git_repo / '.worktrees' / 'main.p'
+    # spawn the child under p (_NODE makes it the resolved caller)
+    node_dir = p_wt / '.fractal' / 'main.p'
+    monkeypatch.setenv('_NODE', f'{node_dir}')
+    Node(git_repo).init(name='c')
+    c_wt = git_repo / '.worktrees' / 'main.p.c'
+    # spawn the grandchild under c
+    node_dir = c_wt / '.fractal' / 'main.p.c'
+    monkeypatch.setenv('_NODE', f'{node_dir}')
+    Node(git_repo).init(name='g')
+    monkeypatch.delenv('_NODE')
+    g_wt = git_repo / '.worktrees' / 'main.p.c.g'
+    p = Node(p_wt)
+    c = Node(c_wt)
+    g = Node(g_wt)
+    # bring p and g up like running nodes -- present live tmux sessions, so the
+    # reject-active/reconcile probe and list --live both read the loops alive
+    # (else mutating signals reconcile to exited and --live relabels them)
+    sessions = frozenset({p.tmux_session, g.tmux_session})
+    monkeypatch.setattr('fractal.util.tmux.probe', lambda: sessions)
+    for node in (p, g):
+        node.status_set('active')
+        node.record.run_start()
+    c.status_set('completed')
+    return p, c, g
 
 
 def _make_git_repo(path: pathlib.Path) -> pathlib.Path:

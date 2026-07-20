@@ -17,6 +17,7 @@ import subprocess
 
 import pytest
 
+from fractal.core.node import Node
 from tests._helpers import _git
 
 from .conftest import _run
@@ -33,7 +34,7 @@ __all__ = [
 
 @pytest.fixture(scope='module')
 def root(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
-    """A repo with a user node; each test inits its own uniquely-named worker."""
+    """Return a repo with a user node; each test inits its own worker."""
     root = tmp_path_factory.mktemp('fractal_reconcile')
     _git(root, 'init', '-b', 'main')
     _git(root, 'config', 'user.email', 'reconcile@test.local')
@@ -58,7 +59,7 @@ def _crashed_worker(root: pathlib.Path, name: str) -> pathlib.Path:
     assert init.returncode == 0, init.stderr
     worktree = root / '.worktrees' / f'main.{name}'
     # a crashed loop: status active, but no tmux session was ever started
-    assert _run(worktree, '_status', 'active').returncode == 0
+    Node(worktree).status_set('active')
     return worktree
 
 
@@ -143,8 +144,8 @@ def _orphaned_worker(
 
     Fabricates the out-of-band pane death: a crashed-active worker plus a real
     process in its own group (``start_new_session`` -- pgid equals its pid,
-    like the pane command ``_run.sh``), recorded in the node's ``.pgid`` the
-    way ``_run.sh`` records it at run start.
+    like the pane's loop process), recorded in the node's ``.pgid`` the
+    way the loop records it at run start.
     """
     worktree = _crashed_worker(root, name)
     orphan = subprocess.Popen(['sleep', '300'], start_new_session=True)

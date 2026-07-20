@@ -1,4 +1,4 @@
-"""Pure render helpers shared by the panes.
+"""Functions for pane rendering.
 
 Timestamps, status glyphs, gauges, fixed-width grid primitives, and the
 box-drawing tree renderer. Side-effect-free string/``Text`` builders consuming
@@ -11,9 +11,12 @@ from __future__ import annotations
 import datetime as dt
 from typing import Optional, Union
 
+from rich.markup import escape
 from rich.text import Text
 
-from fractal.tui import theme
+from fractal.constants import STATUSES
+
+from . import theme
 
 __all__ = [
     'NODE_VERB',
@@ -23,11 +26,15 @@ __all__ = [
     'dot',
     'cap_bar',
     'trunc',
+    'esc',
     'col',
     'cell',
     'row',
+    'toggle',
     'dur',
     'money',
+    'chat_meta',
+    'chat_summary',
     'tree_lines',
 ]
 
@@ -41,6 +48,7 @@ NODE_VERB = {
     'approve': 'approved',
     'merge': 'merged',
     'delete': 'deleted',
+    'start': 'started',
     'finish': 'finished',
     'stop': 'stopped',
     'kill': 'killed',
@@ -49,6 +57,26 @@ NODE_VERB = {
     'retire': 'retired',
     'unretire': 'unretired',
 }
+
+# the (glyph, color-token name) per lifecycle status, keyed through the real
+# vocabulary -- a status added to fractal.constants.STATUSES without a style
+# row here fails loudly at import instead of quietly rendering as idle.
+# Colors are stored by token NAME and resolved per call: a palette selected
+# after import (theme.select) must still color the dots
+_STYLE_ROWS = {
+    'active': (theme.DOT_ON, 'SUCCESS'),
+    # paused is live-shaped (frozen mid-work, holding its slot), not
+    # settled -- filled, unlike stopped
+    'paused': (theme.DOT_ON, 'WARNING'),
+    'idle': (theme.DOT_OFF, 'DIM'),
+    'completed': (theme.DOT_OFF, 'SUCCESS'),
+    'stopped': (theme.DOT_OFF, 'WARNING'),
+    'exited': (theme.DOT_OFF, 'ERROR'),
+    'killed': (theme.DOT_OFF, 'ERROR'),
+    'failed': (theme.DOT_OFF, 'ERROR'),
+    'retired': (theme.DOT_OFF, 'DIM'),
+}
+_STATUS_STYLE = {status: _STYLE_ROWS[status] for status in STATUSES}
 
 
 def timestamp(at: dt.datetime, tz: dt.tzinfo) -> str:
@@ -64,9 +92,11 @@ def clock(at: dt.datetime, tz: dt.tzinfo) -> str:
 def status_style(status: str, signal: str = '') -> tuple[str, str]:
     """Return the ``(glyph, color)`` for a lifecycle status.
 
-    Filled ``●`` means running (or carrying a pending signal, which overrides
-    the status color); hollow ``○`` means settled. Statuses are the real
-    lifecycle vocabulary (``Node._statuses``).
+    Filled ``DOT_ON`` means running (or carrying a pending signal, which
+    overrides the status color); hollow ``DOT_OFF`` means settled. Statuses
+    are the real lifecycle vocabulary (``fractal.constants.STATUSES``); an
+    unknown string (a hand-edited ``.status`` file) degrades to the hollow
+    dim default.
     """
     # a pending signal overrides the status (the loop honors it next boundary)
     override = {
@@ -78,19 +108,8 @@ def status_style(status: str, signal: str = '') -> tuple[str, str]:
     }
     if signal in override:
         return override[signal]
-    return {
-        'active': (theme.DOT_ON, theme.SUCCESS),
-        # paused is live-shaped (frozen mid-work, holding its slot), not
-        # settled -- filled, unlike stopped
-        'paused': (theme.DOT_ON, theme.WARNING),
-        'idle': (theme.DOT_OFF, theme.DIM),
-        'retired': (theme.DOT_OFF, theme.DIM),
-        'completed': (theme.DOT_OFF, theme.SUCCESS),
-        'stopped': (theme.DOT_OFF, theme.WARNING),
-        'exited': (theme.DOT_OFF, theme.ERROR),
-        'killed': (theme.DOT_OFF, theme.ERROR),
-        'failed': (theme.DOT_OFF, theme.ERROR),
-    }.get(status, (theme.DOT_OFF, theme.DIM))
+    glyph, color = _STATUS_STYLE.get(status, (theme.DOT_OFF, 'DIM'))
+    return glyph, getattr(theme, color)
 
 
 def dot(status: str, signal: str = '') -> str:
@@ -119,6 +138,20 @@ def trunc(text: str, width: int) -> str:
     if len(text) > width:
         return text[: width - 1] + theme.ELLIPSIS
     return text
+
+
+def esc(text: str) -> str:
+    """Escape Rich markup in untrusted text so it renders literally.
+
+    Agent- and message-authored strings (node titles, radio subjects and
+    bodies, event metadata) reach the cockpit through markup f-strings that
+    ``Text.from_markup``/``Static`` parse. Without
+    escaping, a stray ``[/]`` raises ``MarkupError`` and crashes the pane
+    rebuild on the next poll, and ``[link=...]`` injects terminal escape
+    sequences. Escape the interpolated value, never the composed string,
+    so the surrounding style tags survive.
+    """
+    return escape(text)
 
 
 def col(text: str, width: int) -> str:
@@ -157,40 +190,95 @@ def row(*cells: Union[Text, str], gap: int = theme.GAP) -> Text:
     return result
 
 
+def toggle(labels: tuple[str, str], active: str, lit: bool) -> str:
+    """Render a two-segment switch: each label boxed with a space per side.
+
+    The active segment always sits on a brighter chip than the inactive
+    (resting AND lit/hover), so selection reads from the chip.
+    """
+    result = []
+    for label in labels:
+        if label == active:
+            if lit:
+                style = f'{theme.INK_BRIGHT} on {theme.LIT_ACTIVE}'
+            else:
+                style = f'{theme.INK} on {theme.SEL}'
+        else:
+            if lit:
+                style = f'{theme.INK} on {theme.LIT}'
+            else:
+                style = f'{theme.CHROME} on {theme.SURFACE}'
+        result.append(f'[{style}] {label} [/]')
+    return ''.join(result)
+
+
 def dur(secs: Optional[float]) -> str:
-    """Return a compact duration (``43s`` / ``18m`` / ``1h``); ``…`` for none."""
+    """Return a compact duration (``43s`` / ``18m`` / ``1h``); ellipsis for none."""
     if secs is None:
         return theme.ELLIPSIS
     if secs < 60:
         return f'{secs:.0f}s'
-    if secs < 3600:
+    if secs < 3_600:
         return f'{secs / 60:.0f}m'
-    return f'{secs / 3600:.0f}h'
+    return f'{secs / 3_600:.0f}h'
 
 
 def money(value: Optional[float]) -> str:
-    """Return a dollar figure (``$1,083.42``); ``…`` for none (not yet recorded)."""
+    """Return a dollar figure (``$1,083.42``); ellipsis for none (not yet recorded)."""
     if value is None:
         return theme.ELLIPSIS
     return f'${value:,.2f}'
 
 
+def chat_meta(duration: float) -> str:
+    """Return a chat turn's closing meta line (wall clock alone)."""
+    return f'done {theme.SEP} {duration:.1f}s'
+
+
+def chat_summary(
+    turns: Optional[int],
+    duration: float,
+    cost: Optional[float],
+) -> str:
+    """Return a chat result's closing summary line.
+
+    A turn-counting result (claude) closes on turns/duration/cost (``$?``
+    when there is no cost fact); a wall-time result (codex) closes on
+    duration alone.
+    """
+    if turns is None:
+        return chat_meta(duration)
+    cost_str = f'${cost:.2f}' if cost is not None else '$?'
+    return (
+        f'done {theme.SEP} {turns} turns {theme.SEP}'
+        f' {duration:.1f}s {theme.SEP} {cost_str}'
+    )
+
+
 # ------ tree
 
 
-def tree_lines(rows: list[dict], collapsed: set[str]) -> list[tuple[str, str]]:
+def tree_lines(
+    rows: list[dict],
+    collapsed: set[str],
+) -> list[tuple[str, str, str, str]]:
     """Render the whole-tree rows as box-drawing lines.
 
     ``rows`` is the DFS-ordered list of tree-row dicts from the snapshot (each
     with ``branch``/``name``/``depth``/``status``/``signal``/``is_user``/
     ``is_focused``/``has_kids``). Descendants of a collapsed branch are hidden.
+    The glyph head (box-drawing prefix, caret, dot) is kept apart from the
+    label so a wrapping label hangs under its own start column; the hang line
+    carries the still-continuing vertical glyphs under those wrapped lines so
+    the tree's lines stay unbroken.
 
     Args:
         rows: DFS-ordered tree rows.
         collapsed: Branches whose subtrees are folded.
 
     Returns:
-        ``(branch, markup_line)`` pairs for the visible rows.
+        ``(branch, head_markup, hang_markup, label_markup)`` tuples for the
+        visible rows.
 
     """
     # visibility: skip descendants of a collapsed branch
@@ -227,6 +315,14 @@ def tree_lines(rows: list[dict], collapsed: set[str]) -> list[tuple[str, str]]:
         prefix = ''.join(parts)
         if depth >= 1:
             cont[depth] = not is_last[index]
+        # the hang line -- what continues beneath the glyphs when the label
+        # wraps: ancestor columns carry through, a tee becomes a pipe, and an
+        # elbow (its line ends at this row) becomes indent
+        hang = ''.join(
+            theme.PIPE if cont.get(level) else theme.INDENT
+            for level in range(1, depth + 1)
+        )
+        hang = f'[{theme.DIM}]{hang}[/]' if hang else ''
         if entry['has_kids']:
             caret = (
                 theme.CARET_CLOSED if entry['branch'] in collapsed else theme.CARET_OPEN
@@ -234,16 +330,20 @@ def tree_lines(rows: list[dict], collapsed: set[str]) -> list[tuple[str, str]]:
             marker = f'[{theme.DIM}]{caret}[/] '
         else:
             marker = '  '
+        name = esc(entry['name'])
         if entry['is_focused']:
-            name = f'[b]{entry["name"]}[/]'
+            name = f'[b]{name}[/]'
         else:
-            name = f'[{theme.DIM}]{entry["name"]}[/]'
+            name = f'[{theme.DIM}]{name}[/]'
         if entry['is_user']:
-            # the user (root) node sits outside the agent lifecycle: a white
-            # outline circle instead of a status color
-            mark = f'[{theme.INK}]{theme.DOT_OFF}[/]'
+            # the user (root) node sits outside the agent lifecycle: a filled
+            # circle in the row's text color instead of a status color
+            if entry['is_focused']:
+                mark = f'[{theme.INK}]{theme.DOT_ON}[/]'
+            else:
+                mark = f'[{theme.DIM}]{theme.DOT_ON}[/]'
         else:
             mark = dot(entry['status'], entry['signal'])
-        line = f'[{theme.DIM}]{prefix}[/]{marker}{mark} {name}'
-        result.append((entry['branch'], line))
+        head = f'[{theme.DIM}]{prefix}[/]{marker}{mark} '
+        result.append((entry['branch'], head, hang, name))
     return result

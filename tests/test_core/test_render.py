@@ -1,4 +1,4 @@
-"""Tests for ``Node`` template-variable rendering (``$VAR`` substitution).
+"""Test the ``fractal.core.render`` module.
 
 The engine is pinned against GNU ``envsubst`` -- the grammar the renderer is
 matched to -- so a template renders byte-identically to what ``envsubst``
@@ -14,7 +14,9 @@ import subprocess
 
 import pytest
 
-from fractal.core.node import Node, _strip_frontmatter, _VarTemplate
+import fractal.core.render
+from fractal.core.node import Node
+from fractal.core.render import _VarTemplate
 
 __all__ = [
     'test_var_template_matches_envsubst',
@@ -67,7 +69,7 @@ def test_render_template_substitutes_static_and_passes_runtime(
     node = node_with_db
     template = 'wt=$WORKTREE_DIR step=$STEP_LABEL desc=$MAX_DESCENDANTS none=$NOPE'
     rendered = node.render_template(template)
-    assert f'wt={node._root}' in rendered  # static var -> real path
+    assert f'wt={node.worktree}' in rendered  # static var -> real path
     assert 'step=$STEP_LABEL' in rendered  # run-scoped: left for the caller
     assert '$MAX_DESCENDANTS' not in rendered  # gap fix: now substituted
     assert 'none=$NOPE' in rendered  # unknown placeholder passes through
@@ -77,8 +79,8 @@ def test_render_template_substitutes_static_and_passes_runtime(
 
 
 @pytest.mark.parametrize(
-    ('text', 'expected'),
-    [
+    argnames=('text', 'expected'),
+    argvalues=[
         # a plain body passes through, gaining a trailing newline if absent
         ('body\n', 'body\n'),
         ('body', 'body\n'),
@@ -96,14 +98,14 @@ def test_render_template_substitutes_static_and_passes_runtime(
     ],
 )
 def test_strip_frontmatter_edges(text: str, expected: str) -> None:
-    """``_strip_frontmatter`` holds its documented edge semantics.
+    """``strip_frontmatter`` holds its documented edge semantics.
 
     The edges are the byte-contract surface of the prompt assembly: fence
     detection trims leading whitespace only, an unclosed block swallows
     the body, lines split on the newline byte alone (CRLF passes through
     raw), and every surviving line comes back newline-terminated.
     """
-    assert _strip_frontmatter(text) == expected
+    assert fractal.core.render.strip_frontmatter(text) == expected
 
 
 def test_build_prompt_assembles_charter_step_and_modes(node_with_db: Node) -> None:
@@ -115,11 +117,11 @@ def test_build_prompt_assembles_charter_step_and_modes(node_with_db: Node) -> No
     the prompt.
     """
     node = node_with_db
-    (node._node_dir / 'NODE.md').write_text(
+    (node.node_dir / 'NODE.md').write_text(
         'charter for $CURRENT_BRANCH\n',
         encoding='utf-8',
     )
-    step = node._node_dir / 'step.md'
+    step = node.node_dir / 'step.md'
     step.write_text(
         '---\nrequires_approval: true\n---\n\ndo the work ($STEP_LABEL)\n',
         encoding='utf-8',
@@ -130,7 +132,7 @@ def test_build_prompt_assembles_charter_step_and_modes(node_with_db: Node) -> No
     )
     # charter leads, the step body follows with its frontmatter stripped,
     # and the activated mode doc trails -- all substituted in one pass
-    assert prompt.startswith(f'charter for {node._branch}\n')
+    assert prompt.startswith(f'charter for {node.branch}\n')
     assert 'do the work (step 1 of 2)' in prompt
     assert 'requires_approval' not in prompt
     assert 'This node was paused mid-run' in prompt  # RESUME.md (override: on)
@@ -142,11 +144,11 @@ def test_build_prompt_assembles_charter_step_and_modes(node_with_db: Node) -> No
 def test_chat_seed_renders_paths_and_chat_sentinels(node_with_db: Node) -> None:
     """A chat seed renders real paths and ``N/A (chat)`` for run-scoped fields."""
     node = node_with_db
-    (node._node_dir / 'NODE.md').write_text(
+    (node.node_dir / 'NODE.md').write_text(
         'node=$NODE_DIR step=$STEP_LABEL desc=$MAX_DESCENDANTS\n',
         encoding='utf-8',
     )
-    seed = node._chat_seed(charter=True)
-    assert f'node={node._node_dir}' in seed
+    seed = fractal.core.render.chat_seed(node, fresh=True)
+    assert f'node={node.node_dir}' in seed
     assert 'step=N/A (chat)' in seed
     assert '$MAX_DESCENDANTS' not in seed

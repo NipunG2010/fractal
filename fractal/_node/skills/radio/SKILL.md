@@ -14,17 +14,37 @@ Two reading surfaces: the listings and `read`. `fractal radio messages`
 your other channels) and `fractal radio feed` (fans out across your
 subscriptions) list metadata only -- sender, subject, priority, UUID,
 counts, never the body -- and are passive: listing never changes read
-state. `fractal radio read` is the body surface: pass UUIDs and/or a
-selector (`--channel=<name>`, `--feed`, each narrowable with `--unread`)
-to print full messages; it writes your read receipts for exactly what it
-displayed. Feed catch-up is `fractal radio read --feed --unread`. Review
-your outbound mail with `fractal radio sent` (each row names its
-recipient; output is NOT guaranteed newest-first -- sort by `created_at`
-before treating any slice as "the latest"). A bare `fractal radio send`
-(no `--node`/`--parent`/`--channel`) posts to your own `outbox` -- the
-report-upward default; every send echoes its resolved channel and target
-on stderr. Pass `--channel=private` for a private self-note; use
-`--parent` for a direct ask.
+state. Every listing takes `--json` for a JSON array of row objects
+(mutex with `--csv`); `messages` and `feed` also take `--body` (valid
+only with `--json`) to include the message bodies -- still passive, no
+receipts. The counter columns (`replies`, `pos_reacts`, `neg_reacts`)
+are live -- they mutate as threads evolve -- so never byte-diff listing
+snapshots to detect new mail: dedupe on `message_uuid` and track what
+you have seen via `read`. `fractal radio read` is the body surface: pass
+UUIDs and/or a selector (`--channel=<name>`, `--feed`, each narrowable
+with `--unread`) to print full messages; it writes your read receipts
+for exactly what it displayed. Feed catch-up is
+`fractal radio read --feed --unread`. Review your outbound mail with
+`fractal radio sent` (each row names its recipient; output is NOT
+guaranteed newest-first -- sort by `created_at` before treating any
+slice as "the latest").
+
+Two writing verbs: `send` is the superset -- give it at least one
+routing dimension (a target via `--node=<branch>` or `--parent`, or a
+`--channel`) and it writes any channel your write permissions allow;
+`post` is the quiet public subset, writing publicly readable channels
+only (`outbox`, `public`; custom channels obey their own flags) and
+refusing privately readable ones naming `radio send`. A bare
+`fractal radio post` (no `--node`/`--parent`/`--channel`) lands in your
+own `outbox` -- the report-upward default; a fully bare `send` errors.
+The channel default keys on the target: `send` to another node defaults
+to their `inbox`, to yourself `private` (a self-note); `post` defaults
+to your own `outbox`, or to another node's `public` board (their
+`outbox` is owner-only write); a `send` naming only a channel targets
+yourself. Explicit `--channel` always wins. Every send or post echoes
+its resolved channel and target on stderr; `send` also names each
+dimension it defaulted in one extra stderr line, while `post` stays
+quiet.
 
 Run `fractal radio --help` and `fractal radio <command> --help` for the
 CLI.
@@ -39,10 +59,10 @@ radio use during other steps).
 
 ## Conventions
 
-- **Report upward via outbox.** Write to your own outbox to report
-  status, findings, or blockers -- your parent is auto-subscribed and
-  sees it in their feed. To reach a specific node directly, send to
-  their inbox (`--node=<branch>`).
+- **Report upward via outbox.** Post to your own outbox (a bare
+  `fractal radio post`) to report status, findings, or blockers -- your
+  parent is auto-subscribed and sees it in their feed. To reach a
+  specific node directly, send to their inbox (`--node=<branch>`).
 - **Your outbox is a tax and a rider on every subscriber.** Outbox
   history is a spawn-order tax: every new child pays a one-time
   first-SYNC read of the whole backlog (observed: ~half a worker's
@@ -70,10 +90,10 @@ radio use during other steps).
   view, and receipts always attribute to you, the actual reader. `--all`
   shows everything regardless.
 - **Read means seen, saved means open.** Read state tracks what you have
-  *seen*, not what you have handled; `save`/`unsave` is the todo queue.
-  The loop protocol: read new messages, `save` the actionable ones,
-  `unsave` each when done, and review the open set with
-  `messages --saved`.
+  *seen*, not what you have handled; `save`/`unsave` is the todo queue
+  (a feed message saves the same way). The loop protocol: read new
+  messages, `save` the actionable ones, `unsave` each when done, and
+  review the open set with `messages --saved`.
 - **Reply routing, plainly.** A reply threads in place only where the
   replier may write (your own channels; another node's open channels
   like `public`). Feed (outbox) posts are NOT replyable in place:
@@ -81,20 +101,26 @@ radio use during other steps).
   *author's inbox* as a direct conversation turn -- the outbox itself
   never carries it (a `public`-channel post seen in your feed threads in
   place). A reply to a message in your own inbox likewise goes to the
-  original sender's inbox. Replying also marks the parent read for you.
+  original sender's inbox. `reply` routes by the parent message alone --
+  there is no send/post class choice to make. Replying also marks the
+  parent read for you.
 - **Replies are threaded, not in feed.** Only root-level messages appear
   in `feed`. To see replies, use `fractal radio thread <uuid>` (it shows
   the whole tree -- root and every reply -- not just unread).
 - **Replies inherit the parent's subject.** `fractal radio reply`
   carries the parent's subject forward as `Re: ...` (and its priority)
-  automatically -- do not pass `--subject` (it rejects one); `send` is
-  the command that requires a subject.
-- **Sending into another node's read-only channel is fire-and-forget.**
-  A send or reply into a node's `inbox` (or any read-only channel you
-  don't own) lands in *their* mailbox, and `read`/`thread` on a
-  read-only channel are owner-only -- so you cannot read it back
-  afterward. `fractal radio sent` lists what you sent; for a durable
-  record keep your own copy (your `outbox`, `private`, or memory).
+  automatically -- do not pass `--subject` (it rejects one); `send` and
+  `post` are the commands that require a subject.
+- **Sending into another node's channel is fire-and-forget.** A send or
+  reply into a node's `inbox` (or any privately readable channel you
+  don't own) lands in *their* mailbox. `read` on a privately readable
+  channel is owner-only, but `thread` and `reply` exempt conversation
+  participants -- as the original sender you can
+  `fractal radio thread <uuid>` your own rerouted conversation whole,
+  and reply into it; only a bystander (neither owner nor participant) is
+  refused. `fractal radio sent` lists what you sent; keep your own copy
+  (your `outbox`, `private`, or memory) only when the record must
+  survive independently.
 - **Quote hygiene.** Radio bodies are shell arguments: multi-line quotes
   TRUNCATE at the first mishandled newline, and backticks inside
   double-quoted bodies EXECUTE as command substitution. Send plain text;
@@ -124,3 +150,13 @@ radio use during other steps).
   peer, route through the shared parent: post peer-relevant findings to
   your outbox (the parent relays), and watch the parent's outbox in your
   feed for cohort directives.
+- **Blind nodes subscribe to nothing.** A child spawned with
+  `fractal node init --blind` starts with no subscriptions -- it has no
+  feed to read, and any subscription that lands before its first start
+  is swept at launch. The wiring is one-way: the parent still
+  auto-subscribes to the child's `outbox` and `public`, so a blind
+  child's reports flow upward normally. When pruning subscriptions by
+  hand, `unsub` reports the true rowcount
+  (`Removed N subscription(s).`); a count of 0 still exits 0 -- it means
+  nothing matched, so re-check the `--node`/`--channel` pair rather than
+  assuming the subscription is gone.

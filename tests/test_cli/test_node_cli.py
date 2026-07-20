@@ -15,34 +15,45 @@ machine-output guarantees (piped status is unbracketed for clean parsing).
 
 from __future__ import annotations
 
+import csv
+import io
 import json
+import os
 import pathlib
 import shutil
 import subprocess
 
 import pytest
 
+import fractal
 from fractal.core.node import Node
 from tests._helpers import _git
 
-from .conftest import _require_tmux, _run
+from .conftest import _await_settled, _cli_env, _fractal_bin, _require_tmux, _run
 
 __all__ = [
     'test_init_persists_run_config',
+    'test_init_ignores_ambient_provider_and_effort',
     'test_scope_flags_flatten_to_recorded_roots',
     'test_space_joined_scope_normalizes_on_read',
     'test_init_reserve_budget_defaults_to_ten_percent',
-    'test_init_title_override',
+    'test_init_title_override_is_stored_verbatim',
+    'test_init_single_word_name_without_title_warns',
     'test_node_init_requires_agent',
     'test_init_uses_central_db',
     'test_init_reset_reinitializes_node',
     'test_init_rejects_negative_limits',
     'test_init_rejects_iter_cost_without_max_cost',
     'test_init_from_worktree_nests_under_that_node',
+    'test_child_spawn_nests_under_parent',
+    'test_child_without_base_branches_from_parent_tip',
+    'test_node_init_path_records_subproject',
     'test_init_prints_node_md_next_steps',
     'test_init_scaffolds_ignored_tmp_scratch_dir',
     'test_init_uncapped_priced_agent_warns',
     'test_init_uncapped_unpriced_agent_stays_quiet',
+    'test_init_uncapped_warning_reads_the_spawning_parents_agent',
+    'test_init_blind_seeds_no_subs_and_start_sweeps',
     'test_list_filters_by_retired_and_depth',
     'test_list_status_count_and_live',
     'test_list_rejects_invalid_filters',
@@ -67,21 +78,33 @@ __all__ = [
     'test_commit_help_states_message_requirement',
     'test_list_pipe_status_has_no_brackets',
     'test_list_csv_columns_stable_empty_vs_populated',
+    'test_activity_json_mirrors_csv_shape',
+    'test_activity_names_attribution_and_lineage_columns',
     'test_chat_requires_a_prompt',
     'test_chat_rejects_codex_fork',
     'test_chat_current_requires_a_live_session',
-    'test_prompt_bridge_assembles_and_renders',
 ]
+
+# minimal claude stand-in: emits the init + result frames the stream driver
+# expects and exits 0, so a launched loop completes an iteration hermetically
+_AGENT_STUB = """#!/usr/bin/env bash
+SID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+printf '{"type":"system","subtype":"init","session_id":"%s"}\\n' "$SID"
+printf '{"type":"result","session_id":"%s","total_cost_usd":0.001,"num_turns":1,"duration_ms":1}\\n' "$SID"
+"""
 
 
 @pytest.fixture(scope='module')
 def repo(tmp_path_factory: pytest.TempPathFactory) -> dict:
-    """A repo with a user node and two worker nodes (task, docs).
+    """Return a repo with a user node and two worker nodes (task, docs).
 
     Built once via the real CLI so the tests exercise ``init``, the
     bootstrapped project wiki, and cross-node configuration. ``task`` is
     created with the full set of run-config flags; ``docs`` is a plain
-    detached worker.
+    detached worker. Mutating tests either init (and delete) their own
+    uniquely-named workers, round-trip the state they touch (retire then
+    unretire), or confirm rewrites against prior values they read first,
+    so no test depends on another's writes.
     """
     root = tmp_path_factory.mktemp('fractal_node')
     _git(root, 'init', '-b', 'main')
@@ -146,8 +169,8 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 @pytest.mark.parametrize(
-    ('key', 'expected'),
-    [
+    argnames=('key', 'expected'),
+    argvalues=[
         ('scope', 'src'),
         ('base', 'main'),
         ('agent', 'claude'),
@@ -175,9 +198,33 @@ def test_init_persists_run_config(repo: dict, key: str, expected: str) -> None:
     assert _config(repo['task'], key) == expected
 
 
+def test_init_ignores_ambient_provider_and_effort(repo: dict) -> None:
+    """Exported ``PROVIDER``/``EFFORT`` shell variables never reach the config.
+
+    Only the explicit ``--provider``/``--effort`` flags set these keys; an
+    operator's ambient environment must not silently reroute the agent.
+    """
+    root = repo['root']
+    ambient = _run(
+        root,
+        'node',
+        'init',
+        'ambient',
+        '--agent',
+        'claude',
+        '--local',
+        PROVIDER='openrouter',
+        EFFORT='max',
+    )
+    assert ambient.returncode == 0, ambient.stderr
+    worktree = root / '.worktrees' / 'main.ambient'
+    assert _config(worktree, 'provider') == ''
+    assert _config(worktree, 'effort') == ''
+
+
 @pytest.mark.parametrize(
-    ('name', 'scope_flags', 'expected'),
-    [
+    argnames=('name', 'scope_flags', 'expected'),
+    argvalues=[
         ('comma', ['--scope', 'src,docs'], ['src', 'docs']),
         ('repeat', ['--scope', 'src', '--scope', 'docs'], ['src', 'docs']),
         (
@@ -270,7 +317,7 @@ def test_init_reserve_budget_defaults_to_ten_percent(repo: dict) -> None:
     assert _run(root, 'node', 'delete', 'main.budgeted', '--force').returncode == 0
 
 
-def test_init_title_override(repo: dict) -> None:
+def test_init_title_override_is_stored_verbatim(repo: dict) -> None:
     """``--title`` overrides the de-slugged default and is stored verbatim."""
     root = repo['root']
     spawn = _run(
@@ -288,6 +335,37 @@ def test_init_title_override(repo: dict) -> None:
     assert _config(node, 'title') == 'Data Pipeline v2'
     # clean up so the shared module fixture is left as other tests expect
     assert _run(root, 'node', 'delete', 'main.pipeline', '--force').returncode == 0
+
+
+@pytest.mark.parametrize(
+    argnames=('name', 'title_flags', 'warns'),
+    argvalues=[
+        ('solo', [], True),
+        ('solo', ['--title', 'Solo Effort'], False),
+        ('two_words', [], False),
+    ],
+    ids=['single_word_untitled', 'single_word_titled', 'multi_word'],
+)
+def test_init_single_word_name_without_title_warns(
+    repo: dict,
+    name: str,
+    title_flags: list[str],
+    warns: bool,
+) -> None:
+    """A single-word name with no ``--title`` warns; a title or separator is quiet.
+
+    A separator-less name de-slugs to itself capitalized, so the default
+    title is indistinguishable from the slug in every title surface -- init
+    flags it on stderr (advisory, the node is still created) and points at
+    ``node update --title``. An explicit ``--title`` or a multi-word name
+    resolves to a real title, so neither warns.
+    """
+    root = repo['root']
+    spawn = _run(root, 'node', 'init', name, '--agent', 'claude', *title_flags)
+    assert spawn.returncode == 0, spawn.stderr
+    assert ('single-word name without --title' in spawn.stderr) == warns, spawn.stderr
+    # clean up so the shared module fixture is left as other tests expect
+    assert _run(root, 'node', 'delete', f'main.{name}', '--force').returncode == 0
 
 
 def test_node_init_requires_agent(repo: dict) -> None:
@@ -333,20 +411,18 @@ def test_init_reset_reinitializes_node(repo: dict) -> None:
     """``--reset`` re-inits config in place -- and spares the central database."""
     root, docs = repo['root'], repo['docs']
     before = _config(docs, 'max_iters')
-    assert (
-        _run(
-            root,
-            'node',
-            'init',
-            'docs',
-            '--reset',
-            '--max-iters',
-            '9',
-            '--agent',
-            'codex',
-        ).returncode
-        == 0
+    reset = _run(
+        root,
+        'node',
+        'init',
+        'docs',
+        '--reset',
+        '--max-iters',
+        '9',
+        '--agent',
+        'codex',
     )
+    assert reset.returncode == 0
     assert _config(docs, 'max_iters') == '9'
     assert before != '9'
     # a node-level reset must never wipe the tree's shared history
@@ -356,8 +432,8 @@ def test_init_reset_reinitializes_node(repo: dict) -> None:
 
 
 @pytest.mark.parametrize(
-    'flag',
-    [
+    argnames='flag',
+    argvalues=[
         '--max-iters',
         '--max-depth',
         '--max-children',
@@ -471,6 +547,112 @@ def test_init_from_worktree_nests_under_that_node(repo: dict) -> None:
     assert _run(root, 'node', 'delete', 'main.explicit_top', '--force').returncode == 0
 
 
+def test_child_spawn_nests_under_parent(repo: dict) -> None:
+    """A child spawned for ``task`` should be ``main.task.c1``."""
+    root, task = repo['root'], repo['task']
+    node_dir = task / '.fractal' / 'main.task'
+    # run from inside the worktree with no --path: the caller (_NODE) drives
+    # both the repo-root resolution and the parent nesting; task is capped,
+    # so the child must set --max-cost
+    spawn = _run(
+        task,
+        'node',
+        'init',
+        'c1',
+        '--agent',
+        'claude',
+        '--max-cost',
+        '0.5',
+        _NODE=str(node_dir),
+    )
+    assert spawn.returncode == 0, spawn.stderr
+    assert (root / '.worktrees' / 'main.task.c1').exists()
+    # clean up so the shared module fixture is left as other tests expect
+    assert _run(root, 'node', 'delete', 'main.task.c1', '--force').returncode == 0
+
+
+def test_child_without_base_branches_from_parent_tip(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A child spawned without ``--base`` branches from its parent's tip.
+
+    Creating the child worktree with no start ref would branch it from the
+    main repo's HEAD rather than the spawning node -- starting divergent
+    (missing the parent's commits) until the first parent merge. Uses its own
+    repo (not the shared fixture) so the parent can be advanced one commit
+    past ``main``; the child must inherit that commit at creation.
+    """
+    root = tmp_path / 'repo'
+    root.mkdir()
+    _git(root, 'init', '-b', 'main')
+    _git(root, 'config', 'user.email', 'base@test.local')
+    _git(root, 'config', 'user.name', 'base')
+    (root / 'README.md').write_text('# base\n', encoding='utf-8')
+    wiki = root / 'wiki'
+    wiki.mkdir()
+    (wiki / '_index.md').write_text(
+        '---\nname: wiki\n---\n# wiki\n\n***\n',
+        encoding='utf-8',
+    )
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-m', 'init')
+    assert _run(root, 'init').returncode == 0
+    assert _run(root, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+
+    # advance the parent one commit past main, in its own worktree
+    task = root / '.worktrees' / 'main.task'
+    (task / 'parent_work.txt').write_text('only on the parent\n', encoding='utf-8')
+    _git(task, 'add', 'parent_work.txt')
+    _git(task, 'commit', '-m', 'parent work')
+
+    # delegate a child from inside the parent with no --base: nests as main.task.c1
+    node_dir = task / '.fractal' / 'main.task'
+    spawn = _run(task, 'node', 'init', 'c1', '--agent', 'claude', _NODE=str(node_dir))
+    assert spawn.returncode == 0, spawn.stderr
+
+    # the child branched from the parent tip, so the parent's commit is present;
+    # it would be ABSENT had the child branched off main HEAD
+    child = root / '.worktrees' / 'main.task.c1'
+    assert (child / 'parent_work.txt').exists(), spawn.stdout
+    # main never saw that file -- proves the parent was genuinely ahead
+    assert not (root / 'parent_work.txt').exists()
+
+
+def test_node_init_path_records_subproject(tmp_path: pathlib.Path) -> None:
+    """``node init --path=<subdir>`` records the sub-project, not ``'.'``.
+
+    A monorepo child pointed at a sub-project via ``--path`` must record it
+    like the ``fractal init <subdir>`` user flow: the resolved sub-path
+    reaches init.sh instead of being dropped for the parent's project.
+    """
+    root = tmp_path
+    _git(root, 'init', '-b', 'main')
+    _git(root, 'config', 'user.email', 'mono@test.local')
+    _git(root, 'config', 'user.name', 'mono')
+    (root / 'README.md').write_text('# mono\n', encoding='utf-8')
+    # both wikis committed in base: the root's for the user node, the
+    # sub-project's for the child's precondition lookup
+    for wiki in (root / 'wiki', root / 'app' / 'wiki'):
+        wiki.mkdir(parents=True)
+        (wiki / '_index.md').write_text(
+            '---\nname: wiki\n---\n# wiki\n\n***\n',
+            encoding='utf-8',
+        )
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-m', 'init')
+    # a root user node, then a child pointed at the sub-project
+    assert _run(root, 'init').returncode == 0
+    result = _run(root, 'node', 'init', 'sub', '--path', 'app', '--agent', 'claude')
+    assert result.returncode == 0, result.stderr
+    # the child records project 'app' and nests its data under it
+    cache = root / '.worktrees' / '.project' / 'main.sub'
+    assert cache.read_text(encoding='utf-8').strip() == 'app'
+    worktree = root / '.worktrees' / 'main.sub'
+    config = worktree / 'app' / '.fractal' / 'main.sub' / 'config.json'
+    assert config.is_file()
+    assert json.loads(config.read_text(encoding='utf-8'))['project'] == 'app'
+
+
 def test_init_prints_node_md_next_steps(repo: dict) -> None:
     """``node init`` ends with the task contract and the start command.
 
@@ -509,8 +691,8 @@ def test_init_scaffolds_ignored_tmp_scratch_dir(repo: dict) -> None:
 
 
 @pytest.mark.parametrize(
-    ('flags', 'warns'),
-    [
+    argnames=('flags', 'warns'),
+    argvalues=[
         ([], True),
         (['--max-cost', '1'], False),
         (['--max-iters', '3'], False),
@@ -553,6 +735,106 @@ def test_init_uncapped_unpriced_agent_stays_quiet(repo: dict) -> None:
     assert '--max-cost' not in spawn.stderr
     # clean up so the shared module fixture is left as other tests expect
     assert _run(root, 'node', 'delete', 'main.quietchk', '--force').returncode == 0
+
+
+def test_init_uncapped_warning_reads_the_spawning_parents_agent(repo: dict) -> None:
+    """The uncapped warning meters the calling node's agent, not the root's.
+
+    An agent spawns children under itself (``_NODE``), so init inherits that
+    node's agent -- the warning must read the same chain. A codex (unpriced)
+    parent spawning an uncapped child stays quiet even though the root default
+    is a priced claude.
+    """
+    root = repo['root']
+    assert _run(root, 'node', 'init', 'coparent', '--agent', 'codex').returncode == 0
+    parent_dir = root / '.worktrees' / 'main.coparent' / '.fractal' / 'main.coparent'
+    spawn = _run(root, 'node', 'init', 'gchild', _NODE=str(parent_dir))
+    assert spawn.returncode == 0, spawn.stderr
+    # the effective agent is the codex parent's -- unpriced, so no warning
+    assert '--max-cost' not in spawn.stderr
+    # clean up so the shared module fixture is left as other tests expect
+    assert _run(root, 'node', 'delete', 'main.coparent', '--force').returncode == 0
+
+
+def test_init_blind_seeds_no_subs_and_start_sweeps(
+    repo: dict,
+    tmp_path: pathlib.Path,
+) -> None:
+    """``--blind`` persists, seeds no subs, and ``start`` sweeps raced rows.
+
+    A blind worker's config carries ``blind``; its radio seeds channels but
+    no subscriptions, while the parent's own watch of it is untouched. A
+    subscription planted between init and launch -- the window the start-time
+    sweep closes -- is gone once ``node start`` boots the run.
+    """
+    _require_tmux()
+    root = repo['root']
+    spawn = _run(
+        root,
+        'node',
+        'init',
+        'blindkid',
+        '--agent',
+        'claude',
+        '--blind',
+        '--max-iters',
+        '1',
+        '--no-sync',
+        '--local',
+    )
+    assert spawn.returncode == 0, spawn.stderr
+    worktree = root / '.worktrees' / 'main.blindkid'
+    assert _config(worktree, 'blind') == 'true'
+    # the blind child holds no subscriptions of its own (header-only csv)
+    fresh = _run(worktree, 'radio', 'subs', '--csv').stdout
+    assert len(fresh.strip().splitlines()) == 1, fresh
+    # the parent's own watch of the blind child is untouched
+    watching = _run(root, 'radio', 'subs', '--csv').stdout
+    assert 'main.blindkid' in watching
+    # plant a raced sub -- the init-to-start window the sweep closes
+    assert _run(worktree, 'radio', 'sub', '--node', 'main').returncode == 0
+    planted = _run(worktree, 'radio', 'subs', '--csv').stdout
+    assert len(planted.strip().splitlines()) > 1, planted
+    # one trivial committed step so the stubbed launch settles quickly
+    steps_dir = worktree / '.fractal' / 'main.blindkid' / 'steps'
+    for step in steps_dir.glob('*.md'):
+        step.unlink()
+    (steps_dir / '01-work.md').write_text('# Work\n\nOne step.\n', encoding='utf-8')
+    _git(worktree, 'add', '-A')
+    _git(worktree, 'commit', '-m', 'setup blindkid')
+    # launch with the stub agent on PATH (start.sh propagates PATH into tmux)
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    agent = bindir / 'claude'
+    agent.write_text(_AGENT_STUB, encoding='utf-8')
+    agent.chmod(0o755)
+    env = _cli_env()
+    path = env['PATH']
+    env['PATH'] = f'{bindir}{os.pathsep}{path}'
+    session = f'{root.name} (main-blindkid)'
+    try:
+        started = subprocess.run(
+            [_fractal_bin(), 'node', 'start'],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=180,
+        )
+        assert started.returncode == 0, started.stderr
+        # the sweep runs before the launch, so the raced row is already gone
+        swept = _run(worktree, 'radio', 'subs', '--csv').stdout
+        assert len(swept.strip().splitlines()) == 1, swept
+        # let the one-iteration run settle so the cleanup delete is legal
+        assert _await_settled(worktree), _run(worktree, 'node', 'status').stdout
+    finally:
+        # `=` prefix forces an exact target match (no prefix resolution)
+        subprocess.run(
+            ['tmux', 'kill-session', '-t', f'={session}'],
+            capture_output=True,
+        )
+    # clean up so the shared module fixture is left as other tests expect
+    assert _run(root, 'node', 'delete', 'main.blindkid', '--force').returncode == 0
 
 
 # ------ list / status
@@ -612,26 +894,40 @@ def test_list_status_count_and_live(repo: dict) -> None:
     # relabels an active node with no live session to exited, so the session
     # must exist for --live to report it active (the session name start.sh
     # derives: <repo dirname> (<branch, dots dashed>))
-    assert _run(task, '_status', 'active').returncode == 0
+    Node(task).status_set('active')
     session = f'{root.name} (main-task)'
     subprocess.run(['tmux', 'new-session', '-d', '-s', session], check=True)
     try:
-        active = _run(
-            root, 'node', 'list', '--status', 'active', '--live', '--csv'
-        ).stdout
+        listed = _run(
+            root,
+            'node',
+            'list',
+            '--status',
+            'active',
+            '--live',
+            '--csv',
+        )
+        active = listed.stdout
         assert 'main.task' in active
         assert 'main.docs' not in active
         active_count = _run(
-            root, 'node', 'list', '--status', 'active', '--live', '--count'
+            root,
+            'node',
+            'list',
+            '--status',
+            'active',
+            '--live',
+            '--count',
         )
         assert int(active_count.stdout.strip()) == len(active.splitlines()) - 1
     finally:
         # `=` prefix forces an exact target match (no prefix resolution)
         subprocess.run(
-            ['tmux', 'kill-session', '-t', f'={session}'], capture_output=True
+            ['tmux', 'kill-session', '-t', f'={session}'],
+            capture_output=True,
         )
     # restore the fixture
-    assert _run(task, '_status', 'idle').returncode == 0
+    Node(task).status_set('idle')
 
 
 def test_list_rejects_invalid_filters(repo: dict) -> None:
@@ -690,12 +986,6 @@ def test_rm_rf_worktree_lists_orphan_then_force_deletes(repo: dict) -> None:
     deleted = _run(root, 'node', 'delete', 'main.lost', '--force')
     assert deleted.returncode == 0, deleted.stdout + deleted.stderr
     assert 'main.lost' not in _run(root, 'node', 'list', '--all', '--csv').stdout
-
-
-def _orphan_activity_rows(activity: str, branch: str) -> list[str]:
-    """Activity CSV lines recording ``branch``'s orphan event."""
-    lines = activity.splitlines()
-    return [line for line in lines if 'orphan' in line and branch in line]
 
 
 def test_list_shows_stored_status_for_orphaned_terminal_node(repo: dict) -> None:
@@ -765,8 +1055,8 @@ def test_reconcile_records_orphan_event_once(repo: dict) -> None:
 
 
 @pytest.mark.parametrize(
-    ('command', 'message'),
-    [
+    argnames=('command', 'message'),
+    argvalues=[
         ('finish', 'Cannot finish: node is not active.'),
         ('stop', 'Cannot stop: node is not active.'),
         ('kill', 'Cannot kill: node is not active or paused (status: idle).'),
@@ -795,10 +1085,13 @@ def test_retire_unretire_round_trips_through_list(repo: dict) -> None:
     """An idle node can retire and unretire, toggling its list visibility."""
     root, docs = repo['root'], repo['docs']
     # retire is allowed from idle and confirms
-    retired = _run(docs, 'node', 'retire')
+    retired = _run(docs, 'node', 'retire', '--reason', 'superseded by rework')
     assert retired.returncode == 0
     assert 'retire' in retired.stdout.lower()
     assert 'main.docs' not in _run(root, 'node', 'list', '--csv').stdout
+    # the reason rides the retire event metadata after the prior status
+    activity = _run(docs, 'node', 'activity', '--csv').stdout
+    assert 'idle: superseded by rework' in activity
     # unretire restores visibility and confirms
     restored = _run(docs, 'node', 'unretire')
     assert restored.returncode == 0
@@ -976,22 +1269,23 @@ def test_update_validates_config_like_init(repo: dict) -> None:
     )
     assert spawn.returncode == 0, spawn.stderr
     capped = root / '.worktrees' / 'main.capped'
-    # max_cost=0 is rejected (a $0 ceiling degenerates the subtree check)
+    # max_cost=0 is rejected (a $0 ceiling degenerates the subtree check);
+    # the invariant layer lives in core (exit 1), not the CLI boundary
     zero = _run(root, 'node', 'update', 'main.capped', '--max-cost', '0')
-    assert zero.returncode == 2
+    assert zero.returncode == 1
     assert 'max_cost' in (zero.stdout + zero.stderr)
     # lowering max_cost below the stored max_iter_cost inverts the ordering
     inverted = _run(root, 'node', 'update', 'main.capped', '--max-cost', '5')
-    assert inverted.returncode == 2
+    assert inverted.returncode == 1
     assert 'max_iter_cost' in (inverted.stdout + inverted.stderr)
     # raising a per-iter cap above the effective max_cost is the same
     # inversion from the other side
     iter_over = _run(root, 'node', 'update', 'main.capped', '--max-iter-cost', '15')
-    assert iter_over.returncode == 2
+    assert iter_over.returncode == 1
     assert 'max_iter_cost' in (iter_over.stdout + iter_over.stderr)
     # a step cap above the stored max_iter_cost breaks step <= iter
     step_over = _run(root, 'node', 'update', 'main.capped', '--max-step-cost', '9')
-    assert step_over.returncode == 2
+    assert step_over.returncode == 1
     assert 'max_step_cost' in (step_over.stdout + step_over.stderr)
     # the rejected updates never touched the stored config
     assert _config(capped, 'max_cost') == '10.0'
@@ -1053,8 +1347,11 @@ def test_update_retunes_iter_and_step_cost(repo: dict) -> None:
 
 
 @pytest.mark.parametrize(
-    ('flag', 'key'),
-    [('--max-iter-cost', 'max_iter_cost'), ('--max-step-cost', 'max_step_cost')],
+    argnames=('flag', 'key'),
+    argvalues=[
+        ('--max-iter-cost', 'max_iter_cost'),
+        ('--max-step-cost', 'max_step_cost'),
+    ],
 )
 def test_update_rejects_iter_cost_on_uncapped_child(
     repo: dict,
@@ -1065,11 +1362,12 @@ def test_update_rejects_iter_cost_on_uncapped_child(
 
     Mirrors init's guard: ``docs`` carries no ``max_cost``, so granting it a
     per-iter/step cap alone would be unenforceable once the per-iter budget
-    drains. The rejection names ``--max-cost`` and writes nothing.
+    drains. The rejection comes from core's retune policy (exit 1), names
+    ``--max-cost``, and writes nothing.
     """
     root, docs = repo['root'], repo['docs']
     rejected = _run(root, 'node', 'update', 'main.docs', flag, '5')
-    assert rejected.returncode == 2, rejected.stderr
+    assert rejected.returncode == 1, rejected.stderr
     assert '--max-cost' in (rejected.stdout + rejected.stderr)
     assert _config(docs, key) == ''
 
@@ -1096,16 +1394,17 @@ def test_cost_breakdown_rows_sum_to_spent_with_a_deleted_descendant(
     parent_node = Node(root)
     parent_node.init(name='bp', agent='claude')
     parent_wt = root / '.worktrees' / 'main.bp'
-    monkeypatch.setenv('_NODE', f'{parent_wt / ".fractal" / "main.bp"}')
+    node_dir = parent_wt / '.fractal' / 'main.bp'
+    monkeypatch.setenv('_NODE', f'{node_dir}')
     Node(root).init(name='kid', agent='claude')
     monkeypatch.delenv('_NODE')
     child_wt = parent_wt.parent / 'main.bp.kid'
     parent, child = Node(parent_wt), Node(child_wt)
     parent.status_set('active')
-    p_run = parent.run_start()
+    p_run = parent.record.run_start()
     child.status_set('active')
     # the child run links to the parent's active run via the central DB
-    child_run = child.run_start()
+    child_run = child.record.run_start()
     # record spend on both, then delete the child (its spend must survive)
     _record_step_cost(parent, run_id=p_run, cost=0.5)
     _record_step_cost(child, run_id=child_run, cost=1.5)
@@ -1114,7 +1413,13 @@ def test_cost_breakdown_rows_sum_to_spent_with_a_deleted_descendant(
 
     # the breakdown rows (self + the deleted descendant) total cost spent
     breakdown = _run(
-        parent_wt, 'node', 'cost', 'breakdown', '--run', str(p_run), '--csv'
+        parent_wt,
+        'node',
+        'cost',
+        'breakdown',
+        '--run',
+        str(p_run),
+        '--csv',
     )
     assert breakdown.returncode == 0, breakdown.stderr
     rows = breakdown.stdout.strip().splitlines()[1:]  # drop the header
@@ -1145,7 +1450,7 @@ def test_cost_family_answers_for_a_deleted_target(repo: dict) -> None:
     assert capped.returncode == 0, capped.stderr
     gone = Node(root / '.worktrees' / 'main.gone')
     gone.status_set('active')
-    run_id = gone.run_start()
+    run_id = gone.record.run_start()
     _record_step_cost(gone, run_id=run_id, cost=2.5)
     gone.status_set('completed')
     assert _run(root, 'node', 'delete', 'main.gone', '--force').returncode == 0
@@ -1177,22 +1482,21 @@ def test_cost_family_answers_for_a_deleted_target(repo: dict) -> None:
 
 
 def test_version_flag_reports_a_version(repo: dict) -> None:
-    """``fractal --version`` prints the installed version and exits 0.
+    """``fractal --version`` prints the package's own version and exits 0.
 
     The first-install smoke test for a distributed CLI: an eager root option,
-    so it resolves before any command and works with no node present.
+    so it resolves before any command and works with no node present. The
+    subprocess imports this worktree's package, so the output must equal its
+    ``__version__`` -- the code that runs, not install-time dist-info.
     """
     result = _run(repo['root'], '--version')
     assert result.returncode == 0, result.stderr
-    version = result.stdout.strip()
-    # a real version string (e.g. 0.0.0) -- digits and dots, never empty
-    assert version
-    assert version.replace('.', '').isdigit()
+    assert result.stdout.strip() == fractal.__version__
 
 
 @pytest.mark.parametrize(
-    'argv',
-    [
+    argnames='argv',
+    argvalues=[
         ('node', 'list', '--help'),
         ('node', 'activity', '--help'),
         ('node', 'cost', 'breakdown', '--help'),
@@ -1258,6 +1562,83 @@ def test_list_csv_columns_stable_empty_vs_populated(repo: dict) -> None:
     assert 'node_id' not in header
 
 
+def test_activity_json_mirrors_csv_shape(repo: dict) -> None:
+    """``activity --json`` emits an array of CSV-shaped row objects.
+
+    The JSON surface is additive -- CSV stays the piped default -- and
+    mirrors the CSV projection: one object per row, keys in the CSV
+    header's column order. ``--json`` and ``--csv`` contradict and are
+    refused.
+    """
+    root = repo['root']
+    header = _run(root, 'node', 'activity', '--csv').stdout.splitlines()[0].split(',')
+    listed = _run(root, 'node', 'activity', '--json')
+    assert listed.returncode == 0, listed.stderr
+    rows = json.loads(listed.stdout)
+    assert rows, 'the fixture spawns recorded activity'
+    assert all(list(row) == header for row in rows)
+    # values round-trip: the fixture's worker inits recorded spawn events
+    assert any(row['event'] == 'spawn' for row in rows)
+    # --json contradicts --csv
+    clash = _run(root, 'node', 'activity', '--json', '--csv')
+    assert clash.returncode != 0
+    assert 'mutually exclusive' in clash.stderr.lower()
+
+
+def test_activity_names_attribution_and_lineage_columns(repo: dict) -> None:
+    """``activity --csv`` renders ``actor`` and the display numbers.
+
+    Consumers bind by header name, so the header names every projected
+    column; an event row carries its writer and a step row its name, the
+    iteration-relative step number, and the run-relative iteration number
+    the surrogate lineage ids stand for.
+    """
+    root = repo['root']
+    # seed one settled lineage on the root node so a step row exists to
+    # read (closed at every level, so no active run leaks to other tests)
+    node = Node(root)
+    run_id = node.record.run_start()
+    iter_id = node.record.iter_start(run_id=run_id, iter=3)
+    step_id = node.record.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=2,
+        step_name='PLAN',
+    )
+    node.record.step_end(step_id=step_id, status='completed', exit_code=0)
+    node.record.iter_end(iter_id=iter_id, status='completed', exit_code=0)
+    node.record.run_end(run_id=run_id, status='completed', exit_code=0)
+
+    activity = _run(root, 'node', 'activity', '--csv').stdout
+    # the header names the full projection, in its documented order
+    header = activity.splitlines()[0].split(',')
+    assert header == [
+        'timestamp',
+        'node',
+        'event_id',
+        'step_id',
+        'iter_id',
+        'run_id',
+        'event',
+        'actor',
+        'step_name',
+        'step',
+        'iter',
+        'status',
+        'exit_code',
+        'metadata',
+        'duration',
+        'cost',
+    ]
+    rows = list(csv.DictReader(io.StringIO(activity)))
+    # an event row names its writer -- the fixture's spawns are operator-made
+    spawn = next(row for row in rows if row['event'] == 'spawn')
+    assert spawn['actor'] == 'operator'
+    # a step row renders its name and the run-relative numbers
+    step = next(row for row in rows if row['step_id'])
+    assert (step['step_name'], step['step'], step['iter']) == ('PLAN', '2', '3')
+
+
 # ------ chat
 
 
@@ -1287,39 +1668,6 @@ def test_chat_current_requires_a_live_session(repo: dict) -> None:
     assert 'live session' in result.stderr.lower()
 
 
-# ------ prompt
-
-
-def test_prompt_bridge_assembles_and_renders(repo: dict) -> None:
-    """``node _prompt`` joins charter + step + modes, substituted with ``--var``."""
-    step = repo['task'] / '.fractal' / 'main.task' / 'steps' / '01-PLAN.md'
-    result = _run(
-        repo['task'],
-        'node',
-        '_prompt',
-        f'{step}',
-        '--var',
-        'STEP_LABEL=step 1 of 3',
-        '--var',
-        'CONTINUE_MODE=true',
-    )
-    assert result.returncode == 0, result.stderr
-    out = result.stdout
-    # the charter leads; the step body follows, frontmatter stripped
-    assert out.startswith('You are an autonomous node')
-    assert '## Plan' in out
-    assert 'requires_approval' not in out
-    # the --var-activated mode doc joins; an inactive one stays out
-    assert 'This node was continued' in out
-    assert 'This node was paused mid-run' not in out
-    # static vars substitute, --var overrides win (value with spaces),
-    # unsupplied run-scoped placeholders pass through for the caller
-    assert '$WORKTREE_DIR' not in out
-    assert 'main.task' in out
-    assert 'step 1 of 3' in out
-    assert '$TIME_BUDGET' in out
-
-
 # ------ helpers
 
 
@@ -1328,14 +1676,20 @@ def _config(cwd: pathlib.Path, key: str) -> str:
     return _run(cwd, 'config', '_get', key).stdout.strip()
 
 
+def _orphan_activity_rows(activity: str, branch: str) -> list[str]:
+    """Activity CSV lines recording ``branch``'s orphan event."""
+    lines = activity.splitlines()
+    return [line for line in lines if 'orphan' in line and branch in line]
+
+
 def _record_step_cost(node: Node, *, run_id: int, cost: float) -> None:
     """Record one completed step of ``cost`` USD in ``run_id`` (for cost rollups)."""
-    iter_id = node.iter_start(run_id=run_id, iter=1)
-    step_id = node.step_start(
+    iter_id = node.record.iter_start(run_id=run_id, iter=1)
+    step_id = node.record.step_start(
         iter_id=iter_id,
         run_id=run_id,
         step=1,
         step_name='PLAN',
     )
-    node.step_cost(step_id=step_id, cost=cost)
-    node.step_end(step_id=step_id, status='completed', exit_code=0)
+    node.record.step_cost(step_id=step_id, cost=cost)
+    node.record.step_end(step_id=step_id, status='completed', exit_code=0)

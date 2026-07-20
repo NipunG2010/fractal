@@ -24,7 +24,7 @@ MERGE_SH = pathlib.Path(__file__).parents[2] / 'fractal' / '_scripts' / 'merge.s
 # `git <intercept>`: it SIGTERMs its parent (the bash running merge.sh) and skips
 # the real subcommand -- a deterministic stand-in for an async signal arriving in
 # the unprotected window; the subcommand is matched after skipping a leading
-# ``-C <dir>`` (merge.sh always targets the parent worktree that way)
+# -C <dir> (merge.sh always targets the parent worktree that way)
 _GIT_SHIM = """\
 #!/usr/bin/env bash
 args=("$@")
@@ -73,14 +73,15 @@ def test_merge_restores_parent_when_signalled_mid_merge(
     pre_tree = _git(parent_dir, 'rev-parse', 'HEAD^{tree}').stdout.strip()
 
     # inject a SIGTERM when merge.sh reaches `git <intercept>` on the parent
-    # the shim dir must live OUTSIDE the repo (the ``git_repo`` fixture roots the
-    # repo at ``tmp_path``), or it would show up as untracked parent residue
+    # the shim dir must live OUTSIDE the repo (the git_repo fixture roots the
+    # repo at tmp_path), or it would show up as untracked parent residue
     real_git = shutil.which('git')
     assert real_git is not None, 'git must be on PATH'
     bin_dir = tmp_path_factory.mktemp('shim')
     _write_git_shim(bin_dir, intercept=intercept, real_git=real_git)
-    env = dict(os.environ)  # the session fixture already strips ``_NODE`` et al.
-    env['PATH'] = f'{bin_dir}{os.pathsep}{env["PATH"]}'
+    env = dict(os.environ)  # the session fixture already strips _NODE et al.
+    path = env['PATH']
+    env['PATH'] = f'{bin_dir}{os.pathsep}{path}'
 
     result = subprocess.run(
         ['bash', f'{MERGE_SH}', f'{child_dir}'],

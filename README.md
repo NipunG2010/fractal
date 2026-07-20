@@ -1,6 +1,6 @@
 # fractal
 
-[![license](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/plasma-ai/fractal/blob/main/LICENSE)
 [![build](https://github.com/plasma-ai/fractal/actions/workflows/build.yaml/badge.svg)](https://github.com/plasma-ai/fractal/actions/workflows/build.yaml)
 [![docs](https://github.com/plasma-ai/fractal/actions/workflows/docs.yaml/badge.svg)](https://github.com/plasma-ai/fractal/actions/workflows/docs.yaml)
 [![lint](https://github.com/plasma-ai/fractal/actions/workflows/lint.yaml/badge.svg)](https://github.com/plasma-ai/fractal/actions/workflows/lint.yaml)
@@ -39,11 +39,17 @@ Install the `fractal` package from PyPI:
 pip install plasma-fractal
 ```
 
-Use `pipx install plasma-fractal` or `uv tool install plasma-fractal` to
-install in an isolated environment. If you use one of these two methods,
-you must also install `plasma-wiki` (a plain `pip` install pulls
-`plasma-wiki` and puts `wiki` on your `PATH`, but this is not the case
-when using `pipx install` or `uv tool install`).
+or
+
+```bash
+pip install fractal
+```
+
+Use `pipx install` or `uv tool install` to install the package in an
+isolated environment. If you use one of these two methods, you must also
+install `plasma-wiki` (a plain `pip` install pulls `plasma-wiki` and
+puts `wiki` on your `PATH`, but this is not the case when using
+`pipx install` or `uv tool install`).
 
 `uv tool install plasma-fractal --with-executables-from plasma-wiki`
 does the same in one command.
@@ -58,8 +64,8 @@ Open the dashboard from your project root with `fractal open`.
 
 ### Skill
 
-Install the `/fractal` skill for your agent via the plugin marketplace
-(Claude Code and Codex):
+Install the skill for your agent via the plugin marketplace (Claude Code
+and Codex):
 
 ```bash
 # Claude Code
@@ -76,8 +82,11 @@ Or from the CLI, which copies the fractal and wiki skills into
 current project only):
 
 ```bash
-fractal install
+fractal install [--link]
 ```
+
+After upgrading the package, re-run `fractal install` to refresh the
+copied skill (pass `--link` for symlinked install).
 
 ## Usage
 
@@ -86,6 +95,14 @@ loop. The root node branches from your working tree, and child nodes
 branch from their parent. Agents iterate in tmux sessions, and all state
 (runs, iters, steps, costs, signals) is tracked in a local SQLite
 database.
+
+Five agent backends are supported — Claude Code (`claude`), Codex
+(`codex`), Grok Build (`grok`), opencode (`opencode`), and Oh My Pi
+(`omp`) — selected per node with `--agent` (children inherit it). Claude
+and Codex can additionally route through OpenRouter with
+`--provider=openrouter`, which authenticates via `OPENROUTER_API_KEY`
+from the launching shell; opencode and omp reach OpenRouter natively
+through their own `openrouter/<author>/<model>` model ids.
 
 Use the `/fractal` skill to spawn and manage agent nodes. The `fractal`
 CLI is also available directly — run `fractal --help` and
@@ -110,8 +127,12 @@ Run `./install.sh --help` for all options. Alternatively, run
 Installing a dependency as editable (e.g. a sibling package) is left to
 the caller: `uv pip install --editable <path>`.
 
-Once installed, run tools with `uv run <command>`, or activate the
-environment first (`source .venv/bin/activate`).
+With an editable install, `fractal install --link` symlinks the bundled
+skill into the agent skill directories instead of copying it, so skill
+edits apply without re-running the install.
+
+Once installed, run tools with `uv run --no-sync <command>`, or activate
+the environment first (`source .venv/bin/activate`).
 
 ### Tests
 
@@ -134,15 +155,19 @@ pre-commit run --all-files
 
 ### Contributing
 
-The contribution workflow is covered by the organization-wide
-[CONTRIBUTING.md](https://github.com/plasma-ai/.github/blob/main/CONTRIBUTING.md);
-repository conventions live in [AGENTS.md](AGENTS.md), and the release
-process (version sources, tagging, CI guard) in the organization-wide
-[RELEASING.md](https://github.com/plasma-ai/.github/blob/main/RELEASING.md).
+The contribution workflow, repository conventions, and release process
+(version sources, tagging, CI guard) are documented in:
+
+- Contribution workflow (organization-wide):
+  [CONTRIBUTING.md](https://github.com/plasma-ai/.github/blob/main/CONTRIBUTING.md)
+- Repository conventions:
+  [AGENTS.md](https://github.com/plasma-ai/fractal/blob/main/AGENTS.md)
+- Release process (organization-wide):
+  [RELEASING.md](https://github.com/plasma-ai/.github/blob/main/RELEASING.md)
 
 ## License
 
-Licensed under the Functional Source License 1.1 (Apache 2.0 Future
-License) — see [LICENSE](LICENSE).
+Licensed under the Apache License 2.0 — see
+[LICENSE](https://github.com/plasma-ai/fractal/blob/main/LICENSE).
 
 Copyright © 2026 Plasma AI

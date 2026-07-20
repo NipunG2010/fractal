@@ -45,6 +45,6 @@ def db_query(app: typer.Typer) -> typer.Typer:
                 raise typer.BadParameter(f'Invalid query: {e}.') from e
             print_rows(rows, csv=csv)
         else:
-            raise typer.BadParameter(f'No fractal node at {node._root}.')
+            raise typer.BadParameter(f'No fractal node at {node.worktree}.')
 
     return app

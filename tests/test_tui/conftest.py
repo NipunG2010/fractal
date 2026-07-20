@@ -27,6 +27,7 @@ class _AllLive(frozenset):
     """
 
     def __contains__(self: _AllLive, _name: object) -> bool:
+        """Report every name as a live session."""
         return True
 
 
@@ -38,7 +39,7 @@ def _stub_live_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(scope='session')
 def cockpit_tree(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
-    """The canonical deterministic tree (READ-ONLY by convention).
+    """Return the canonical deterministic tree (READ-ONLY by convention).
 
     Tests that write build their own small tree instead of mutating this one.
     """
@@ -49,20 +50,20 @@ def cockpit_tree(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
 
 @pytest.fixture
 def pair_tree(tmp_path: pathlib.Path) -> pathlib.Path:
-    """A minimal writable tree (root + ``main.alpha``) for mutating tests."""
+    """Return a minimal writable tree (root + ``main.alpha``) for mutating tests."""
     build_pair(tmp_path)
     return tmp_path
 
 
 @pytest.fixture
 def data(cockpit_tree: pathlib.Path) -> TuiData:
-    """A fresh read stack over the canonical tree."""
+    """Return a fresh read stack over the canonical tree."""
     return TuiData(resolve_node(cockpit_tree))
 
 
 @pytest.fixture
 def builder(data: TuiData) -> SnapshotBuilder:
-    """A snapshot builder with the pinned clock (live elapsed is stable)."""
+    """Return a snapshot builder with the pinned clock (live elapsed is stable)."""
     return SnapshotBuilder(data, NodePoller(data.db_dir), now=lambda: NOW_EPOCH)
 
 
@@ -71,7 +72,7 @@ def cockpit_app(
     cockpit_tree: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Callable[..., FractalApp]:
-    """A factory for cockpit apps over the canonical tree (UTC, pinned clock)."""
+    """Return a cockpit-app factory over the canonical tree (UTC, pinned clock)."""
     # the send-key capability probe reads the terminal env at import; pin it
     # so the compose hint (and its snapshot) is environment-independent
     monkeypatch.setattr('fractal.tui.panes.message._ENTER_SENDS', True)

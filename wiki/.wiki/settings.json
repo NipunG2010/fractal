@@ -1,6 +1,9 @@
 {
   "naming": {
-    "validate": [],
+    "validate": [
+      "ascii",
+      "identifier"
+    ],
     "allow": "",
     "deny": "",
     "pattern": null,

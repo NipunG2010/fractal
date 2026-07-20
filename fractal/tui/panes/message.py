@@ -11,18 +11,19 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import time
 import typing
 from typing import Optional
 
 from rich.style import Style
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.events import Enter, Key, Leave
 from textual.widgets import Input, Label, OptionList, Rule as Divider, Static, TextArea
 from textual.widgets.text_area import TextAreaTheme
 
-from fractal.tui import fmt, theme
+import fractal.tui.fmt
+import fractal.tui.theme
 from fractal.tui.data import leaf_of
 from fractal.tui.widgets import PaneScroll
 
@@ -65,7 +66,7 @@ class Composer(TextArea):
         self.register_theme(
             TextAreaTheme(
                 name='fractal',
-                syntax_styles={'slash': Style(color=theme.PRIMARY)},
+                syntax_styles={'slash': Style(color=fractal.tui.theme.PRIMARY)},
             )
         )
         self.theme = 'fractal'
@@ -149,66 +150,40 @@ class MessagePane:
         yield Divider(id='m_chatline')
         with Horizontal(id='m_subjectrow'):
             yield Label('subject')
-            yield Input(placeholder=theme.EMPTY, id='m_subject')
+            yield Input(placeholder=fractal.tui.theme.EMPTY, id='m_subject')
         with Horizontal(id='m_composer'):
-            yield Label(theme.PROMPT, id='m_prompt')
+            yield Label(fractal.tui.theme.PROMPT, id='m_prompt')
             yield Composer(id='m_body', show_line_numbers=False)
-        if _ENTER_SENDS:
-            hint = (
-                f'[{theme.DIM}]{theme.SHIFT}{theme.RET} newline {theme.SEP}'
-                f' {theme.RET}/{theme.CTRL}S send {theme.SEP} /field[/]'
-            )
-        else:
-            hint = (
-                f'[{theme.DIM}]{theme.RET} newline {theme.SEP}'
-                f' {theme.CTRL}S send {theme.SEP} /field[/]'
-            )
-        yield Static(hint, id='m_hint')
+        yield Static(self._hint(), id='m_hint')
 
     def _default(self: MessagePane, fid: str) -> str:
         """Return the field's initial value."""
-        return {
+        defaults = {
             'm_node': leaf_of(self.node),
             'm_channel': 'public',
-            'm_thread': theme.EMPTY,
+            'm_thread': fractal.tui.theme.EMPTY,
             'm_priority': '10',
-            'm_session': fmt.trunc(self.session, theme.SESS_W),
-        }.get(fid, '')
+            'm_session': fractal.tui.fmt.trunc(self.session, fractal.tui.theme.SESS_W),
+        }
+        return defaults.get(fid, '')
 
     def show_node(self: MessagePane) -> None:
         """Show the node's leaf name; ``self.node`` keeps the full branch."""
         field = self.app.query_one('#m_node', Input)
         field.value = leaf_of(self.node)
-        field.styles.width = len(field.value) + theme.HUG_PAD
+        field.styles.width = len(field.value) + fractal.tui.theme.HUG_PAD
 
     def show_session(self: MessagePane) -> None:
         """Show the (truncated) session id; ``self.session`` keeps the full value."""
-        truncated = fmt.trunc(self.session, theme.SESS_W)
+        truncated = fractal.tui.fmt.trunc(self.session, fractal.tui.theme.SESS_W)
         self.app.query_one('#m_session', Input).value = truncated
 
     def _kind_markup(self: MessagePane) -> str:
-        """Render the segmented kind switch.
-
-        The active kind always sits on a brighter chip than the inactive
-        (resting AND lit/hover), so selection reads from the chip.
-        """
-        lit = (
-            self.app.mode in ('field', 'edit', 'combo') and self.cursor == 'm_kind'
-        ) or self.kind_hover
-        result = []
-        for kind in ('chat', 'radio'):
-            if kind == self.kind:
-                if lit:
-                    style = f'{theme.INK_BRIGHT} on {theme.LIT_ACTIVE}'
-                else:
-                    style = f'{theme.INK} on {theme.SEL}'
-            else:
-                if lit:
-                    style = f'{theme.INK} on {theme.LIT}'
-                else:
-                    style = f'{theme.CHROME} on {theme.SURFACE}'
-            result.append(f'[{style}] {kind} [/]')
-        return ''.join(result)
+        """Render the segmented kind switch."""
+        active = self.app.mode in ('field', 'edit', 'combo')
+        cursor_lit = active and self.cursor == 'm_kind'
+        lit = cursor_lit or self.kind_hover
+        return fractal.tui.fmt.toggle(('chat', 'radio'), self.kind, lit)
 
     def paint_kind(self: MessagePane) -> None:
         """Repaint the kind toggle."""
@@ -257,7 +232,7 @@ class MessagePane:
         # mutation path funnels through here
         for fid in ('m_node', 'm_channel'):
             field = self.app.query_one(f'#{fid}', Input)
-            field.styles.width = len(field.value) + theme.HUG_PAD
+            field.styles.width = len(field.value) + fractal.tui.theme.HUG_PAD
         radio = self.kind == 'radio'
         self.app.query_one('#message').set_class(radio, 'radiokind')
         self.app.query_one('#cell_m_session').display = not radio
@@ -268,8 +243,46 @@ class MessagePane:
         self.app.query_one('#m_convo').display = not radio
         self.app.query_one('#m_chatline').display = not radio
 
+    def _hint(self: MessagePane) -> str:
+        """Render the hint line for the active input mode.
+
+        Field, combo, and chat-scroll modes list their live keys; edit mode
+        (and the resting pane) keeps the terminal-aware send-key hint.
+        """
+        if self.app.mode == 'field':
+            return (
+                f'[{fractal.tui.theme.DIM}]{fractal.tui.theme.LEFT}'
+                f'{fractal.tui.theme.RIGHT}{fractal.tui.theme.UP}'
+                f'{fractal.tui.theme.DOWN} fields {fractal.tui.theme.SEP}'
+                f' {fractal.tui.theme.RET} edit {fractal.tui.theme.SEP} esc back[/]'
+            )
+        if self.app.mode == 'combo':
+            return (
+                f'[{fractal.tui.theme.DIM}]type to filter {fractal.tui.theme.SEP}'
+                f' {fractal.tui.theme.UP}{fractal.tui.theme.DOWN} pick'
+                f' {fractal.tui.theme.SEP} {fractal.tui.theme.RET} select'
+                f' {fractal.tui.theme.SEP} esc cancel[/]'
+            )
+        if self.app.mode == 'chatscroll':
+            return (
+                f'[{fractal.tui.theme.DIM}]{fractal.tui.theme.UP}'
+                f'{fractal.tui.theme.DOWN} scroll {fractal.tui.theme.SEP} esc back[/]'
+            )
+        if _ENTER_SENDS:
+            return (
+                f'[{fractal.tui.theme.DIM}]{fractal.tui.theme.SHIFT}'
+                f'{fractal.tui.theme.RET} newline {fractal.tui.theme.SEP}'
+                f' {fractal.tui.theme.RET}/{fractal.tui.theme.CTRL}s send'
+                f' {fractal.tui.theme.SEP} /field[/]'
+            )
+        return (
+            f'[{fractal.tui.theme.DIM}]{fractal.tui.theme.RET} newline'
+            f' {fractal.tui.theme.SEP} {fractal.tui.theme.CTRL}s send'
+            f' {fractal.tui.theme.SEP} /field[/]'
+        )
+
     def paint_fields(self: MessagePane) -> None:
-        """Paint the field cursor, composer light, and chat-scroll dividers."""
+        """Paint the field cursor, composer light, dividers, and mode hint."""
         active = self.app.mode in ('field', 'edit', 'combo')
         for fid, *_ in _MFIELDS:
             if fid == 'm_kind':
@@ -282,12 +295,12 @@ class MessagePane:
         # light the whole composer so the body highlight is a full rectangle
         self.app.query_one('#m_composer').set_class(body, 'bodylit')
         convo = self.app.query_one('#m_convo')
-        convo.set_class(
-            self.app.mode == 'field' and self.cursor == 'm_convo', 'zonefocus'
-        )
+        convo_lit = self.app.mode == 'field' and self.cursor == 'm_convo'
+        convo.set_class(convo_lit, 'zonefocus')
         lit = self.app.mode == 'chatscroll'
         self.app.query_one('#m_chattop').set_class(lit, 'litdiv')
         self.app.query_one('#m_chatline').set_class(lit, 'litdiv')
+        self.app.query_one('#m_hint', Static).update(self._hint())
 
     def enter(self: MessagePane) -> None:
         """Enter the pane straight into the body, ready to type."""
@@ -301,7 +314,7 @@ class MessagePane:
         self.app.set_focus(None)
         self.app.mode = 'ring'
         self.paint_fields()
-        self.app._apply()
+        self.app.paint_ring()
 
     def rescope(self: MessagePane, snap: Snapshot) -> None:
         """Re-point the compose at the new scope (node field, session, convo)."""
@@ -334,6 +347,7 @@ class MessagePane:
                     widget.insert(event.character or '')
                 else:
                     widget.insert_text_at_cursor(event.character or '')
+                self.paint_fields()
         else:
             return
         event.stop()
@@ -382,6 +396,7 @@ class MessagePane:
         else:
             self.app.mode = 'edit'
             self.app.query_one(f'#{self.cursor}').focus()
+            self.paint_fields()
 
     def _flip_kind(self: MessagePane) -> None:
         """Toggle chat <-> radio, re-show the fields, keep the cursor valid."""
@@ -395,14 +410,14 @@ class MessagePane:
         """Handle edit mode: esc ends, up/down end + move."""
         key = event.key
         if key == 'escape':
-            self._end_edit()
+            self.end_edit()
             event.stop()
         elif key in ('up', 'down'):
-            self._end_edit()
+            self.end_edit()
             self._move_field(key)
             event.stop()
 
-    def _end_edit(self: MessagePane) -> None:
+    def end_edit(self: MessagePane) -> None:
         """End edit mode back to field mode."""
         self.app.set_focus(None)
         self.app.mode = 'field'
@@ -427,13 +442,18 @@ class MessagePane:
         if self.app.mode not in ('field', 'edit', 'combo'):
             return
         if self.app.mode == 'edit':
-            self._end_edit()
+            self.end_edit()
         elif self.app.mode == 'combo':
             self._close_combo(commit=True)
         visible = self._visible_fields()
         index = visible.index(self.cursor) if self.cursor in visible else 0
         self.cursor = visible[(index + step) % len(visible)]
         self.paint_fields()
+
+    @property
+    def combo_field(self: MessagePane) -> str:
+        """Return the field id owning the open combo (``''`` when none)."""
+        return self._cfid
 
     def _open_combo(self: MessagePane, fid: str, seed: str = '') -> None:
         """Open the field's combo drop (optionally seeded by a typed char)."""
@@ -447,6 +467,7 @@ class MessagePane:
         self.app.mount(OptionList(id='m_combodrop'))
         field.value = seed
         field.focus()
+        self.paint_fields()
         self.app.call_after_refresh(self.filter_combo)
 
     def filter_combo(self: MessagePane) -> None:
@@ -460,7 +481,11 @@ class MessagePane:
         self._cfiltered = [option for option in options if typed in option.lower()]
         drop.clear_options()
         if self._cfiltered:
-            drop.add_options(self._cfiltered)
+            # no_wrap: options never wrap -- a screen-clamped drop ellipsizes
+            drop.add_options(
+                Text(option, no_wrap=True, overflow='ellipsis')
+                for option in self._cfiltered
+            )
             if not typed and self._ccurrent in self._cfiltered:
                 drop.highlighted = self._cfiltered.index(self._ccurrent)
             else:
@@ -469,8 +494,11 @@ class MessagePane:
         # cap the drop to the space below the field (it scrolls internally)
         space = max(self.app.size.height - region.y - 2, 5)
         drop.styles.height = min(max(len(self._cfiltered), 1) + 2, space)
+        # fit the widest option plus the drop chrome -- border and padding
+        # (2 each) and the scrollbar column -- clamped to the screen edge
         widest = max((len(option) for option in options), default=6)
-        drop.styles.width = max(widest + 4, 14)
+        available = max(self.app.size.width - region.x - 1, 14)
+        drop.styles.width = min(max(widest + 5, 14), available)
         drop.styles.offset = (region.x, region.y + 1)
 
     def key_combo(self: MessagePane, event: Key) -> None:
@@ -521,26 +549,35 @@ class MessagePane:
         """Swap the transcript to the scoped branch's buffer."""
         convo = self.app.query_one('#m_convo')
         convo.remove_children()
-        for who, text in self.app.chat.convo(self.app.scope):
+        for who, text in self.app.chat.transcript(self.app.scope):
             convo.mount(self._msg(who, text))
         self._streaming = False
         # a turn in flight on this branch keeps its spinner at the tail
-        if self.app._turn is not None and self.app._turn_branch == self.app.scope:
+        chat = self.app.chat
+        if chat.turn is not None and chat.turn_branch == self.app.scope:
             self.show_pending()
         self.app.call_after_refresh(convo.scroll_end, animate=False)
 
     def _msg(self: MessagePane, who: str, text: str) -> Static:
         """Build one transcript bubble for a ``who`` line."""
+        # agent text is pure data with no style wrapping: markup stays off
+        # (matching the streamed bubble, where a tag can split across deltas
+        # and escaping cannot cover the partial) so a stray tag never renders
+        # or crashes the transcript
+        if who == 'auth':
+            return Static(text, classes='msg auth', markup=False)
+        # every other bubble wraps its text in app-owned style markup; the
+        # text itself is data (the prompt, a tool name, an error), so escape
+        # it once here so a stray tag never renders or crashes the transcript
+        text = fractal.tui.fmt.esc(text)
         if who == 'you':
             return Static(
-                f'[{theme.PRIMARY}]{theme.PROMPT}[/] {text}',
+                f'[{fractal.tui.theme.PRIMARY}]{fractal.tui.theme.PROMPT}[/] {text}',
                 classes='msg you',
             )
-        if who == 'auth':
-            return Static(text, classes='msg auth')
         if who == 'error':
-            return Static(f'[{theme.ERROR}]{text}[/]', classes='msg')
-        return Static(f'[{theme.DIM}]{text}[/]', classes='msg')
+            return Static(f'[{fractal.tui.theme.ERROR}]{text}[/]', classes='msg')
+        return Static(f'[{fractal.tui.theme.DIM}]{text}[/]', classes='msg')
 
     def post(self: MessagePane, branch: str, who: str, text: str) -> None:
         """Append a transcript line (buffer + widget when the branch is scoped)."""
@@ -557,13 +594,18 @@ class MessagePane:
         if branch != self.app.scope:
             return
         convo = self.app.query_one('#m_convo')
-        buffered = self.app.chat.convo(branch)[-1][1]
-        # the trailing agent bubble sits just above the spinner, when present
+        buffered = self.app.chat.transcript(branch)[-1][1]
+        # the trailing agent bubble sits just above the spinner, when present;
+        # markup stays off (matching _msg's agent bubble) -- a delta boundary
+        # can split a tag, so a raw buffer must never parse as markup
         bubbles = [child for child in convo.children if child.id != 'm_chatpending']
         if self._streaming and bubbles:
             bubbles[-1].update(buffered)
         else:
-            convo.mount(Static(buffered, classes='msg auth'), before=self._pending())
+            convo.mount(
+                Static(buffered, classes='msg auth', markup=False),
+                before=self._pending(),
+            )
             self._streaming = True
         self.app.call_after_refresh(convo.scroll_end, animate=False)
 
@@ -585,9 +627,14 @@ class MessagePane:
         pending = self._pending()
         if pending is None:
             return
-        glyph = theme.SPINNER[self.app._spin_frame % len(theme.SPINNER)]
-        seconds = int(time.monotonic() - self.app._spin_started)
-        pending.update(f'[{theme.DIM}]{glyph} thinking {theme.SEP} {seconds}s[/]')
+        glyph = fractal.tui.theme.SPINNER[
+            self.app.chat.spin_frame % len(fractal.tui.theme.SPINNER)
+        ]
+        seconds = int(self.app.chat.spin_elapsed())
+        pending.update(
+            f'[{fractal.tui.theme.DIM}]{glyph} thinking'
+            f' {fractal.tui.theme.SEP} {seconds}s[/]'
+        )
 
     def clear_pending(self: MessagePane) -> None:
         """Drop the spinner line (the turn finished or was cancelled)."""
@@ -623,7 +670,7 @@ class MessagePane:
         priority_value = self.app.query_one('#m_priority', Input).value.strip()
         priority = int(priority_value) if priority_value.isdigit() else 10
         try:
-            if thread and thread != theme.EMPTY:
+            if thread and thread != fractal.tui.theme.EMPTY:
                 self.app.actions.reply(
                     message_uuid=thread,
                     data=text,
@@ -643,9 +690,10 @@ class MessagePane:
             self.app.notify(str(error), severity='warning')
             return
         self.app.notify(
-            f'radio {kind} {theme.RIGHT} {leaf_of(target)} {theme.SEP} {channel}'
+            f'radio {kind} {fractal.tui.theme.RIGHT} {leaf_of(target)}'
+            f' {fractal.tui.theme.SEP} {channel}'
         )
-        if self.app.mode not in ('radio', 'rdrop', 'rdetail'):
+        if self.app.mode not in ('radio', 'rdrop', 'rdetail', 'rreact'):
             self.app.refresh_radio()
 
     def _apply_slash(self: MessagePane, text: str) -> None:
@@ -687,12 +735,12 @@ class MessagePane:
         parts = text[1:].split(maxsplit=1) if text.startswith('/') else []
         command = parts[0].lower() if parts else ''
         body = self.app.query_one('#m_body', Composer)
-        # TextArea has no public span API: style by writing its private
-        # per-line highlight map
+        # private API: TextArea has no public span API -- style by
+        # writing its private per-line highlight map
         body._highlights.clear()
         if command in _SLASH_COMMANDS:
             body._highlights[0].append((0, 1 + len(command), 'slash'))
-        # the rendered lines are cached; drop them so the new span paints
+        # private API: the rendered lines are cached; drop them so the new span paints
         body._line_cache.clear()
         body.refresh()
 
@@ -707,7 +755,7 @@ class MessagePane:
         self.cursor = 'm_body'
         self.app.focus_id = 'message'
         self.refresh_visibility()
-        self.app._apply()
+        self.app.paint_ring()
         self.paint_fields()
 
     def compose_reply(self: MessagePane, row: dict) -> None:
@@ -726,7 +774,7 @@ class MessagePane:
         self.app.focus_id = 'message'
         self.cursor = 'm_body'
         self.app.mode = 'edit'
-        self.app._apply()
+        self.app.paint_ring()
         self.app.query_one('#m_body').focus()
         self.paint_fields()
 
@@ -735,7 +783,7 @@ class MessagePane:
         sender = row['sender']
         known = any(entry['branch'] == sender for entry in self.app.snapshot.tree)
         if known and sender != self.app.scope:
-            self.app._rescope(sender)
+            self.app.scope_to(sender)
         self.kind = 'chat'
         if session:
             self.session = session
@@ -744,7 +792,7 @@ class MessagePane:
         self.app.focus_id = 'message'
         self.cursor = 'm_body'
         self.app.mode = 'edit'
-        self.app._apply()
+        self.app.paint_ring()
         self.app.query_one('#m_body').focus()
         self.paint_fields()
 

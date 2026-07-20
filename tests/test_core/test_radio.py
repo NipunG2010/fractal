@@ -6,26 +6,30 @@ central database (the ``radio_pair`` fixture) -- no resolver mocks.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import json
+import subprocess
 
 import pytest
 
+from fractal.core.node import Node
 from fractal.core.radio import Radio
 
 __all__ = [
     'test_init_seeds_default_channels',
     'test_init_subscribes_within_subtree_only',
+    'test_init_blind_seeds_channels_without_subs',
     'test_send_stamps_sender_session',
     'test_send_to_self',
     'test_send_self_targeted_node_behaves_as_bare',
     'test_send_routes_to_target',
-    'test_send_parent_flag',
+    'test_send_parent_lands_in_the_dotted_parents_inbox',
     'test_send_unknown_node',
     'test_send_nonexistent_channel',
     'test_send_rejects_invalid_priority',
+    'test_post_enforces_publicly_readable_class',
     'test_sent_lists_outbound_mail',
     'test_sent_includes_own_replies',
-    'test_messages_query',
+    'test_messages_order_by_priority_then_created_at',
     'test_messages_channel_filter',
     'test_messages_read_filter',
     'test_acting_marks_message_read',
@@ -39,13 +43,16 @@ __all__ = [
     'test_reply_inherits_subject_and_priority',
     'test_reply_lands_in_parents_channel_space',
     'test_reply_to_inbox_message_reaches_the_sender',
-    'test_thread_structure',
+    'test_thread_returns_flat_list_with_depth',
     'test_uuid_resolves_globally',
     'test_cross_node_read_respects_read_only',
-    'test_write_only_permission',
+    'test_thread_hides_read_only_rows_from_bystanders',
+    'test_reply_refuses_a_read_only_message_for_a_bystander',
+    'test_child_add_skips_subscription_for_a_blind_parent',
+    'test_write_only_channel_accepts_owner_and_rejects_others',
     'test_react_and_re_react',
-    'test_react_invalid_value',
-    'test_custom_channel',
+    'test_react_rejects_invalid_values',
+    'test_custom_channel_registers_with_flags',
     'test_custom_channel_rejects_reserved',
     'test_custom_channel_rejects_duplicate',
     'test_channel_delete_scoped_to_owner',
@@ -57,9 +64,10 @@ __all__ = [
     'test_unsave_not_found_stays_terse',
     'test_not_found_by_uuid',
     'test_unsend_deletes_message',
+    'test_read_receipt_skips_a_reused_message_id',
     'test_unsend_deletes_replies_and_reacts',
     'test_unsend_refuses_thread_without_force',
-    'test_unsend_wrong_sender',
+    'test_unsend_rejects_callers_other_than_the_sender',
     'test_unsend_force_aborts_on_concurrent_reply',
 ]
 
@@ -89,8 +97,8 @@ def test_init_subscribes_within_subtree_only(radio_pair: tuple[Radio, Radio]) ->
     (which depth-counting alone would catch) is not a child.
     """
     root, peer = radio_pair
-    peer_branch = peer.node._branch
-    root_branch = root.node._branch
+    peer_branch = peer.node.branch
+    root_branch = root.node.branch
     # the fixture mirrors production: peer subscribed to its parent at init,
     # root subscribed to the peer (child_add)
     assert {s['target'] for s in peer.subs()} == {root_branch}
@@ -99,12 +107,44 @@ def test_init_subscribes_within_subtree_only(radio_pair: tuple[Radio, Radio]) ->
     foreign = f'{peer_branch}x.kid'
     root.db.merge({'node': foreign, 'status': 'idle'}, 'nodes')
     root.db.merge(
-        {'node': foreign, 'channel': 'public', 'read_only': 0, 'write_only': 0},
-        'channels',
+        data={'node': foreign, 'channel': 'public', 'read_only': 0, 'write_only': 0},
+        table='channels',
     )
     # re-init is idempotent and must not subscribe across subtrees
     peer.init()
     assert {s['target'] for s in peer.subs()} == {root_branch}
+
+
+def test_init_blind_seeds_channels_without_subs(
+    radio_pair: tuple[Radio, Radio],
+) -> None:
+    """A blind node's init seeds channels only; unsubscribe reports the count.
+
+    With ``blind`` in the config, ``init`` skips the parent and child
+    subscription passes -- the node reads nothing -- while the parent's own
+    watch of it is untouched. ``unsubscribe`` returns the number of rows it
+    removed: the true count on a match, 0 when nothing is left.
+    """
+    root, peer = radio_pair
+    peer_branch = peer.node.branch
+    root_branch = root.node.branch
+    # flip the peer blind and drop the parent subs its init seeded (one per
+    # readable channel on the root: public and outbox)
+    peer.node.config.set('blind', True)
+    assert peer.unsubscribe(root_branch) == 2
+    # a blind init seeds the default channels but never subscribes
+    peer.init()
+    assert {c['channel'] for c in peer.channels()} == {
+        'public',
+        'private',
+        'inbox',
+        'outbox',
+    }
+    assert peer.subs() == []
+    # the parent's own watch of the blind peer is untouched
+    assert {s['target'] for s in root.subs()} == {peer_branch}
+    # nothing left to remove reports the honest zero
+    assert peer.unsubscribe(root_branch) == 0
 
 
 def test_send_stamps_sender_session(radio: Radio) -> None:
@@ -113,13 +153,13 @@ def test_send_stamps_sender_session(radio: Radio) -> None:
     The stamp ties a message to the conversation that wrote it; a node with
     no configured agent or no woven session stamps NULL.
     """
-    bare = radio.send(channel='public', subject='s', data='d', priority=5)
+    bare, _, _ = radio.send(channel='public', subject='s', data='d', priority=5)
     [row] = radio.node.db.read('messages', where={'message_uuid': bare})
     assert row['session'] is None
     # a live session (and an agent command with flags) stamps its base session
-    radio.node.config_set(agent='claude --verbose')
-    radio.node.session_set('claude', 'sess-1')
-    stamped = radio.send(channel='public', subject='s2', data='d2', priority=5)
+    radio.node.config.set('agent', 'claude --verbose')
+    radio.node.sessions.set('claude', 'sess-1')
+    stamped, _, _ = radio.send(channel='public', subject='s2', data='d2', priority=5)
     [row] = radio.node.db.read('messages', where={'message_uuid': stamped})
     assert row['session'] == 'sess-1'
     reply_uuid, _, _ = radio.reply(stamped, 'on it')
@@ -129,7 +169,7 @@ def test_send_stamps_sender_session(radio: Radio) -> None:
 
 def test_send_to_self(radio: Radio) -> None:
     """A bare send lands in the own inbox; a channel send in that channel."""
-    msg_uuid = radio.send(
+    msg_uuid, _, _ = radio.send(
         subject='test subject',
         data='test data',
         priority=5,
@@ -138,7 +178,7 @@ def test_send_to_self(radio: Radio) -> None:
     assert len(msg_uuid) == 8
     rows = radio.messages(channel='inbox')
     assert len(rows) == 1
-    assert rows[0]['node'] == radio.node._branch
+    assert rows[0]['node'] == radio.node.branch
     assert rows[0]['subject'] == 'test subject'
     assert rows[0]['data'] == 'test data'
     assert rows[0]['priority'] == 5
@@ -152,35 +192,37 @@ def test_send_to_self(radio: Radio) -> None:
 
 def test_send_self_targeted_node_behaves_as_bare(radio: Radio) -> None:
     """A self-targeted ``node`` normalizes to the bare (own-inbox) send."""
-    uuid = radio.send(
-        radio.node._branch,
+    uuid, _, _ = radio.send(
+        radio.node.branch,
         subject='s',
         data='d',
         priority=0,
     )
     [row] = radio.db.read('messages', where={'message_uuid': uuid})
-    assert row['node'] == radio.node._branch
+    assert row['node'] == radio.node.branch
 
 
 def test_send_routes_to_target(radio_pair: tuple[Radio, Radio]) -> None:
     """A targeted send lands in the recipient's channel-space, not the sender's."""
     root, peer = radio_pair
-    peer_branch = peer.node._branch
-    uuid = root.send(peer_branch, subject='task', data='do it', priority=7)
+    peer_branch = peer.node.branch
+    uuid, _, _ = root.send(peer_branch, subject='task', data='do it', priority=7)
     # the row's node column names the host; the sender keeps no mailbox copy
     [row] = root.db.read('messages', where={'message_uuid': uuid})
     assert row['node'] == peer_branch
-    assert row['sender'] == root.node._branch
+    assert row['sender'] == root.node.branch
     assert [m['message_uuid'] for m in peer.messages(channel='inbox')] == [uuid]
     assert root.messages(channel='inbox') == []
 
 
-def test_send_parent_flag(radio_pair: tuple[Radio, Radio]) -> None:
+def test_send_parent_lands_in_the_dotted_parents_inbox(
+    radio_pair: tuple[Radio, Radio],
+) -> None:
     """``parent=True`` resolves the dotted parent and lands in its inbox."""
     root, peer = radio_pair
-    uuid = peer.send(parent=True, subject='done', data='summary', priority=5)
+    uuid, _, _ = peer.send(parent=True, subject='done', data='summary', priority=5)
     [row] = peer.db.read('messages', where={'message_uuid': uuid})
-    assert row['node'] == root.node._branch
+    assert row['node'] == root.node.branch
     assert row['channel'] == 'inbox'
 
 
@@ -192,7 +234,7 @@ def test_send_unknown_node(radio: Radio) -> None:
 
 def test_send_nonexistent_channel(radio: Radio) -> None:
     """Sending to a nonexistent channel raises ValueError."""
-    with pytest.raises(ValueError, match='not found'):
+    with pytest.raises(ValueError, match='specify a target node or create it'):
         radio.send(
             channel='nonexistent',
             subject='s',
@@ -212,17 +254,40 @@ def test_send_rejects_invalid_priority(radio: Radio) -> None:
     radio.send(subject='s', data='d', priority=10)
 
 
+def test_post_enforces_publicly_readable_class(radio: Radio) -> None:
+    """``post=True`` gates a write to publicly readable channels only.
+
+    ``post`` (``post=True``) writes publicly readable channels and a
+    privately readable one names the sibling verb -- custom channels slot
+    into the same classes by their flags, not their names; ``send`` and
+    internal callers pass nothing and route anywhere write permissions
+    allow.
+    """
+    # the public class passes for post
+    radio.send(channel='public', subject='s', data='d', priority=5, post=True)
+    # a privately readable channel names the sibling verb
+    with pytest.raises(ValueError, match='fractal radio send'):
+        radio.send(channel='private', subject='s', data='d', priority=5, post=True)
+    # a custom channel's flags place it in a class -- read-only refuses too
+    radio.channel('drafts', read_only=True)
+    with pytest.raises(ValueError, match='fractal radio send'):
+        radio.send(channel='drafts', subject='s', data='d', priority=5, post=True)
+    # unset skips the class check (send and internal callers route freely)
+    radio.send(channel='outbox', subject='s', data='d', priority=5)
+    radio.send(channel='inbox', subject='s', data='d', priority=5)
+
+
 def test_sent_lists_outbound_mail(radio_pair: tuple[Radio, Radio]) -> None:
     """``sent`` lists own-authored messages with the recipient in ``node``."""
     root, peer = radio_pair
-    peer_branch = peer.node._branch
-    to_peer = root.send(peer_branch, subject='for you', data='d', priority=6)
-    to_self = root.send(channel='private', subject='note', data='d', priority=2)
+    peer_branch = peer.node.branch
+    to_peer, _, _ = root.send(peer_branch, subject='for you', data='d', priority=6)
+    to_self, _, _ = root.send(channel='private', subject='note', data='d', priority=2)
     peer.send(parent=True, subject='not yours', data='d', priority=5)
     # both outbound messages list, recipient-attributed, priority first
     rows = root.sent()
     assert [r['message_uuid'] for r in rows] == [to_peer, to_self]
-    assert [r['node'] for r in rows] == [peer_branch, root.node._branch]
+    assert [r['node'] for r in rows] == [peer_branch, root.node.branch]
     # the channel filter narrows to one host's channel
     inbox_only = root.sent(channel='inbox')
     assert [r['message_uuid'] for r in inbox_only] == [to_peer]
@@ -240,16 +305,16 @@ def test_sent_includes_own_replies(radio_pair: tuple[Radio, Radio]) -> None:
     """
     root, peer = radio_pair
     # an in-place reply into the peer's readable channel
-    post = peer.send(channel='public', subject='post', data='d', priority=3)
+    post, _, _ = peer.send(channel='public', subject='post', data='d', priority=3)
     in_place, _, _ = root.reply(post, 'seen')
     # a follow-up threaded onto the own outbox post
-    cast = root.send(channel='outbox', subject='cast', data='d', priority=3)
+    cast, _, _ = root.send(channel='outbox', subject='cast', data='d', priority=3)
     follow_up, _, _ = root.reply(cast, 'follow-up')
     uuids = {r['message_uuid'] for r in root.sent()}
     assert {in_place, cast, follow_up} <= uuids
 
 
-def test_messages_query(radio: Radio) -> None:
+def test_messages_order_by_priority_then_created_at(radio: Radio) -> None:
     """Messages are ordered by priority DESC, created_at ASC."""
     radio.send(subject='low', data='d', priority=1)
     radio.send(subject='high', data='d', priority=9)
@@ -319,7 +384,7 @@ def test_read_returns_counts(radio: Radio) -> None:
     assert message['pos_reacts'] == 1
     assert message['neg_reacts'] == 0
     # the reader's receipt is on record
-    receipt = {'message_id': message['message_id'], 'node': radio.node._branch}
+    receipt = {'message_id': message['message_id'], 'node': radio.node.branch}
     assert radio.db.exists('reads', where=receipt)
 
 
@@ -332,13 +397,13 @@ def test_read_multiple_uuids_dedupes_without_partial_receipts(
     only after every lookup resolves -- a not-found UUID anywhere in the
     call leaves even its resolvable companions unread.
     """
-    first = radio.send(subject='one', data='d', priority=0)
-    second = radio.send(subject='two', data='d', priority=0)
+    first, _, _ = radio.send(subject='one', data='d', priority=0)
+    second, _, _ = radio.send(subject='two', data='d', priority=0)
     messages = radio.read(first, second, first)
     assert [m['message_uuid'] for m in messages] == [first, second]
     assert len(radio.messages(read=True)) == 2
     # a not-found UUID aborts the whole read before any receipt
-    third = radio.send(subject='three', data='d', priority=0)
+    third, _, _ = radio.send(subject='three', data='d', priority=0)
     with pytest.raises(ValueError, match='not found'):
         radio.read(third, 'DEADBEEF')
     assert len(radio.messages(read=False)) == 1
@@ -350,8 +415,8 @@ def test_read_channel_selector_reads_and_receipts(radio: Radio) -> None:
     The ``unread`` narrowing follows this reader's receipts, so a second
     unread read returns nothing new; rows outside the selection stay unread.
     """
-    kept = radio.send(subject='kept', data='d', priority=2)
-    swept = radio.send(subject='swept', data='d', priority=5)
+    kept, _, _ = radio.send(subject='kept', data='d', priority=2)
+    swept, _, _ = radio.send(subject='swept', data='d', priority=5)
     radio.send(channel='private', subject='note', data='d', priority=5)
     # the selector reads the whole channel, priority first
     messages = radio.read(channel='inbox', unread=True)
@@ -362,7 +427,7 @@ def test_read_channel_selector_reads_and_receipts(radio: Radio) -> None:
     # an explicit UUID returns regardless of its read state
     [again] = radio.read(swept)
     assert again['subject'] == 'swept'
-    # without ``unread`` the selector re-reads the full channel
+    # without unread the selector re-reads the full channel
     assert len(radio.read(channel='private')) == 1
     assert radio.messages(channel='private', read=False) == []
 
@@ -376,8 +441,8 @@ def test_read_feed_selector_catches_up_subscriptions(
     order); receipts land for the returned rows, for this reader only.
     """
     root, peer = radio_pair
-    cast = peer.send(channel='outbox', subject='cast', data='d', priority=5)
-    post = peer.send(channel='public', subject='post', data='d', priority=3)
+    cast, _, _ = peer.send(channel='outbox', subject='cast', data='d', priority=5)
+    post, _, _ = peer.send(channel='public', subject='post', data='d', priority=3)
     messages = root.read(feed=True, unread=True)
     assert [m['message_uuid'] for m in messages] == [cast, post]
     # the catch-up is complete: nothing unread remains for this reader
@@ -396,19 +461,19 @@ def test_read_receipts_attribute_to_reader_not_mailbox(
     unread state.
     """
     root, peer = radio_pair
-    peer_branch = peer.node._branch
-    cast = peer.send(channel='outbox', subject='cast', data='d', priority=5)
+    peer_branch = peer.node.branch
+    cast, _, _ = peer.send(channel='outbox', subject='cast', data='d', priority=5)
     [message] = root.read(node=peer_branch, channel='outbox')
     assert message['message_uuid'] == cast
     # the receipt names the root, and only the root
     [receipt] = root.db.read('reads', where={'message_id': message['message_id']})
-    assert receipt['node'] == root.node._branch
+    assert receipt['node'] == root.node.branch
     # the owner's unread state never moved
     assert len(peer.messages(channel='outbox', read=False)) == 1
-    # the feed selector honors ``node`` too: the peer views the ROOT's feed
+    # the feed selector honors node too: the peer views the ROOT's feed
     # (the root's subscriptions carry the peer's cast, not the root's own post)
-    note = root.send(channel='outbox', subject='note', data='d', priority=5)
-    viewed = peer.read(node=root.node._branch, feed=True)
+    note, _, _ = root.send(channel='outbox', subject='note', data='d', priority=5)
+    viewed = peer.read(node=root.node.branch, feed=True)
     read_uuids = {m['message_uuid'] for m in viewed}
     assert cast in read_uuids
     assert note not in read_uuids
@@ -419,9 +484,9 @@ def test_read_channel_selector_respects_read_only(
 ) -> None:
     """A read-only channel selector is owner-only, like the by-UUID rule."""
     root, peer = radio_pair
-    root.send(peer.node._branch, subject='secret', data='d', priority=0)
+    root.send(peer.node.branch, subject='secret', data='d', priority=0)
     with pytest.raises(PermissionError, match='read-only'):
-        root.read(node=peer.node._branch, channel='inbox')
+        root.read(node=peer.node.branch, channel='inbox')
     # the owner reads its own read-only channel freely
     [message] = peer.read(channel='inbox')
     assert message['subject'] == 'secret'
@@ -435,9 +500,9 @@ def test_feed_fans_out_with_sources(radio_pair: tuple[Radio, Radio]) -> None:
     ``read``, and even then only for that reader.
     """
     root, peer = radio_pair
-    peer_branch = peer.node._branch
-    cast = peer.send(channel='outbox', subject='cast', data='d', priority=5)
-    post = peer.send(channel='public', subject='post', data='d', priority=3)
+    peer_branch = peer.node.branch
+    cast, _, _ = peer.send(channel='outbox', subject='cast', data='d', priority=5)
+    post, _, _ = peer.send(channel='public', subject='post', data='d', priority=3)
     rows = root.feed(read=False)
     assert {r['message_uuid'] for r in rows} == {cast, post}
     assert {r['node'] for r in rows} == {peer_branch}
@@ -458,7 +523,7 @@ def test_reply_inherits_subject_and_priority(radio: Radio) -> None:
     # the return carries the resolved destination beside the UUID
     assert isinstance(reply_uuid, str)
     assert len(reply_uuid) == 8
-    assert (node, channel) == (radio.node._branch, 'inbox')
+    assert (node, channel) == (radio.node.branch, 'inbox')
     [reply] = radio.db.read('messages', where={'message_uuid': reply_uuid})
     assert reply['subject'] == 'Re: original'
     assert reply['priority'] == 4
@@ -475,16 +540,16 @@ def test_reply_lands_in_parents_channel_space(
     reply reroutes to the owner's inbox as a conversation turn.
     """
     root, peer = radio_pair
-    peer_branch = peer.node._branch
-    post = peer.send(channel='public', subject='post', data='d', priority=3)
+    peer_branch = peer.node.branch
+    post, _, _ = peer.send(channel='public', subject='post', data='d', priority=3)
     reply_uuid, node, channel = root.reply(post, 'seen')
     [reply] = root.db.read('messages', where={'message_uuid': reply_uuid})
     assert reply['node'] == peer_branch
-    assert reply['sender'] == root.node._branch
+    assert reply['sender'] == root.node.branch
     assert (node, channel) == (peer_branch, 'public')
     # a non-owner's reply into a write-only channel reaches the owner's
     # inbox instead of the channel itself
-    cast = peer.send(channel='outbox', subject='cast', data='d', priority=3)
+    cast, _, _ = peer.send(channel='outbox', subject='cast', data='d', priority=3)
     cast_uuid, node, channel = root.reply(cast, 'ack')
     [rerouted] = root.db.read('messages', where={'message_uuid': cast_uuid})
     assert (rerouted['node'], rerouted['channel']) == (peer_branch, 'inbox')
@@ -501,10 +566,10 @@ def test_reply_to_inbox_message_reaches_the_sender(
     sender never sees it.
     """
     root, peer = radio_pair
-    root_branch = root.node._branch
-    peer_branch = peer.node._branch
+    root_branch = root.node.branch
+    peer_branch = peer.node.branch
     # peer asks in root's inbox; root's answer must land with the peer
-    ask = peer.send(node=root_branch, subject='ask', data='d', priority=3)
+    ask, _, _ = peer.send(node=root_branch, subject='ask', data='d', priority=3)
     answer, _, _ = root.reply(ask, 'answer')
     [reply] = root.db.read('messages', where={'message_uuid': answer})
     assert reply['node'] == peer_branch
@@ -513,14 +578,14 @@ def test_reply_to_inbox_message_reaches_the_sender(
     assert reply['subject'] == 'Re: ask'
     assert reply['parent_message_uuid'] == ask
     # a reply to my own outbox message stays self-threaded
-    cast = root.send(channel='outbox', subject='cast', data='d', priority=3)
+    cast, _, _ = root.send(channel='outbox', subject='cast', data='d', priority=3)
     note, _, _ = root.reply(cast, 'follow-up')
     [reply] = root.db.read('messages', where={'message_uuid': note})
     assert reply['node'] == root_branch
     assert reply['channel'] == 'outbox'
 
 
-def test_thread_structure(radio: Radio) -> None:
+def test_thread_returns_flat_list_with_depth(radio: Radio) -> None:
     """Thread returns flat list with depth for indentation."""
     radio.send(subject='root', data='d', priority=0)
     root_uuid = radio.messages()[0]['message_uuid']
@@ -543,9 +608,9 @@ def test_uuid_resolves_globally(radio_pair: tuple[Radio, Radio]) -> None:
     feed-discovered message is readable directly.
     """
     root, peer = radio_pair
-    cast = peer.send(channel='outbox', subject='cast', data='body', priority=5)
+    cast, _, _ = peer.send(channel='outbox', subject='cast', data='body', priority=5)
     [message] = root.read(cast)
-    assert message['node'] == peer.node._branch
+    assert message['node'] == peer.node.branch
     assert message['data'] == 'body'
 
 
@@ -565,14 +630,20 @@ def test_cross_node_read_respects_read_only(
     """
     root, peer = radio_pair
     # a read-only message in the peer's inbox and a readable outbox cast
-    private_uuid = root.send(peer.node._branch, subject='secret', data='d', priority=0)
-    public_uuid = peer.send(channel='outbox', subject='cast', data='d', priority=0)
+    private_uuid, _, _ = root.send(
+        peer.node.branch, subject='secret', data='d', priority=0
+    )
+    public_uuid, _, _ = peer.send(
+        channel='outbox', subject='cast', data='d', priority=0
+    )
     extra = (1,) if method == 'react' else ()
     call = getattr(root, method)
     if method == 'thread':
         # root sent the inbox message, so it may thread that conversation;
         # a peer-only private note keeps root a non-participant
-        secret = peer.send(channel='private', subject='note', data='d', priority=0)
+        secret, _, _ = peer.send(
+            channel='private', subject='note', data='d', priority=0
+        )
         with pytest.raises(PermissionError, match='read-only'):
             call(secret)
     else:
@@ -585,14 +656,113 @@ def test_cross_node_read_respects_read_only(
     assert note['subject'] == 'secret'
 
 
-def test_write_only_permission(radio_pair: tuple[Radio, Radio]) -> None:
+def test_thread_hides_read_only_rows_from_bystanders(
+    radio_pair: tuple[Radio, Radio],
+) -> None:
+    """A bystander threads a public root but never its read-only inbox rows.
+
+    A reply to a write-only broadcast (an outbox notice) reroutes into the
+    author's read-only inbox, and the counter-reply into the replier's
+    inbox -- all chained under the publicly readable outbox root. Any node
+    may subscribe to that outbox and see the root's UUID, but threading it
+    must not hand back the rerouted inbox bodies (which a direct ``read``
+    refuses). Participants still read the whole conversation; only a true
+    bystander is filtered.
+    """
+    parent, author = radio_pair
+    # a third node, a peer of the author, is a pure bystander
+    bystander = _register_peer(parent, 'bystander')
+
+    # author broadcasts on its outbox; parent replies (reroutes to the
+    # author's inbox); author replies back (reroutes to the parent's inbox)
+    root_uuid, _, _ = author.send(
+        channel='outbox', subject='run exited', data='public notice', priority=5
+    )
+    reply_uuid, _, _ = parent.reply(root_uuid, 'private feedback: creds are hunter2')
+    author.reply(reply_uuid, 'private ack to parent')
+
+    # the bystander can discover the public root but a direct read of the
+    # rerouted inbox row is refused
+    bystander.subscribe(author.node.branch)
+    with pytest.raises(PermissionError, match='read-only'):
+        bystander.read(reply_uuid)
+    # threading the public root returns only readable rows -- no inbox bodies
+    rows = bystander.thread(root_uuid)
+    bodies = [row['data'] for row in rows]
+    assert 'public notice' in bodies
+    assert all('private' not in (row['data'] or '') for row in rows), bodies
+    # every row handed to the bystander is readable from ITS perspective --
+    # perspective matters: _is_read_only is False for the viewer's own rows,
+    # so checking against the parent would pass vacuously for parent-owned rows
+    assert all(not _is_read_only(row, bystander) for row in rows)
+    # a participant (the parent) still reads the whole rerouted conversation
+    parent_rows = parent.thread(root_uuid)
+    assert len(parent_rows) == 3
+
+
+def test_reply_refuses_a_read_only_message_for_a_bystander(
+    radio_pair: tuple[Radio, Radio],
+) -> None:
+    """A non-owner cannot reply into a read-only channel it doesn't own.
+
+    ``reply`` is a write verb that threads in place and marks the parent
+    read; without the read-only gate a bystander could reply to a message
+    in another node's inbox, which not only writes there but makes the
+    caller a thread participant -- unlocking the very rerouted-conversation
+    read that ``thread``'s bystander filter blocks. The gate mirrors
+    ``read``/``react``/``save``: reply into a readable channel still works.
+    """
+    parent, author = radio_pair
+    bystander = _register_peer(parent, 'bystander')
+    # author broadcasts (readable outbox); parent replies -> author's inbox
+    root_uuid, _, _ = author.send(
+        channel='outbox', subject='run exited', data='notice', priority=5
+    )
+    reply_uuid, _, _ = parent.reply(root_uuid, 'private: creds are hunter2')
+    bystander.subscribe(author.node.branch)
+    # replying to the read-only inbox row is refused for the bystander
+    with pytest.raises(PermissionError, match='read-only'):
+        bystander.reply(reply_uuid, 'sneak in')
+    # and thread()'s bystander filter stays intact (no participant foothold gained)
+    assert all(
+        'private' not in (row['data'] or '') for row in bystander.thread(root_uuid)
+    )
+    # replying to the readable outbox root still works (the normal flow)
+    bystander.reply(root_uuid, 'public follow-up')
+
+
+def test_child_add_skips_subscription_for_a_blind_parent(
+    radio_pair: tuple[Radio, Radio],
+) -> None:
+    """A blind parent registering a child never subscribes to it.
+
+    ``blind`` means the node holds no subscriptions of its own -- its
+    ``radio.init`` seeds none and its launch sweeps any that landed. But
+    ``child_add`` auto-subscribes the parent to a new child, so a blind
+    parent that spawns a child mid-run would start reading the child's
+    feed until its next launch. The subscribe is skipped at the source.
+    """
+    parent, child = radio_pair
+    parent_node = parent.node
+    # the fixture already subscribed the parent to the child (child_add);
+    # clear it, flip the parent blind, then re-register the child
+    parent_node.db.delete('subs', where={'node': parent_node.branch})
+    parent_node.config.set('blind', True)
+    child_name = child.node.branch.rsplit('.', 1)[-1]
+    parent_node.child_add(child_name)
+    assert parent.subs() == []
+
+
+def test_write_only_channel_accepts_owner_and_rejects_others(
+    radio_pair: tuple[Radio, Radio],
+) -> None:
     """Owner can send to own write_only channel; others are rejected."""
     root, peer = radio_pair
     peer.send(channel='outbox', subject='self publish', data='d', priority=0)
     assert len(peer.messages(channel='outbox')) == 1
     with pytest.raises(PermissionError, match='write-only'):
         root.send(
-            peer.node._branch,
+            peer.node.branch,
             channel='outbox',
             subject='rejected',
             data='d',
@@ -615,7 +785,7 @@ def test_react_and_re_react(radio: Radio) -> None:
     assert reacts[0]['value'] == -1
 
 
-def test_react_invalid_value(radio: Radio) -> None:
+def test_react_rejects_invalid_values(radio: Radio) -> None:
     """React rejects values other than 1 or -1."""
     radio.send(subject='s', data='d', priority=0)
     uuid = radio.messages()[0]['message_uuid']
@@ -623,7 +793,7 @@ def test_react_invalid_value(radio: Radio) -> None:
         radio.react(uuid, 0)
 
 
-def test_custom_channel(radio: Radio) -> None:
+def test_custom_channel_registers_with_flags(radio: Radio) -> None:
     """Custom channels can be registered."""
     radio.channel('alerts', read_only=True, write_only=True)
     channels = radio.channels()
@@ -667,15 +837,15 @@ def test_channel_delete_scoped_to_owner(radio_pair: tuple[Radio, Radio]) -> None
     root, peer = radio_pair
     root.channel('team')
     peer.channel('team')
-    root_msg = root.send(channel='team', subject='ours', data='d', priority=5)
-    peer_msg = peer.send(channel='team', subject='theirs', data='d', priority=5)
+    root_msg, _, _ = root.send(channel='team', subject='ours', data='d', priority=5)
+    peer_msg, _, _ = peer.send(channel='team', subject='theirs', data='d', priority=5)
     root.react(root_msg, 1)
     root.channel_delete('team', force=True)
     # the root's channel-space is gone: message, react, receipt, channel row
     assert not root.db.exists('messages', where={'message_uuid': root_msg})
     assert root.db.read('reacts') == []
     assert not root.db.exists(
-        'channels', where={'node': root.node._branch, 'channel': 'team'}
+        'channels', where={'node': root.node.branch, 'channel': 'team'}
     )
     # the peer's same-named channel and message survive untouched
     assert peer.db.exists('messages', where={'message_uuid': peer_msg})
@@ -703,7 +873,7 @@ def test_channel_delete_refuses_messages_without_force(radio: Radio) -> None:
 
 def test_subscribe_and_unsubscribe(radio: Radio) -> None:
     """Subscribe writes sub rows for readable channels; unsubscribe removes them."""
-    branch = radio.node._branch
+    branch = radio.node.branch
     radio.subscribe(branch, channel='outbox')
     radio.subscribe(branch, channel='public')
     channels = {s['channel'] for s in radio.subs() if s['target'] == branch}
@@ -718,7 +888,7 @@ def test_subscribe_and_unsubscribe(radio: Radio) -> None:
 
 def test_subscribe_validates_target(radio: Radio) -> None:
     """Subscribe rejects unknown nodes, channels, and unreadable channels."""
-    branch = radio.node._branch
+    branch = radio.node.branch
     with pytest.raises(ValueError, match='Node not found'):
         radio.subscribe('main.ghost', channel='public')
     with pytest.raises(ValueError, match='Channel not found'):
@@ -730,13 +900,13 @@ def test_subscribe_validates_target(radio: Radio) -> None:
 def test_archive_round_trip_per_saver(radio_pair: tuple[Radio, Radio]) -> None:
     """Save copies a message per saver; unsave removes only the own copy."""
     root, peer = radio_pair
-    cast = peer.send(channel='outbox', subject='keep', data='body', priority=5)
+    cast, _, _ = peer.send(channel='outbox', subject='keep', data='body', priority=5)
     root.save(cast)
     peer.save(cast)
     # each saver holds its own copy, attributed to the source host
     [root_copy] = root.saved()
     assert root_copy['message_uuid'] == cast
-    assert root_copy['owner'] == peer.node._branch
+    assert root_copy['owner'] == peer.node.branch
     assert len(peer.saved()) == 1
     # re-saving is idempotent; unsave removes only the caller's copy
     root.save(cast)
@@ -749,7 +919,7 @@ def test_archive_round_trip_per_saver(radio_pair: tuple[Radio, Radio]) -> None:
 def test_archive_survives_unsend(radio_pair: tuple[Radio, Radio]) -> None:
     """An archived copy outlives the original message (the copy's purpose)."""
     root, peer = radio_pair
-    cast = peer.send(channel='outbox', subject='going', data='body', priority=5)
+    cast, _, _ = peer.send(channel='outbox', subject='going', data='body', priority=5)
     root.save(cast)
     peer.unsend(cast)
     assert not root.db.exists('messages', where={'message_uuid': cast})
@@ -765,7 +935,8 @@ def test_unsave_not_found_stays_terse(radio: Radio) -> None:
 
 
 @pytest.mark.parametrize(
-    'method', ['read', 'thread', 'reply', 'react', 'save', 'unsend']
+    argnames='method',
+    argvalues=['read', 'thread', 'reply', 'react', 'save', 'unsend'],
 )
 def test_not_found_by_uuid(radio: Radio, method: str) -> None:
     """A not-found UUID raises a terse ValueError on every by-uuid command.
@@ -781,15 +952,37 @@ def test_not_found_by_uuid(radio: Radio, method: str) -> None:
 
 def test_unsend_deletes_message(radio: Radio) -> None:
     """Unsend removes a message from the database."""
-    uuid = radio.send(subject='s', data='d', priority=0)
+    uuid, _, _ = radio.send(subject='s', data='d', priority=0)
     assert len(radio.messages()) == 1
     radio.unsend(uuid)
     assert len(radio.messages()) == 0
 
 
+def test_read_receipt_skips_a_reused_message_id(radio: Radio) -> None:
+    """A receipt never lands on a message that re-minted a stale id.
+
+    ``message_id`` is ``INTEGER PRIMARY KEY`` without ``AUTOINCREMENT``, so
+    unsending the newest message and sending another reuses its id. A reader
+    holding the old message must not receipt the new one: the guarded write
+    drops it once the id no longer maps to the fetched uuid.
+    """
+    u1, _, _ = radio.send(channel='public', subject='s1', data='d', priority=5)
+    stale = radio.db.read('messages', where={'message_uuid': u1})[0]
+    radio.unsend(u1)
+    u2, _, _ = radio.send(channel='public', subject='s2', data='d', priority=5)
+    reused = radio.db.read('messages', where={'message_uuid': u2})[0]
+    # precondition: the id was genuinely reused (no AUTOINCREMENT)
+    assert reused['message_id'] == stale['message_id']
+
+    # a stale read of the unsent message must not receipt the new one
+    radio._mark_read(stale)
+    receipts = radio.db.read('reads', where={'message_id': reused['message_id']})
+    assert receipts == []
+
+
 def test_unsend_deletes_replies_and_reacts(radio: Radio) -> None:
     """Forced unsend cascades to replies, reacts, and reads."""
-    uuid = radio.send(subject='root', data='d', priority=0)
+    uuid, _, _ = radio.send(subject='root', data='d', priority=0)
     # add a reply and a react
     radio.reply(uuid, 'reply data')
     radio.react(uuid, 1)
@@ -805,7 +998,7 @@ def test_unsend_deletes_replies_and_reacts(radio: Radio) -> None:
 
 def test_unsend_refuses_thread_without_force(radio: Radio) -> None:
     """Unsend refuses a message with replies unless forced."""
-    uuid = radio.send(subject='root', data='d', priority=0)
+    uuid, _, _ = radio.send(subject='root', data='d', priority=0)
     radio.reply(uuid, 'reply data')
     # a message with replies is refused, leaving the thread intact
     with pytest.raises(ValueError, match='has replies'):
@@ -813,15 +1006,20 @@ def test_unsend_refuses_thread_without_force(radio: Radio) -> None:
     assert len(radio.db.read('messages')) == 2
 
 
-def test_unsend_wrong_sender(radio_pair: tuple[Radio, Radio]) -> None:
+def test_unsend_rejects_callers_other_than_the_sender(
+    radio_pair: tuple[Radio, Radio],
+) -> None:
     """Unsend rejects if caller is not the sender."""
     root, peer = radio_pair
-    uuid = root.send(peer.node._branch, subject='s', data='d', priority=0)
+    uuid, _, _ = root.send(peer.node.branch, subject='s', data='d', priority=0)
     with pytest.raises(PermissionError, match='sender can unsend'):
         peer.unsend(uuid)
 
 
-def test_unsend_force_aborts_on_concurrent_reply(radio: Radio) -> None:
+def test_unsend_force_aborts_on_concurrent_reply(
+    radio: Radio,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Abort an unsend(force) when a reply lands between the walk and delete.
 
     The descendant set is re-collected immediately before the cascade; a reply
@@ -829,7 +1027,7 @@ def test_unsend_force_aborts_on_concurrent_reply(radio: Radio) -> None:
     and leaves the thread intact for a retry.
     """
     # a message to unsend, with a hook to inject a racing reply mid-walk
-    uuid = radio.send(channel='public', subject='s', data='d', priority=0)
+    uuid, _, _ = radio.send(channel='public', subject='s', data='d', priority=0)
     original = radio._collect_message_ids
     calls = {'n': 0}
 
@@ -839,8 +1037,59 @@ def test_unsend_force_aborts_on_concurrent_reply(radio: Radio) -> None:
         if calls['n'] == 1:  # a reply lands after the first walk
             radio.reply(uuid, 'late')
 
-    with patch.object(radio, '_collect_message_ids', side_effect=injecting):
-        with pytest.raises(ValueError, match='mid-unsend'):
-            radio.unsend(uuid, force=True)
+    monkeypatch.setattr(radio, '_collect_message_ids', injecting)
+    with pytest.raises(ValueError, match='mid-unsend'):
+        radio.unsend(uuid, force=True)
     # the thread survived -- the abort happened before any delete
     assert radio.db.exists('messages', where={'message_uuid': uuid})
+
+
+# ------ helpers
+
+
+def _register_peer(root_radio: Radio, name: str) -> Radio:
+    """Register a fresh peer node under the tree root and return its Radio.
+
+    Mirrors the ``radio_pair`` fixture: a real worktree so the branch
+    resolves, a hand-built config, seeded channels, then the root
+    subscribes (the ``child_add`` order).
+    """
+    root = root_radio.node
+    repo = root.worktree
+    peer_branch = f'{root.branch}.{name}'
+    worktree = repo / '.worktrees' / peer_branch
+    subprocess.run(
+        ['git', 'worktree', 'add', '-b', peer_branch, f'{worktree}', root.branch],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    )
+    node_dir = worktree / '.fractal' / peer_branch
+    node_dir.mkdir(parents=True)
+    config = {
+        'project': '.',
+        'root': root.branch,
+        'scope': '',
+        'agent': 'claude',
+        'local': False,
+        'detached': False,
+    }
+    (node_dir / 'config.json').write_text(
+        json.dumps(config, indent=2), encoding='utf-8'
+    )
+    (node_dir / '.status').write_text('idle\n', encoding='utf-8')
+    root.db.merge({'node': peer_branch, 'status': 'idle'}, 'nodes')
+    peer = Radio(Node(worktree))
+    peer.init()
+    root_radio.subscribe(peer_branch)
+    return peer
+
+
+def _is_read_only(row: dict, radio: Radio) -> bool:
+    """Whether ``row`` sits in a read-only channel owned by another node."""
+    if row['node'] == radio.node.branch:
+        return False
+    channels = radio.db.read(
+        'channels', where={'node': row['node'], 'channel': row['channel']}, limit=1
+    )
+    return bool(channels and channels[0]['read_only'])

@@ -5,7 +5,9 @@ repo with a user node and one worker. ``config _set`` is the private setter the
 node scripts use to write ``config.json``; it JSON-coerces a fixed set of keys,
 so the tests pin that a well-formed-but-wrong-typed value (a list, a float cap, a
 bool cost, an int flag) is rejected with a clean ``BadParameter`` rather than
-silently corrupting the loop -- the same invariants ``init`` enforces.
+silently corrupting the loop, and that a well-typed value breaking a launch
+invariant is rejected by the core validator -- the same invariants ``init``
+enforces.
 """
 
 from __future__ import annotations
@@ -21,19 +23,27 @@ from .conftest import _run
 
 __all__ = [
     'test_set_rejects_mistyped_coerced_values',
+    'test_set_rejects_invariant_breaking_values',
     'test_set_accepts_well_typed_coerced_values',
     'test_public_node_config_get_set_round_trip',
     'test_public_set_scope_space_form_normalizes_to_init_shape',
+    'test_get_rejects_unknown_keys_and_stays_silent_for_unset',
     'test_cost_scope_key_is_gone',
     'test_init_scope_space_form_stores_init_shape',
     'test_node_config_set_cannot_flip_user_flag',
+    'test_node_config_set_cannot_promote_a_child_to_a_root',
     'test_corrupt_config_errors_naming_the_file',
 ]
 
 
 @pytest.fixture(scope='module')
 def task(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
-    """A worker node's worktree, built once via the real CLI."""
+    """Return a worker node's worktree, built once via the real CLI.
+
+    Writing tests restore each key's prior value (or restore the config
+    file in a ``finally`` block), and init-path tests use their own
+    uniquely-named children, so siblings always see the fixture as built.
+    """
     root = tmp_path_factory.mktemp('fractal_cfg')
     _git(root, 'init', '-b', 'main')
     _git(root, 'config', 'user.email', 'cfg@test.local')
@@ -53,14 +63,17 @@ def task(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
 
 
 @pytest.mark.parametrize(
-    ('entry', 'fragment'),
-    [
-        # integer caps reject negatives, floats, lists, and bools
+    argnames=('entry', 'fragment'),
+    argvalues=[
+        # integer caps reject negatives, floats, lists, bools, and values at
+        # the SQLite INTEGER ceiling (an oversized cap raises a raw adapter
+        # error at the registry cap-sync)
         ('max_iters=-5', 'max_iters'),
         ('max_iters=0', 'max_iters'),
         ('max_iters=3.7', 'max_iters'),
         ('max_depth=-3', 'max_depth'),
         ('max_children=[1, 2]', 'max_children'),
+        (f'max_children={2**63}', 'max_children'),
         ('max_descendants=true', 'max_descendants'),
         # boolean keys reject non-bool JSON (a non-bool corrupts SYNC/the user flag)
         ('sync=1', 'sync'),
@@ -69,14 +82,10 @@ def task(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
         # cost keys reject bools and non-numbers (a clean error, never a TypeError)
         ('max_cost=true', 'max_cost'),
         ('max_cost=[1, 2]', 'max_cost'),
-        ('max_cost=0', 'max_cost'),
         ('reserve_budget="abc"', 'reserve_budget'),
         # cost caps allow 0 but reject negatives (parity with the integer caps)
         ('max_iter_cost=-1', 'max_iter_cost'),
         ('max_step_cost=-0.5', 'max_step_cost'),
-        # cost caps reject non-finite values (NaN/Infinity slip past < 0 and <= 0)
-        ('max_cost=NaN', 'max_cost'),
-        ('max_step_cost=Infinity', 'max_step_cost'),
     ],
 )
 def test_set_rejects_mistyped_coerced_values(
@@ -94,6 +103,36 @@ def test_set_rejects_mistyped_coerced_values(
     before = _run(task, 'config', '_get', key).stdout.strip()
     result = _run(task, 'config', '_set', entry)
     assert result.returncode == 2, result.stdout + result.stderr
+    assert fragment in (result.stdout + result.stderr)
+    # the rejected write never landed -- the key keeps its prior value
+    assert _run(task, 'config', '_get', key).stdout.strip() == before
+
+
+@pytest.mark.parametrize(
+    argnames=('entry', 'fragment'),
+    argvalues=[
+        # a $0 ceiling degenerates the subtree check
+        ('max_cost=0', 'max_cost'),
+        # cost caps reject non-finite values (NaN/Infinity slip past < 0 and <= 0)
+        ('max_cost=NaN', 'max_cost'),
+        ('max_step_cost=Infinity', 'max_step_cost'),
+    ],
+)
+def test_set_rejects_invariant_breaking_values(
+    task: pathlib.Path,
+    entry: str,
+    fragment: str,
+) -> None:
+    """A well-typed value breaking a launch invariant fails in core (exit 1).
+
+    Every case here passes the CLI's typed coercion and is rejected only by
+    the merged core validator (``Config.validate``), leaving the key at its
+    prior value rather than storing a value ``init`` would refuse.
+    """
+    key, _, _ = entry.partition('=')
+    before = _run(task, 'config', '_get', key).stdout.strip()
+    result = _run(task, 'config', '_set', entry)
+    assert result.returncode == 1, result.stdout + result.stderr
     assert fragment in (result.stdout + result.stderr)
     # the rejected write never landed -- the key keeps its prior value
     assert _run(task, 'config', '_get', key).stdout.strip() == before
@@ -180,15 +219,46 @@ def test_public_set_scope_space_form_normalizes_to_init_shape(
     assert _run(task, 'node', 'config', 'set', 'scope=null').returncode == 0
 
 
+@pytest.mark.parametrize(
+    argnames='surface',
+    argvalues=[('config', '_get'), ('node', 'config', 'get')],
+    ids=['private', 'public'],
+)
+def test_get_rejects_unknown_keys_and_stays_silent_for_unset(
+    task: pathlib.Path,
+    surface: tuple[str, ...],
+) -> None:
+    """Both getter surfaces validate keys like the setter; an unset key is silent.
+
+    An unknown key is a ``BadParameter`` (exit 2) naming the valid keys, so a
+    typo'd probe cannot read as unset; a valid-but-unset key keeps printing
+    nothing with exit 0 -- the contract the node scripts branch on.
+    """
+    # an unknown key is rejected with the setter's message and the key list
+    result = _run(task, *surface, 'no_such_key')
+    assert result.returncode == 2, result.stdout + result.stderr
+    output = result.stdout + result.stderr
+    assert 'Unknown config key' in output
+    assert 'max_cost' in output
+    # a valid key with no stored value prints nothing and exits 0
+    unset = _run(task, *surface, 'meta')
+    assert unset.returncode == 0, unset.stderr
+    assert unset.stdout == ''
+
+
 def test_cost_scope_key_is_gone(task: pathlib.Path) -> None:
     """``cost_scope`` is not a config key: runs are isolated by design.
 
     There is no lifetime scope knob, so ``cost_scope`` must stay absent
-    from both the write surface and the init path.
+    from the write and read surfaces and the init path.
     """
     root = task.parents[1]  # task == <root>/.worktrees/main.task
     # the setter rejects cost_scope like any unknown key
     result = _run(root, 'node', 'config', 'set', 'cost_scope=run')
+    assert result.returncode == 2, result.stderr
+    assert 'Unknown config key' in (result.stdout + result.stderr)
+    # the getter rejects it the same way -- a probe cannot read it as unset
+    result = _run(root, 'node', 'config', 'get', 'cost_scope')
     assert result.returncode == 2, result.stderr
     assert 'Unknown config key' in (result.stdout + result.stderr)
     # a fresh child config carries no cost_scope entry
@@ -235,8 +305,10 @@ def test_node_config_set_cannot_flip_user_flag(task: pathlib.Path) -> None:
 
     A user (root) node carries ``user: true`` and ``node start`` refuses to launch
     it; allowing a later ``config set user=false`` would bypass that guard. The
-    setter rejects the change (exit 2) and leaves ``user`` true. ``init`` writes the
-    flag directly, so the first-write-at-init path is unaffected.
+    setter rejects the change upfront as ``BadParameter`` (exit 2) and leaves
+    ``user`` true -- atomically, so a multi-key set carrying the immutable key
+    writes none of its keys. ``init`` writes the flag directly, so the
+    first-write-at-init path is unaffected.
     """
     root = task.parents[1]  # task == <root>/.worktrees/main.task
     assert _run(root, 'config', '_get', 'user').stdout.strip() == 'true'
@@ -244,6 +316,30 @@ def test_node_config_set_cannot_flip_user_flag(task: pathlib.Path) -> None:
     assert rejected.returncode == 2, rejected.stdout + rejected.stderr
     assert 'user' in (rejected.stdout + rejected.stderr)
     assert _run(root, 'config', '_get', 'user').stdout.strip() == 'true'
+    # a multi-key set is all-or-nothing: the immutable key's rejection must
+    # not leave the earlier key's write (or its confirmation echo) behind
+    before = _run(root, 'config', '_get', 'max_iters').stdout.strip()
+    rejected = _run(root, 'node', 'config', 'set', 'max_iters=7', 'user=false')
+    assert rejected.returncode == 2, rejected.stdout + rejected.stderr
+    assert 'max_iters' not in rejected.stdout
+    assert _run(root, 'config', '_get', 'max_iters').stdout.strip() == before
+
+
+def test_node_config_set_cannot_promote_a_child_to_a_root(task: pathlib.Path) -> None:
+    """``config set user=true`` on a child cannot brick it into a root node.
+
+    A child carries no ``user`` key, so a first-write-only gate let the
+    operator set ``user=true`` -- promoting the child to a root node and
+    latching the tree-wide pause. The setter rejects any operator write of the
+    init-fixed key (exit 2), first write included, leaving the child unset.
+    """
+    # task == <root>/.worktrees/main.task, a spawned child with no `user` key
+    assert _run(task, 'config', '_get', 'user').stdout.strip() == ''
+    rejected = _run(task, 'node', 'config', 'set', 'user=true')
+    assert rejected.returncode == 2, rejected.stdout + rejected.stderr
+    assert 'user' in (rejected.stdout + rejected.stderr)
+    # the child stays a non-user node -- no first write landed
+    assert _run(task, 'config', '_get', 'user').stdout.strip() == ''
 
 
 def test_corrupt_config_errors_naming_the_file(task: pathlib.Path) -> None:

@@ -1,0 +1,2030 @@
+"""Test the ``fractal.core.loop`` module.
+
+The in-process doubles tier of the loop suite: ``MockLoop`` replaces
+the agent launch with canned :class:`StepResult` outcomes (never a
+subprocess), so budget policy, step discovery, the terminal cascade, and
+the on_iteration/on_step hook pairings are exercised against real rows
+in a real repo. The process tier -- the full ``fractal node _loop``
+launches with stubbed agents -- lives in ``test_cli/test_run_modes.py``.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import pathlib
+import subprocess
+import time
+from typing import Any, Optional
+
+import pytest
+
+from fractal.core import pricing
+from fractal.core.event import Event
+from fractal.core.loop import Loop, Step, StepResult
+from fractal.core.node import Node
+from fractal.exceptions import _Abort
+from tests._helpers import _age_run, _past_timestamp
+
+from ._agents import SampleAgent
+from .conftest import _record_step_cost, _spawn_parent_child
+
+__all__ = [
+    'test_step_load_parses_strict_flat_scalar_frontmatter',
+    'test_duration_validation_mirrors_the_launch_contract',
+    'test_step_timeout_frontmatter_substitutes_at_launch',
+    'test_malformed_midrun_retune_warns_and_keeps_the_previous_value',
+    'test_provider_frontmatter_rebinds_the_boot_agent',
+    'test_agent_env_publishes_node_branch',
+    'test_stream_fault_attributes_to_the_stream_side',
+    'test_agent_stderr_tolerates_non_utf8_output',
+    'test_agent_launch_failure_books_a_failed_step',
+    'test_setup_tolerates_non_utf8_output',
+    'test_unsupported_provider_frontmatter_refuses_the_step',
+    'test_discover_steps_orders_and_validates_prefixes',
+    'test_park_if_latched_walks_ancestors_with_resume_exemption',
+    'test_step_budget_math_binds_the_tightest_cap',
+    'test_step_budget_reserve_window_floors_at_remaining',
+    'test_boundary_checks_read_live_caps',
+    'test_untracked_spend_under_caps_warns_once',
+    'test_cap_gate_demands_a_priced_model_from_tracking_gaps',
+    'test_pending_finish_winds_down_in_reserve_for_budget_cascades',
+    'test_pending_finish_between_iterations_starts_none',
+    'test_run_records_step_attribution_matrix',
+    'test_step_timeout_reason_names_step_and_limit',
+    'test_deadline_expired_before_launch_keeps_the_plain_reason',
+    'test_step_failure_books_never_run_steps_and_a_described_backstop',
+    'test_sync_timeout_save_carries_the_reason_body',
+    'test_failed_step_retries_on_a_fresh_row',
+    'test_retry_of_an_approval_gated_step_re_arms_the_gate',
+    'test_step_retries_zero_disables_the_retry',
+    'test_pause_during_retry_backoff_parks',
+    'test_ceiling_trip_during_retry_backoff_abandons_the_retry',
+    'test_err_snapshots_keep_every_attempts_diagnosis',
+    'test_run_end_drain_outlives_the_closed_iterations_deadline',
+    'test_finalize_terminal_cascade_matrix',
+    'test_stop_during_finish_drain_books_stopped',
+    'test_pre_iteration_finish_drain_uses_the_run_wall_not_the_iter_deadline',
+    'test_finalize_reclassifies_budget_overruns_on_finish',
+    'test_finalize_park_leaves_rows_open',
+    'test_run_fires_hook_pairings_off_stdout',
+    'test_sync_launch_fires_step_pairing',
+    'test_run_fires_iteration_failure_on_unhandled_loop_error',
+    'test_resume_preflight_abort_preserves_the_paused_run',
+    'test_resume_preflight_abort_recredits_the_reparked_wait',
+    'test_resume_adopt_with_no_open_run_records_exited',
+    'test_resume_anchors_run_deadline_on_credited_remaining',
+    'test_interval_defaults_iter_timeout_but_honors_a_tighter_one',
+    'test_stop_during_the_inter_iteration_sleep_ends_the_run',
+]
+
+
+class MockLoop(Loop):
+    """Loop double: canned launch results, no preflight, no subprocesses."""
+
+    def __init__(
+        self: MockLoop,
+        node: Node,
+        results: Optional[list[StepResult]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize ``MockLoop``."""
+        super().__init__(node, **kwargs)
+        self.results = list(results or [])
+        self.launched: list[str] = []
+
+    def _preflight(self: MockLoop) -> None:
+        """Skip the binary/pricing/provider probes (no processes here)."""
+
+    def _run_setup(self: MockLoop) -> bool:
+        """Skip setup.sh (no processes here)."""
+        return True
+
+    def _commit_check(self: MockLoop) -> bool:
+        """Read the tree as clean (commit behavior is test_commit's)."""
+        return True
+
+    def _launch(
+        self: MockLoop,
+        step: Step,
+        prompt: str,
+        *,
+        agent: Any,
+        budget: Optional[float],
+    ) -> StepResult:
+        """Pop the next scripted outcome instead of spawning an agent."""
+        self.launched.append(self._step_label)
+        if self.results:
+            return self.results.pop(0)
+        return StepResult(status='completed')
+
+
+class TrackingLoop(MockLoop):
+    """Mock loop recording every fired hook via the override recipe."""
+
+    def __init__(self: TrackingLoop, node: Node, **kwargs: Any) -> None:
+        """Initialize ``TrackingLoop``."""
+        super().__init__(node, **kwargs)
+        self.calls: list[Event] = []
+
+    def on_iteration(self: TrackingLoop, *args: Any, **kwargs: Any) -> Event:
+        """Record the iteration event."""
+        event = super().on_iteration(*args, **kwargs)
+        self.calls.append(event)
+        return event
+
+    def on_iteration_success(self: TrackingLoop, *args: Any, **kwargs: Any) -> Event:
+        """Record the iteration success event."""
+        event = super().on_iteration_success(*args, **kwargs)
+        self.calls.append(event)
+        return event
+
+    def on_iteration_failure(self: TrackingLoop, *args: Any, **kwargs: Any) -> Event:
+        """Record the iteration failure event."""
+        event = super().on_iteration_failure(*args, **kwargs)
+        self.calls.append(event)
+        return event
+
+    def on_step(self: TrackingLoop, *args: Any, **kwargs: Any) -> Event:
+        """Record the step event."""
+        event = super().on_step(*args, **kwargs)
+        self.calls.append(event)
+        return event
+
+    def on_step_success(self: TrackingLoop, *args: Any, **kwargs: Any) -> Event:
+        """Record the step success event."""
+        event = super().on_step_success(*args, **kwargs)
+        self.calls.append(event)
+        return event
+
+    def on_step_failure(self: TrackingLoop, *args: Any, **kwargs: Any) -> Event:
+        """Record the step failure event."""
+        event = super().on_step_failure(*args, **kwargs)
+        self.calls.append(event)
+        return event
+
+
+@pytest.fixture
+def loop_node(node_with_db: Node) -> Node:
+    """Return a DB-backed node with the seed files a loop reads at boot."""
+    (node_with_db.node_dir / 'NODE.md').write_text(
+        '# Charter\n\nDo the work.\n', encoding='utf-8'
+    )
+    _seed_steps(node_with_db, ['01-PLAN.md', '02-EXECUTE.md'])
+    _configure(node_with_db, max_iters=1, sync=False, local=True)
+    return node_with_db
+
+
+# ------ step parsing and discovery
+
+
+@pytest.mark.parametrize(
+    argnames=('text', 'expected'),
+    argvalues=[
+        # the five supported keys, values right-trimmed
+        (
+            '---\nrequires_approval: true\nagent: codex\nmodel: o3  \n'
+            'timeout: 90s\ndetached: true\n---\n# S\n',
+            {
+                'requires_approval': 'true',
+                'agent': 'codex',
+                'model': 'o3',
+                'timeout': '90s',
+                'detached': 'true',
+            },
+        ),
+        # no opening fence -> no frontmatter
+        ('# S\n\nagent: codex\n', {}),
+        # an unclosed block still contributes its scalar lines
+        ('---\nmodel: opus\n# S\n', {'model': 'opus'}),
+        # uppercase keys and empty values are not flat scalars
+        ('---\nMODEL: opus\nagent:\n---\n', {}),
+        # first occurrence wins
+        ('---\nmodel: first\nmodel: second\n---\n', {'model': 'first'}),
+    ],
+)
+def test_step_load_parses_strict_flat_scalar_frontmatter(
+    tmp_path: pathlib.Path,
+    text: str,
+    expected: dict,
+) -> None:
+    """``Step.load`` honors the strict ``key: value`` grammar exactly."""
+    path = tmp_path / '01-work.md'
+    path.write_text(text, encoding='utf-8')
+    step = Step.load(path, number=1)
+    assert step.frontmatter == expected
+    assert step.name == 'work'
+    assert step.requires_approval == (expected.get('requires_approval') == 'true')
+    assert step.timeout == expected.get('timeout')
+
+
+@pytest.mark.parametrize(
+    argnames=('key', 'value', 'match'),
+    argvalues=[
+        ('timeout', 'soon', 'timeout must be a duration with a unit suffix'),
+        ('iter_timeout', '10', 'iter_timeout must be a duration with a unit suffix'),
+        ('step_timeout', '0.5s', 'step_timeout must be greater than zero'),
+        ('sleep', '0s', 'sleep must be greater than zero'),
+    ],
+)
+def test_duration_validation_mirrors_the_launch_contract(
+    loop_node: Node,
+    key: str,
+    value: str,
+    match: str,
+) -> None:
+    """A malformed or sub-second duration refuses the launch with its key."""
+    _configure(loop_node, **{key: value})
+    with pytest.raises(ValueError, match=match):
+        MockLoop(loop_node)
+
+
+def test_step_timeout_frontmatter_substitutes_at_launch(
+    loop_node: Node,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A step's ``timeout:`` bounds its own launch; a malformed one falls back.
+
+    The node-global ``step_timeout`` is the default ceiling; a parseable
+    frontmatter override substitutes for it in either direction -- a slow
+    step raises its own ceiling above the global rather than min-ing with
+    it -- and a malformed scalar -- step files are live-edited steering
+    surfaces -- warns on stderr and falls back to the global instead of
+    crashing the loop.
+    """
+    node = loop_node
+    _configure(node, step_timeout='30s')
+    loop = MockLoop(node)
+    steps_dir = node.node_dir / 'steps'
+    (steps_dir / '01-PLAN.md').write_text(
+        '---\ntimeout: 5s\n---\n# PLAN\n\nWork.\n', encoding='utf-8'
+    )
+    (steps_dir / '02-EXECUTE.md').write_text(
+        '---\ntimeout: soon\n---\n# EXECUTE\n\nWork.\n', encoding='utf-8'
+    )
+    (steps_dir / '03-COMMIT.md').write_text(
+        '---\ntimeout: 90s\n---\n# COMMIT\n\nWork.\n', encoding='utf-8'
+    )
+    below, malformed, above = loop._discover_steps()
+    # a parseable override substitutes for the node global, below or above
+    assert loop._run_step(below).status == 'completed'
+    assert loop._step_limit_seconds == 5
+    assert loop._run_step(above).status == 'completed'
+    assert loop._step_limit_seconds == 90
+    # the malformed one warns and falls back to the global
+    assert loop._run_step(malformed).status == 'completed'
+    assert loop._step_limit_seconds == 30
+    err = capsys.readouterr().err
+    assert 'Warning:' in err
+    assert '02-EXECUTE.md' in err
+
+
+def test_malformed_midrun_retune_warns_and_keeps_the_previous_value(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A malformed mid-run config edit warns and keeps the prior values.
+
+    Config is a live-edited steering surface: the iteration-top re-reads
+    of ``max_iters``/``step_timeout``/``wait`` must warn and fall back on
+    a hand-edit the launch validation never saw (a bare number, a
+    non-integer), never crash the run and lose the remaining iterations.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _configure(loop_node, max_iters=2, step_timeout='30s')
+
+    class EditingLoop(MockLoop):
+        """Mock loop whose first launch hand-corrupts the retunable knobs."""
+
+        def _launch(
+            self: EditingLoop, step: Step, prompt: str, **kwargs: Any
+        ) -> StepResult:
+            """Break the config mid-run, then run the scripted outcome."""
+            _configure(self.node, max_iters='two', step_timeout='600', wait='soon')
+            return super()._launch(step, prompt, **kwargs)
+
+    loop = EditingLoop(loop_node)
+    assert loop.run() == 0
+    # both iterations ran to the max-iters completion on the kept values
+    assert len(loop.launched) == 4
+    assert loop_node.status() == 'completed'
+    err = capsys.readouterr().err
+    assert 'keeping the previous value' in err
+    assert 'keeping the previous step_timeout' in err
+    assert 'keeping the previous wait' in err
+
+
+def test_provider_frontmatter_rebinds_the_boot_agent(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider-only override rebinds the boot agent on the step's route.
+
+    The boot binding pins the node's own (native) route, so a step
+    carrying ``provider:`` frontmatter with no ``agent:`` override must
+    reach the launch on a fresh agent bound to that route -- a dispatch
+    that reused the boot agent would silently run the step on the
+    vendor-native endpoint.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    (loop_node.node_dir / 'steps' / '01-PLAN.md').write_text(
+        '---\nprovider: openrouter\n---\n# PLAN\n\nWork.\n', encoding='utf-8'
+    )
+
+    class RoutingLoop(MockLoop):
+        """Mock loop recording the agent each launch receives."""
+
+        def __init__(self: RoutingLoop, node: Node, **kwargs: Any) -> None:
+            """Initialize ``RoutingLoop``."""
+            super().__init__(node, **kwargs)
+            self.agents: list[Any] = []
+
+        def _launch(
+            self: RoutingLoop, step: Step, prompt: str, **kwargs: Any
+        ) -> StepResult:
+            """Record the launch's agent alongside the scripted outcome."""
+            self.agents.append(kwargs['agent'])
+            return super()._launch(step, prompt, **kwargs)
+
+    loop = RoutingLoop(loop_node)
+    assert loop.run() == 0
+    # the launch received an agent bound to the step's route
+    (agent,) = loop.agents
+    assert agent.provider == 'openrouter'
+    assert loop_node.status() == 'completed'
+
+
+def test_agent_env_publishes_node_branch(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-launch agent env carries ``NODE_BRANCH`` == the node's branch.
+
+    External env consumers key node identity off this field rather than
+    ``_NODE``'s basename, so it rides every step launch beside the
+    run/iter/step lineage.
+    """
+    monkeypatch.setenv('_NODE', '')
+
+    class CapturingLoop(MockLoop):
+        """Mock loop recording the env each launch would receive."""
+
+        def __init__(self: CapturingLoop, node: Node, **kwargs: Any) -> None:
+            """Initialize ``CapturingLoop``."""
+            super().__init__(node, **kwargs)
+            self.envs: list[dict[str, str]] = []
+
+        def _launch(
+            self: CapturingLoop, step: Step, prompt: str, **kwargs: Any
+        ) -> StepResult:
+            """Record the launch env alongside the scripted outcome."""
+            self.envs.append(self._agent_env(self._step_label))
+            return super()._launch(step, prompt, **kwargs)
+
+    loop = CapturingLoop(loop_node)
+    assert loop.run() == 0
+    # every launch published the node's branch for external consumers
+    assert loop.envs
+    assert all(env['NODE_BRANCH'] == loop_node.branch for env in loop.envs)
+
+
+def test_stream_fault_attributes_to_the_stream_side(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream-consumer fault (agent still live) books a stream error.
+
+    When ``agent.stream`` raises while the agent is still running, the launch
+    SIGKILLs the group and ``process.wait`` returns a signal death. That death
+    must be attributed to the stream side -- its traceback recorded -- not
+    mislabeled a generic ``agent error (exit 137)`` that buries the real fault
+    and leaves no traceback to diagnose it.
+    """
+    monkeypatch.setenv('_NODE', '')
+
+    class StreamRaisingAgent(SampleAgent):
+        """A backend whose stream raises mid-run over a still-live process."""
+
+        def spawn(
+            self: StreamRaisingAgent,
+            invocation: Any,
+            *,
+            start_new_session: bool = True,
+            stderr: Any = None,
+        ) -> subprocess.Popen:
+            """Spawn a long-lived stub so the fault handler SIGKILLs a live group."""
+            return subprocess.Popen(
+                ['sleep', '30'],
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                start_new_session=start_new_session,
+            )
+
+        def stream(self: StreamRaisingAgent, stdout: Any, **kwargs: Any) -> Any:
+            """Raise a fractal-side (non-``AgentStreamError``) fault mid-drain."""
+            raise ValueError('parser boom')
+
+    class StreamFaultLoop(MockLoop):
+        """Mock loop that swaps in the stream-raising agent and records outcomes."""
+
+        def __init__(self: StreamFaultLoop, node: Node, **kwargs: Any) -> None:
+            """Initialize ``StreamFaultLoop``."""
+            super().__init__(node, **kwargs)
+            self.launch_results: list[StepResult] = []
+
+        def _launch(
+            self: StreamFaultLoop, step: Step, prompt: str, **kwargs: Any
+        ) -> StepResult:
+            """Run the REAL launch (not MockLoop's mock) with a stream-raising agent."""
+            # super() is MockLoop, whose _launch returns canned results; call the
+            # base Loop._launch directly so the actual attribution runs, with the
+            # per-step state run() has already set up
+            kwargs['agent'] = StreamRaisingAgent(self.node)
+            result = Loop._launch(self, step, prompt, **kwargs)
+            self.launch_results.append(result)
+            return result
+
+    loop = StreamFaultLoop(loop_node)
+    loop.run()
+    # the fault is attributed to the stream side, never a generic 'agent error'
+    assert loop.launch_results
+    assert all(result.status == 'failed' for result in loop.launch_results)
+    assert all(
+        'stream error' in (result.reason or '')
+        and 'agent error' not in (result.reason or '')
+        for result in loop.launch_results
+    ), [result.reason for result in loop.launch_results]
+
+
+def test_agent_stderr_tolerates_non_utf8_output(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-UTF-8 byte in the agent's stderr capture never crashes the run.
+
+    The failure surface re-reads the ``.err`` capture to print it and to
+    tail the durable reason; agent stderr is external output, so a stray
+    byte (raw terminal noise, a truncated multibyte char) must degrade to
+    a replaced character -- not a ``UnicodeDecodeError`` that kills the
+    whole loop where an honest ``agent error`` row should land.
+    """
+    monkeypatch.setenv('_NODE', '')
+
+    class NoisyErrAgent(SampleAgent):
+        """A failing backend whose stderr capture carries non-UTF-8 bytes."""
+
+        def spawn(
+            self: NoisyErrAgent,
+            invocation: Any,
+            *,
+            start_new_session: bool = True,
+            stderr: Any = None,
+        ) -> subprocess.Popen:
+            """Fail immediately with raw bytes already in the .err capture."""
+            self.err_path.parent.mkdir(parents=True, exist_ok=True)
+            self.err_path.write_bytes(b'boom \xff\xfe fatal\n')
+            return subprocess.Popen(
+                ['false'],
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                start_new_session=start_new_session,
+            )
+
+    class NoisyLoop(MockLoop):
+        """Mock loop that swaps in the noisy-stderr agent for the real launch."""
+
+        def _launch(
+            self: NoisyLoop, step: Step, prompt: str, **kwargs: Any
+        ) -> StepResult:
+            """Run the REAL launch so the failure-surface reads execute."""
+            kwargs['agent'] = NoisyErrAgent(self.node)
+            return Loop._launch(self, step, prompt, **kwargs)
+
+    loop = NoisyLoop(loop_node)
+    assert loop.run() == 0
+    # the step failed honestly; the reason carries the tail, not a crash
+    step = loop_node.db.read('steps', where={'step': 1})[0]
+    assert step['status'] == 'failed'
+    assert 'agent error' in (step['metadata'] or '')
+
+
+def test_agent_launch_failure_books_a_failed_step(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spawn that cannot exec books a failed step, never a loop death.
+
+    The agent binary can disappear mid-run (a PATH shim removed, a broken
+    env edit), so the launch's OSError must land as an honest failed step
+    row with the launch failure named, the loop continuing through the
+    normal cascade instead of dying with the run relabeled ``Loop exited
+    abnormally``.
+    """
+    monkeypatch.setenv('_NODE', '')
+
+    class UnspawnableAgent(SampleAgent):
+        """A backend whose binary cannot be executed."""
+
+        def spawn(self: UnspawnableAgent, invocation: Any, **kwargs: Any) -> Any:
+            """Refuse to exec, like a vanished binary."""
+            raise FileNotFoundError(2, 'No such file or directory', 'sample')
+
+    class UnspawnableLoop(MockLoop):
+        """Mock loop that swaps in the unspawnable agent for the real launch."""
+
+        def _launch(
+            self: UnspawnableLoop, step: Step, prompt: str, **kwargs: Any
+        ) -> StepResult:
+            """Run the REAL launch so the spawn-failure surface executes."""
+            kwargs['agent'] = UnspawnableAgent(self.node)
+            return Loop._launch(self, step, prompt, **kwargs)
+
+    loop = UnspawnableLoop(loop_node)
+    assert loop.run() == 0
+    # the step failed honestly with the launch failure named
+    step = loop_node.db.read('steps', where={'step': 1})[0]
+    assert step['status'] == 'failed'
+    assert 'agent launch failed' in (step['metadata'] or '')
+
+
+def test_setup_tolerates_non_utf8_output(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-UTF-8 byte in setup.sh output decodes leniently, never fatal.
+
+    The exit code -- not the text -- decides success, so strict decoding
+    would crash the whole run on a stray byte instead of running setup.
+    """
+    monkeypatch.setenv('_NODE', '')
+    scripts = loop_node.node_dir / 'scripts'
+    scripts.mkdir(exist_ok=True)
+    (scripts / 'setup.sh').write_text(
+        "#!/bin/bash\nprintf '\\xff\\n'\necho done\n", encoding='utf-8'
+    )
+
+    class SetupLoop(MockLoop):
+        """Mock loop that runs the real setup.sh step."""
+
+        _run_setup = Loop._run_setup
+
+    assert SetupLoop(loop_node)._run_setup() is True
+
+
+def test_unsupported_provider_frontmatter_refuses_the_step(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A step routed on a provider its agent lacks fails cleanly, not fatally.
+
+    The refusal lands at dispatch -- an invocation-time ValueError would
+    crash the loop at the launch site -- so no launch fires, the step
+    records ``failed`` with the unsupported route named on stderr, and
+    the run still ends through the normal cascade.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    (loop_node.node_dir / 'steps' / '01-PLAN.md').write_text(
+        '---\nprovider: bogus\n---\n# PLAN\n\nWork.\n', encoding='utf-8'
+    )
+    _configure(loop_node, step_retries=0)
+    loop = MockLoop(loop_node)
+    assert loop.run() == 0
+    assert loop.launched == []
+    err = capsys.readouterr().err
+    assert "unsupported provider 'bogus' for claude" in err
+    step = loop_node.db.read('steps', where={'step': 1})[0]
+    assert (step['status'], step['exit_code']) == ('failed', 1)
+
+
+def test_discover_steps_orders_and_validates_prefixes(
+    loop_node: Node,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Discovery orders NN- files and fails loudly on prefix violations."""
+    loop = MockLoop(loop_node)
+    # a valid dir discovers in lexicographic order with 1-based numbers
+    _seed_steps(loop_node, ['02-EXECUTE.md', '01-PLAN.md', '03-COMMIT.md'])
+    steps = loop._discover_steps()
+    assert [(step.number, step.name) for step in steps] == [
+        (1, 'PLAN'),
+        (2, 'EXECUTE'),
+        (3, 'COMMIT'),
+    ]
+    # an empty dir is a loud failure naming the real cause
+    _seed_steps(loop_node, [])
+    assert loop._discover_steps() is None
+    assert loop._fail_reason == 'no step files'
+    # a file without the NN- prefix fails discovery
+    _seed_steps(loop_node, ['plan.md'])
+    assert loop._discover_steps() is None
+    assert loop._fail_reason == 'invalid step files'
+    # inconsistent digit widths fail discovery
+    _seed_steps(loop_node, ['1-a.md', '02-b.md'])
+    assert loop._discover_steps() is None
+    assert loop._fail_reason == 'invalid step files'
+    assert 'Error:' in capsys.readouterr().err
+
+
+# ------ boot latch
+
+
+def test_park_if_latched_walks_ancestors_with_resume_exemption(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A boot into a paused subtree parks; resume skips the ancestor walk."""
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    parent.status_set('paused')
+    # a boot under a paused ancestor parks: banner, pause signal, paused stamp
+    loop = MockLoop(child)
+    assert loop._park_if_latched() is True
+    assert f'=== Parked at boot: {parent.branch} is paused ===' in (
+        capsys.readouterr().out
+    )
+    assert child.status() == 'paused'
+    assert child.record.signal_get('pause') is not None
+    # a resume relaunch is exempt from the ancestor walk (the leaf-first
+    # fan-out legitimately leaves ancestors paused while a child boots)
+    child.record.signal_clear('pause')
+    child.status_set('active')
+    resumed = MockLoop(child, resume=True)
+    assert resumed._park_if_latched() is False
+    # ... but not from a NEW tree-wide brake landing during the relaunch
+    child._tree_latch_file.write_text('paused\n', encoding='utf-8')
+    assert resumed._park_if_latched() is True
+
+
+# ------ budget policy
+
+
+def test_step_budget_math_binds_the_tightest_cap(loop_node: Node) -> None:
+    """The per-step leash is min(run remaining - reserve, iter headroom, cap)."""
+    node = loop_node
+    # uncapped: no leash at all
+    loop = MockLoop(node)
+    loop._run_id = node.record.run_start()
+    assert loop._step_budget() is None
+    # a run ceiling alone: remaining minus the (defaulted 10%) reserve
+    _configure(node, max_cost=10.0)
+    loop._read_cost_caps()
+    _record_step_cost(node, run_id=loop._run_id, cost=2.0)
+    assert loop._step_budget() == pytest.approx(7.0)
+    # the iteration's live headroom binds when tighter than the run leash
+    _configure(node, max_cost=10.0, max_iter_cost=1.0)
+    loop._read_cost_caps()
+    loop._iter_id = node.record.iter_start(run_id=loop._run_id, iter=2)
+    step_id = node.record.step_start(
+        iter_id=loop._iter_id, run_id=loop._run_id, step=1, step_name='PLAN'
+    )
+    node.record.step_cost(step_id=step_id, cost=0.4)
+    node.record.step_end(step_id=step_id, status='completed', exit_code=0)
+    assert loop._step_budget() == pytest.approx(0.6)
+    # a drained iteration headroom is skipped, not zeroed: the run leash governs
+    node.record.step_cost(step_id=step_id, cost=1.4)
+    assert loop._step_budget() == pytest.approx(10.0 - 3.4 - 1.0)
+    # the static step cap binds when tightest
+    _configure(node, max_cost=10.0, max_iter_cost=1.0, max_step_cost=0.25)
+    loop._read_cost_caps()
+    assert loop._step_budget() == pytest.approx(0.25)
+
+
+def test_step_budget_reserve_window_floors_at_remaining(loop_node: Node) -> None:
+    """Inside the reserve window the leash floors at the full remaining."""
+    node = loop_node
+    _configure(node, max_cost=10.0, reserve_budget=1.0)
+    loop = MockLoop(node)
+    loop._run_id = node.record.run_start()
+    # spend into the reserve window: remaining (0.5) - reserve (1.0) goes
+    # non-positive, so the leash floors at the remaining -- wind-down steps
+    # spend the reserve but never past the ceiling
+    _record_step_cost(node, run_id=loop._run_id, cost=9.5)
+    assert loop._step_budget() == pytest.approx(0.5)
+    # a fully drained budget yields a non-positive leash: the step is skipped
+    _record_step_cost(node, run_id=loop._run_id, cost=0.5, iter=2)
+    assert loop._step_budget() <= 0
+
+
+def test_boundary_checks_read_live_caps(loop_node: Node) -> None:
+    """Both boundary checks read the caps live, not an iteration-top snapshot.
+
+    A snapshot-bound check would stay pinned to stale values for a whole
+    iteration: a cap lowered -- or first granted -- mid-iteration must
+    reach the very next reserve-boundary and per-step ceiling probe.
+    """
+    node = loop_node
+    # boot capped high: the boot-time snapshot alone would never trip
+    _configure(node, max_cost=50.0)
+    loop = MockLoop(node)
+    loop._run_id = node.record.run_start()
+    _record_step_cost(node, run_id=loop._run_id, cost=6.0)
+    assert loop._check_reserve_boundary() is False
+    # lower the cap mid-iteration (no _read_cost_caps): the live value trips
+    _configure(node, max_cost=5.0)
+    assert loop._check_reserve_boundary() is True
+    # a cap first granted mid-iteration arms the ceiling on an uncapped boot
+    _configure(node, max_cost=None)
+    uncapped = MockLoop(node)
+    uncapped._run_id = node.record.run_start()
+    _record_step_cost(node, run_id=uncapped._run_id, cost=6.0)
+    assert uncapped._check_subtree_ceiling() is False
+    _configure(node, max_cost=5.0)
+    assert uncapped._check_subtree_ceiling() is True
+
+
+def test_untracked_spend_under_caps_warns_once(
+    loop_node: Node,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Armed caps over untracked spend warn once per run and never block.
+
+    An all-NULL run counts $0 in the guards, so neither boundary check
+    can ever trip; the first probe says so loudly (advisory only) and
+    the latch keeps every later probe quiet. An uncapped run has
+    nothing inert to warn about.
+    """
+    node = loop_node
+    _configure(node, max_cost=5.0)
+    loop = MockLoop(node)
+    loop._run_id = node.record.run_start()
+    _record_unpriced_step(node, run_id=loop._run_id)
+    # the first probe warns without tripping ...
+    assert loop._check_subtree_ceiling() is False
+    warning = "WARNING: cost caps are set but this run's spend is untracked"
+    assert warning in capsys.readouterr().out
+    # ... and the latch keeps the other boundary check quiet
+    assert loop._check_reserve_boundary() is False
+    assert capsys.readouterr().out == ''
+    # the same untracked spend on an uncapped run stays quiet
+    _configure(node, max_cost=None)
+    uncapped = MockLoop(node)
+    uncapped._run_id = node.record.run_start()
+    _record_unpriced_step(node, run_id=uncapped._run_id)
+    assert uncapped._check_reserve_boundary() is False
+    assert capsys.readouterr().out == ''
+
+
+def test_cap_gate_demands_a_priced_model_from_tracking_gaps(
+    loop_node: Node,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Armed caps refuse steps whose spend the loop cannot track.
+
+    A routed claude prices from token counts like the token-priced
+    natives, so under a cap it needs a chain-priced model: a model-less
+    step refuses naming the requirement, an unpriced slug refuses naming
+    the entry gap, and a chain-priced slug launches.
+    """
+    node = loop_node
+    _configure(node, max_cost=5.0, step_retries=0)
+    node.config.set('provider', 'openrouter')
+    # no model anywhere: the cap requires one before any launch
+    monkeypatch.setattr(pricing, '_load', lambda: {})
+    loop = MockLoop(node)
+    loop.run()
+    assert loop.launched == []
+    assert 'a cost cap requires a model for claude' in capsys.readouterr().err
+    # an unpriceable slug refuses naming the missing pricing entry
+    _configure(node, model='mystery/model')
+    loop = MockLoop(node)
+    loop.run()
+    assert loop.launched == []
+    assert 'has no pricing entry' in capsys.readouterr().err
+    # a chain-priced slug launches (the openrouter/ prefix carries the rates)
+    monkeypatch.setattr(
+        pricing,
+        '_load',
+        lambda: {
+            'openrouter/anthropic/claude-haiku-4.5': {'input_cost_per_token': 1e-6}
+        },
+    )
+    _configure(node, model='anthropic/claude-haiku-4.5')
+    loop = MockLoop(node)
+    loop.run()
+    assert loop.launched != []
+
+
+# the reason shapes a descendant's pending finish signal carries: an ancestor
+# budget check's fan-out (its raw reason + attribution) vs a deliberate finish
+_CASCADED_ABORT = (
+    'subtree cost budget reached (spent $9 >= $5 max) (via finish of main.parent)'
+)
+_DELIBERATE_FINISH = 'parent done (via finish of main.parent)'
+
+
+@pytest.mark.parametrize(
+    argnames=('max_iters', 'signal_step', 'reason', 'reserved_prompts', 'status'),
+    argvalues=[
+        # a cascaded budget abort landing mid-iteration: the remaining step
+        # winds down in reserve and the run lands exited/0 under the relabel
+        pytest.param(1, 1, _CASCADED_ABORT, [False, True], 'exited', id='cascaded'),
+        # a deliberate finish flips nothing: the remaining step runs plain
+        # and the gate closes the run as a goal-met completion
+        pytest.param(
+            1, 1, _DELIBERATE_FINISH, [False, False], 'completed', id='deliberate'
+        ),
+        # a cascaded abort landing during the final step overlays nothing --
+        # the iteration closes, the gate honors the pending signal, and no
+        # further iteration starts (the terminal sweep still relabels)
+        pytest.param(2, 2, _CASCADED_ABORT, [False, False], 'exited', id='final-step'),
+    ],
+)
+def test_pending_finish_winds_down_in_reserve_for_budget_cascades(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    max_iters: int,
+    signal_step: int,
+    reason: str,
+    reserved_prompts: list[bool],
+    status: str,
+) -> None:
+    """A pending cascaded-budget finish winds down the iteration in reserve.
+
+    The current iteration is always the run's last under a pending
+    finish (the post-iteration gate ends it), so once an ancestor's
+    budget abort lands the per-step derivation flips reserve and the
+    remaining steps carry the wind-down overlay -- while a deliberate
+    finish leaves them plain.
+    """
+    monkeypatch.setenv('_NODE', '')
+    node = loop_node
+    _configure(node, max_iters=max_iters)
+
+    class SignalingLoop(MockLoop):
+        """Mock loop that lands a propagated finish during a scripted step."""
+
+        def __init__(self: SignalingLoop, node: Node, **kwargs: Any) -> None:
+            """Initialize ``SignalingLoop``."""
+            super().__init__(node, **kwargs)
+            self.prompts: list[str] = []
+
+        def _launch(
+            self: SignalingLoop, step: Step, prompt: str, **kwargs: Any
+        ) -> StepResult:
+            self.prompts.append(prompt)
+            if len(self.prompts) == signal_step:
+                self.node.record.signal_set('finish', reason)
+            return super()._launch(step, prompt, **kwargs)
+
+    loop = SignalingLoop(node)
+    assert loop.run() == 0
+    # the signal never cuts the iteration short, and only the steps after a
+    # cascaded abort compose the wind-down overlay
+    marker_flags = ['Reserve Mode' in prompt for prompt in loop.prompts]
+    assert marker_flags == reserved_prompts
+    row = node.db.read('runs', where={'run_id': loop._run_id})[0]
+    if status == 'exited':
+        assert (row['status'], row['exit_code']) == ('exited', 0)
+        assert row['metadata'] == (
+            f'ancestor budget abort: {reason}; this run spent untracked'
+        )
+    else:
+        assert (row['status'], row['exit_code']) == ('completed', 0)
+        assert row['metadata'] == ''
+
+
+def test_pending_finish_between_iterations_starts_none(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cascaded finish landing between iterations starts no further one.
+
+    The pre-iteration gate catches a signal planted during the
+    inter-iteration sleep before the next iteration opens -- no new
+    iteration row, no further launches -- and the terminal sweep still
+    relabels the landing with this run's own figures.
+    """
+    monkeypatch.setenv('_NODE', '')
+    node = loop_node
+    _configure(node, max_iters=2, sleep='1s')
+    planted = []
+
+    def _plant_finish(seconds: float) -> None:
+        """Land the propagated finish during the inter-iteration sleep."""
+        if not planted:
+            node.record.signal_set('finish', _CASCADED_ABORT)
+            planted.append(len(loop.launched))
+
+    monkeypatch.setattr(time, 'sleep', _plant_finish)
+    loop = MockLoop(node)
+    assert loop.run() == 0
+    # the signal landed after iteration 1's two steps (in the sleep), and
+    # iteration 2 never started: the pre-iteration gate broke out first
+    assert planted == [2]
+    assert len(loop.launched) == 2
+    iters = node.db.read('iters', where={'run_id': loop._run_id})
+    assert [row['iter'] for row in iters] == [1]
+    # the terminal sweep still relabels the landing as a budget exit
+    row = node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert (row['status'], row['exit_code']) == ('exited', 0)
+    assert row['metadata'] == (
+        f'ancestor budget abort: {_CASCADED_ABORT}; this run spent untracked'
+    )
+
+
+# ------ step attribution
+
+
+@pytest.mark.parametrize(
+    argnames=('result', 'row', 'banner', 'node_status'),
+    argvalues=[
+        # a deadline overrun records exited/1 with the timed-out reason, and
+        # the run ends exited (never shadowed by max-iters)
+        (
+            StepResult(status='timed out', exit_code=124),
+            ('exited', 1, 'timed out'),
+            '--- Step 1/2 (PLAN): timed out (',
+            'exited',
+        ),
+        # a budget skip records stopped/0 flagged over budget -- the skip
+        # banner vocabulary never lands in the row
+        (
+            StepResult(status='skipped', exit_code=125),
+            ('stopped', 0, 'over budget'),
+            '--- Step 1/2 (PLAN): skipped (over budget) ---',
+            'completed',
+        ),
+        # a pause abort records paused/0 and parks the run
+        (
+            StepResult(status='paused'),
+            ('paused', 0, ''),
+            '--- Step 1/2 (PLAN): paused (',
+            'paused',
+        ),
+    ],
+    ids=['timed_out', 'over_budget', 'paused'],
+)
+def test_run_records_step_attribution_matrix(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    result: StepResult,
+    row: tuple[str, int, str],
+    banner: str,
+    node_status: str,
+) -> None:
+    """Timed-out, budget-skipped, and paused launches record honest rows."""
+    monkeypatch.setenv('_NODE', '')
+    loop = MockLoop(loop_node, results=[result])
+    assert loop.run() == 0
+    assert banner in capsys.readouterr().out
+    assert loop_node.status() == node_status
+    step = loop_node.db.read('steps', where={'step': 1})[0]
+    assert (step['status'], step['exit_code'], step['metadata']) == row
+
+
+def test_step_timeout_reason_names_step_and_limit(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A step deadline overrun names the step and its effective ceiling.
+
+    The step row keeps the short ``timed out`` reason (its ``step_name``
+    column already names the step) while the iteration row carries the
+    enriched ``<step> timed out (<limit>)`` label -- and the run still ends
+    ``exited`` with the run-qualified timeout reason: a timeout on the
+    final iteration is never relabeled ``completed``.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _configure(loop_node, step_timeout='30s')
+    timeout = StepResult(status='timed out', exit_code=124)
+    loop = MockLoop(loop_node, results=[timeout])
+    assert loop.run() == 0
+    iteration = loop_node.db.read('iters', where={'node': loop_node.branch})[0]
+    assert iteration['metadata'] == 'PLAN timed out (30s)'
+    run = loop_node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert (run['status'], run['exit_code']) == ('exited', 1)
+    assert run['metadata'] == f'Timed out at iteration {loop._run_id}.1 (30s/step)'
+
+
+def test_deadline_expired_before_launch_keeps_the_plain_reason(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deadline that expires before a launch resolves no step ceiling.
+
+    The step never ran, so the iteration reason names it without a
+    parenthetical limit -- a ``(0s)`` label would read as a real ceiling.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _configure(loop_node, timeout='1s')
+
+    class SlowLoop(MockLoop):
+        """Mock loop whose first launch outlives the run deadline."""
+
+        def _launch(self: SlowLoop, *args: Any, **kwargs: Any) -> StepResult:
+            time.sleep(2.5)
+            return super()._launch(*args, **kwargs)
+
+    loop = SlowLoop(loop_node, results=[StepResult(status='completed')])
+    assert loop.run() == 0
+    iteration = loop_node.db.read('iters', where={'node': loop_node.branch})[0]
+    assert iteration['metadata'] == 'EXECUTE timed out'
+
+
+def test_step_failure_books_never_run_steps_and_a_described_backstop(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-iteration failure books the never-run tail and a self-describing save.
+
+    Steps after the failed one become real ``stopped`` rows naming the
+    failure (so ``node activity`` answers which steps never ran), and the
+    backstop commit carries the run-qualified subject plus a body naming
+    the reason, the never-run tail, and the swept files.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md', '02-EXECUTE.md', '03-REVIEW.md'])
+    _configure(loop_node, step_retries=0)
+    results = [
+        StepResult(status='completed'),
+        StepResult(status='failed', exit_code=2, reason='agent error (exit 2)'),
+    ]
+    loop = MockLoop(loop_node, results=results)
+    # leave real uncommitted work for the backstop sweep to save
+    (loop_node.worktree / 'partial.txt').write_text('half-done\n', encoding='utf-8')
+    assert loop.run() == 0
+    # the never-run tail is a real row: stopped, naming the failed step
+    rows = loop_node.db.read('steps', where={'node': loop_node.branch})
+    by_name = {row['step_name']: row for row in rows}
+    review = by_name['REVIEW']
+    assert (review['status'], review['metadata']) == ('stopped', 'failed on EXECUTE')
+
+    def _log(fmt: str) -> str:
+        result = subprocess.run(
+            ['git', '-C', f'{loop_node.worktree}', 'log', '-1', f'--format={fmt}'],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    # the backstop commit describes itself: the run-qualified subject names
+    # the failed step; the body carries the reason, the tail, and a diffstat
+    # naming the swept work
+    subject = f'{loop_node.branch}: iteration {loop._run_id}.1 (failed on EXECUTE)'
+    assert _log('%s') == subject
+    body = _log('%b')
+    assert 'agent error (exit 2)' in body
+    assert 'steps not run: REVIEW' in body
+    assert 'partial.txt' in body
+
+
+def test_sync_timeout_save_carries_the_reason_body(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fatal pre-step SYNC timeout's backstop body names the limit.
+
+    The subject only says ``timed out during SYNC``; the body carries the
+    enriched ``SYNC timed out (<limit>)`` reason the iteration row records,
+    so the save explains the ceiling from git history alone.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    _configure(loop_node, sync=True, step_timeout='30s')
+    timeout = StepResult(status='timed out', exit_code=124)
+    loop = MockLoop(loop_node, results=[timeout])
+    # leave real uncommitted work for the backstop sweep to save
+    (loop_node.worktree / 'partial.txt').write_text('half-done\n', encoding='utf-8')
+    assert loop.run() == 0
+    iteration = loop_node.db.read('iters', where={'node': loop_node.branch})[0]
+    assert iteration['metadata'] == 'SYNC timed out (30s)'
+    log = subprocess.run(
+        ['git', '-C', f'{loop_node.worktree}', 'log', '-1', '--format=%b'],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert 'SYNC timed out (30s)' in log.stdout
+
+
+# ------ step retry
+
+
+def test_failed_step_retries_on_a_fresh_row(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A failed launch retries once: a plain failed row, then a retry row.
+
+    The first attempt's row closes ``failed`` with its plain reason; the
+    retry books a fresh row whose metadata carries the ``retry`` marker,
+    and the iteration succeeds off the retried attempt.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    _configure(loop_node, step_retry_backoff='1s')
+    results = [
+        StepResult(status='failed', exit_code=2, reason='agent error (exit 2)'),
+        StepResult(status='completed'),
+    ]
+    loop = MockLoop(loop_node, results=results)
+    assert loop.run() == 0
+    assert '--- Step 1/1 (PLAN): retrying in 1s ---' in capsys.readouterr().out
+    # one row per attempt (read newest-first): the failed attempt keeps its
+    # plain reason, the retry carries the marker
+    retried, failed = loop_node.db.read('steps', where={'node': loop_node.branch})
+    assert (failed['status'], failed['metadata']) == ('failed', 'agent error (exit 2)')
+    assert (retried['status'], retried['metadata']) == ('completed', 'retry')
+    # the iteration closes off the retried attempt's success
+    assert loop_node.status() == 'completed'
+
+
+def test_retry_of_an_approval_gated_step_re_arms_the_gate(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retried approval-gated step pends a fresh gate, never a free pass.
+
+    Only a failed attempt retries, and a failed attempt's wait never ran --
+    so the retry's row arms its own gate (approval is granted per attempt,
+    not inherited) and the failed row's superseded gate is voided rather
+    than left pending forever.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    (loop_node.node_dir / 'steps' / '01-PLAN.md').write_text(
+        '---\nrequires_approval: true\n---\n# PLAN\n\nWork.\n', encoding='utf-8'
+    )
+    _configure(loop_node, step_retry_backoff='1s')
+
+    class ApprovingLoop(MockLoop):
+        """Mock loop whose operator approves the final attempt's gate."""
+
+        def _launch(self: ApprovingLoop, *args: Any, **kwargs: Any) -> StepResult:
+            result = super()._launch(*args, **kwargs)
+            # approve only the attempt that will succeed -- the failed
+            # attempt's wait never runs, so its gate goes unapproved
+            if not self.results:
+                self.node.record.step_approve(step_id=self._step_id)
+            return result
+
+    results = [
+        StepResult(status='failed', exit_code=2, reason='agent error (exit 2)'),
+        StepResult(status='completed'),
+    ]
+    loop = ApprovingLoop(loop_node, results=results)
+    assert loop.run() == 0
+    # one row per attempt: the retry carries its own granted gate and the
+    # failed attempt's superseded gate is voided, not pending forever
+    retried, failed = loop_node.db.read('steps', where={'node': loop_node.branch})
+    assert (retried['status'], retried['metadata']) == ('completed', 'retry')
+    assert retried['approved']
+    assert failed['approved'] is None
+
+
+@pytest.mark.parametrize('step_retries', [0, -1])
+def test_step_retries_zero_disables_the_retry(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    step_retries: int,
+) -> None:
+    """``step_retries=0`` gives a failed launch exactly one attempt.
+
+    A hand-edited negative clamps to the same single attempt instead of
+    crashing the iteration with an empty attempt loop.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    _configure(loop_node, step_retries=step_retries)
+    failure = StepResult(status='failed', exit_code=2, reason='agent error (exit 2)')
+    loop = MockLoop(loop_node, results=[failure])
+    assert loop.run() == 0
+    assert loop.launched == ['step 1 of 1 (PLAN)']
+    steps = loop_node.db.read('steps', where={'node': loop_node.branch})
+    assert [row['status'] for row in steps] == ['failed']
+
+
+def test_pause_during_retry_backoff_parks(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pause landing during the retry backoff parks instead of retrying."""
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    _configure(loop_node, step_retry_backoff='1s')
+
+    class PausingLoop(MockLoop):
+        """Mock loop whose failing launch lands beside a pause request."""
+
+        def _launch(self: PausingLoop, *args: Any, **kwargs: Any) -> StepResult:
+            self.node.record.signal_set('pause', 'operator')
+            return super()._launch(*args, **kwargs)
+
+    failure = StepResult(status='failed', exit_code=2, reason='agent error (exit 2)')
+    loop = PausingLoop(loop_node, results=[failure])
+    assert loop.run() == 0
+    # the backoff detected the pause: a single attempt, then the park
+    assert loop.launched == ['step 1 of 1 (PLAN)']
+    assert loop_node.status() == 'paused'
+
+
+def test_ceiling_trip_during_retry_backoff_abandons_the_retry(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A subtree ceiling spent by the failed attempt buys no retry."""
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    _configure(loop_node, max_cost=5.0, step_retry_backoff='1s')
+
+    class SpendingLoop(MockLoop):
+        """Mock loop whose failing launch spends past the run ceiling."""
+
+        def _launch(self: SpendingLoop, *args: Any, **kwargs: Any) -> StepResult:
+            _record_step_cost(self.node, run_id=self._run_id, cost=6.0, iter=2)
+            return super()._launch(*args, **kwargs)
+
+    failure = StepResult(status='failed', exit_code=2, reason='agent error (exit 2)')
+    loop = SpendingLoop(loop_node, results=[failure])
+    assert loop.run() == 0
+    assert 'Subtree cost budget reached' in capsys.readouterr().out
+    # the spent cap abandoned the retry: one attempt, one failed row
+    assert loop.launched == ['step 1 of 1 (PLAN)']
+    failed_rows = loop_node.db.read('steps', where={'status': 'failed'})
+    assert len(failed_rows) == 1
+
+
+# ------ launch diagnostics
+
+
+def test_err_snapshots_keep_every_attempts_diagnosis(loop_node: Node) -> None:
+    """Each failing launch snapshots its stderr to its own tmp/err file.
+
+    Retries book one step row per attempt, and the durable stderr
+    snapshot matches that granularity: the first failure keeps the plain
+    run-iter-step name, and a repeat under the same key -- a retry
+    attempt or a later same-iteration SYNC -- lands beside it instead of
+    overwriting the earlier diagnosis.
+    """
+
+    class MockProcess:
+        """Process double whose launch fails with exit code 7."""
+
+        pid = 4242
+        stdout: tuple[str, ...] = ()
+
+        def wait(self: MockProcess) -> int:
+            """Report the failing exit."""
+            return 7
+
+    class MockInvocation:
+        """Invocation double carrying no session."""
+
+        session = None
+
+    class MockResult:
+        """Drained-stream double carrying no session, cost, or budget stop."""
+
+        session = None
+        cost = None
+        budget_stopped = False
+
+    class MockAgent:
+        """Agent double writing a canned diagnosis per spawn, then failing."""
+
+        name = 'claude'
+        enforces_budget = False
+
+        def __init__(
+            self: MockAgent, err_path: pathlib.Path, diagnoses: list[str]
+        ) -> None:
+            """Initialize ``MockAgent``."""
+            self.err_path = err_path
+            self.diagnoses = list(diagnoses)
+
+        def config_model(self: MockAgent) -> None:
+            """Report no configured model."""
+            return None
+
+        def invocation(self: MockAgent, prompt: str, **kwargs: Any) -> Any:
+            """Build a session-less invocation double."""
+            return MockInvocation()
+
+        def spawn(self: MockAgent, invocation: Any, **kwargs: Any) -> MockProcess:
+            """Write this launch's diagnosis to the stderr capture."""
+            kwargs['stderr'].write(self.diagnoses.pop(0).encode('utf-8'))
+            return MockProcess()
+
+        def stream(self: MockAgent, lines: Any, **kwargs: Any) -> MockResult:
+            """Drain nothing and report an empty stream outcome."""
+            return MockResult()
+
+    node = loop_node
+    loop = Loop(node)
+    loop._run_id = node.record.run_start()
+    loop._iter = 1
+    step = Step(node.node_dir / 'steps' / '01-PLAN.md', number=1)
+    agent = MockAgent(
+        node.node_dir / 'claude.err', ['first diagnosis\n', 'second diagnosis\n']
+    )
+    first = loop._launch(step, 'prompt', agent=agent, budget=None)
+    second = loop._launch(step, 'prompt', agent=agent, budget=None)
+    assert (first.status, second.status) == ('failed', 'failed')
+    # the first failure keeps the plain run-iter-step name; the repeat
+    # serializes beside it with its own diagnosis intact
+    err_dir = node.node_dir / 'tmp' / 'err'
+    plain = err_dir / f'{loop._run_id}-1-PLAN.err'
+    assert plain.read_text(encoding='utf-8') == 'first diagnosis\n'
+    (repeat,) = [path for path in err_dir.glob('*.err') if path != plain]
+    assert repeat.read_text(encoding='utf-8') == 'second diagnosis\n'
+
+
+# ------ run-end drain
+
+
+def test_run_end_drain_outlives_the_closed_iterations_deadline(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The run-end child drain is bounded by the run wall alone.
+
+    An iteration's deadline dies with the iteration: the finish drain
+    runs after the closing iteration ends, so a leftover per-iteration
+    deadline would time the drain out -- stamping the run completed over
+    still-active children -- instead of waiting them out.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    _configure(loop_node, iter_timeout='2s', wait='1s')
+
+    class DrainingLoop(MockLoop):
+        """Mock loop with scripted descendant polls and a mid-step finish."""
+
+        def __init__(self: DrainingLoop, node: Node, **kwargs: Any) -> None:
+            """Initialize ``DrainingLoop``."""
+            super().__init__(node, **kwargs)
+            self.polls = [True] * 5
+
+        def _launch(self: DrainingLoop, *args: Any, **kwargs: Any) -> StepResult:
+            """Land the finish signal during the step's launch."""
+            self.node.record.signal_set('finish', 'done')
+            return super()._launch(*args, **kwargs)
+
+        def _descendants_active(self: DrainingLoop) -> bool:
+            """Report the children active until the scripted polls run out."""
+            return bool(self.polls and self.polls.pop(0))
+
+    loop = DrainingLoop(loop_node)
+    assert loop.run() == 0
+    out = capsys.readouterr().out
+    # the drain waits the children out past the dead iteration's deadline
+    assert loop.polls == []
+    assert '--- Finishing: all child nodes finished ---' in out
+    assert '--- Waiting for children: timed out ---' not in out
+    assert loop_node.status() == 'completed'
+
+
+# ------ terminal cascade
+
+
+@pytest.mark.parametrize(
+    argnames=('arrange', 'node_status', 'run_status', 'exit_code', 'reason'),
+    argvalues=[
+        # an unexplained break is abnormal; a run that never reached its
+        # first iteration composes the zero-iteration ref
+        (lambda loop: None, 'exited', 'exited', 1, 'Exited at iteration {run}.0'),
+        # a timeout is abnormal even on the final iteration (never shadowed
+        # by the max-iters clause)
+        (
+            lambda loop: (
+                setattr(loop, '_timed_out', True),
+                setattr(loop, '_max_iters', 1),
+                setattr(loop, '_iter', 1),
+            ),
+            'exited',
+            'exited',
+            1,
+            'Timed out at iteration {run}.1 (no limit)',
+        ),
+        # a stop on the final iteration is not shadowed either
+        (
+            lambda loop: (
+                loop.node.record.signal_set('stop', 'manual'),
+                setattr(loop, '_max_iters', 1),
+                setattr(loop, '_iter', 1),
+            ),
+            'stopped',
+            'stopped',
+            0,
+            'Stopped by request',
+        ),
+        # running out the iteration budget is a clean, expected end
+        (
+            lambda loop: (
+                setattr(loop, '_max_iters', 2),
+                setattr(loop, '_iter', 2),
+            ),
+            'completed',
+            'completed',
+            0,
+            'Reached max iterations (2)',
+        ),
+        # a goal-met finish records completed with no reason
+        (
+            lambda loop: loop.node.record.signal_set('finish', 'done'),
+            'completed',
+            'completed',
+            0,
+            None,
+        ),
+        # a stop that interrupts the finish drain abandons the finish: the
+        # run must not claim completed over a subtree it never drained
+        (
+            lambda loop: (
+                loop.node.record.signal_set('finish', 'done'),
+                loop.node.record.signal_set('stop', 'manual'),
+                setattr(loop, '_wait_seconds', 1),
+                setattr(loop, '_descendants_active', lambda: True),
+            ),
+            'stopped',
+            'stopped',
+            0,
+            'Stopped by request',
+        ),
+        # a run-wall expiry during the drain abandons the finish the same
+        # way, keeping its abnormal timeout terminal
+        (
+            lambda loop: (
+                loop.node.record.signal_set('finish', 'done'),
+                setattr(loop, '_run_end_epoch', 1),
+                setattr(loop, '_wait_seconds', 1),
+                setattr(loop, '_descendants_active', lambda: True),
+            ),
+            'exited',
+            'exited',
+            1,
+            'Timed out at iteration {run}.0 (no limit)',
+        ),
+        # a budget abort is never a goal-met completion, but it is a
+        # designed landing -- exited with exit 0, the budget discriminator
+        (
+            lambda loop: (
+                setattr(loop, '_budget_hit', True),
+                setattr(loop, '_budget_reason', 'subtree cost budget reached'),
+            ),
+            'exited',
+            'exited',
+            0,
+            'subtree cost budget reached',
+        ),
+        # a setup crash-loop ends exited with the honest reason
+        (
+            lambda loop: (
+                setattr(loop, '_setup_abort', True),
+                setattr(loop, '_setup_fails', 3),
+            ),
+            'exited',
+            'exited',
+            1,
+            'setup failed x3',
+        ),
+    ],
+    ids=[
+        'break',
+        'timeout',
+        'stop',
+        'max_iters',
+        'finish',
+        'stop_abandons_finish_drain',
+        'timeout_abandons_finish_drain',
+        'budget',
+        'setup_abort',
+    ],
+)
+def test_finalize_terminal_cascade_matrix(
+    loop_node: Node,
+    arrange: Any,
+    node_status: str,
+    run_status: str,
+    exit_code: int,
+    reason: Optional[str],
+) -> None:
+    """The status matrix records the honest terminal on node and run row."""
+    loop = MockLoop(loop_node)
+    loop._run_id = loop_node.record.run_start()
+    arrange(loop)
+    assert loop._finalize() == 0
+    assert loop_node.status() == node_status
+    row = loop_node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert (row['status'], row['exit_code']) == (run_status, exit_code)
+    # a clean finish records no reason (the column keeps its blank default);
+    # abnormal iteration labels are run-qualified, so bind the live run id
+    expected = '' if reason is None else reason.format(run=loop._run_id)
+    assert row['metadata'] == expected
+    assert row['ended_at'] is not None
+
+
+def test_stop_during_finish_drain_books_stopped(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop that interrupts the finish drain reads as a requested end.
+
+    A stop is the designed escape from a finish drain (a crashed-but-active
+    child would otherwise hang the wait forever), so the interrupted
+    iteration books ``stopped``/0 -- never a fabricated ``agent error`` --
+    and the run ends ``stopped``: it must not claim a completed finish over
+    a subtree it never drained.
+    """
+    monkeypatch.setenv('_NODE', '')
+
+    class _StopMidDrain(MockLoop):
+        """Signal finish+stop after the first step; keep a child 'active'."""
+
+        def _launch(
+            self: _StopMidDrain,
+            step: Step,
+            prompt: str,
+            *,
+            agent: Any,
+            budget: Optional[float],
+        ) -> StepResult:
+            result = super()._launch(step, prompt, agent=agent, budget=budget)
+            if len(self.launched) == 1:
+                self.node.record.signal_set('finish', 'requirements met')
+                self.node.record.signal_set('stop', 'manual')
+            return result
+
+        def _descendants_active(self: _StopMidDrain) -> bool:
+            return True
+
+    loop = _StopMidDrain(loop_node)
+    loop._wait_seconds = 1
+    assert loop.run() == 0
+    # the drain interrupted before the last step -- only the first launched
+    assert len(loop.launched) == 1
+    iteration = loop_node.db.read('iters', where={'node': loop_node.branch})[0]
+    assert (iteration['status'], iteration['exit_code']) == ('stopped', 0)
+    run = loop_node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert (run['status'], run['exit_code']) == ('stopped', 0)
+    assert run['metadata'] == 'Stopped by request'
+    assert loop_node.status() == 'stopped'
+
+
+def test_pre_iteration_finish_drain_uses_the_run_wall_not_the_iter_deadline(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finish caught pre-iteration drains under the run wall, not iter_timeout.
+
+    The loop arms ``_iter_end_epoch`` at the top of every pass, before the
+    pre-iteration signal checks. A pending finish there drains the subtree
+    (``_wait_for_children('run end')``) -- but for an iteration that never
+    runs (the break precedes ``iter_start``), so the just-armed iteration
+    deadline must not bound the drain, exactly as the post-iteration path
+    clears it. Left armed, a drain outlasting one ``iter_timeout`` books
+    ``exited``/timed-out over children that were finishing normally --
+    deterministic on any resumed or sleeping finishing parent.
+    """
+    monkeypatch.setenv('_NODE', '')
+    node = loop_node
+    _configure(node, iter_timeout='5m')  # arms _iter_end_epoch each pass
+
+    class _DrainCapture(MockLoop):
+        """Record the iteration deadline live at each run-end drain."""
+
+        def __init__(self: _DrainCapture, node: Node, **kwargs: Any) -> None:
+            """Initialize ``_DrainCapture``."""
+            super().__init__(node, **kwargs)
+            self.drain_epochs: list[int] = []
+
+        def _adopt(self: _DrainCapture) -> None:
+            # the run exists now -- arm the finish the pre-iteration check reads
+            super()._adopt()
+            self.node.record.signal_set('finish', 'requirements met')
+
+        def _wait_for_children(self: _DrainCapture, context: str) -> bool:
+            self.drain_epochs.append(self._iter_end_epoch)
+            return True
+
+    loop = _DrainCapture(node)
+    assert loop.run() == 0
+    # the pre-iteration drain saw no iteration deadline (run wall alone)
+    assert loop.drain_epochs
+    assert loop.drain_epochs[0] == 0
+    # and the finish completed, never a spurious timeout
+    run = node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert (run['status'], run['exit_code']) == ('completed', 0)
+
+
+def test_finalize_reclassifies_budget_overruns_on_finish(loop_node: Node) -> None:
+    """The over-cap and cascaded-budget sweeps reclassify a finish as exited.
+
+    The in-loop budget checks disarm once a finish signal exists, so a
+    self-signalled finish that crossed the cap -- and a budget finish
+    cascaded from an ancestor -- both reach the cascade budget-clean and
+    would close as goal-met ``completed`` without the sweeps.
+    """
+    node = loop_node
+    # over-cap sweep: finish set, spend past the cap (back-dated cost rows)
+    _configure(node, max_cost=5.0)
+    loop = MockLoop(node)
+    loop._run_id = node.record.run_start()
+    node.record.signal_set('finish', 'wind down')
+    _record_step_cost(node, run_id=loop._run_id, cost=6.0)
+    assert loop._finalize() == 0
+    row = node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert (row['status'], row['exit_code']) == ('exited', 0)
+    assert row['metadata'] == 'cost budget exceeded in finish wind-down'
+    # cascaded-budget sweep: an ancestor's propagated budget finish
+    # reclassifies too, relabeled with this run's own child-scope figures
+    # (the ancestor's figures name its scope, not this run's)
+    cascaded = MockLoop(node)
+    cascaded._run_id = node.record.run_start()
+    reason = (
+        'subtree cost budget reached (spent $9 >= $5 max) (via finish of main.parent)'
+    )
+    node.record.signal_set('finish', reason)
+    _record_step_cost(node, run_id=cascaded._run_id, cost=1.0)
+    assert cascaded._finalize() == 0
+    row = node.db.read('runs', where={'run_id': cascaded._run_id})[0]
+    assert (row['status'], row['exit_code']) == ('exited', 0)
+    assert row['metadata'] == (
+        f'ancestor budget abort: {reason}; this run spent $1.0000 of $5.0'
+    )
+    # a NON-budget cascaded finish stays a goal-met completion
+    clean = MockLoop(node)
+    clean._run_id = node.record.run_start()
+    node.record.signal_set('finish', 'parent done (via finish of main.parent)')
+    _configure(node, max_cost=None)
+    clean._read_cost_caps()
+    assert clean._finalize() == 0
+    row = node.db.read('runs', where={'run_id': clean._run_id})[0]
+    assert (row['status'], row['exit_code']) == ('completed', 0)
+
+
+def test_finalize_park_leaves_rows_open(
+    loop_node: Node,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A pause park stamps ``paused`` and leaves run/iter rows open."""
+    node = loop_node
+    loop = MockLoop(node)
+    loop._run_id = node.record.run_start()
+    loop._iter_id = node.record.iter_start(run_id=loop._run_id, iter=1)
+    loop._paused = True
+    assert loop._finalize() == 0
+    assert node.status() == 'paused'
+    # both rows stay open for resume to adopt, and the pause span is recorded
+    run = node.db.read('runs', where={'run_id': loop._run_id})[0]
+    iteration = node.db.read('iters', where={'iter_id': loop._iter_id})[0]
+    assert run['ended_at'] is None
+    assert iteration['ended_at'] is None
+    events = node.db.read('events', where={'event': 'pause'})
+    assert events
+    assert events[0]['metadata'] == 'parked'
+    assert '=== Paused (resume with: fractal node resume) ===' in (
+        capsys.readouterr().out
+    )
+
+
+# ------ hook pairings
+
+
+def test_run_fires_hook_pairings_off_stdout(
+    loop_node: Node,
+    capsys: pytest.CaptureFixture,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full scripted run fires ordered pairings that never touch the pane.
+
+    The transcript stays anchor-exact (the hooks emit only through the
+    stdlib logger), each terminal event threads its initial event, and
+    the step failure pairing carries the ``StepResult`` and a synthesized
+    error while the iteration still closes with an honest attribution.
+    """
+    # the loop pins _NODE for its children; route it through monkeypatch so
+    # the ambient environment is restored after the run
+    monkeypatch.setenv('_NODE', '')
+    caplog.set_level(logging.DEBUG)
+    # this test pins the single-attempt event sequence, so the failed step
+    # must not buy a retry
+    _configure(loop_node, step_retries=0)
+    results = [
+        StepResult(status='completed'),
+        StepResult(status='failed', exit_code=2, reason='agent error (exit 2)'),
+    ]
+    loop = TrackingLoop(loop_node, results=results)
+    assert loop.run() == 0
+    captured = capsys.readouterr()
+    out = captured.out
+
+    # the transcript carries the loop banners, not the hooks' event text
+    assert 'Starting node on' in out
+    assert '=== Iteration 1 of 1' in out
+    assert '--- Step 1/2 (PLAN) ---' in out
+    assert '--- Step 2/2 (EXECUTE): exit 2 (' in out
+    assert '=== Iteration 1 of 1 failed (' in out
+    assert 'LOOP' not in out
+    assert 'LOOP' not in captured.err
+    assert 'LOOP_STEP_EVENT' in caplog.text
+    # pytest's root capture handler masks the stdlib lastResort fallback, so
+    # the no-handler stderr guard is asserted directly: the loop module ships
+    # a NullHandler on its logger hierarchy, keeping a handlerless pane free
+    # of raw event text
+    assert any(
+        isinstance(handler, logging.NullHandler)
+        for handler in logging.getLogger('fractal.core.loop').handlers
+    )
+
+    # the pairings fire in order with initial_event/error threading
+    names = [type(event).__name__ for event in loop.calls]
+    assert names == [
+        'LoopIterationEvent',
+        'LoopStepEvent',
+        'LoopStepSuccessEvent',
+        'LoopStepEvent',
+        'LoopStepFailureEvent',
+        'LoopIterationFailureEvent',
+    ]
+    iteration, step_one, ok, step_two, failure, iter_failure = loop.calls
+    # event payloads are snapshots (deep copies), so pair by creation instant
+    assert ok.initial_event.created == step_one.created
+    assert ok.result.status == 'completed'
+    assert failure.initial_event.created == step_two.created
+    assert failure.result.status == 'failed'
+    assert isinstance(failure.error, RuntimeError)
+    assert iter_failure.initial_event.created == iteration.created
+    # the failed step's honest attribution reaches the rows too
+    steps = loop_node.db.read('steps', where={'node': loop_node.branch})
+    by_number = {row['step']: row for row in steps}
+    assert by_number[1]['status'] == 'completed'
+    assert by_number[2]['status'] == 'failed'
+    assert by_number[2]['metadata'] == 'agent error (exit 2)'
+    run = loop_node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert run['status'] == 'completed'
+
+
+def test_sync_launch_fires_step_pairing(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYNC launches fire the on_step pairing too, via ``_sync``."""
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    _configure(loop_node, sync=True)
+    loop = TrackingLoop(loop_node)
+    assert loop.run() == 0
+    names = [type(event).__name__ for event in loop.calls]
+    assert names == [
+        'LoopIterationEvent',
+        'LoopStepEvent',
+        'LoopStepSuccessEvent',
+        'LoopStepEvent',
+        'LoopStepSuccessEvent',
+        'LoopIterationSuccessEvent',
+    ]
+    # the sync's pairing carries its own label; the step follows with its own
+    assert loop.calls[1].step == 'SYNC (before PLAN)'
+    assert loop.calls[3].step == 'step 1 of 1 (PLAN)'
+
+
+def test_run_fires_iteration_failure_on_unhandled_loop_error(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unhandled loop error fires the failure pairing, then propagates."""
+    monkeypatch.setenv('_NODE', '')
+    loop = TrackingLoop(loop_node)
+
+    def explode() -> bool:
+        raise RuntimeError('boom')
+
+    monkeypatch.setattr(loop, '_iterate', explode)
+    with pytest.raises(RuntimeError, match='boom'):
+        loop.run()
+    names = [type(event).__name__ for event in loop.calls]
+    assert names == ['LoopIterationEvent', 'LoopIterationFailureEvent']
+    iteration, failure = loop.calls
+    assert failure.initial_event.created == iteration.created
+    # the error payload is a snapshot (deep copy), so compare by text
+    assert f'{failure.error}' == 'boom'
+    # the crash path (the EXIT-trap mirror) still records the honest terminal
+    assert loop_node.status() == 'exited'
+    run = loop_node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert (run['status'], run['metadata']) == ('exited', 'Loop exited abnormally')
+
+
+def test_resume_preflight_abort_preserves_the_paused_run(node_with_db: Node) -> None:
+    """A resume boot aborting preflight leaves its paused run adoptable.
+
+    Pause froze the worktree and left the run open; a transient preflight
+    failure on resume (a key unset in the new shell, the binary momentarily
+    off PATH) must not close that run -- doing so would strand the frozen work
+    behind ``--continue``'s discard. The node stays paused and resumable.
+    """
+    node = node_with_db
+    node.status_set('active')
+    run_id = node.record.run_start()
+    node.status_set('paused')
+    loop = MockLoop(node, resume=True)
+    with pytest.raises(_Abort):
+        loop._abort_preflight('OPENROUTER_API_KEY is not set')
+    # the paused run survives for resume to adopt; the node stays paused
+    assert node.status() == 'paused'
+    run = node.db.read('runs', where={'run_id': run_id})[0]
+    assert run['ended_at'] is None
+
+
+def test_resume_preflight_abort_recredits_the_reparked_wait(
+    node_with_db: Node,
+) -> None:
+    """A failed resume boot re-opens the pause credit span it closed.
+
+    ``Node._resume`` stamps a completed ``resume`` event when tmux comes up --
+    before the loop's preflight -- which closes the pause credit span. If the
+    preflight then aborts and re-parks the node, the wait until a fixed-
+    environment resume would charge the run/iter deadlines, timing out the very
+    recovery the guard preserves. The abort re-opens the span (a trailing
+    ``pause`` event) so ``_pause_credit`` keeps crediting the re-parked wait.
+    """
+    node = node_with_db
+    node.status_set('active')
+    run_id = node.record.run_start()
+    node.status_set('paused')
+    # the original pause opens a credit span; the failed resume's completed
+    # event (stamped by Node._resume before the loop boots) closes it
+    pause_id = node.record.event_start('pause')
+    node.record.event_end(event_id=pause_id, status='completed')
+    resume_id = node.record.event_start('resume')
+    node.record.event_end(event_id=resume_id, status='completed')
+    loop = MockLoop(node, resume=True)
+    with pytest.raises(_Abort):
+        loop._abort_preflight('OPENROUTER_API_KEY is not set')
+    # the abort trails a second pause after the resume -- the span is re-opened,
+    # so the credit walk's unmatched-trailing-pause branch keeps accruing
+    events = node.db.read('events', where={'run_id': run_id})
+    events.sort(key=lambda e: e['event_id'])
+    credit_seq = [e['event'] for e in events if e['event'] in ('pause', 'resume')]
+    assert credit_seq == ['pause', 'resume', 'pause']
+    # and the node is still paused with its run adoptable (unchanged)
+    assert node.status() == 'paused'
+    assert node.db.read('runs', where={'run_id': run_id})[0]['ended_at'] is None
+
+
+def test_resume_adopt_with_no_open_run_records_exited(node_with_db: Node) -> None:
+    """A resume boot that finds no open run records exited, never wedging paused.
+
+    Pause parks with the run open, but if that run was closed out of band the
+    resume boot has nothing to adopt -- there is no paused run to preserve, so
+    it must land a durable exited row (``--continue`` recovers), not stay
+    paused with the diagnosis lost in the dying pane (only ``kill`` recovers).
+    """
+    node = node_with_db
+    node.status_set('active')
+    run_id = node.record.run_start()
+    node.record.run_end(run_id=run_id, status='exited', exit_code=1)
+    node.status_set('paused')
+    loop = MockLoop(node, resume=True)
+    with pytest.raises(_Abort):
+        loop._adopt()
+    # a durable exited record landed and the node is no longer wedged paused
+    assert node.status() == 'exited'
+    runs = node.db.read('runs')
+    assert any(r['metadata'] == 'no open run to adopt' for r in runs)
+
+
+def test_resume_anchors_run_deadline_on_credited_remaining(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resume re-arms the run wall on the credited remaining, not afresh.
+
+    ``run`` anchors ``_run_end_epoch`` on ``time.remaining(scope='run')``
+    only when resuming, so a run paused for part of its life resumes with
+    exactly its unspent wall. Re-arming the full ``--timeout`` on every
+    resume would let a node exceed its budget indefinitely across
+    pause/resume cycles; anchoring on raw elapsed (uncredited) would
+    expire the run the instant it resumes, killing the recovery the pause
+    preserves. Deleting the resume branch or dropping the pause credit
+    keeps every other test green, so this pins the anchor directly.
+    """
+    node = loop_node
+    monkeypatch.setenv('_NODE', '')
+    node.config.set('timeout', '10m')
+    node.status_set('active')
+    run_id = node.record.run_start()
+    _age_run(node, run_id, 300.0)
+    # a closed 180s pause span (240s ago -> 60s ago) credits 180s back
+    for event, seconds_ago in (('pause', 240.0), ('resume', 60.0)):
+        event_id = node.record.event_start(event, run_id=run_id)
+        node.record.event_end(event_id=event_id, status='completed')
+        node.db.update(
+            data={'created_at': _past_timestamp(seconds_ago)},
+            table='events',
+            where={'event_id': event_id},
+        )
+
+    class _CaptureLoop(MockLoop):
+        """Stop the run the instant it has anchored the deadline."""
+
+        def _main_loop(self: _CaptureLoop) -> None:
+            raise _Abort
+
+    loop = _CaptureLoop(node, resume=True)
+    before = int(time.time())
+    assert loop.run() == 1
+    # 600 - (300 elapsed - 180 credit) = 480 remaining, credited -- not the
+    # full 600 (re-armed) nor 300 (uncredited)
+    assert 465 <= loop._run_end_epoch - before <= 485
+
+
+def test_interval_defaults_iter_timeout_but_honors_a_tighter_one(
+    loop_node: Node,
+) -> None:
+    """Interval sets the iteration deadline only when none is given.
+
+    An interval caps how long an iteration may run to its slot, so a
+    bare ``--interval`` defaults the iteration deadline to the cadence.
+    But an explicit tighter ``--iter-timeout`` is the operator asking for
+    shorter iterations on that cadence -- it must be honored, never
+    silently loosened back to the full interval.
+    """
+    node = loop_node
+    # interval alone: the iteration deadline defaults to the slot
+    _configure(node, interval='30m', iter_timeout=None)
+    assert MockLoop(node)._iter_timeout_seconds == 1800
+    # an explicit tighter iter_timeout survives (not widened to 30m)
+    _configure(node, interval='30m', iter_timeout='1m')
+    assert MockLoop(node)._iter_timeout_seconds == 60
+
+
+def test_stop_during_the_inter_iteration_sleep_ends_the_run(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop landing during the between-iterations sleep ends the run promptly.
+
+    The sleep polls every signal, so a stop (or finish/pause) arriving
+    while a paced node sleeps between iterations is acted on at the next
+    chunk -- not ignored until the node wakes a full interval later and
+    runs another iteration.
+    """
+    monkeypatch.setenv('_NODE', '')
+    node = loop_node
+    # a 5m sleep chunked at 30s = 10 chunks if the poll ignores the stop
+    _configure(node, sleep='5m', max_iters=3)
+
+    # the stop lands on the first sleep chunk: a signal-polling loop reacts at
+    # the next chunk (1 chunk); a pause-only loop sleeps through all 10
+    chunks = {'n': 0}
+
+    def fake_sleep(_seconds: float) -> None:
+        chunks['n'] += 1
+        node.record.signal_set('stop', 'manual')
+
+    monkeypatch.setattr('fractal.core.loop.time.sleep', fake_sleep)
+
+    loop = MockLoop(node)
+    assert loop.run() == 0
+    # the sleep broke at the first chunk -- not slept through the whole window
+    assert chunks['n'] == 1, chunks
+    # one iteration ran, and the run ended stopped
+    iters = node.db.read('iters', where={'node': node.branch})
+    assert len(iters) == 1
+    run = node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert (run['status'], run['exit_code']) == ('stopped', 0)
+
+
+# ------ helpers
+
+
+def _configure(node: Node, **values: Any) -> None:
+    """Merge ``values`` into the node's raw ``config.json``."""
+    path = node.node_dir / 'config.json'
+    config = json.loads(path.read_text(encoding='utf-8'))
+    config.update(values)
+    path.write_text(json.dumps(config, indent=2), encoding='utf-8')
+
+
+def _record_unpriced_step(node: Node, *, run_id: int) -> None:
+    """Record one ended NULL-cost step in ``run_id`` (its spend reads untracked)."""
+    iter_id = node.record.iter_start(run_id=run_id, iter=1)
+    step_id = node.record.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='PLAN',
+    )
+    node.record.step_end(step_id=step_id, status='exited', exit_code=1)
+
+
+def _seed_steps(node: Node, names: list[str]) -> None:
+    """Create a steps dir holding one trivial step file per name."""
+    steps_dir = node.node_dir / 'steps'
+    steps_dir.mkdir(parents=True, exist_ok=True)
+    for existing in steps_dir.glob('*.md'):
+        existing.unlink()
+    for name in names:
+        (steps_dir / name).write_text(f'# {name}\n\nWork.\n', encoding='utf-8')

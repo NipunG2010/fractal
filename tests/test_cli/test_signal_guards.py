@@ -1,37 +1,35 @@
-"""Status-guard and step/iteration-boundary tests for the signal surface.
+"""Status-guard and approval tests for the signal surface.
 
 Drives the real ``fractal`` console script against a throwaway repo, exercising
-the parts of the signal/boundary surface the existing suite leaves uncovered.
+the parts of the signal surface the existing suite leaves uncovered.
 ``test_node_cli`` already pins the ``finish``/``stop``/``kill`` guards from the
 ``idle`` state; this module covers the rest of the matrix and the bookkeeping:
 
 - the guards from every *non-active* lifecycle status (terminal states and
-  ``retired``), proving a finished/killed/retired node cannot be re-signalled;
+  ``retired``), proving a finished/killed/retired node cannot be re-signalled
+  -- and that every refusal leaves a ``failed`` event row naming the actor;
 - the ``active`` allow-path -- ``finish``/``stop``/``pause`` record a signal but
   leave the node ``active`` for the loop to act on;
 - the tree-wide brake -- ``fractal pause`` latches the root against new work,
   and ``fractal resume`` withdraws the pending pause and lifts the latch;
 - ``kill``'s node/row status agreement -- the node and every active run/iteration/
-  step row all land on ``killed`` together;
+  step row all land on ``killed`` together, pinned both as pure bookkeeping and
+  against a real loop launch reaped mid-step through ``kill.sh``;
 - the double-signal sequencing (``stop`` after ``finish`` is allowed; ``kill`` is
   terminal for further signals);
-- the step/iteration boundary -- numbering, the active->completed transition, and
-  the CLI ``_list`` view reconciled against the database;
-- the ``signal _get``/``_list`` read semantics -- ``_get`` is exit-coded
-  (1 unset, 0 set) and latest-wins over the append-only signal log, and
-  ``_list`` filters by name and caps rows with ``--limit``;
 - the step approval tri-state (``approved`` NULL/``''``/timestamp) and the
-  parent-only ``node approve`` guard, reconciled across ``_approved`` and
-  ``pending``;
-- the ``exit`` signal -- the one signal name with no ``node`` command -- round-trips
-  through the low-level CRUD (the loop sets it itself at run end).
+  parent-only ``node approve`` guard;
+- the ``exit`` signal -- the one signal name with no ``node`` command (the loop
+  records it itself at run end).
 
-The node status is forced with ``fractal _status`` (the same private command the
-loop uses) so a test can place a node in any lifecycle state without a live tmux
-session; ``kill.sh`` is a no-op when no session exists, so the kill allow-path is
-fully exercised here. The ``finish``/``stop`` allow-path is the exception: both
+The node status is forced through the core ``status_set`` (the loop's own hook)
+so a test can place a node in any lifecycle state without a live tmux session;
+``kill.sh`` is a no-op when no session exists, so the kill allow-path is fully
+exercised here. The ``finish``/``stop`` allow-path is the exception: both
 reconcile an ``active`` node with no live session to ``exited`` (a crashed loop),
-so those tests spawn the node's real tmux session to model a running loop.
+so those tests spawn the node's real tmux session to model a running loop; the
+mid-step kill pin drives a real stubbed loop launch instead, so ``kill.sh``
+reaps live process groups.
 Assertions look only at CLI stdout/exit codes and at rows read back through
 ``db _query``, so the suite tracks behavior, not internals.
 """
@@ -40,51 +38,92 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import pathlib
 import subprocess
+import time
 import uuid
 from collections.abc import Callable, Iterator
+from typing import Optional
 
 import pytest
 
+from fractal.cli.utils import resolve_node, resolve_user_node
+from fractal.core.node import Node
 from tests._helpers import _git
 
-from .conftest import _require_tmux, _run
+from .conftest import _cli_env, _fractal_bin, _reap_group, _require_tmux, _run
 
 __all__ = [
     'test_signal_rejected_from_non_active_status',
     'test_active_node_accepts_graceful_signals',
+    'test_user_node_resolves_from_a_non_init_checkout',
     'test_tree_pause_latches_and_resume_releases',
     'test_finish_cancel_withdraws_the_pending_signal',
     'test_list_surfaces_pending_signal_and_filters_on_base',
     'test_kill_marks_node_and_active_rows_killed',
+    'test_kill_mid_step_lands_killed_on_every_surface',
+    'test_step_timeout_kills_a_term_trapping_survivor',
     'test_stop_after_finish_records_both_and_keeps_active',
     'test_kill_is_terminal_for_further_signals',
-    'test_step_iteration_boundary_reconciles_with_db',
-    'test_signal_get_is_exit_coded_and_latest_wins',
     'test_step_approval_tristate_drives_approved_and_pending',
     'test_step_approve_is_parent_only_and_validates_the_step',
-    'test_exit_signal_round_trips_through_the_crud',
+    'test_default_approve_targets_the_gated_step_during_a_sync_window',
+    'test_exit_signal_has_no_node_command',
 ]
 
 
-# (finish, stop, pause, kill) all require ``active`` (kill also accepts
-# ``paused``, covered separately); the kill message names the status
+# (finish, stop, pause, kill, finish --cancel) all require active (kill also
+# accepts paused, covered separately); the kill message names the status
 _REJECT_MESSAGES = {
     'finish': 'Cannot finish: node is not active.',
     'stop': 'Cannot stop: node is not active.',
     'pause': 'Cannot pause: node is not active.',
     'kill': 'Cannot kill: node is not active or paused (status: {status}).',
+    'finish --cancel': 'Cannot cancel finish: node is not active.',
 }
+
+# the event type each refused verb records (the cancel verb maps
+# to the finish_cancel event)
+_REFUSAL_EVENTS = {
+    'finish': 'finish',
+    'stop': 'stop',
+    'pause': 'pause',
+    'kill': 'kill',
+    'finish --cancel': 'finish_cancel',
+}
+
+# hanging claude stand-in for the live mid-step kill: emits the init frame the
+# stream driver expects, then blocks -- the launch parks mid-step until kill.sh
+# reaps the loop and step process groups
+_HANG_STUB = """#!/usr/bin/env bash
+SID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+printf '{"type":"system","subtype":"init","session_id":"%s"}\\n' "$SID"
+exec sleep 600
+"""
+
+# a step-timeout survivor for the group-kill backstop: emit the init frame,
+# spawn a child in the leader's own process group that ignores TERM and keeps
+# the stdout pipe open, then exit the leader -- a leader-only poll() reaps the
+# leader and returns, skipping the group KILL, so the survivor outlives the step
+# and the stream reader blocks on its pipe forever; only a whole-group probe
+# draws the KILL that reaps it
+_TERM_TRAP_STUB = """#!/usr/bin/env bash
+SID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+printf '{"type":"system","subtype":"init","session_id":"%s"}\\n' "$SID"
+bash -c 'trap "" TERM; while true; do sleep 1; done' &
+exit 0
+"""
 
 
 @pytest.fixture(scope='module')
 def repo(tmp_path_factory: pytest.TempPathFactory) -> dict:
-    """A repo with a user node and one shared ``guard`` worker.
+    """Return a repo with a user node and one shared ``guard`` worker.
 
     Built once via the real CLI. The ``guard`` worker is reused by the
-    (non-mutating) guard-rejection matrix; mutating tests init their own
-    uniquely-named workers so they never interfere with one another.
+    guard-rejection matrix (whose only writes are its refusal event rows,
+    asserted newest-first); mutating tests init their own uniquely-named
+    workers so they never interfere with one another.
     """
     # tmux session names embed this dirname machine-wide: a run-unique suffix
     # keeps sibling suite runs and stale leaked sessions from duplicate-colliding
@@ -109,11 +148,11 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 @pytest.fixture
 def live_loop() -> Iterator[Callable[[pathlib.Path], None]]:
-    """Spawn a worker's real tmux session to model a running loop.
+    """Yield a callable spawning a worker's real tmux session (a running loop).
 
     ``finish``/``stop`` reconcile an ``active`` node with no live session to
-    ``exited``, so the allow-path tests must present a live session. Returns a
-    callable that spawns the session ``start.sh`` would (skipping the test when
+    ``exited``, so the allow-path tests must present a live session. The
+    callable spawns the session ``start.sh`` would (skipping the test when
     tmux is unavailable); every spawned session is killed on teardown.
     """
     _require_tmux()
@@ -138,29 +177,40 @@ def live_loop() -> Iterator[Callable[[pathlib.Path], None]]:
 
 
 @pytest.mark.parametrize(
-    'status',
-    ['completed', 'stopped', 'exited', 'killed', 'retired'],
+    argnames='status',
+    argvalues=['completed', 'stopped', 'exited', 'killed', 'retired'],
 )
-@pytest.mark.parametrize('command', ['finish', 'stop', 'pause', 'kill'])
+@pytest.mark.parametrize(
+    argnames='command',
+    argvalues=['finish', 'stop', 'pause', 'kill', 'finish --cancel'],
+)
 def test_signal_rejected_from_non_active_status(
     repo: dict,
     command: str,
     status: str,
 ) -> None:
-    """``finish``/``stop``/``pause``/``kill`` are rejected from settled statuses.
+    """The signal verbs are rejected from settled statuses, on the record.
 
     A finished, stopped, exited, killed, or retired node is not running, so
-    each signal must fail with a clear ``RuntimeError`` (exit 1, message on
-    stderr, no stdout) and must not mutate the node's status.
+    ``finish``/``stop``/``pause``/``kill``/``finish --cancel`` must each fail
+    with a clear ``RuntimeError`` (exit 1, message on stderr, no stdout) and
+    must not mutate the node's status. The refusal itself is durable
+    evidence: a ``failed`` event row naming the reason and the actor who
+    tried, so a raced sweep's skipped node is never a silent mystery.
     """
     guard = repo['guard']
-    assert _run(guard, '_status', status).returncode == 0
-    result = _run(guard, 'node', command)
+    Node(guard).status_set(status)
+    result = _run(guard, 'node', *command.split())
     assert result.returncode == 1
     assert _REJECT_MESSAGES[command].format(status=status) in result.stderr
     assert result.stdout.strip() == ''
     # the rejected signal leaves the lifecycle state untouched
     assert _run(guard, 'node', 'status').stdout.strip() == status
+    # ...and leaves a failed event row attributing the refused attempt
+    refusal = _last_event(guard, _REFUSAL_EVENTS[command])
+    assert refusal['status'] == 'failed'
+    assert refusal['actor'] == 'operator'
+    assert refusal['metadata'].startswith('refused: ')
 
 
 # ------ active allow-path
@@ -190,6 +240,40 @@ def test_active_node_accepts_graceful_signals(
     # the node stays active, now with the pending signal surfaced
     suffix = {'finish': 'finishing', 'stop': 'stopping', 'pause': 'pausing'}[signal]
     assert _run(wt, 'node', 'status').stdout.strip() == f'active ({suffix})'
+
+
+def test_user_node_resolves_from_a_non_init_checkout(tmp_path: pathlib.Path) -> None:
+    """The tree-wide brake resolves the user node by config, not the checkout.
+
+    On a non-init branch (the user on their own branch while nodes run),
+    ``resolve_node`` keys on the current branch and scopes the brake to a lone
+    child; ``resolve_user_node`` finds the ``user: true`` config regardless of
+    checkout, so pause/resume never silently mis-scope.
+    """
+    root = tmp_path / 'repo'
+    root.mkdir()
+    _git(root, 'init', '-b', 'main')
+    _git(root, 'config', 'user.email', 't@t.local')
+    _git(root, 'config', 'user.name', 't')
+    (root / 'README.md').write_text('# r\n', encoding='utf-8')
+    wiki = root / 'wiki'
+    wiki.mkdir()
+    (wiki / '_index.md').write_text(
+        '---\nname: wiki\n---\n# wiki\n\n***\n', encoding='utf-8'
+    )
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-m', 'init')
+    assert _run(root, 'init').returncode == 0
+    assert _run(root, 'node', 'init', 'kid', '--agent', 'claude').returncode == 0
+    # the user checks the repo root out to their own branch while the node exists
+    _git(root, 'checkout', '-b', 'sidework')
+
+    # resolve_node keys on the checkout -> scopes the brake to the child (the bug)
+    assert not resolve_node(root).is_user
+    # resolve_user_node anchors on the user config regardless of checkout
+    user = resolve_user_node(root)
+    assert user.is_user
+    assert user.branch == 'main'
 
 
 def test_tree_pause_latches_and_resume_releases(
@@ -318,30 +402,213 @@ def test_list_surfaces_pending_signal_and_filters_on_base(
 # ------ kill: node/row status agreement
 
 
-def test_kill_marks_node_and_active_rows_killed(repo: dict) -> None:
+@pytest.mark.parametrize('reason', [None, 'wedged mid-step'])
+def test_kill_marks_node_and_active_rows_killed(
+    repo: dict,
+    reason: Optional[str],
+) -> None:
     """``kill`` lands the node and every active row on ``killed`` together.
 
     The signal (node status) and the persisted row state must agree: after a
     kill, the node is ``killed`` and the open run, iteration, and step rows are
     all ``killed`` -- no row is left dangling ``active``. The kill itself is
     audited: a completed ``kill`` event row names the interrupted step, so
-    forensics never have to infer a kill from status transitions.
+    forensics never have to infer a kill from status transitions -- and the
+    ``killed by`` attribution (with the reason appended, when one is given)
+    reads identically off the event, the ``kill`` signal, and the run row.
     """
-    wt, ids = _arm(repo['root'], 'killrows', step=True)
-    result = _run(wt, 'node', 'kill')
+    wt, ids = _arm(repo['root'], 'killrows_why' if reason else 'killrows', step=True)
+    args = ('--reason', reason) if reason else ()
+    result = _run(wt, 'node', 'kill', *args)
     assert result.returncode == 0
     assert _run(wt, 'node', 'status').stdout.strip() == 'killed'
-    assert _cell(wt, f'SELECT status FROM runs WHERE run_id={ids["run"]}') == 'killed'
-    iter_status = _cell(wt, f'SELECT status FROM iters WHERE iter_id={ids["iter"]}')
+    run_id = ids['run']
+    assert _cell(wt, f'SELECT status FROM runs WHERE run_id={run_id}') == 'killed'
+    iter_id = ids['iter']
+    iter_status = _cell(wt, f'SELECT status FROM iters WHERE iter_id={iter_id}')
     assert iter_status == 'killed'
-    step_status = _cell(wt, f'SELECT status FROM steps WHERE step_id={ids["step"]}')
+    step_id = ids['step']
+    step_status = _cell(wt, f'SELECT status FROM steps WHERE step_id={step_id}')
     assert step_status == 'killed'
     # the kill leaves an event row -- completed, pinned to the open step
     events = (
         f"SELECT COUNT(*) FROM events WHERE node='{wt.name}'"
-        f" AND event='kill' AND status='completed' AND step_id={ids['step']}"
+        f" AND event='kill' AND status='completed' AND step_id={step_id}"
     )
     assert _cell(wt, events) == '1'
+    # the attribution names the killer on event, signal, and run row alike
+    label = f'killed by operator: {reason}' if reason else 'killed by operator'
+    event = _last_event(wt, 'kill')
+    assert (event['status'], event['actor']) == ('completed', 'operator')
+    assert event['metadata'] == label
+    signal = f"SELECT metadata FROM signals WHERE node='{wt.name}' AND signal='kill'"
+    assert _cell(wt, signal) == label
+    run = f'SELECT metadata FROM runs WHERE run_id={run_id}'
+    assert _cell(wt, run) == label
+
+
+def test_kill_mid_step_lands_killed_on_every_surface(
+    repo: dict,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A mid-step kill of a live loop lands ``killed`` on every surface.
+
+    The end-to-end twin of the bookkeeping pin above: a real loop launch
+    parked mid-step on a hanging stub agent, ended by ``node kill`` --
+    ``kill.sh`` reaps the loop and step process groups. The kill is the
+    recorded ending everywhere at once -- the node status, the run/iteration/
+    step rows, and the ``node activity`` feed all read ``killed`` -- and no
+    surface re-classifies the reaped loop as a crash (no row carries
+    ``Loop exited abnormally``).
+    """
+    root = repo['root']
+    init = _run(
+        root,
+        'node',
+        'init',
+        'killlive',
+        '--agent',
+        'claude',
+        '--max-iters',
+        '1',
+        '--no-sync',
+        '--local',
+    )
+    assert init.returncode == 0, init.stderr
+    wt = root / '.worktrees' / 'main.killlive'
+    node_dir = wt / '.fractal' / 'main.killlive'
+    # one hanging step, so the launch parks mid-step until the kill
+    steps_dir = node_dir / 'steps'
+    for step in steps_dir.glob('*.md'):
+        step.unlink()
+    (steps_dir / '01-hang.md').write_text('# Hang\n\nHanging step.\n', encoding='utf-8')
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    agent = bindir / 'claude'
+    agent.write_text(_HANG_STUB, encoding='utf-8')
+    agent.chmod(0o755)
+    # the loop machinery runs from the package: launch the console script's
+    # hidden loop entry directly, with the stub shadowing PATH (tmux is the
+    # only piece this skips -- kill.sh falls back to the recorded .pgid)
+    env = _cli_env()
+    path = env['PATH']
+    env['PATH'] = f'{bindir}{os.pathsep}{path}'
+    log = tmp_path / 'loop.log'
+    with open(log, 'w', encoding='utf-8') as handle:
+        proc = subprocess.Popen(
+            [_fractal_bin(), 'node', '_loop', f'--path={wt}'],
+            cwd=f'{wt}',
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+    try:
+        # mid-step: an open step row with the agent invocation in flight
+        # (.step_pgid is the launch-recorded handle kill.sh reaps)
+        open_step = (
+            f"SELECT COUNT(*) FROM steps WHERE node='{wt.name}' AND status='active'"
+        )
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if _cell(wt, open_step) == '1' and (node_dir / '.step_pgid').exists():
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail(f'launch never parked mid-step:\n{log.read_text()}')
+        killed = _run(wt, 'node', 'kill')
+        assert killed.returncode == 0, killed.stderr
+        # the reaped loop is gone -- it never got to settle rows of its own
+        proc.wait(timeout=30)
+    finally:
+        _reap_group(proc)
+    # every surface reads the kill together: status file, entity rows...
+    assert _run(wt, 'node', 'status').stdout.strip() == 'killed'
+    for table in ('runs', 'iters', 'steps'):
+        status = f"SELECT status FROM {table} WHERE node='{wt.name}'"
+        assert _cell(wt, status) == 'killed', table
+    # ...and the activity feed: all three end rows read killed, the kill event
+    # completed, and nothing re-labeled the reaped loop as a crash
+    csv_out = _run(wt, 'node', 'activity', '--csv').stdout
+    rows = list(csv.DictReader(io.StringIO(csv_out)))
+    ends = [row for row in rows if row['event'] == 'end']
+    assert len(ends) == 3, csv_out
+    assert all(row['status'] == 'killed' for row in ends), csv_out
+    kills = [row['status'] for row in rows if row['event'] == 'kill']
+    assert kills == ['completed'], csv_out
+    assert all('Loop exited abnormally' not in row['metadata'] for row in rows), csv_out
+
+
+def test_step_timeout_kills_a_term_trapping_survivor(
+    repo: dict,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A step timeout SIGKILLs a group survivor that traps TERM.
+
+    The in-process step deadline TERMs the invocation group, then KILLs any
+    survivor after a grace. A child that traps TERM and keeps the stdout pipe
+    open must still draw that KILL -- otherwise the stream reader blocks on the
+    pipe with no mid-step deadline left, and the whole run hangs. The launch
+    runs under a short step timeout against a stub that leaves such a survivor;
+    the run must settle on its own (the survivor reaped so the reader unblocks)
+    rather than hang -- and reaching a terminal step row at all proves it did.
+    """
+    root = repo['root']
+    init = _run(
+        root,
+        'node',
+        'init',
+        'survivor',
+        '--agent',
+        'claude',
+        '--max-iters',
+        '1',
+        '--step-timeout',
+        '3s',
+        '--no-sync',
+        '--local',
+    )
+    assert init.returncode == 0, init.stderr
+    wt = root / '.worktrees' / 'main.survivor'
+    node_dir = wt / '.fractal' / 'main.survivor'
+    # one step, so the single-iteration run parks on the survivor until the
+    # step deadline reaps it
+    steps_dir = node_dir / 'steps'
+    for step in steps_dir.glob('*.md'):
+        step.unlink()
+    (steps_dir / '01-hang.md').write_text('# Hang\n\nHang step.\n', encoding='utf-8')
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    agent = bindir / 'claude'
+    agent.write_text(_TERM_TRAP_STUB, encoding='utf-8')
+    agent.chmod(0o755)
+    env = _cli_env()
+    path = env['PATH']
+    env['PATH'] = f'{bindir}{os.pathsep}{path}'
+    log = tmp_path / 'loop.log'
+    with open(log, 'w', encoding='utf-8') as handle:
+        proc = subprocess.Popen(
+            [_fractal_bin(), 'node', '_loop', f'--path={wt}'],
+            cwd=f'{wt}',
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+    try:
+        # 3s step deadline + 5s grace + settle: the group KILL reaps the
+        # survivor and the single-iteration run ends on its own -- a leader-only
+        # poll would leave the reader blocked and this wait would time out
+        proc.wait(timeout=60)
+    finally:
+        _reap_group(proc)
+    # a terminal step row proves the survivor was reaped and the reader
+    # unblocked (the leader exits cleanly, so a truncated stream reads 'exited');
+    # a leader-only poll would leave the step 'active' and hang the wait above
+    status = f"SELECT status FROM steps WHERE node='{wt.name}'"
+    assert _cell(wt, status) in {'exited', 'timed out'}, log.read_text()
 
 
 # ------ double-signal sequencing
@@ -385,151 +652,36 @@ def test_kill_is_terminal_for_further_signals(repo: dict) -> None:
     assert 'Cannot finish' in after_finish.stderr
 
 
-# ------ step/iteration boundary
-
-
-def test_step_iteration_boundary_reconciles_with_db(repo: dict) -> None:
-    """Step/iteration bookkeeping is correct and matches what the CLI reports.
-
-    Pins the boundary invariants: the iteration row stores the iteration
-    *number* (not its surrogate id), steps keep the number they are started
-    with (SYNC is 0, work steps are 1-based), a row is ``active`` until ended
-    and ``completed`` after, and the ``_list`` view counts exactly the database
-    rows.
-    """
-    wt, ids = _arm(repo['root'], 'boundary', iter=True)
-    run_id, iter_id = ids['run'], ids['iter']
-    # the iteration column carries the human number, not the surrogate id
-    iter_num = _cell(wt, f'SELECT iter FROM iters WHERE iter_id={iter_id}')
-    assert iter_num == '1'
-    # steps keep the number they are started with (SYNC=0, then 1-based)
-    sync = _run(
-        wt,
-        'step',
-        '_start',
-        '--iter',
-        iter_id,
-        '--run',
-        run_id,
-        '--step',
-        '0',
-        '--name',
-        'SYNC',
-    ).stdout.strip()
-    prepare = _run(
-        wt,
-        'step',
-        '_start',
-        '--iter',
-        iter_id,
-        '--run',
-        run_id,
-        '--step',
-        '1',
-        '--name',
-        'PREPARE',
-    ).stdout.strip()
-    assert _cell(wt, f'SELECT step FROM steps WHERE step_id={sync}') == '0'
-    assert _cell(wt, f'SELECT step FROM steps WHERE step_id={prepare}') == '1'
-    # a started row is active until ended, then completed
-    assert _cell(wt, f'SELECT status FROM steps WHERE step_id={prepare}') == 'active'
-    assert (
-        _run(
-            wt,
-            'step',
-            '_end',
-            prepare,
-            '--status',
-            'completed',
-            '--exit-code',
-            '0',
-        ).returncode
-        == 0
-    )
-    assert _cell(wt, f'SELECT status FROM steps WHERE step_id={prepare}') == 'completed'
-    assert (
-        _run(
-            wt,
-            'iter',
-            '_end',
-            iter_id,
-            '--status',
-            'completed',
-            '--exit-code',
-            '0',
-        ).returncode
-        == 0
-    )
-    iter_status = _cell(wt, f'SELECT status FROM iters WHERE iter_id={iter_id}')
-    assert iter_status == 'completed'
-    # the CLI _list view matches the database row count
-    listed = _run(wt, 'step', '_list', run_id, '--csv').stdout.splitlines()
-    db_count = int(_cell(wt, f'SELECT COUNT(*) FROM steps WHERE run_id={run_id}'))
-    assert len(listed) - 1 == db_count
-
-
-# ------ signal read semantics (_get exit codes + latest-wins, _list filters)
-
-
-def test_signal_get_is_exit_coded_and_latest_wins(repo: dict) -> None:
-    """``signal _get`` is exit-coded and returns the latest reason.
-
-    The loop polls ``signal _get`` to detect a pending finish/stop: it exits 1
-    when the signal is unset and 0 once set, echoing the metadata as the reason.
-    The signal log is append-only, so setting ``finish`` twice keeps both rows;
-    ``_get`` must read the *most recent* reason (it auto-resolves the run and
-    takes the newest row), and ``_list`` must filter by name and cap with
-    ``--limit``.
-    """
-    wt, _ = _arm(repo['root'], 'sigget')
-    # unset -> exit 1, nothing on stdout
-    miss = _run(wt, 'signal', '_get', 'finish')
-    assert miss.returncode == 1
-    assert miss.stdout.strip() == ''
-    # append two finish signals, then _get returns the latest reason at exit 0
-    assert _run(wt, 'signal', '_set', 'finish', 'first').returncode == 0
-    assert _run(wt, 'signal', '_set', 'finish', 'second').returncode == 0
-    got = _run(wt, 'signal', '_get', 'finish')
-    assert got.returncode == 0
-    assert got.stdout.strip() == 'second'
-    # both rows persist (append-only); _list --signal narrows, --limit caps
-    count = f"SELECT COUNT(*) FROM signals WHERE node='{wt.name}' AND signal='finish'"
-    assert _cell(wt, count) == '2'
-    listed = _run(wt, 'signal', '_list', '--signal', 'finish', '--csv')
-    assert len(listed.stdout.splitlines()) - 1 == 2
-    capped = _run(wt, 'signal', '_list', '--signal', 'finish', '--limit', '1', '--csv')
-    assert len(capped.stdout.splitlines()) - 1 == 1
-
-
 # ------ step approval tri-state + parent-only approve guard
 
 
 def test_step_approval_tristate_drives_approved_and_pending(repo: dict) -> None:
-    """The ``approved`` tri-state drives ``_approved`` and ``pending`` together.
+    """The ``approved`` tri-state drives the approval read and ``pending`` together.
 
     ``approved`` has three states: NULL (no approval needed), ``''`` (pending),
-    and a timestamp (approved). A fresh step is NULL -- ``_approved`` exits 0 and
-    it is absent from ``pending``. ``_pending`` moves it to ``''`` -- ``_approved``
-    exits 1 and it shows up in ``pending``. The parent ``node approve`` sets a
-    timestamp -- ``_approved`` exits 0 again and it leaves ``pending``.
+    and a timestamp (approved). A fresh step is NULL -- approved and absent from
+    ``pending``. ``step_pending`` moves it to ``''`` -- unapproved and it shows
+    up in ``pending``. The parent ``node approve`` sets a timestamp -- approved
+    again and it leaves ``pending``.
     """
     wt, ids = _arm(repo['root'], 'tristate', step=True)
     step_id = ids['step']
+    record = Node(wt).record
     # NULL: a fresh step requires no approval (distinct from the '' pending state)
     assert (
         _cell(wt, f'SELECT approved IS NULL FROM steps WHERE step_id={step_id}') == '1'
     )
-    assert _run(wt, 'step', '_approved', step_id).returncode == 0
+    assert record.step_approved(step_id=step_id)
     assert _pending_ids(wt) == []
     # '': now requires approval and is pending
-    assert _run(wt, 'step', '_pending', step_id).returncode == 0
-    assert _run(wt, 'step', '_approved', step_id).returncode == 1
+    record.step_pending(step_id=step_id)
+    assert not record.step_approved(step_id=step_id)
     assert _pending_ids(wt) == [step_id]
     # timestamp: the parent approves (no step_id -> the child's active step),
     # so it becomes approved and leaves pending
     approved = _run(repo['root'], 'node', 'approve', 'main.tristate')
     assert approved.returncode == 0
-    assert _run(wt, 'step', '_approved', step_id).returncode == 0
+    assert record.step_approved(step_id=step_id)
     assert _pending_ids(wt) == []
 
 
@@ -546,17 +698,18 @@ def test_step_approve_is_parent_only_and_validates_the_step(repo: dict) -> None:
     """
     wt, ids = _arm(repo['root'], 'approveperm', step=True)
     step_id = ids['step']
-    assert _run(wt, 'step', '_pending', step_id).returncode == 0
+    record = Node(wt).record
+    record.step_pending(step_id=step_id)
     # a node approving its own step (not its parent) is rejected; stays pending
-    denied = _run(wt, 'node', 'approve', 'main.approveperm', step_id)
+    denied = _run(wt, 'node', 'approve', 'main.approveperm', f'{step_id}')
     assert denied.returncode == 1
     assert denied.stderr.startswith('Error:')
     assert 'parent' in denied.stderr
-    assert _run(wt, 'step', '_approved', step_id).returncode == 1
+    assert not record.step_approved(step_id=step_id)
     # the parent (root on main) may approve
-    ok = _run(repo['root'], 'node', 'approve', 'main.approveperm', step_id)
+    ok = _run(repo['root'], 'node', 'approve', 'main.approveperm', f'{step_id}')
     assert ok.returncode == 0
-    assert _run(wt, 'step', '_approved', step_id).returncode == 0
+    assert record.step_approved(step_id=step_id)
     # dual-logged: an approve event for this child lands on the parent's feed
     # and on the child's own feed (both scoped -- the shared central DB
     # accrues rows across tests)
@@ -571,7 +724,14 @@ def test_step_approve_is_parent_only_and_validates_the_step(repo: dict) -> None:
     assert _cell(wt, child_approve) == '1'
     # approving a step that never required approval (NULL) is a ValueError
     _, ids2 = _arm(repo['root'], 'approvenull', step=True)
-    no_req = _run(repo['root'], 'node', 'approve', 'main.approvenull', ids2['step'])
+    step_id2 = ids2['step']
+    no_req = _run(
+        repo['root'],
+        'node',
+        'approve',
+        'main.approvenull',
+        f'{step_id2}',
+    )
     assert no_req.returncode == 1
     assert 'does not require approval' in no_req.stderr
     # approving a non-existent step is a ValueError
@@ -587,35 +747,40 @@ def test_step_approve_is_parent_only_and_validates_the_step(repo: dict) -> None:
     assert _cell(repo['root'], null_approve) == '0'
 
 
-# ------ exit signal: loop-only, round-trips through the CRUD
+def test_default_approve_targets_the_gated_step_during_a_sync_window(
+    repo: dict,
+) -> None:
+    """The default ``node approve`` resolves the gated step, not a live SYNC row.
+
+    During an approval wait the periodic SYNC opens a second active step row
+    (approval NULL) with a newer id, so the newest-active default would land on
+    it and reject a genuinely pending approval; the default must pick the gated
+    row (approval set) instead.
+    """
+    wt, ids = _arm(repo['root'], 'syncgate', step=True)
+    record = Node(wt).record
+    record.step_pending(step_id=ids['step'])
+    # a second active step, newer, mimics the approval-wait SYNC bookkeeping row
+    record.step_start(iter_id=ids['iter'], run_id=ids['run'], step=1, step_name='SYNC')
+    # the parent's default approve (no step_id) resolves the gated EXECUTE step
+    approved = _run(repo['root'], 'node', 'approve', 'main.syncgate')
+    assert approved.returncode == 0
+    assert record.step_approved(step_id=ids['step'])
+    assert _pending_ids(wt) == []
 
 
-def test_exit_signal_round_trips_through_the_crud(repo: dict) -> None:
-    """``exit`` is a loop-only signal -- CRUD round-trip, but no ``node`` command.
+# ------ exit signal: loop-only
+
+
+def test_exit_signal_has_no_node_command(repo: dict) -> None:
+    """``exit`` is a loop-only signal -- ``node exit`` is not a command.
 
     Of the five signal names (``finish``/``stop``/``kill``/``pause``/``exit``),
-    only ``exit`` has no ``node`` sub-command: the loop sets it itself via
-    ``signal _set exit`` at the end of a run that wound down without an explicit
-    finish/stop (``_run.sh``). So ``exit`` must round-trip through the low-level
-    signal CRUD like the others -- ``_get`` is exit-coded (1 unset, 0 set) and
-    echoes the reason, and ``_list --signal`` narrows to it -- while ``node exit``
-    is not a command at all.
+    only ``exit`` has no ``node`` sub-command: the loop records it itself at
+    the end of a run that wound down without an explicit finish/stop, so no
+    operator surface may set it.
     """
     wt, _ = _arm(repo['root'], 'exitsig')
-    # unset -> exit 1, nothing on stdout
-    miss = _run(wt, 'signal', '_get', 'exit')
-    assert miss.returncode == 1
-    assert miss.stdout.strip() == ''
-    # the loop's own usage: set the exit signal with a reason, then read it back
-    assert _run(wt, 'signal', '_set', 'exit', 'budget exhausted').returncode == 0
-    got = _run(wt, 'signal', '_get', 'exit')
-    assert got.returncode == 0
-    assert got.stdout.strip() == 'budget exhausted'
-    count = f"SELECT COUNT(*) FROM signals WHERE node='{wt.name}' AND signal='exit'"
-    assert _cell(wt, count) == '1'
-    listed = _run(wt, 'signal', '_list', '--signal', 'exit', '--csv')
-    assert len(listed.stdout.splitlines()) - 1 == 1
-    # unlike finish/stop/kill, exit has no node command -- it is loop-only
     no_cmd = _run(wt, 'node', 'exit')
     assert no_cmd.returncode != 0
     assert 'No such command' in no_cmd.stderr
@@ -630,6 +795,16 @@ def _cell(wt: pathlib.Path, sql: str) -> str:
     return rows[1] if len(rows) > 1 else ''
 
 
+def _last_event(wt: pathlib.Path, event: str) -> dict:
+    """Return the newest ``events`` row of type ``event`` on ``wt``."""
+    sql = (
+        f"SELECT status, actor, metadata FROM events WHERE node='{wt.name}'"
+        f" AND event='{event}' ORDER BY event_id DESC LIMIT 1"
+    )
+    out = _run(wt, 'db', '_query', sql, '--csv').stdout
+    return next(csv.DictReader(io.StringIO(out)))
+
+
 def _session_name(wt: pathlib.Path) -> str:
     """The tmux session name ``start.sh`` derives for a worker worktree.
 
@@ -640,11 +815,11 @@ def _session_name(wt: pathlib.Path) -> str:
     return f'{wt.parents[1].name} ({branch})'
 
 
-def _pending_ids(wt: pathlib.Path) -> list[str]:
+def _pending_ids(wt: pathlib.Path) -> list[int]:
     """Return the ``step_id``s on ``wt`` awaiting approval (``approved = ''``)."""
     sql = f"SELECT step_id FROM steps WHERE node='{wt.name}' AND approved = ''"
     out = _run(wt, 'db', '_query', sql, '--csv').stdout
-    return [row['step_id'] for row in csv.DictReader(io.StringIO(out))]
+    return [int(row['step_id']) for row in csv.DictReader(io.StringIO(out))]
 
 
 def _arm(
@@ -657,35 +832,23 @@ def _arm(
     """Init a fresh worker, force it ``active``, and open a run.
 
     Optionally opens an active iteration (and a step under it) so the kill and
-    boundary tests have row-level state to assert against. Returns the worker's
+    approval tests have row-level state to assert against. Returns the worker's
     worktree and the ids of the rows it created.
     """
     wt = root / '.worktrees' / f'main.{name}'
     assert _run(root, 'node', 'init', name, '--agent', 'claude').returncode == 0
-    # force the node active without a live loop -- _status is the loop's own hook
-    assert _run(wt, '_status', 'active').returncode == 0
-    ids = {'run': _run(wt, 'run', '_start').stdout.strip()}
+    # force the node active without a live loop -- status_set is the loop's
+    # own hook -- and seed the rows through the core recorder
+    node = Node(wt)
+    node.status_set('active')
+    ids = {'run': node.record.run_start()}
     if iter or step:
-        ids['iter'] = _run(
-            wt,
-            'iter',
-            '_start',
-            ids['run'],
-            '--iter',
-            '1',
-        ).stdout.strip()
+        ids['iter'] = node.record.iter_start(run_id=ids['run'], iter=1)
     if step:
-        ids['step'] = _run(
-            wt,
-            'step',
-            '_start',
-            '--iter',
-            ids['iter'],
-            '--run',
-            ids['run'],
-            '--step',
-            '1',
-            '--name',
-            'EXECUTE',
-        ).stdout.strip()
+        ids['step'] = node.record.step_start(
+            iter_id=ids['iter'],
+            run_id=ids['run'],
+            step=1,
+            step_name='EXECUTE',
+        )
     return wt, ids

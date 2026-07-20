@@ -49,13 +49,13 @@ if COMMON_DIR=$(git -C "$WORKTREE_DIR" rev-parse --git-common-dir 2>/dev/null); 
     REPO_NAME=${REPO_ROOT##*/}
 fi
 
-TMUX_SESSION_NAME="$REPO_NAME"
+TMUX_SESSION_NAME="${REPO_NAME//[.:]/-}"
 BRANCH=""
 if BRANCH=$(git -C "$WORKTREE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null); then
-    TMUX_SESSION_NAME="$REPO_NAME (${BRANCH//./-})"
+    TMUX_SESSION_NAME="${REPO_NAME//[.:]/-} (${BRANCH//./-})"
 fi
 
-# derive the node's data directory (mirrors Node._node_dir): the project
+# derive the node's data directory (mirrors Node.node_dir): the project
 # prefix comes from the .worktrees/.project/<branch> cache in the main repo
 PGID_FILE=""
 if [[ -n "$REPO_ROOT" && -n "$BRANCH" ]]; then
@@ -80,7 +80,7 @@ PANE_PID=$(
 )
 
 # capture pgid before teardown -- pane shell vanishes but orphans keep the pgid
-PGID=
+PGID=""
 if [[ -n "$PANE_PID" ]]; then
     PGID=$(ps -o pgid= -p "$PANE_PID" 2>/dev/null | tr -d ' ') || true
 fi
@@ -95,7 +95,7 @@ if [[ -z "$PGID" && -n "$PGID_FILE" && -f "$PGID_FILE" ]]; then
 fi
 
 # the in-flight agent invocation runs in its own group (.step_pgid, recorded by
-# _agent.sh) outside the pane's -- reap it too or the agent survives the kill,
+# the loop at launch) outside the pane's -- reap it too or the agent survives the kill,
 # headless and still spending
 STEP_PGID=""
 STEP_PGID_FILE=""
@@ -112,14 +112,14 @@ fi
 
 # grep -qxF (exact match), not tmux -t: -t resolves targets by
 # prefix/fnmatch, so a short name false-matches longer session names
-SESSION_EXISTS=
+SESSION_EXISTS=false
 if tmux list-sessions -F '#{session_name}' 2>/dev/null \
     | grep -qxF "$TMUX_SESSION_NAME"; then
-    SESSION_EXISTS=1
+    SESSION_EXISTS=true
 fi
 
-if [[ -z "$PANE_PID" && -z "$SESSION_EXISTS" && -z "$PGID" && -z "$STEP_PGID" ]]; then
-    if tmux list-sessions >/dev/null 2>&1; then
+if [[ -z "$PANE_PID" && "$SESSION_EXISTS" != true && -z "$PGID" && -z "$STEP_PGID" ]]; then
+    if tmux list-sessions &>/dev/null; then
         echo "No running node found: $TMUX_SESSION_NAME"
     else
         echo "tmux server not running (node already dead): $TMUX_SESSION_NAME"
@@ -158,7 +158,9 @@ if _alive; then
     _reap KILL
 fi
 
-tmux kill-session -t "$TMUX_SESSION_NAME" 2>/dev/null || true
+# '=' pins the target to the exact name -- a bare -t falls back to
+# prefix/fnmatch resolution and could retarget another live session
+tmux kill-session -t "=$TMUX_SESSION_NAME" 2>/dev/null || true
 # drop the recorded pgid handles -- the groups are dead either way
 [[ -n "$PGID_FILE" ]] && rm -f "$PGID_FILE" 2>/dev/null || true
 [[ -n "$STEP_PGID_FILE" ]] && rm -f "$STEP_PGID_FILE" 2>/dev/null || true

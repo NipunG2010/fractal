@@ -10,14 +10,33 @@ already reads parent directories), also check the parent directory for
 `plasma-fractal` is a standalone plugin providing the **fractal** skill.
 
 The `fractal/` package is organized into `cli/` (typer app), `core/`
-(business logic), `tui/` (Textual app), `skills/` (the plugin skill),
-`util/` (shared utilities), and the node machinery seeds — `_assets/`,
-`_node/`, and `_scripts/` — with the pytest suite in `tests/`.
+(business logic), `tui/` (Textual app), `impl/` (provider backends),
+`skills/` (the plugin skill), `util/` (shared utilities), and the node
+machinery seeds — `_assets/`, `_node/`, and `_scripts/` — with the
+pytest suite in `tests/`.
+
+`shim/` holds the metadata-only `fractal` pointer dist for PyPI: no
+code, just exact `plasma-fractal==<version>` pins that bump in lockstep
+with every release surface. The build workflow gates and builds it
+alongside the main package, and the publish job uploads both dists —
+both PyPI projects must trust that workflow (same repository, workflow
+file, and environment) as their publisher.
 
 `Node` delegates lifecycle operations to the `_scripts/` shell scripts
-via `subprocess.run()`. The iteration loop
-(`fractal/_node/scripts/_run.sh`) runs in tmux and invokes the
-configured agent for each step.
+via `subprocess.run()`. The iteration loop is in-process Python:
+`start.sh` execs `fractal node _loop` inside the tmux session, and
+`Loop` (`fractal/core/loop.py`) drives each iteration end to end —
+prompt assembly, agent launches, run/iter/step row accounting through
+`node.record`, and the work-product commit pipeline in
+`fractal/core/commit.py`.
+
+Agent invocation is a core/impl seam: `fractal/core/agent.py` defines
+the `Agent` base class (invocation argv, stream parsing, cost and
+logging hooks) plus the name registry
+(`resolve`/`register`/`supported`), and
+`fractal/impl/{claude,codex,grok,opencode,omp}.py` are the provider
+backends — a new provider slots in as one new `impl/` module registered
+in `core/agent.py`.
 
 ## Build & Development
 
@@ -112,9 +131,8 @@ just accelerate your ramp-up.
   aren't yet documented, add them to the appropriate `AGENTS.md`:
   repo-specific conventions belong in the repo's own file; org-wide
   conventions belong in the shared sections, which are maintained at the
-  organization level and synced verbatim across repositories — make
-  shared-section changes at the source (or flag them for promotion),
-  never in a synced copy.
+  organization level — make shared-section changes at the org root (or
+  flag them for promotion) and propagate them to repo copies.
 
 **Propose better conventions.** If you see a pattern that could be
 improved across the codebase — a more readable structure, a safer error
@@ -259,11 +277,11 @@ random magic numbers — use descriptive variable names or setup helpers
 that make the test's intent clear.
 
 **Red before green across boundaries.** A failing test that must land
-before its fix — crossing a commit or merge boundary — carries
-`pytest.mark.xfail(strict=True)` naming the reason; the fix commit
-removes the marker, and strict mode makes a lingering marker fail the
-suite. A red-then-fix chain inside a single change stays bare-red and
-never commits red.
+before its fix — crossing a commit or merge boundary — carries the test
+framework's strict expected-failure marker naming the reason; the fix
+commit removes the marker, and strict mode makes a lingering marker fail
+the suite. A red-then-fix chain inside a single change stays bare-red
+and never commits red.
 
 ### Good Tests
 
@@ -290,19 +308,19 @@ never commits red.
 
 ## Wiki Maintenance
 
-The project wiki at `wiki/` is the authoritative reference for fractal's
-concepts, modules, and architecture. **Think of the wiki as a nested,
-dynamic-access AGENTS.md** — the structure mirrors the `fractal/` source
-tree, so when working in a module you read the corresponding wiki branch
-for context.
+The project wiki at `wiki/` is the descriptive reference for fractal's
+concepts, modules, and architecture; coverage is partial and grows
+module by module. **Think of the wiki as a nested, dynamic-access
+AGENTS.md** — the structure mirrors the `fractal/` source tree, so when
+working in a module you read the corresponding wiki branch for context.
 
 - **Wiki paths mirror source paths.** Working on a module? Read the
-  corresponding wiki branch (e.g., `fractal/core/radio.py` →
-  `wiki/core/radio/`). Cross-cutting topics live in folders like
-  `wiki/project/`.
+  corresponding wiki branch (e.g., `fractal/core/loop.py` →
+  `wiki/core/loop/`). Cross-cutting topics get their own folders beside
+  the module branches.
 - **Read the wiki first.** When the user asks about a fractal concept or
-  module, check `wiki/` before answering. The descriptive reference
-  lives there, not in this file.
+  module, check `wiki/` before answering. For covered topics the
+  descriptive reference lives there, not in this file.
 - **Update the wiki when code changes.** When you add, rename, remove,
   or significantly modify a class or module, update the corresponding
   wiki page in the same task. Treat wiki maintenance as part of the
@@ -312,7 +330,8 @@ for context.
   page.
 - **Use the CLI.** Run `wiki search <pattern>` to find content. Run
   `wiki map` for the navigation tree. Run `wiki update` to refresh
-  frontmatter and links. Run `wiki lint` to surface stale content.
+  frontmatter and links. Run `wiki lint` to catch what `wiki update`
+  cannot repair.
 - **Description style.** Frontmatter `desc` fields and link descriptions
   are human-readable prose — complete sentences ending in a period, with
   class/method names rephrased into plain language (backticks only if
@@ -371,25 +390,26 @@ See `pyproject.toml` for formatter/linter config.
 ### Naming Conventions
 
 - **Public CLI commands:** normal names (`init`, `start`, `finish`)
-- **Private CLI commands:** underscore prefix (`_get`, `_set`,
-  `_status`) — hidden from `--help`, used only by internal scripts
+- **Private CLI commands:** underscore prefix (`_get`, `_set`, `_query`)
+  — hidden from `--help`, used only by internal scripts
 - **Signal names:** `finish`, `stop`, `kill`, `pause`, `exit`
-- **Lifecycle status:** one status set (`Node._statuses` is the source
-  of truth) shared by the node `.status` file and the DB row tables. Not
-  every status applies at every level: `failed` is entity-row only (a
-  run uses `exited`, never `failed`); `idle`/`retired` are node-only; a
-  user (root) node is marked by config, not a status. `paused` is
-  active-like everywhere but execution: the loop exits (no tmux session
-  is the normal parked state — never crash-healed), the run row (and any
-  still-open iteration) stays open for `resume` to adopt, the node holds
-  its spawn slot and blocks ancestor finish-drains, and only
-  `resume`/`kill`/`chat` are legal on it; a user-node (tree-wide) pause
-  also latches the root (a `.paused` marker beside the central DB), so
-  even depth-1 spawns and starts refuse until the tree-wide resume. Exit
-  codes are binary, derived from status; rows carry start/end instants
-  (duration is derived, not stored) and events are point-in-time —
-  `pause`/`resume` event instants credit paused spans back to run/iter
-  deadlines. Read `Node._statuses` and the DB schema in `core/` before
+- **Lifecycle status:** one status set (`fractal.constants.STATUSES` is
+  the source of truth) shared by the node `.status` file and the DB row
+  tables. Not every status applies at every level: `failed` is
+  entity-row only (a run uses `exited`, never `failed`);
+  `idle`/`retired` are node-only; a user (root) node is marked by
+  config, not a status. `paused` is active-like everywhere but
+  execution: the loop exits (no tmux session is the normal parked state
+  — never crash-healed), the run row (and any still-open iteration)
+  stays open for `resume` to adopt, the node holds its spawn slot and
+  blocks ancestor finish-drains, and only `resume`/`kill`/`chat` are
+  legal on it; a user-node (tree-wide) pause also latches the root (a
+  `.paused` marker beside the central DB), so even depth-1 spawns and
+  starts refuse until the tree-wide resume. Exit codes are binary,
+  derived from outcome; rows carry start/end instants (duration is
+  derived, not stored) and events are point-in-time — `pause`/`resume`
+  event instants credit paused spans back to run/iter deadlines. Read
+  `fractal.constants.STATUSES` and the DB schema in `core/` before
   touching lifecycle or DB code.
 - **Database scoping:** one central SQLite DB per tree, in the root
   (user) node's data directory, resolved through the `root` config key
@@ -401,15 +421,29 @@ See `pyproject.toml` for formatter/linter config.
   removes every worktree, branch, and registration while the user node's
   data (config, memory, the central DB with all history) survives;
   `fractal destroy` is the full inverse of `fractal init`, the database
-  included. All three refuse over running or paused nodes.
-- **Project-files surface:** the `files_*` methods expose a node's work
-  product to consumers: git-tracked files minus machinery (any
-  `.fractal` component, the project wiki, `.git`, `.worktrees` — matched
-  casefolded), with `since` anchors (`base`/`commit`/`iteration`/`run`)
-  resolved from the node's own event log so diffs survive merges,
-  node-scoped and floored at the newest `init` event. Every
-  caller-supplied path validates through `_validate_relpath`;
-  transcripts resolve per agent via `session_transcript`.
+  included. All three refuse over running nodes; `reset`/`destroy` kill
+  paused nodes as part of the confirmed teardown (the confirmation or
+  `--force` authorizes discarding their frozen work), while `delete` —
+  agent-reachable — refuses over them.
+- **Project-files surface:** `node.files` (the `Files` facade in
+  `core/files.py`) exposes a node's work product to consumers:
+  git-tracked files minus machinery (any `.fractal` component, the
+  project wiki, `.git`, `.worktrees` — matched casefolded), with `since`
+  anchors (`base`/`commit`/`iteration`/`run`) resolved from the node's
+  own event log so diffs survive merges, node-scoped and floored at the
+  newest `init` event. Every caller-supplied path validates through
+  `Files._validate_relpath`; transcripts resolve per agent via
+  `Agent.transcript`, fronted by `node.sessions`.
+
+### Event Hooks
+
+Event hooks follow a uniform shape: every hook is `on_<event>` with a
+`logging_level: int = logging.<LEVEL>` signature default, on `Agent`
+(`core/agent.py`) and `Loop` (`core/loop.py`). When running the audit
+(the `logging_level: int = logging\.` grep count must equal the
+`def on_` count), scope both greps to `fractal/core/` — `tui/` defines
+Textual message handlers (`on_mount`, `on_key`, …) that match `def on_`
+but are framework callbacks, not event hooks.
 
 ### Shell Scripts (`_scripts/`, `_node/scripts/`)
 

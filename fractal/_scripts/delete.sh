@@ -14,7 +14,7 @@ Options:
     --merge-target=<branch>    Branch to warn unmerged commits against
                                (default: the node's base, else its dotted
                                parent)
-    --help|-h    Show this help message
+    --help|-h                  Show this help message
 USAGE
     exit 0
 }
@@ -59,7 +59,7 @@ LOCAL=$(fractal config _get local --path="$WORKTREE_DIR" 2>/dev/null || echo tru
 # ------ fail if node is still running in tmux
 # grep -qxF (exact match), not tmux -t: -t resolves targets by
 # prefix/fnmatch, so a short name false-matches longer session names
-TMUX_SESSION_NAME="$REPO_NAME (${BRANCH//./-})"
+TMUX_SESSION_NAME="${REPO_NAME//[.:]/-} (${BRANCH//./-})"
 
 if tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$TMUX_SESSION_NAME"; then
     echo "Error: node is still running in tmux ($TMUX_SESSION_NAME)" >&2
@@ -102,8 +102,10 @@ if [[ -n "$MERGE_TARGET" ]] \
     PROJECT_PATH=$(cat "$REPO_DIR/.worktrees/.project/$BRANCH" 2>/dev/null || echo ".")
     if [[ "$PROJECT_PATH" == "." ]]; then
         SEED_EXCLUDE=":!.fractal"
+        WIKI_PREFIX="wiki"
     else
         SEED_EXCLUDE=":!$PROJECT_PATH/.fractal"
+        WIKI_PREFIX="$PROJECT_PATH/wiki"
     fi
     # the branch's work is preserved when it is an ancestor of the target (a fast
     # merge) or the target already matches it on the paths the branch itself
@@ -112,8 +114,12 @@ if [[ -n "$MERGE_TARGET" ]] \
     # symmetric tree diff -- once a squash-merged child's parent keeps iterating in
     # other paths, a symmetric `diff TARGET BRANCH` false-fires though the child's
     # work is in the target; exclude the .fractal/ seed (merge-up strips it, so it
-    # never counts as unmerged) and skip when the base can't resolve (best-effort,
-    # never block the delete); warn only when none of these holds
+    # never counts as unmerged) and the wiki's generated indexes plus its whole
+    # tool-owned .wiki/ dir (merge-up regenerates them on the target, so the
+    # branch's copies always differ; that deliberately waives .wiki/ settings
+    # too -- tool config, not work worth warning about) and skip when the base
+    # can't resolve (best-effort, never block the delete); warn only when none
+    # of these holds
     MERGE_BASE=$(git -C "$REPO_DIR" merge-base "$MERGE_TARGET" "$BRANCH" 2>/dev/null || true)
     if [[ -n "$MERGE_BASE" ]] \
         && ! git -C "$REPO_DIR" merge-base --is-ancestor "$BRANCH" "$MERGE_TARGET" 2>/dev/null; then
@@ -121,7 +127,8 @@ if [[ -n "$MERGE_TARGET" ]] \
         # (read line-by-line so a path with a space stays one entry); an empty
         # array means only the seed changed -- nothing to warn about
         CHANGED=$(git -C "$REPO_DIR" diff --name-only "$MERGE_BASE" "$BRANCH" \
-            -- "$SEED_EXCLUDE" 2>/dev/null || true)
+            -- "$SEED_EXCLUDE" ":(exclude,glob)$WIKI_PREFIX/**/_index.md" \
+            ":!$WIKI_PREFIX/.wiki" 2>/dev/null || true)
         CHANGED_PATHS=()
         while IFS= read -r CHANGED_PATH; do
             [[ -z "$CHANGED_PATH" ]] && continue
@@ -142,7 +149,7 @@ fi
 # remote first, local last: a remote-delete failure must leave the local node
 # intact so the delete stays retriable (Node.delete's exists() guard needs the
 # worktree present); the removability pre-check above guards the inverse failure
-if [[ $LOCAL != true ]]; then
+if [[ "$LOCAL" != true ]]; then
     if git -C "$REPO_DIR" ls-remote --exit-code --heads origin "$BRANCH" \
         >/dev/null 2>&1; then
         git -C "$REPO_DIR" push origin --delete "$BRANCH"

@@ -2,12 +2,14 @@
 
 Regressions here drive the real console script on real repos: ``init`` must
 resolve its ``wiki`` step off its own interpreter, leave a repairable state
-behind a failed wiki step, and sweep everything init itself wrote -- never
-the user's own pending edits -- into the baseline commit.
+behind a failed wiki step, record a sub-project target under its subdir, and
+sweep everything init itself wrote -- never the user's own pending edits --
+into the baseline commit.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import shutil
@@ -25,6 +27,7 @@ __all__ = [
     'test_init_names_the_missing_wiki_dependency',
     'test_init_failure_leaves_a_repairable_state',
     'test_init_summarizes_creations_and_baseline_commit',
+    'test_init_subproject_records_project',
     'test_commit_init_sweeps_the_gitattributes_edit',
     'test_commit_init_never_sweeps_user_gitattributes_edits',
 ]
@@ -43,7 +46,8 @@ def test_init_prefers_the_environments_wiki_over_a_broken_shim(
     """
     repo = _init_repo(tmp_path / 'repo')
     shims = _broken_wiki_shim(tmp_path)
-    path = f'{shims}{os.pathsep}{os.environ["PATH"]}'
+    inherited = os.environ['PATH']
+    path = f'{shims}{os.pathsep}{inherited}'
     result = _run(repo, 'init', PATH=path)
     assert result.returncode == 0, result.stderr
     assert (repo / 'wiki' / '_index.md').is_file()
@@ -115,6 +119,26 @@ def test_init_summarizes_creations_and_baseline_commit(
     # the needed baseline commit, stated as the next step
     assert 'fractal commit' in result.stdout
     assert '--init' in result.stdout
+
+
+def test_init_subproject_records_project(tmp_path: pathlib.Path) -> None:
+    """``fractal init <subdir>`` creates a sub-project user node under it.
+
+    A monorepo sub-project node nests its data under ``<subdir>/.fractal`` with
+    the project recorded, and the prefix is applied exactly once (no doubling).
+    """
+    repo = _init_repo(tmp_path / 'repo')
+    (repo / 'app').mkdir()
+    # init the sub-project user node via the real CLI
+    result = _run(repo, 'init', 'app')
+    assert result.returncode == 0, result.stderr
+    # data nests under app/, recorded as project 'app', not doubled
+    config = repo / 'app' / '.fractal' / 'main' / 'config.json'
+    assert config.is_file()
+    assert json.loads(config.read_text(encoding='utf-8'))['project'] == 'app'
+    cache = repo / '.worktrees' / '.project' / 'main'
+    assert cache.read_text(encoding='utf-8').strip() == 'app'
+    assert not (repo / 'app' / 'app').exists()
 
 
 def test_commit_init_sweeps_the_gitattributes_edit(tmp_path: pathlib.Path) -> None:

@@ -13,6 +13,8 @@ import pathlib
 from collections.abc import Mapping
 from typing import Optional
 
+from fractal.constants import DB_FILE, STATUS_FILE
+
 __all__ = ['NodePoller']
 
 
@@ -50,11 +52,11 @@ class NodePoller:
 
         """
         db = (
-            _mtime(self._db_dir / '.db'),
-            _mtime(self._db_dir / '.db-wal'),
+            _mtime(self._db_dir / DB_FILE),
+            _mtime(self._db_dir / f'{DB_FILE}-wal'),
         )
         status = {
-            branch: _mtime(node_dir / '.status') for branch, node_dir in dirs.items()
+            branch: _mtime(node_dir / STATUS_FILE) for branch, node_dir in dirs.items()
         }
         if db != self._db:
             moved = set(status)

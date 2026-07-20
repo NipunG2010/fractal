@@ -54,49 +54,66 @@ CLI.
   `node start --continue` and a `node unretire` that lands `idle` put a
   node back in play and re-check both caps exactly like a spawn (refused
   over cap, no override); depth is structural, so only spawn checks it.
-- **Cost.** A `--max-cost` (per-run USD ceiling -- every new
-  `node start` re-arms it; runs are isolated, so a continue opens a
-  fresh budget) is strongly recommended for every child -- without one
-  the child launches uncapped, with a loud warning at start and bounded
-  only by `--max-iters`/`--timeout`; a non-positive `--max-cost` is
-  rejected. Set it at init (`--max-cost`, \<= your remaining when
-  `$COST_BUDGET` is finite) and optionally `--max-iter-cost`. Allocate
-  conservatively; you may over-allocate across children optimistically,
-  but monitor (`fractal node cost spent`, `fractal node cost breakdown`)
-  and kill over-spenders. Caps are **soft** -- a child is not
-  *hard*-stopped when it nears `--max-cost`; once it drains into the
-  reserve it gets cleanup guidance to wind down the remainder of the
-  current iteration cheaply, then the loop ends its run at that
-  iteration's boundary (the child does not run `finish` itself) -- but a
-  single iteration or its subtree can still overshoot, so reining in an
-  over-spender is on you, the parent. Price a cap as solve + wind-down +
-  reserve: a clean finish costs a full iteration of close overhead on
-  top of the last unit of work (typically a few dollars per leaf child
-  -- environment- and model-specific), so a cap sized to the solve alone
-  strands a *done* child `exited` at the reserve boundary instead of
-  `completed`. Size `--max-iter-cost` to one wind-down pass as well: the
-  iteration cap, not the run-level cap, is what bounds each close
-  attempt. Iteration caps bind at step boundaries, never mid-step --
-  plan each iteration to end under the cap, and read a trip as
-  disclosure that an iteration ran hot, not as a hard stop. If a done
-  child strands anyway, prefer raise-cap + continue + stop over a full
-  re-finish -- the re-finish re-pays the whole close severalfold and can
-  still near-miss -- and treat `exited` with recorded DB finish signals
-  as a defensible terminal once the work is merged and verified.
-  Child-side corollary: `fractal node cost remaining` reports against
-  `--max-cost`, NOT against (`--max-cost` - reserve); a node inside the
-  reserve band reads positive remaining and plans an iteration the loop
-  will never grant. Plan your last productive iteration against
-  (`--max-cost` - reserve), and if you intend to signal `finish`, fire
-  it BEFORE draining into the reserve -- wind-down work scheduled for
-  "next iteration" does not happen. In-step overshoot is bounded for
-  claude children (each step runs under a hard per-invocation budget and
-  stops cleanly at it), but the run-level cap stays soft. A child's
-  spend (including its sync) counts against your own budget. Some agents
-  report cost directly; others report token usage, priced from published
-  rates -- so a cost cap on a token-reporting child requires a (priced)
-  `--model` (the run fails on the first step otherwise). Today claude
-  reports cost directly and codex reports tokens.
+
+## Cost
+
+A `--max-cost` (per-run USD ceiling -- runs are isolated, and a
+budget-ended run refuses `node start --continue` without an explicit new
+`--max-cost`) is strongly recommended for every child -- without one the
+child launches uncapped, with a loud warning at start and bounded only
+by `--max-iters`/`--timeout`; a non-positive `--max-cost` is rejected.
+Set it at init (`--max-cost`, \<= your remaining when `$COST_BUDGET` is
+finite) and optionally `--max-iter-cost`. Allocate conservatively; you
+may over-allocate across children optimistically, but monitor
+(`fractal node cost spent`, `fractal node cost breakdown`) and kill
+over-spenders. Caps are **soft** -- a child is not *hard*-stopped when
+it nears `--max-cost`; once it drains into the reserve it gets cleanup
+guidance to wind down the remainder of the current iteration cheaply,
+then the loop ends its run at that iteration's boundary (the child does
+not run `finish` itself) -- but a single iteration or its subtree can
+still overshoot, so reining in an over-spender is on you, the parent.
+Price a cap as solve + wind-down + reserve: a clean finish costs a full
+iteration of close overhead on top of the last unit of work (typically a
+few dollars per leaf child -- environment- and model-specific), so a cap
+sized to the solve alone strands a *done* child `exited` at the reserve
+boundary instead of `completed`. Size `--max-iter-cost` to one wind-down
+pass as well: the iteration cap, not the run-level cap, is what bounds
+each close attempt. Iteration caps bind at step boundaries, never
+mid-step -- plan each iteration to end under the cap, and read a trip as
+disclosure that an iteration ran hot, not as a hard stop. If a done
+child strands anyway, prefer raise-cap + continue + stop over a full
+re-finish -- the re-finish re-pays the whole close severalfold and can
+still near-miss -- and treat `exited` with recorded DB finish signals as
+a defensible terminal once the work is merged and verified. Child-side
+corollary: `fractal node cost remaining` reports against `--max-cost`,
+NOT against (`--max-cost` - reserve); a node inside the reserve band
+reads positive remaining and plans an iteration the loop will never
+grant. Plan your last productive iteration against (`--max-cost` -
+reserve), and if you intend to signal `finish`, fire it BEFORE draining
+into the reserve -- wind-down work scheduled for "next iteration" does
+not happen. In-step overshoot is bounded for claude children (each step
+runs under a hard per-invocation budget and stops cleanly at it), but
+the run-level cap stays soft. A child's spend (including its sync)
+counts against your own budget. Some agents report cost directly; others
+report token usage, priced from published rates -- so a cost cap on a
+token-reporting child requires a (priced) `--model` (the run fails on
+the first step otherwise). claude, grok, opencode, and omp report cost
+directly; codex reports tokens. A claude child routed through openrouter
+is priced from tokens too, so under a cap it also needs an explicit
+priced `--model`.
+
+Every dollar figure you read has a scope; know it before comparing two.
+Budget-guard figures, recorded run-end reasons, and
+`fractal node cost spent` / `cost remaining` are all full-depth
+**per-run subtree** spend -- the run's own steps plus every descendant
+run chained under it -- so a spawning node's guard trips on money its
+children spent. `fractal node activity`'s `cost` column is the row's
+**own-node** step cost only (run and iteration end rows sum just that
+node's steps), so activity totals read *below* the guard figures on a
+spawning node by design -- the gap is the children's spend, itemized by
+`cost breakdown`. And every figure is per-run: runs are isolated, and no
+cost command reports a lifetime rollup -- reconcile across runs by
+scoping each run (`cost spent --run <id>`) and summing.
 
 > [!WARNING]
 > A **small `--max-cost` on a child running an expensive `--model`** is
@@ -105,7 +122,11 @@ CLI.
 > steps, so one pricey step can be a big fraction of -- or exceed -- the
 > child's whole budget before the next check. Give expensive-model
 > children a budget large enough that a single step is a small slice, or
-> hand a small budget to a cheaper `--model`.
+> hand a small budget to a cheaper `--model`. The sizing floor: never
+> set `--max-cost` (or a remaining grant) within ~2x the model's
+> single-turn cost -- a cap inside that band can be overshot by a large
+> fraction in one turn, and that overshoot is documented, accepted
+> behavior: no enforcement absorbs it.
 
 For well-specified single-mission leaf work, a cheaper model at the same
 dollar cap (e.g. `--model=sonnet`) is a first-class choice --
@@ -121,13 +142,21 @@ budget pool a cheaper token rate buys more steps, not a lower bill.
 
 1. **Init:** run `fractal node init --help` to see available options,
    then run `fractal node init <name> --path="$PROJECT_DIR" [...]`.
-   `--agent` is optional (currently `claude` or `codex`): when omitted,
-   the child automatically inherits your agent -- pass it only to give a
-   child a different agent. `<name>` uses letters, digits, and `_` only
-   (no `-`). **All run parameters** (budget, depth/children, iters,
-   timing) are set here and stored in the child's `config.json` --
-   editable before launch. Capture the output for the child's
-   project/node dirs. Init is lockfile-serialized -- run calls
+   `--agent` is optional (currently `claude`, `codex`, `grok`,
+   `opencode`, or `omp`): when omitted, the child automatically inherits
+   your agent -- pass it only to give a child a different agent.
+   `--provider` is optional the same way (e.g. `openrouter` routes
+   claude or codex through OpenRouter; it inherits, and agents without
+   routes ignore it). `--inherit=<surfaces>` (comma-separated: `steps`,
+   `scripts`, `skills`, `config`, or `all`) seeds those surfaces from
+   YOUR node dir instead of the package seed -- steps/scripts/skills
+   copy your live files, `config` snapshots preference keys (model,
+   effort, sync, detached, iter/step timing, retries, pacing) and never
+   budget caps; agent config always inherits. `<name>` uses letters,
+   digits, and `_` only (no `-`). **All run parameters** (budget,
+   depth/children, iters, timing) are set here and stored in the child's
+   `config.json` -- editable before launch. Capture the output for the
+   child's project/node dirs. Init is lockfile-serialized -- run calls
    sequentially. A worked example of spawn hygiene -- every cap, the
    model, and the step timeout explicit at init (leaf caps shown -- give
    a manager child depth/children/descendants; fill every placeholder
@@ -169,11 +198,13 @@ budget pool a cheaper token rate buys more steps, not a lower bill.
    REVIEW is where memory folds -- when you trim it, relocate its duties
    into a surviving step (e.g. append the fold to EXECUTE's tail) or,
    minimally, tell the child in its NODE.md to fold memory before
-   COMMIT. Managers keep the full profile.
+   COMMIT. Managers keep the full profile. When your own `steps/`
+   already fits the child, skip the hand-trim and pass `--inherit=steps`
+   at init.
 
 3. **Commit the config** so the child starts from a committed baseline
-   (continue cleans uncommitted changes, so an unconfigured baseline
-   would otherwise be lost). Run the commit **from the child's
+   (a continue refuses over uncommitted project files -- commit them or
+   pass `--clean` to discard them). Run the commit **from the child's
    worktree** -- a bare `commit` acts on the current directory's
    worktree (yours), not the child's (or pass
    `--path=<child worktree>`):
@@ -215,7 +246,8 @@ budget pool a cheaper token rate buys more steps, not a lower bill.
 Node configuration is the highest-leverage work you do -- a
 well-configured node runs autonomously for hours; a poorly configured
 one burns budget and creates entropy. Invest real time here, and commit
-the baseline before launch -- a continue wipes uncommitted changes. You
+the baseline before launch -- a continue refuses over uncommitted
+project files until they are committed or discarded with `--clean`. You
 can still steer a running child by editing its NODE.md, steps, or
 scripts (the loop re-reads them each iteration), but a strong baseline
 is fundamental.
@@ -243,16 +275,28 @@ NODE.md instructions to direct decomposition.
   can be freely renamed, added, or replaced. A step file may begin with
   YAML frontmatter: `agent: <command>` runs it on a different agent
   (each agent keeps its own woven session across the steps it runs),
-  `model: <name>` overrides the model, `detached: true` isolates that
-  step in its own session within a continuous node, and
-  `requires_approval: true` holds the loop after the step completes
-  until you approve it (`fractal node pending`/`approve`). Pass
+  `provider: <route>` overrides the provider route (agents without
+  routes ignore it), `model: <name>` overrides the model,
+  `effort: <level>` overrides the reasoning effort,
+  `timeout: <duration>` overrides the node-global `step_timeout` for
+  that step alone, `detached: true` isolates that step in its own
+  session within a continuous node, and `requires_approval: true` holds
+  the loop after the step completes until you approve it
+  (`fractal node pending`/`approve`). Size step timeouts where the step
+  is defined -- give a slow test or research step its own `timeout:`
+  ceiling rather than inflating the global -- and retune the global
+  mid-run with `fractal node update --step-timeout` (it lands at the
+  next iteration top). Set a generous global `step_timeout` too, as a
+  resilience floor: without one a hung or stalled invocation (a stuck
+  API call, a wedged tool) blocks the step and the whole node
+  indefinitely, where a ceiling lets the loop abort and retry. Pass
   `--no-sync` at init to disable sync for lightweight leaf nodes.
 - **Scripts** (`setup.sh`/`test.sh`/`lint.sh`): `setup.sh` runs every
   iteration (keep it idempotent) -- add dependency installs, env setup,
-  or data seeding here. `lint.sh` is invoked by the commit script and
+  or data seeding here. `lint.sh` is invoked by `fractal commit` and
   `test.sh` during EXECUTE; extend them to match the child's scope (e.g.
-  narrower test paths, additional linters).
+  narrower test paths, additional linters). A parent's tuned scripts
+  propagate with `--inherit=scripts` at init.
 - **Skills** (`skills/`): add or customize skill files to give the child
   domain-specific capabilities beyond the defaults.
 
@@ -280,13 +324,13 @@ writes a high-quality seed; once done, merge it and launch the target.
 ## Monitor and control
 
 - **Status:** `fractal node list`, `fractal node status <branch>`. A
-  node that hits its `--max-cost` reports `exited` (exit 1) even if it
-  finished and signalled `finish` -- a deliberate under-claim (a
-  budget-*aborted* node must never read `completed`). So treat a capped
-  node's `exited` as "inspect the work", not "failed": check its
-  memory/plans and merge if the work is done. Verify a child's
-  *executable* artifacts -- checkers, scripts, anything you will run --
-  from a clean checkout of its committed bytes
+  node that hits its `--max-cost` reports `exited` (exit 0 -- a designed
+  landing, not a crash) even if it finished and signalled `finish` -- a
+  deliberate under-claim (a budget-*aborted* node must never read
+  `completed`). So treat a capped node's `exited` as "inspect the work",
+  not "failed": check its memory/plans and merge if the work is done.
+  Verify a child's *executable* artifacts -- checkers, scripts, anything
+  you will run -- from a clean checkout of its committed bytes
   (`tmp=$(mktemp -d) && git archive <branch> | tar -xf - -C "$tmp"`),
   never in-place in a working tree: artifacts that depend on uncommitted
   or path-relative state pass in-place and fail everywhere else.
@@ -300,8 +344,10 @@ writes a high-quality seed; once done, merge it and launch the target.
   same budgets, same iteration count. A paused child still holds its
   spawn slot and blocks your finish-drain, so resume or kill it before
   finishing. Only `resume`, `kill`, and `chat` act on a paused node;
-  `start --continue` is for stopped/exited nodes (fresh run, full budget
-  re-arm, cleaned worktree), never for paused ones.
+  `start --continue` is for stopped/exited nodes (fresh run, restored
+  worktree -- uncommitted project files need `--clean`, and a
+  budget-ended run needs an explicit `--max-cost`), never for paused
+  ones.
 - **Clean up:** `fractal node merge <branch>`. Deleting after the merge
   (`fractal node delete <branch>`) is OPTIONAL hygiene, never automatic
   -- a merged node's branch and records keep audit value, so keep them
@@ -316,7 +362,9 @@ When `$CONTINUE_MODE` is `true`, decide per child whether to propagate
 by assessing its memory/plans:
 
 - **continue** (`fractal node start <branch> --continue`) if its work
-  was in progress and still relevant;
+  was in progress and still relevant -- uncommitted project files in its
+  worktree refuse the launch, so commit them or add `--clean` to discard
+  them;
 - **reset** (`fractal node init <name> --path="$PROJECT_DIR" --reset`,
   then start) if the direction was wrong but the task stands --
   `--reset` wipes the node to a **stock empty node** (memory, plans,

@@ -8,6 +8,8 @@ import sqlite3
 from collections.abc import Iterator
 from typing import Any, Optional
 
+from fractal.typing import Row
+
 __all__ = ['Database']
 
 
@@ -16,9 +18,10 @@ class Database:
 
     Provides generic table operations -- ``init``, ``read``,
     ``write``, ``update``, ``merge``, ``delete``, ``exists``,
-    and ``count`` -- with no domain-specific logic. Multi-statement
-    transitions run inside :meth:`transaction`, passing its connection
-    to the table operations via ``connection=``.
+    and ``count`` -- with no domain-specific logic. Each operation runs
+    on its own one-shot handle unless passed a :meth:`transaction`
+    connection via ``connection=``, which makes a multi-statement block
+    one atomic unit.
     """
 
     _timeout = 30
@@ -27,55 +30,70 @@ class Database:
         self: Database,
         path: pathlib.Path,
         schema: pathlib.Path,
-        **kwargs: Any,
     ) -> None:
         """Initialize ``Database``.
 
         Args:
             path: Path to the ``.db`` file.
             schema: Path to the ``.sql`` schema executed by ``init``.
-            **kwargs: Additional configuration retained on the instance.
 
         """
-        self._path = pathlib.Path(path).resolve()
-        self._schema = pathlib.Path(schema).resolve()
-        self._config = kwargs
+        self._path = pathlib.Path(path).expanduser().resolve()
+        self._schema = pathlib.Path(schema).expanduser().resolve()
+
+    @property
+    def path(self: Database) -> pathlib.Path:
+        """Return the database file path (read-only)."""
+        return self._path
 
     def init(self: Database) -> None:
         """Create the database and tables from the schema.
 
-        Idempotent -- safe to call on an existing database.
+        Idempotent -- safe to call on an existing database -- but purely
+        additive: the schema's ``IF NOT EXISTS`` DDL never alters an
+        existing table or refreshes a changed view, so a database created
+        under an older schema is not upgraded and must be rebuilt.
         """
         sql = self._schema.read_text(encoding='utf-8')
-        connection = self._connect()
+        connection = self.connect()
         try:
             connection.executescript(sql)
+            # stamp the schema version on an unstamped database only, so a
+            # future migration mechanism can key on the stored version
+            version, *_ = connection.execute('PRAGMA user_version').fetchone()
+            if version == 0:
+                connection.execute('PRAGMA user_version = 1')
         finally:
             connection.close()
 
-    def _connect(
+    def connect(
         self: Database,
+        *,
         read_only: bool = False,
+        timeout: Optional[float] = None,
     ) -> sqlite3.Connection:
         """Open a database connection.
 
         Sets WAL journal mode and enables foreign keys, and gives every handle a
         30-second busy timeout (overriding ``sqlite3.connect``'s 5-second
         default) so a contending writer waits for the lock under wide node
-        fan-out instead of failing fast and aborting the loop. A caller may
-        override the timeout via the ``Database`` kwargs. Each caller is
-        responsible for closing the returned connection.
+        fan-out instead of failing fast and aborting the loop. ``timeout``
+        overrides the default -- a UI-thread reader passes a short one so a
+        busy writer never stalls a refresh. Each caller is responsible for
+        closing the returned connection.
 
         Args:
             read_only: Open in read-only mode.
+            timeout: Busy timeout in seconds (default 30).
 
         Returns:
             Database connection.
 
         """
         # default the busy timeout to 30s (the fleet contends on one DB under
-        # fan-out); a caller's explicit timeout in self._config still wins
-        config = {'timeout': self._timeout, **self._config}
+        # fan-out); a caller's explicit timeout still wins
+        if timeout is None:
+            timeout = self._timeout
         # create connection
         if read_only:
             # a read-only open of a missing file yields a cryptic "unable to open
@@ -85,9 +103,9 @@ class Database:
                     f'No database at {self._path}; run `fractal init` at the repo root.'
                 )
             uri = f'file:{self._path}?mode=ro'
-            connection = sqlite3.connect(uri, uri=True, **config)
+            connection = sqlite3.connect(uri, uri=True, timeout=timeout)
         else:
-            connection = sqlite3.connect(f'{self._path}', **config)
+            connection = sqlite3.connect(f'{self._path}', timeout=timeout)
         # configure connection -- journal_mode is a write, so only set it on a
         # writable handle (a read-only connection reads a WAL db fine without it,
         # and setting it errors when no -wal/-shm sidecar exists)
@@ -99,7 +117,7 @@ class Database:
 
     @contextlib.contextmanager
     def transaction(self: Database) -> Iterator[sqlite3.Connection]:
-        """One ``BEGIN IMMEDIATE`` transaction over a dedicated connection.
+        """Open one ``BEGIN IMMEDIATE`` transaction over a dedicated connection.
 
         Yields a connection holding the database write lock for the whole
         block, so a read-decide-write transition commits or rolls back as
@@ -116,7 +134,7 @@ class Database:
             The transaction's connection.
 
         """
-        connection = self._connect()
+        connection = self.connect()
         # explicit BEGIN/COMMIT -- disable the sqlite3 module's implicit
         # transaction management for this handle
         connection.isolation_level = None
@@ -158,7 +176,7 @@ class Database:
         if connection is not None:
             yield connection
             return
-        owned = self._connect(read_only=read_only)
+        owned = self.connect(read_only=read_only)
         try:
             yield owned
             if not read_only:
@@ -175,7 +193,7 @@ class Database:
         where: Optional[dict[str, Any]] = None,
         limit: Optional[int] = None,
         connection: Optional[sqlite3.Connection] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Row]:
         """Read rows from a table.
 
         Either ``query`` or ``table`` must be provided.
@@ -227,7 +245,8 @@ class Database:
                 params += where_params
             query += ' ORDER BY rowid DESC'
             if limit is not None:
-                query += f' LIMIT {limit}'
+                query += ' LIMIT ?'
+                params += (limit,)
         # execute query
         with self._handle(connection, read_only=True) as handle:
             cursor = handle.execute(query, params)
@@ -236,7 +255,7 @@ class Database:
 
     def write(
         self: Database,
-        data: dict[str, Any],
+        data: Row,
         table: str,
         *,
         connection: Optional[sqlite3.Connection] = None,
@@ -265,7 +284,7 @@ class Database:
 
     def update(
         self: Database,
-        data: dict[str, Any],
+        data: Row,
         table: str,
         *,
         where: dict[str, Any],
@@ -298,7 +317,7 @@ class Database:
 
     def merge(
         self: Database,
-        data: dict[str, Any],
+        data: Row,
         table: str,
         *,
         conflict: Optional[list[str]] = None,
@@ -367,13 +386,14 @@ class Database:
                 # back to resolving the existing row's id by the conflict key(s)
                 returned = cursor.fetchone()
                 if returned is not None:
-                    row_id = returned[0]
+                    row_id, *_ = returned
                 else:
                     where = ' AND '.join(f'{key} = ?' for key in conflict)
-                    found = handle.execute(
+                    lookup = handle.execute(
                         f'SELECT rowid FROM {table} WHERE {where}',
                         tuple(data[key] for key in conflict),
-                    ).fetchone()
+                    )
+                    found = lookup.fetchone()
                     row_id = found[0] if found else 0
             else:
                 row_id = cursor.lastrowid
@@ -385,7 +405,7 @@ class Database:
         *,
         where: dict[str, Any],
         connection: Optional[sqlite3.Connection] = None,
-    ) -> None:
+    ) -> int:
         """Delete rows from a table.
 
         Args:
@@ -394,13 +414,19 @@ class Database:
             connection: Transaction to run inside (from
                 :meth:`transaction`).
 
+        Returns:
+            Number of rows deleted -- so callers can report a zero-match
+            delete honestly instead of implying one landed.
+
         """
         # build statement
         where_clause, params = self._where_clause(where)
         statement = f'DELETE FROM {table} WHERE {where_clause}'
         # execute statement
         with self._handle(connection) as handle:
-            handle.execute(statement, params)
+            cursor = handle.execute(statement, params)
+            count = cursor.rowcount
+        return count
 
     def exists(
         self: Database,

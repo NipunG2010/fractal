@@ -4,6 +4,8 @@ set -euo pipefail
 # Run linters on the node's worktree
 # ----------------------------------
 
+# NODE_DIR walks up from this hook's seeded location -- the inverse of
+# Node.node_dir's <worktree>[/<project>]/.fractal/<branch> derivation
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 NODE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKTREE_DIR="$(git -C "$(dirname "$NODE_DIR")" rev-parse --show-toplevel)"

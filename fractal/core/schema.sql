@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS runs (
     node          TEXT    NOT NULL,
     parent_run_id INTEGER REFERENCES runs(run_id),
     agent         TEXT,
+    max_cost      REAL,
     status        TEXT    NOT NULL,
     exit_code     INTEGER,
     metadata      TEXT    NOT NULL DEFAULT '',
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS events (
     iter_id    INTEGER REFERENCES iters(iter_id),
     run_id     INTEGER REFERENCES runs(run_id),
     event      TEXT    NOT NULL,
+    actor      TEXT    NOT NULL DEFAULT '',
     status     TEXT    NOT NULL,
     exit_code  INTEGER,
     metadata   TEXT    NOT NULL DEFAULT '',
@@ -151,6 +153,10 @@ CREATE TABLE IF NOT EXISTS reads (
     UNIQUE(message_id, node)
 );
 
+-- start arms snapshot the launch instant ('active') -- an entity's
+-- terminal outcome belongs to its end row alone; the run-start arm's
+-- metadata labels the armed cost cap (start-time-immutable, empty when
+-- uncapped)
 CREATE VIEW IF NOT EXISTS activity AS
         -- run start
         SELECT
@@ -161,9 +167,10 @@ CREATE VIEW IF NOT EXISTS activity AS
             NULL       AS iter_id,
             run_id     AS run_id,
             'start'    AS event,
-            status     AS status,
+            ''         AS actor,
+            'active'   AS status,
             NULL       AS exit_code,
-            metadata   AS metadata,
+            COALESCE('max_cost $' || max_cost, '') AS metadata,
             NULL       AS duration,
             NULL       AS cost
         FROM runs
@@ -177,6 +184,7 @@ CREATE VIEW IF NOT EXISTS activity AS
             NULL,
             run_id,
             'end',
+            '',
             status,
             exit_code,
             metadata,
@@ -193,9 +201,10 @@ CREATE VIEW IF NOT EXISTS activity AS
             iter_id,
             run_id,
             'start',
-            status,
+            '',
+            'active',
             NULL,
-            metadata,
+            '',
             NULL,
             NULL
         FROM iters
@@ -209,6 +218,7 @@ CREATE VIEW IF NOT EXISTS activity AS
             iter_id,
             run_id,
             'end',
+            '',
             status,
             exit_code,
             metadata,
@@ -225,9 +235,10 @@ CREATE VIEW IF NOT EXISTS activity AS
             iter_id,
             run_id,
             'start',
-            status,
+            '',
+            'active',
             NULL,
-            metadata,
+            '',
             NULL,
             NULL
         FROM steps
@@ -241,6 +252,7 @@ CREATE VIEW IF NOT EXISTS activity AS
             iter_id,
             run_id,
             'end',
+            '',
             status,
             exit_code,
             metadata,
@@ -257,9 +269,19 @@ CREATE VIEW IF NOT EXISTS activity AS
             iter_id,
             run_id,
             event,
+            actor,
             status,
             exit_code,
             metadata,
             NULL,
             NULL
         FROM events;
+
+-- indexes
+
+CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages (parent_message_id);
+CREATE INDEX IF NOT EXISTS idx_messages_node_channel ON messages (node, channel);
+CREATE INDEX IF NOT EXISTS idx_runs_node ON runs (node);
+CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs (parent_run_id);
+CREATE INDEX IF NOT EXISTS idx_steps_run ON steps (run_id);
+CREATE INDEX IF NOT EXISTS idx_steps_iter ON steps (iter_id);

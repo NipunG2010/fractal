@@ -11,14 +11,17 @@ from fractal.core.db import Database
 
 __all__ = [
     'test_schema_tables_exist',
+    'test_init_stamps_schema_version',
+    'test_activity_start_rows_snapshot_the_launch',
     'test_init_is_idempotent_on_a_populated_db',
-    'test_crud_workflow',
-    'test_merge_upsert',
-    'test_raw_sql_query',
-    'test_read_validation',
+    'test_crud_workflow_round_trips_rows',
+    'test_merge_inserts_replaces_and_partial_upserts',
+    'test_read_executes_raw_sql_queries',
+    'test_read_rejects_invalid_argument_combinations',
     'test_read_orders_by_write_order',
     'test_where_none_filters_match_null_columns',
     'test_connect_sets_generous_busy_timeout',
+    'test_connect_timeout_override_wins',
     'test_concurrent_writers_serialize',
     'test_transaction_commits_and_rolls_back',
     'test_update_reports_rowcount_for_compare_and_swap',
@@ -36,8 +39,11 @@ def _run(**extra: object) -> dict:
     return {'node': _NODE, 'status': 'active', 'started_at': _STARTED, **extra}
 
 
+# ------ schema and init
+
+
 def test_schema_tables_exist(database: Database) -> None:
-    """All expected tables are created by ``init()``."""
+    """All expected tables and indexes are created by ``init()``."""
     tables = database.read(
         query="SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
     )
@@ -53,6 +59,103 @@ def test_schema_tables_exist(database: Database) -> None:
     assert 'signals' in names
     assert 'steps' in names
     assert 'subs' in names
+    # the hot-lookup indexes land with the tables (one idempotent init)
+    indexes = database.read(
+        query="SELECT name FROM sqlite_master WHERE type='index' ORDER BY name",
+    )
+    index_names = [row['name'] for row in indexes]
+    assert 'idx_messages_parent' in index_names
+    assert 'idx_messages_node_channel' in index_names
+    assert 'idx_runs_node' in index_names
+    assert 'idx_runs_parent' in index_names
+    assert 'idx_steps_run' in index_names
+    assert 'idx_steps_iter' in index_names
+
+
+def test_init_stamps_schema_version(database: Database) -> None:
+    """A fresh database carries schema version 1.
+
+    ``init`` stamps ``PRAGMA user_version`` so a future migration
+    mechanism can key on the stored version.
+    """
+    connection = database.connect(read_only=True)
+    try:
+        version, *_ = connection.execute('PRAGMA user_version').fetchone()
+    finally:
+        connection.close()
+    assert version == 1
+
+
+def test_activity_start_rows_snapshot_the_launch(database: Database) -> None:
+    """Start rows read the launch instant; the outcome stays on the end rows.
+
+    The view synthesizes an entity's start and end rows from the same
+    table row, so a terminal status or reason must never bleed backwards
+    into history -- start rows always read ``active`` with bare metadata.
+    Events project their stored ``actor``; synthesized entity rows carry
+    an empty one.
+    """
+    # one settled lineage, every level ended abnormally with a reason
+    ended = '2026-01-01T00:01:30.000Z'
+    run_id = database.write(
+        data=_run(status='exited', metadata='Timed out', ended_at=ended),
+        table='runs',
+    )
+    iter_id = database.write(
+        data={
+            'node': _NODE,
+            'run_id': run_id,
+            'iter': 1,
+            'status': 'killed',
+            'metadata': 'killed by operator',
+            'started_at': _STARTED,
+            'ended_at': ended,
+        },
+        table='iters',
+    )
+    database.write(
+        data={
+            'node': _NODE,
+            'iter_id': iter_id,
+            'run_id': run_id,
+            'step': 1,
+            'step_name': 'EXECUTE',
+            'status': 'failed',
+            'metadata': 'agent error',
+            'started_at': _STARTED,
+            'ended_at': ended,
+        },
+        table='steps',
+    )
+    database.write(
+        data={
+            'node': _NODE,
+            'event': 'kill',
+            'status': 'completed',
+            'actor': 'operator',
+        },
+        table='events',
+    )
+
+    rows = database.read(
+        query='SELECT * FROM activity WHERE node = ?',
+        params=(_NODE,),
+    )
+    # every start row reads as the launch instant, whatever the row's fate
+    starts = [row for row in rows if row['event'] == 'start']
+    assert len(starts) == 3
+    assert all((row['status'], row['metadata']) == ('active', '') for row in starts)
+    # the terminal status and reason stay on the end rows
+    ends = {(row['status'], row['metadata']) for row in rows if row['event'] == 'end'}
+    assert ends == {
+        ('exited', 'Timed out'),
+        ('killed', 'killed by operator'),
+        ('failed', 'agent error'),
+    }
+    # the event carries its stored actor; the synthesized rows an empty one
+    [kill] = [row for row in rows if row['event'] == 'kill']
+    assert kill['actor'] == 'operator'
+    assert all(row['actor'] == '' for row in starts)
 
 
 def test_init_is_idempotent_on_a_populated_db(
@@ -78,7 +181,10 @@ def test_init_is_idempotent_on_a_populated_db(
     assert rows[0]['metadata'] == 'seed'
 
 
-def test_crud_workflow(database: Database) -> None:
+# ------ reads and writes
+
+
+def test_crud_workflow_round_trips_rows(database: Database) -> None:
     """Write, read, update, exists, count, and delete in sequence."""
     # write rows
     id_1 = database.write(_run(metadata='first'), 'runs')
@@ -118,7 +224,7 @@ def test_crud_workflow(database: Database) -> None:
     assert not database.exists('runs', where={'run_id': id_1})
 
 
-def test_merge_upsert(database: Database) -> None:
+def test_merge_inserts_replaces_and_partial_upserts(database: Database) -> None:
     """Merge inserts, replaces, partial-upserts, returns the id, and no-ops."""
     # insert via merge
     database.merge({'node': 'task.a', 'status': 'idle', 'max_depth': 2}, 'nodes')
@@ -144,8 +250,8 @@ def test_merge_upsert(database: Database) -> None:
     # 0 on the ON CONFLICT update path because no INSERT happens)
     node_id = rows[0]['node_id']
     returned = database.merge(
-        {'node': 'task.a', 'status': 'idle'},
-        'nodes',
+        data={'node': 'task.a', 'status': 'idle'},
+        table='nodes',
         conflict=['node'],
     )
     assert returned == node_id
@@ -158,7 +264,7 @@ def test_merge_upsert(database: Database) -> None:
     assert rows[0]['status'] == 'idle'  # unchanged, no exception raised
 
 
-def test_raw_sql_query(database: Database) -> None:
+def test_read_executes_raw_sql_queries(database: Database) -> None:
     """Read with raw SQL query returns expected results."""
     database.write(_run(), 'runs')
     database.write(_run(status='completed'), 'runs')
@@ -168,7 +274,7 @@ def test_raw_sql_query(database: Database) -> None:
     assert rows[0]['n'] == 1
 
 
-def test_read_validation(database: Database) -> None:
+def test_read_rejects_invalid_argument_combinations(database: Database) -> None:
     """Read raises ``ValueError`` for invalid argument combinations."""
     # query + where is invalid
     with pytest.raises(ValueError):
@@ -225,6 +331,9 @@ def test_where_none_filters_match_null_columns(database: Database) -> None:
     assert [row['run_id'] for row in database.read('runs')] == [set_id]
 
 
+# ------ connection settings
+
+
 def test_connect_sets_generous_busy_timeout(database: Database) -> None:
     """Every handle carries the 30s busy timeout (raised from the 5s default).
 
@@ -233,12 +342,30 @@ def test_connect_sets_generous_busy_timeout(database: Database) -> None:
     loop. ``PRAGMA busy_timeout`` reports it in milliseconds.
     """
     for read_only in (False, True):
-        connection = database._connect(read_only=read_only)
+        connection = database.connect(read_only=read_only)
         try:
             timeout_ms = connection.execute('PRAGMA busy_timeout').fetchone()[0]
         finally:
             connection.close()
         assert timeout_ms == 30000
+
+
+def test_connect_timeout_override_wins(database: Database) -> None:
+    """An explicit ``timeout=`` overrides the 30s default on any handle.
+
+    A UI-thread reader passes a short timeout so a busy writer never stalls a
+    refresh. ``PRAGMA busy_timeout`` reports it in milliseconds.
+    """
+    for read_only in (False, True):
+        connection = database.connect(read_only=read_only, timeout=2.0)
+        try:
+            timeout_ms = connection.execute('PRAGMA busy_timeout').fetchone()[0]
+        finally:
+            connection.close()
+        assert timeout_ms == 2000
+
+
+# ------ concurrency and transactions
 
 
 def test_concurrent_writers_serialize(database: Database) -> None:
@@ -288,8 +415,8 @@ def test_transaction_commits_and_rolls_back(database: Database) -> None:
     with database.transaction() as connection:
         run_id = database.write(_run(), 'runs', connection=connection)
         database.update(
-            {'status': 'completed'},
-            'runs',
+            data={'status': 'completed'},
+            table='runs',
             where={'run_id': run_id},
             connection=connection,
         )
@@ -302,8 +429,8 @@ def test_transaction_commits_and_rolls_back(database: Database) -> None:
         assert database.exists('runs', where={'run_id': run_id}, connection=connection)
         assert database.count('runs', connection=connection) == 1
         node_id = database.merge(
-            {'node': 'task.a', 'status': 'idle'},
-            'nodes',
+            data={'node': 'task.a', 'status': 'idle'},
+            table='nodes',
             conflict=['node'],
             connection=connection,
         )
@@ -338,15 +465,15 @@ def test_update_reports_rowcount_for_compare_and_swap(database: Database) -> Non
     run_id = database.write(_run(), 'runs')
     # the first closer wins the swap
     won = database.update(
-        {'status': 'completed', 'ended_at': _STARTED},
-        'runs',
+        data={'status': 'completed', 'ended_at': _STARTED},
+        table='runs',
         where={'run_id': run_id, 'ended_at': None},
     )
     assert won == 1
     # a competing closer on the same guard observes the loss
     lost = database.update(
-        {'status': 'killed', 'ended_at': _STARTED},
-        'runs',
+        data={'status': 'killed', 'ended_at': _STARTED},
+        table='runs',
         where={'run_id': run_id, 'ended_at': None},
     )
     assert lost == 0

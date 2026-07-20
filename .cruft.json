@@ -12,25 +12,17 @@
         "package": "plasma-fractal",
         "title": "Fractal",
         "description": "Hierarchical agent loops with recursive self-organization.",
-        "version": "0.0.0",
+        "version": "1.0.0",
         "authors": [
           {
-            "name": "Andrew Turner",
-            "email": "aturner@plasma.ai"
-          },
-          {
-            "name": "Nicholas Diao",
-            "email": "ndiao@plasma.ai"
+            "name": "Plasma AI",
+            "email": "eng@plasma.ai"
           }
         ],
         "maintainers": [
           {
-            "name": "Andrew Turner",
-            "email": "aturner@plasma.ai"
-          },
-          {
-            "name": "Nicholas Diao",
-            "email": "ndiao@plasma.ai"
+            "name": "Plasma AI",
+            "email": "eng@plasma.ai"
           }
         ],
         "codecov": {

@@ -4,49 +4,56 @@ from __future__ import annotations
 
 import functools
 import json
-import math
 import os
 import pathlib
-import subprocess
 import sys
-import time
 from collections.abc import Callable
 from csv import DictWriter
-from typing import IO, Any, Optional, Union
+from typing import Any, Optional
 
 import typer
 
-from fractal.core.node import Node, _derive_project_name, _find_worktree, _git
-from fractal.util import parse_duration_seconds
+import fractal.core.worktree
+import fractal.util
+from fractal.constants import (
+    CONFIG_FILE,
+    FRACTAL_FOLDER,
+    LOCK_FILE,
+    PROJECT_FOLDER,
+    WORKTREES_FOLDER,
+)
+from fractal.core.agent import StreamEvent
+from fractal.core.config import DEFAULT_RESERVE_FRACTION, RESERVE_PRECISION
+from fractal.core.node import Node
+from fractal.typing import PathLike
 
 __all__ = [
+    'SQLITE_INT_MAX',
     'command',
     'require_non_negative',
     'parse_reserve_budget',
-    'validate_config_values',
-    'render_stream',
-    'update_pricing',
-    'pricing_has_model',
+    'StreamRenderer',
     'print_rows',
-    'ensure_git_repo',
+    'print_json',
     'init_node',
     'resolve_init_target',
     'resolve_node',
+    'resolve_user_node',
     'resolve_target',
+    'resolve_ledger_target',
 ]
-
-_DURATION_KEYS = (
-    'timeout',
-    'iter_timeout',
-    'step_timeout',
-    'interval',
-    'sleep',
-    'wait',
-)
 
 # signed 64-bit ceiling for SQLite INTEGER columns; an integer cap at or above
 # this raises a raw "int too large to convert" from the adapter downstream
-_SQLITE_INT_MAX = 2**63
+SQLITE_INT_MAX = 2**63
+
+# tool-result preview budget: two to three 80-column terminal lines, so one
+# verbose tool call cannot flood the streamed transcript
+_TOOL_RESULT_MAX = 200
+_DIM = '\033[2m'
+_RESET = '\033[0m'
+_BLUE = '\033[34m'
+_YELLOW = '\033[33m'
 
 
 def command(
@@ -109,15 +116,15 @@ def require_non_negative(**limits: Optional[float]) -> None:
         # a signed 64-bit int raises a raw adapter error (and can desync config
         # from the DB on update), so reject it here -- float costs (REAL) are exempt
         if isinstance(value, int) and not isinstance(value, bool):
-            if value >= _SQLITE_INT_MAX:
-                raise typer.BadParameter(f'--{flag} must be < {_SQLITE_INT_MAX}.')
+            if value >= SQLITE_INT_MAX:
+                raise typer.BadParameter(f'--{flag} must be < {SQLITE_INT_MAX}.')
 
 
 def parse_reserve_budget(
     value: Optional[str],
     max_cost: Optional[float],
     *,
-    default: str = '10%',
+    default: str = f'{DEFAULT_RESERVE_FRACTION:.0%}',
 ) -> Optional[float]:
     """Resolve ``--reserve-budget`` to a USD amount.
 
@@ -163,167 +170,108 @@ def parse_reserve_budget(
         raise typer.BadParameter('--reserve-budget must be >= 0.')
     if reserve >= 0.99 * max_cost:
         raise typer.BadParameter('--reserve-budget must be < 99% of --max-cost.')
-    return reserve
+    # money materializes at display precision -- a bare percent product
+    # (10% of $6) would otherwise persist binary noise into config.json
+    # and every echo that quotes it
+    return round(reserve, RESERVE_PRECISION)
 
 
-def validate_config_values(config: dict[str, Any]) -> None:
-    """Validate a merged node config the way ``init`` does.
+class StreamRenderer:
+    """ANSI terminal renderer for parsed agent stream events.
 
-    Mirrors the init-time cost and duration invariants so ``config _set`` cannot
-    store values ``init`` would reject -- a non-positive ceiling (which makes the
-    subtree check finish the node at $0), an out-of-range reserve, a broken
-    ``step <= iter <= run`` cost ordering, or a bare-number duration that bricks
-    the loop at launch. Validates only the keys present (and not ``None``) in
-    ``config``, so it can be called with a node's effective (merged) config.
-
-    Raises:
-        typer.BadParameter: On any violated invariant.
-
+    The single CLI renderer over the seam's normalized events -- one
+    instance per stream, passed as the ``render`` callback to
+    ``Agent.stream`` (the loop's pane rendering) and ``Node.chat`` so core never
+    prints. Branches on ``kind`` only, never on the provider; session and
+    cost facts render nothing (they are recorded, not displayed). Tracks
+    the open text run (a delta without a trailing newline) so tool headers
+    and closing summaries start below it, and ``close()`` ends a truncated
+    stream on a fresh line with the ``-- $?`` placeholder summary.
     """
-    # cost values must be finite -- NaN/Infinity slip past every comparison below
-    # (all False for non-finite floats), so reject them up front
-    for cost_key in ('max_cost', 'max_iter_cost', 'max_step_cost', 'reserve_budget'):
-        cost_value = config.get(cost_key)
-        if cost_value is not None and not math.isfinite(cost_value):
-            raise typer.BadParameter(f'{cost_key} must be a finite number.')
-    # alias cost ceilings
-    max_cost = config.get('max_cost')
-    max_iter_cost = config.get('max_iter_cost')
-    max_step_cost = config.get('max_step_cost')
-    reserve_budget = config.get('reserve_budget')
-    # a ceiling must be positive (0/negative degenerates the subtree check)
-    if max_cost is not None and max_cost <= 0:
-        raise typer.BadParameter('max_cost must be greater than 0.')
-    # reserve must sit in [0, 99% of max_cost)
-    if reserve_budget is not None:
-        if reserve_budget < 0:
-            raise typer.BadParameter('reserve_budget must be >= 0.')
-        if max_cost is not None and reserve_budget >= 0.99 * max_cost:
-            raise typer.BadParameter('reserve_budget must be < 99% of max_cost.')
-    # cost ordering: step <= iter <= run
-    if max_iter_cost is not None and max_cost is not None:
-        if max_iter_cost > max_cost:
-            raise typer.BadParameter(
-                f'max_iter_cost ${max_iter_cost:.2f} exceeds max_cost ${max_cost:.2f}.'
+
+    def __init__(self: StreamRenderer) -> None:
+        """Initialize ``StreamRenderer``."""
+        self._streaming = False
+        self._open = False
+        self._resulted = False
+
+    def __call__(self: StreamRenderer, event: StreamEvent) -> None:
+        """Render one parsed agent stream event."""
+        self._open = True
+        # text deltas stream inline (block opens ride as newline deltas); a
+        # delta without a trailing newline leaves the text run open
+        if event.kind == 'text':
+            print(event.text, end='', flush=True)
+            self._streaming = not event.text.endswith('\n')
+        # tool-use headers, below any open text run
+        elif event.kind == 'tool':
+            self._break()
+            print(f'\n{_DIM}{_BLUE}> {event.tool}{_RESET}', end='', flush=True)
+        # tool results, truncated to a preview
+        elif event.kind == 'tool_result':
+            lines = event.message.split('\n')
+            preview = '\n'.join(lines[:8])
+            if len(preview) > _TOOL_RESULT_MAX:
+                preview = preview[:_TOOL_RESULT_MAX] + '...'
+            # a char-truncated preview that also has more than
+            # 8 lines must still show the "more lines" signal
+            if len(lines) > 8:
+                preview += '\n...'
+            color = _YELLOW if event.failed else _DIM
+            label = ' (error)' if event.failed else ''
+            # the preview's own leading newline closes any open text run
+            self._streaming = False
+            print(f'\n{color}{preview}{label}{_RESET}', end='', flush=True)
+        # the closing summary -- the facts vary per provider (a codex result
+        # closes on wall time and carries no authoritative cost), so a final
+        # result summarizes turns/duration/cost while a per-turn close prints
+        # the recorded turn cost alone -- an absent cost reads '$?', never $0
+        elif event.kind == 'result':
+            self._break()
+            cost_str = f'${event.cost:.4f}' if event.cost is not None else '$?'
+            if event.final:
+                parts = []
+                if event.turns is not None:
+                    parts.append(f'{event.turns} turns')
+                if event.duration is not None:
+                    parts.append(f'{event.duration:.1f}s')
+                parts.append(cost_str)
+                summary = ', '.join(parts)
+            else:
+                summary = cost_str
+            print(f'\n{_DIM}-- {summary}{_RESET}')
+            self._resulted = True
+        # stream-borne errors (some agents report failures on the JSON stream,
+        # not stderr, so without this a failed turn leaves no explanation)
+        elif event.kind == 'error':
+            print(
+                f'{_YELLOW}agent error: {event.message}{_RESET}',
+                file=sys.stderr,
+                flush=True,
             )
-    if max_step_cost is not None and max_iter_cost is not None:
-        if max_step_cost > max_iter_cost:
-            raise typer.BadParameter(
-                f'max_step_cost ${max_step_cost:.2f}'
-                f' exceeds max_iter_cost ${max_iter_cost:.2f}.'
-            )
-    if max_step_cost is not None and max_cost is not None:
-        if max_step_cost > max_cost:
-            raise typer.BadParameter(
-                f'max_step_cost ${max_step_cost:.2f} exceeds max_cost ${max_cost:.2f}.'
-            )
-    # durations must carry a unit suffix (a bare number bricks the loop)
-    for key in _DURATION_KEYS:
-        value = config.get(key)
-        if value is not None and parse_duration_seconds(str(value)) is None:
-            raise typer.BadParameter(
-                f'{key} must be a duration with a unit suffix (e.g. 30s, 10m, 1.5h).'
-            )
 
+    def close(self: StreamRenderer) -> None:
+        """End the stream on a fresh line, settling the closing summary.
 
-def render_stream(
-    node: Optional[Node],
-    *,
-    agent: str,
-    step_id: Optional[int] = None,
-    model: Optional[str] = None,
-    detached: bool = False,
-    input: IO[str] = sys.stdin,
-) -> Optional[str]:
-    """Render agent output from ``input`` and record cost.
+        Called by the driving command after the stream drains -- a truncated
+        stream (killed before its result frame) otherwise leaves the cursor
+        mid-line and shows no closing summary, so the ``-- $?`` placeholder
+        marks the unaccounted turn. Idempotent, and resets for the next
+        stream (the loop reuses one renderer across steps).
+        """
+        if not self._open:
+            return
+        self._break()
+        if not self._resulted:
+            print(f'\n{_DIM}-- $?{_RESET}')
+        self._open = False
+        self._resulted = False
 
-    Args:
-        node: Node instance for cost recording. ``None``
-            disables cost recording.
-        agent: Agent type.
-        step_id: Step to record cost for. Required when
-            ``node`` is not ``None``.
-        model: Model name for token-based cost computation
-            (token-reporting agents).
-        detached: When true, do not persist the captured session id to
-            ``.session`` (each step runs as an isolated session).
-        input: Input stream (default: stdin).
-
-    Returns:
-        The agent's captured session id (claude ``session_id`` / codex
-        ``thread_id``), or ``None`` if the stream carried none. Callers that
-        only render (e.g. ``_stream``) ignore it; ``node chat`` prints it so
-        the forked turn is resumable.
-
-    """
-    if agent == 'codex':
-        return _render_codex_stream(
-            node=node,
-            step_id=step_id,
-            model=model,
-            detached=detached,
-            input=input,
-        )
-    elif agent == 'claude':
-        return _render_claude_stream(
-            node=node,
-            step_id=step_id,
-            model=model,
-            detached=detached,
-            input=input,
-        )
-    else:
-        raise typer.BadParameter(f'--agent must be claude or codex, got {agent!r}.')
-
-
-def update_pricing(max_age: Optional[str] = None) -> str:
-    """Refresh the cached LiteLLM pricing file.
-
-    The file is fetched to a temp path and swapped in atomically, so an
-    interrupted download never leaves a corrupt cache.
-
-    Args:
-        max_age: If given (e.g. ``24h``), skip the fetch when the cache
-            is newer than this duration.
-
-    Returns:
-        ``'fresh'`` (cache new enough, no fetch), ``'fetched'``
-        (downloaded), ``'stale'`` (fetch failed but a cache exists), or
-        ``'missing'`` (fetch failed and no cache exists).
-
-    """
-    # resolve pricing.json path
-    cache = pathlib.Path(_PRICING_CACHE).expanduser()
-    # skip the fetch when the cache is still fresh enough
-    if max_age is not None and cache.exists():
-        max_age_seconds = parse_duration_seconds(max_age)
-        if max_age_seconds is None:
-            raise ValueError(f'Invalid duration: {max_age!r}')
-        if time.time() - cache.stat().st_mtime < max_age_seconds:
-            return 'fresh'
-    # fetch to a per-process temp file, then swap in atomically; import urllib
-    # locally so the http/ssl stack stays off every CLI cold-start -- only this
-    # fetch needs it, and most commands (and the cache-fresh path above) never do
-    import urllib.request
-
-    pid = os.getpid()
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cache.parent / f'{cache.name}.{pid}.tmp'
-    try:
-        urllib.request.urlretrieve(_PRICING_URL, tmp)  # noqa: S310
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        return 'stale' if cache.exists() else 'missing'
-    tmp.replace(cache)
-    return 'fetched'
-
-
-def pricing_has_model(model: str) -> bool:
-    """Return whether a model is present and priced in the cache."""
-    rates = _load_pricing().get(model)
-    if rates is None:
-        return False
-    return ('input_cost_per_token' in rates) or ('output_cost_per_token' in rates)
+    def _break(self: StreamRenderer) -> None:
+        """Close an open text run on a fresh line (a visual break)."""
+        if self._streaming:
+            print()
+            self._streaming = False
 
 
 def print_rows(
@@ -393,66 +341,30 @@ def print_rows(
             typer.echo('  '.join(v.ljust(widths[h]) for v, h in zip(values, headers)))
 
 
-def ensure_git_repo(path: Union[str, pathlib.Path]) -> None:
-    """Bootstrap a git repo at ``path`` when it has no born branch yet.
+def print_json(
+    rows: list[dict[str, Any]],
+    *,
+    columns: Optional[list[str]] = None,
+) -> None:
+    """Print rows as a JSON array of objects.
 
-    ``fractal init`` anchors the user node at the git root, so the target must be
-    a git repo whose branch is born (``_init_user`` resolves ``self._branch`` with
-    ``check=True``). When the target is not inside any repo, initialize one on a
-    branch named after the project -- the sanitized directory name, which also
-    becomes the wiki name. Then, unless the branch is already born, birth it with
-    an initial commit (an empty ``.gitignore``); this also completes a prior
-    bootstrap whose commit failed (a fresh ``.git`` with an unborn branch), so the
-    re-run the identity-error message promises actually works. A repo whose branch
-    is already born (this folder or an ancestor) is left untouched.
+    The machine-readable counterpart to ``print_rows``: one object per
+    row, keys in ``columns`` order, and an empty result prints ``[]``
+    (never nothing), so parsers see one shape per listing.
 
     Args:
-        path: Repo root or sub-project folder (absolute or relative).
-
-    Raises:
-        ValueError: If the directory name cannot yield a valid project name.
-        RuntimeError: If the initial commit fails (e.g. no git identity).
+        rows: List of row dicts.
+        columns: Key order for the row objects (default: each row's own
+            key order).
 
     """
-    # resolve to an absolute path (mirrors init_node)
-    target = pathlib.Path(path)
-    if not target.is_absolute():
-        target = pathlib.Path.cwd() / target
-    target = target.resolve()
-    # done if already in a repo whose branch is born (this folder or an ancestor)
-    git_dir = _git(['rev-parse', '--git-dir'], cwd=target, check=False)
-    if git_dir is not None:
-        sha = _git(
-            ['rev-parse', '--verify', '--quiet', 'HEAD'],
-            cwd=target,
-            check=False,
-        )
-        if sha:
-            return
-    # init a fresh repo on the project-named branch; an existing repo with an
-    # unborn branch (a prior init whose commit failed) skips init and just births it
-    if git_dir is None:
-        name = _derive_project_name(target.name)
-        _git(['init', '-b', name], cwd=target)
-    # birth the branch with an initial commit so _init_user can resolve it
-    branch = _git(['symbolic-ref', '--short', 'HEAD'], cwd=target)
-    gitignore = target / '.gitignore'
-    if not gitignore.exists():
-        gitignore.write_text('', encoding='utf-8')
-    _git(['add', '.gitignore'], cwd=target)
-    try:
-        # scope the commit to .gitignore so a user's unrelated staged work is
-        # never swept into the bootstrap commit (mirrors _commit.sh's scoping)
-        _git(['commit', '-m', f'init {branch}', '--', '.gitignore'], cwd=target)
-    except RuntimeError as e:
-        raise RuntimeError(
-            f'Bootstrapped {target} but the initial commit failed ({e});'
-            " configure your git identity ('git config user.name' and"
-            " 'git config user.email') and re-run."
-        ) from e
+    if columns:
+        rows = [{column: row.get(column) for column in columns} for row in rows]
+    encoded = json.dumps(rows, indent=2)
+    typer.echo(encoded)
 
 
-def init_node(path: Union[str, pathlib.Path]) -> Node:
+def init_node(path: PathLike) -> Node:
     """Resolve a ``Node`` for init (accepts repo root as-is).
 
     When an agent runs init from inside its own worktree (``_NODE`` set) with
@@ -462,28 +374,25 @@ def init_node(path: Union[str, pathlib.Path]) -> Node:
     """
     # an agent in its own worktree with the default path uses its repo root, but
     # only if the caller lives in the cwd's repo (a stale _NODE = wrong repo)
-    caller = Node._resolve_caller()
+    caller = Node.resolve_caller()
     if caller is not None and str(path) == '.':
         try:
             cwd = pathlib.Path.cwd().resolve()
-            cwd_root = Node(cwd)._repo_dir
-            if cwd_root == caller._repo_dir:
-                return Node(caller._repo_dir)
+            cwd_root = Node(cwd).repo_dir
+            if cwd_root == caller.repo_dir:
+                return Node(caller.repo_dir)
         except RuntimeError:
             pass
     # otherwise resolve the given path as-is
-    resolved = pathlib.Path(path)
-    if not resolved.is_absolute():
-        resolved = pathlib.Path.cwd() / resolved
-    return Node(resolved.resolve())
+    return Node(_absolute(path))
 
 
-def resolve_init_target(path: Union[str, pathlib.Path]) -> tuple[Node, pathlib.Path]:
+def resolve_init_target(path: PathLike) -> tuple[Node, pathlib.Path]:
     """Resolve the git-root-anchored node and project path for an init target.
 
     ``fractal init``/``node init`` accept a repo root or a sub-project folder as
     ``path``. The user node and every child must be anchored at the git root --
-    ``Node._node_dir`` derives the ``<project>/`` prefix from the
+    ``Node.node_dir`` derives the ``<project>/`` prefix from the
     ``.worktrees/.project`` cache, so anchoring at a sub-project folder would
     double the prefix. This resolves the target, then returns a ``Node`` at its
     git root plus the target's project-relative path.
@@ -497,12 +406,12 @@ def resolve_init_target(path: Union[str, pathlib.Path]) -> tuple[Node, pathlib.P
 
     """
     target = init_node(path)
-    node = init_node(target._repo_dir)
-    path = target._root.relative_to(target._repo_dir)
+    node = init_node(target.repo_dir)
+    path = target.worktree.relative_to(target.repo_dir)
     return node, path
 
 
-def resolve_node(path: Union[str, pathlib.Path], *, check: bool = True) -> Node:
+def resolve_node(path: PathLike, *, check: bool = True) -> Node:
     """Resolve a ``Node`` instance from a path argument.
 
     Args:
@@ -523,47 +432,42 @@ def resolve_node(path: Union[str, pathlib.Path], *, check: bool = True) -> Node:
 
     """
     # resolve absolute path
-    path = pathlib.Path(path)
-    if not path.is_absolute():
-        path = pathlib.Path.cwd() / path
-    path = path.resolve()
+    path = _absolute(path)
     # canonicalize to git worktree root (handles subdirectories)
-    toplevel = _git_toplevel(path)
+    toplevel = fractal.util.git.toplevel(path, check=False)
     if toplevel is not None:
-        path = toplevel
+        path = toplevel.resolve()
     # detect repo root passed instead of worktree
     # (.git is a directory at the repo root, a file in worktrees)
     if (path / '.git').is_dir():
         # check for a user node on the current branch -- it nests under the project
         # prefix from the .worktrees/.project cache (sub-project nodes nest deeper)
-        if branch := _resolve_branch(path):
-            project_file = path / '.worktrees' / '.project' / branch
-            if project_file.exists():
-                project = project_file.read_text(encoding='utf-8').strip()
-            else:
-                project = '.'
+        if branch := fractal.util.git.branch(path, check=False):
+            project = fractal.core.worktree.project_path(path, branch)
             if project == '.':
-                node_dir = path / '.fractal' / branch
+                node_dir = path / FRACTAL_FOLDER / branch
             else:
-                node_dir = path / project / '.fractal' / branch
-            if (node_dir / 'config.json').exists():
+                node_dir = path / project / FRACTAL_FOLDER / branch
+            if (node_dir / CONFIG_FILE).exists():
                 return Node(path)
-        if (path / '.worktrees').is_dir():
+        if (path / WORKTREES_FOLDER).is_dir():
             # inside a running node -- resolve to caller's worktree
-            if result := Node._resolve_caller():
+            if result := Node.resolve_caller():
                 return result
             # collect worktree candidates
             paths = []
-            for p in (path / '.worktrees').iterdir():
-                if p.is_dir() and p.name not in ('.project', '.lock'):
-                    paths.append(p)
+            for entry in (path / WORKTREES_FOLDER).iterdir():
+                if entry.is_dir() and entry.name not in (PROJECT_FOLDER, LOCK_FILE):
+                    paths.append(entry)
             # one worktree -- resolve to it
             if len(paths) == 1:
                 (path,) = paths
                 typer.echo(f'Resolved to .worktrees/{path.name}/', err=True)
             # multiple -- error with list
             elif len(paths) > 1:
-                paths = ', '.join(f'.worktrees/{p.name}/' for p in sorted(paths))
+                paths = ', '.join(
+                    f'.worktrees/{entry.name}/' for entry in sorted(paths)
+                )
                 raise typer.BadParameter(
                     f'Multiple nodes found: {paths}.'
                     f' Name one with --node, or run from its worktree.'
@@ -574,12 +478,59 @@ def resolve_node(path: Union[str, pathlib.Path], *, check: bool = True) -> Node:
     # user-facing command run outside a node fails cleanly (mirrors resolve_target)
     if check and not node.exists():
         raise typer.BadParameter(
-            f'No fractal node at {node._root}. Run `fractal init` first.'
+            f'No fractal node at {node.worktree}. Run `fractal init` first.'
         )
     return node
 
 
-def resolve_target(path: Union[str, pathlib.Path], node: Optional[str] = None) -> Node:
+def resolve_user_node(path: PathLike) -> Node:
+    """Resolve the tree's user (root) node from any checkout, by config not branch.
+
+    The tree-wide brake (``pause``/``resume``) must always anchor on the user
+    node, but :func:`resolve_node` keys on the repo's *current* branch -- so on
+    a non-init checkout (the user on their own branch while nodes run) it
+    silently mis-scopes to a lone child or dies on two. Scan the repo's fractal
+    data dirs (top-level and each sub-project) for the ``config.json`` marked
+    ``user: true`` and pin a ``Node`` to that branch, independent of the git
+    checkout.
+
+    Args:
+        path: Any path inside the repo.
+
+    Returns:
+        The user (root) node, branch-pinned.
+
+    Raises:
+        typer.BadParameter: If the repo has no user node (no fractal).
+
+    """
+    repo = Node(path).repo_dir
+    # the user config lives at <repo>/[<project>/].fractal/<branch>/config.json;
+    # check the top level first, then each sub-project dir
+    fractal_dirs = [repo / FRACTAL_FOLDER]
+    fractal_dirs += [
+        sub / FRACTAL_FOLDER
+        for sub in sorted(repo.iterdir())
+        if sub.is_dir() and sub.name != WORKTREES_FOLDER
+    ]
+    for fractal_dir in fractal_dirs:
+        if not fractal_dir.is_dir():
+            continue
+        for config_path in sorted(fractal_dir.glob(f'*/{CONFIG_FILE}')):
+            try:
+                config = json.loads(config_path.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if config.get('user'):
+                # the worktree is the fractal dir's parent (<repo> or
+                # <repo>/<project>); the branch is the config dir's name
+                return Node(fractal_dir.parent, branch=config_path.parent.name)
+    raise typer.BadParameter(
+        f'No user node found under {repo}. Run `fractal init` at the repo root.'
+    )
+
+
+def resolve_target(path: PathLike, node: Optional[str] = None) -> Node:
     """Resolve the node to act on, anchored at the caller's worktree.
 
     ``path`` identifies the caller's own worktree (default cwd); ``node``,
@@ -602,33 +553,87 @@ def resolve_target(path: Union[str, pathlib.Path], node: Optional[str] = None) -
     # resolve target node
     if node:
         # resolve absolute anchor path
-        path = pathlib.Path(path)
-        if not path.is_absolute():
-            path = pathlib.Path.cwd() / path
-        path = path.resolve()
+        path = _absolute(path)
         # locate the named node's worktree within the same repo
-        repo_dir = Node(path)._repo_dir
-        worktree_dir = _find_worktree(repo_dir, node)
+        repo_dir = Node(path).repo_dir
+        worktree_dir = fractal.util.git.find_worktree(repo_dir, node)
         if worktree_dir is None:
             # accept a unique short name (trailing branch segment) by
             # resolving it against the caller's registered nodes
             node = _resolve_node_name(path, node)
-            worktree_dir = _find_worktree(repo_dir, node)
+            worktree_dir = fractal.util.git.find_worktree(repo_dir, node)
         if worktree_dir is None:
-            raise typer.BadParameter(f'No node found for branch: {node!r}')
+            raise typer.BadParameter(f'No node found for branch: {node!r}.')
         target = Node(worktree_dir)
     else:
         target = resolve_node(path)
     # require an initialized node at the resolved target
     if target.exists():
         return target
-    raise typer.BadParameter(f'No fractal node at {target._root}.')
+    raise typer.BadParameter(f'No fractal node at {target.worktree}.')
+
+
+def resolve_ledger_target(
+    path: PathLike,
+    node: Optional[str],
+) -> tuple[Node, Optional[str], Optional[int]]:
+    """Resolve a cost-ledger target, answering for deleted branches.
+
+    A live target resolves normally as ``(node, None, None)``. A deleted
+    branch fails resolution while its recorded history persists in the
+    shared db, so it resolves through the caller as
+    ``(caller, branch, latest_run)`` -- how the fallback applies stays per
+    command (``remaining`` reports ``no budget`` without delegating;
+    ``spent``/``breakdown`` substitute ``latest_run`` for an absent scope).
+
+    Args:
+        path: Caller's worktree directory (absolute or relative).
+        node: Target node's branch name, or ``None`` for the caller.
+
+    Returns:
+        ``(node, deleted, latest_run)`` -- the resolved target, the deleted
+        branch name (``None`` for a live target), and the deleted branch's
+        latest recorded run id.
+
+    Raises:
+        typer.BadParameter: If resolution fails and the branch never
+            recorded a run (there is no history to answer from).
+
+    """
+    # a deleted branch fails resolution: answer through the caller (shared db)
+    # when it has a recorded run, keep the not-found error when it never ran
+    try:
+        return resolve_target(path, node), None, None
+    except typer.BadParameter:
+        if node is None:
+            raise
+        caller = resolve_node(path)
+        latest = caller.record.run_latest(branch=node)
+        if latest is None:
+            raise
+        return caller, node, latest
 
 
 # ------ helper functions
 
 
-def _resolve_node_name(path: Union[str, pathlib.Path], name: str) -> str:
+def _absolute(path: PathLike) -> pathlib.Path:
+    """Resolve a path argument to an absolute path (anchored at the cwd).
+
+    Args:
+        path: Path to absolutize (absolute or relative).
+
+    Returns:
+        The resolved absolute path.
+
+    """
+    path = pathlib.Path(path)
+    if not path.is_absolute():
+        path = pathlib.Path.cwd() / path
+    return path.resolve()
+
+
+def _resolve_node_name(path: PathLike, name: str) -> str:
     """Resolve a short node name to a full branch name.
 
     When ``name`` is not already a full branch with a worktree, match it
@@ -652,8 +657,8 @@ def _resolve_node_name(path: Union[str, pathlib.Path], name: str) -> str:
     rows = caller.list(all_nodes=True)
     matches = []
     for row in rows:
-        *_, name_ = row['node'].rsplit('.', 1)
-        if name_ == name:
+        *_, leaf = row['node'].rsplit('.', 1)
+        if leaf == name:
             matches.append(row['node'])
     if len(matches) == 1:
         return matches[0]
@@ -663,505 +668,3 @@ def _resolve_node_name(path: Union[str, pathlib.Path], name: str) -> str:
             f'Ambiguous node name {name!r} (matches: {options}). Use the full branch.'
         )
     return name
-
-
-def _record_session(
-    node: Optional[Node],
-    *,
-    step_id: Optional[int],
-    agent: str,
-    model: Optional[str],
-    session: str,
-    detached: bool,
-) -> None:
-    """Stamp a step's model and real session, and optionally persist for resume.
-
-    The real, agent-specific session is always written to the step row -- so it
-    is resumable later (chat mode) and groups an agent's cost-delta. When not
-    ``detached``, it is also persisted to ``.session`` so the next step in the
-    same continuous session can resume it.
-    """
-    if node is None:
-        return
-    if step_id is not None:
-        node.step_session(agent, step_id=step_id, model=model, session=session)
-    if not detached:
-        node.session_set(agent, session)
-
-
-# ------ helper functions (git)
-
-
-def _git_toplevel(path: pathlib.Path) -> Optional[pathlib.Path]:
-    """Return the git worktree root for ``path``, or ``None`` on failure."""
-    try:
-        result = subprocess.run(
-            ['git', 'rev-parse', '--show-toplevel'],
-            cwd=path,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            toplevel = pathlib.Path(result.stdout.strip()).resolve()
-            if toplevel != path:
-                return toplevel
-    except OSError:
-        pass
-    return None
-
-
-def _resolve_branch(path: pathlib.Path) -> Optional[str]:
-    """Return the current branch name for a repo, or ``None`` on failure."""
-    try:
-        result = subprocess.run(
-            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-            cwd=path,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-    except OSError:
-        pass
-    return None
-
-
-# ------ helper functions (claude stream)
-
-_TOOL_RESULT_MAX = 200
-_DIM = '\033[2m'
-_RESET = '\033[0m'
-_BLUE = '\033[34m'
-_YELLOW = '\033[33m'
-
-
-def _render_claude_stream(
-    node: Optional[Node],
-    *,
-    step_id: Optional[int] = None,
-    model: Optional[str] = None,
-    detached: bool = False,
-    input: IO[str] = sys.stdin,
-) -> Optional[str]:
-    """Render Claude stream-json output and record cost."""
-    streaming_text = False
-    session_recorded = False
-    captured_session = None
-    accumulated_cost = None
-
-    for line in input:
-        if line := line.strip():
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-        else:
-            continue
-
-        # capture the real session (carried on every claude event); prefer the
-        # stream-reported model over the configured one, so a defaulted spawn
-        # (no --model) still stamps a recoverable model
-        if not session_recorded:
-            session = message.get('session_id')
-            if session:
-                captured_session = session
-                model_ = message.get('model') or model
-                _record_session(
-                    node=node,
-                    step_id=step_id,
-                    agent='claude',
-                    model=model_,
-                    session=session,
-                    detached=detached,
-                )
-                session_recorded = True
-
-        message_type = message.get('type')
-
-        # assistant text deltas
-        if message_type == 'stream_event':
-            streaming_text = _handle_stream_event(message, streaming_text)
-
-        # tool results
-        elif message_type == 'user':
-            _handle_user(message)
-            if streaming_text:
-                streaming_text = False
-
-        # assistant messages -- accumulate best-effort cost (a killed/timed-out
-        # agent never emits its result frame)
-        elif message_type == 'assistant':
-            accumulated_cost = _record_assistant_cost(
-                message,
-                node,
-                step_id,
-                model=model,
-                accumulated=accumulated_cost,
-            )
-
-        # result summary
-        elif message_type == 'result':
-            if streaming_text:
-                print()
-                streaming_text = False
-            _handle_result(message, node, step_id)
-
-    if streaming_text:
-        print()
-    return captured_session
-
-
-def _handle_stream_event(message: dict[str, Any], streaming_text: bool) -> bool:
-    """Handle a ``stream_event`` message.
-
-    Returns:
-        Updated ``streaming_text`` state.
-
-    """
-    event = message.get('event', {})
-    event_type = event.get('type')
-
-    if event_type == 'content_block_start':
-        block = event.get('content_block', {})
-        if block.get('type') == 'tool_use':
-            if streaming_text:
-                print()
-                streaming_text = False
-            name = block.get('name', '?')
-            print(f'\n{_DIM}{_BLUE}> {name}{_RESET}', end='', flush=True)
-        elif block.get('type') == 'text':
-            print('\n', end='', flush=True)
-
-    elif event_type == 'content_block_delta':
-        delta = event.get('delta', {})
-        delta_type = delta.get('type')
-        if delta_type == 'text_delta':
-            print(delta.get('text', ''), end='', flush=True)
-            streaming_text = True
-
-    return streaming_text
-
-
-def _handle_user(message: dict[str, Any]) -> None:
-    """Handle a ``user`` message (tool results)."""
-    content = message.get('message', {}).get('content', [])
-    for item in content:
-        if isinstance(item, dict) and item.get('type') == 'tool_result':
-            # extract text from tool result
-            result = item.get('content', '')
-            if isinstance(result, list):
-                parts = []
-                for block in result:
-                    if isinstance(block, dict) and block.get('type') == 'text':
-                        parts.append(block.get('text', ''))
-                result = '\n'.join(parts)
-            if not isinstance(result, str):
-                if result is not None:
-                    print(
-                        f'\n{_YELLOW}unexpected tool_result type:'
-                        f' {type(result).__name__}{_RESET}',
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    result = str(result)
-                else:
-                    result = ''
-            # truncate preview for display
-            if result:
-                lines = result.split('\n')
-                preview = '\n'.join(lines[:8])
-                if len(preview) > _TOOL_RESULT_MAX:
-                    preview = preview[:_TOOL_RESULT_MAX] + '...'
-                # a char-truncated preview that also has more than
-                # 8 lines must still show the "more lines" signal
-                if len(lines) > 8:
-                    preview += '\n...'
-                is_error = item.get('is_error', False)
-                color = _YELLOW if is_error else _DIM
-                label = ' (error)' if is_error else ''
-                print(f'\n{color}{preview}{label}{_RESET}', end='', flush=True)
-
-
-def _handle_result(
-    message: dict[str, Any],
-    node: Optional[Node],
-    step_id: Optional[int],
-) -> None:
-    """Handle a ``result`` message (end-of-session summary)."""
-    # coalesce a present-but-null duration_ms to 0.0 -- the key can be
-    # explicitly null on some result frames, and `0.001 * None` raises
-    duration = 0.001 * (message.get('duration_ms') or 0.0)
-    cost = message.get('total_cost_usd')
-    turns = message.get('num_turns', 0)
-    cost_str = f'${cost:.4f}' if cost is not None else '$?'
-    print(f'\n{_DIM}-- {turns} turns, {duration:.1f}s, {cost_str}{_RESET}')
-    # record cost (claude's total_cost_usd is per-invocation: each
-    # --resume reports its own turns, not the thread's running total)
-    if node is not None and step_id is not None and cost is not None:
-        node.step_cost(step_id=step_id, cost=cost)
-    # a --max-budget-usd hit (claude) is a clean budget stop, not an agent error
-    # even though claude exits non-zero; drop a marker so _agent.sh tells them apart
-    if message.get('subtype') == 'error_max_budget_usd':
-        node_dir = os.environ.get('NODE_DIR')
-        if node_dir:
-            try:
-                (pathlib.Path(node_dir) / '.budget_exceeded').touch()
-            except OSError:
-                pass
-
-
-def _record_assistant_cost(
-    message: dict[str, Any],
-    node: Optional[Node],
-    step_id: Optional[int],
-    *,
-    model: Optional[str],
-    accumulated: Optional[float],
-) -> Optional[float]:
-    """Accumulate an assistant message's priced usage and flush it.
-
-    Claude's ``result`` frame is the authoritative cost record, but a killed
-    or timed-out agent never emits one -- so each assistant message's usage
-    is priced as it arrives and the running total flushed to the step row
-    per event (``_stream`` itself can die by signal). The eventual result
-    overwrites the estimate with claude's own figure.
-
-    Returns:
-        The updated running total, or the prior one when the message
-        carries no usage or the model cannot be priced.
-
-    """
-    usage = message.get('message', {}).get('usage')
-    if not usage:
-        return accumulated
-    cost = _compute_claude_cost(usage, model)
-    if cost is None:
-        return accumulated
-    total = (accumulated or 0.0) + cost
-    if node is not None and step_id is not None:
-        node.step_cost(step_id=step_id, cost=total)
-    return total
-
-
-def _compute_claude_cost(
-    usage: dict[str, Any],
-    model: Optional[str] = None,
-) -> Optional[float]:
-    """Compute cost from claude token usage and LiteLLM pricing.
-
-    Returns ``None`` if the model is unknown or unpriced. The usage shape
-    is Anthropic-specific: ``input_tokens`` EXCLUDES the cache buckets
-    (``cache_creation_input_tokens``/``cache_read_input_tokens`` are
-    disjoint, each priced at its own rate), and every assistant message
-    reports its own API call -- per-call costs sum to the invocation
-    total, unlike codex's cumulative snapshots.
-    """
-    if model is None:
-        return None
-    # look up per-token rates (missing cache rates fall back to the input rate)
-    pricing = _load_pricing()
-    rates = pricing.get(model)
-    if rates is None:
-        return None
-    # a model present without rate keys cannot be priced -- report unknown, not $0
-    if ('input_cost_per_token' not in rates) and ('output_cost_per_token' not in rates):
-        return None
-    input_rate = rates.get('input_cost_per_token', 0.0)
-    cache_read_rate = rates.get('cache_read_input_token_cost', input_rate)
-    cache_creation_rate = rates.get('cache_creation_input_token_cost', input_rate)
-    output_rate = rates.get('output_cost_per_token', 0.0)
-    input_tokens = usage.get('input_tokens', 0.0)
-    cache_read_tokens = usage.get('cache_read_input_tokens', 0.0)
-    cache_creation_tokens = usage.get('cache_creation_input_tokens', 0.0)
-    output_tokens = usage.get('output_tokens', 0.0)
-    return (
-        input_tokens * input_rate
-        + cache_read_tokens * cache_read_rate
-        + cache_creation_tokens * cache_creation_rate
-        + output_tokens * output_rate
-    )
-
-
-# ------ helper functions (codex stream)
-
-_PRICING_URL = (
-    'https://raw.githubusercontent.com/BerriAI/litellm'
-    '/main/model_prices_and_context_window.json'
-)
-_PRICING_CACHE = '~/.fractal/pricing.json'
-
-
-@functools.cache
-def _load_pricing() -> dict[str, Any]:
-    """Load cached pricing data (once per process).
-
-    The cache is populated at run start by ``fractal _pricing``, but only for
-    token-priced agents (``needs_pricing``); claude's best-effort accrual reads
-    it opportunistically, so a missing or corrupt cache degrades to no pricing
-    (streams record unpriced, never crash mid-step).
-    """
-    cache = pathlib.Path(_PRICING_CACHE).expanduser()
-    try:
-        with open(cache) as file:
-            return json.load(file)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _compute_codex_cost(
-    usage: dict[str, Any],
-    model: Optional[str] = None,
-) -> Optional[float]:
-    """Compute cost from codex token usage and LiteLLM pricing.
-
-    Returns ``None`` if the model is unknown or unpriced. The usage shape is
-    codex/OpenAI-specific (see the note below) -- a future token-reporting agent
-    on a different convention needs its own cost helper.
-    """
-    if model is None:
-        return None
-    # look up per-token rates (cached input falls back to the input rate)
-    pricing = _load_pricing()
-    rates = pricing.get(model)
-    if rates is None:
-        return None
-    # a model present without rate keys cannot be priced -- report unknown, not $0
-    if ('input_cost_per_token' not in rates) and ('output_cost_per_token' not in rates):
-        return None
-    input_rate = rates.get('input_cost_per_token', 0.0)
-    cached_rate = rates.get('cache_read_input_token_cost', input_rate)
-    output_rate = rates.get('output_cost_per_token', 0.0)
-    # NOTE: codex follows the OpenAI usage convention: cached_input_tokens
-    #   is a subset of input_tokens and reasoning is folded into output_tokens
-    #   (total = input + output), so non-cached input is input - cached and
-    #   output is priced once so adding reasoning would double-count
-    input_tokens = usage.get('input_tokens', 0.0)
-    cached_tokens = usage.get('cached_input_tokens', 0.0)
-    output_tokens = usage.get('output_tokens', 0.0)
-    # floor at 0: cached is a subset of input, but this is external stream data
-    uncached = max(0.0, input_tokens - cached_tokens)
-    return (
-        uncached * input_rate
-        + cached_tokens * cached_rate
-        + output_tokens * output_rate
-    )
-
-
-def _render_codex_stream(
-    node: Optional[Node],
-    *,
-    step_id: Optional[int] = None,
-    model: Optional[str] = None,
-    detached: bool = False,
-    input: IO[str] = sys.stdin,
-) -> Optional[str]:
-    """Render codex JSONL output and record cost."""
-    cumulative_cost = None
-    error_detail = None
-    captured_session = None
-
-    for line in input:
-        if line := line.strip():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-        else:
-            continue
-
-        event_type = event.get('type')
-
-        # capture the real session (codex calls it a thread id) for resume + cost grouping
-        if event_type == 'thread.started':
-            session = event.get('thread_id')
-            if session:
-                captured_session = session
-                _record_session(
-                    node=node,
-                    step_id=step_id,
-                    agent='codex',
-                    model=model,
-                    session=session,
-                    detached=detached,
-                )
-
-        # agent messages
-        elif event_type == 'item.completed':
-            item = event.get('item', {})
-            if item.get('type') == 'agent_message':
-                text = item.get('text', '')
-                if text:
-                    print(text, flush=True)
-
-        # turn summary -- codex usage is cumulative per thread and only grows,
-        # so keep the max: a zero/empty terminal usage frame (codex emits
-        # usage:{} on some error/cancel paths) must not reset the running total
-        # and drive the per-step delta negative; flush per turn so a stream
-        # killed by signal still has the last increment recorded
-        elif event_type == 'turn.completed':
-            usage = event.get('usage', {})
-            cost = _compute_codex_cost(usage, model)
-            if cost is not None and (cumulative_cost is None or cost > cumulative_cost):
-                cumulative_cost = cost
-                _record_codex_cost(node, step_id, cumulative_cost)
-
-        # surface errors -- codex reports these on the JSON stream, not stderr,
-        # so without this a failed turn leaves no explanation in the output
-        elif event_type in ('error', 'turn.failed'):
-            error = event.get('error')
-            detail = (
-                event.get('message')
-                or (error.get('message') if isinstance(error, dict) else error)
-                or 'unknown error'
-            )
-            print(
-                f'{_YELLOW}codex error: {detail}{_RESET}',
-                file=sys.stderr,
-                flush=True,
-            )
-            error_detail = detail
-
-    # print summary, then record the final cost increment (idempotent with the
-    # per-turn flushes above -- the last flush already wrote this figure)
-    cost_str = f'${cumulative_cost:.4f}' if cumulative_cost is not None else '$?'
-    print(f'\n{_DIM}-- {cost_str}{_RESET}')
-    if cumulative_cost is not None:
-        _record_codex_cost(node, step_id, cumulative_cost)
-
-    # a codex error/turn.failed must fail the step (else it records completed/exit 0)
-    if error_detail is not None:
-        raise RuntimeError(f'codex reported an error: {error_detail}')
-    return captured_session
-
-
-def _record_codex_cost(
-    node: Optional[Node],
-    step_id: Optional[int],
-    cumulative_cost: float,
-) -> None:
-    """Record a step's cost increment from the cumulative thread total.
-
-    Codex usage is cumulative per thread and continuous steps resume one
-    thread, so subtract prior steps sharing this session (a detached step
-    has its own thread, so the delta is the full cost).
-    """
-    if node is None or step_id is None:
-        return
-    rows = node.db.read('steps', where={'step_id': step_id}, limit=1)
-    session = rows[0].get('session') if rows else None
-    cost = cumulative_cost
-    if session is not None:
-        siblings = node.db.read(
-            'steps',
-            where={'session': session, 'node': node._branch},
-        )
-        prior = sum(
-            row['cost']
-            for row in siblings
-            if row['step_id'] != step_id and row['cost'] is not None
-        )
-        # clamp at 0: a step can't have negative spend, and a negative delta
-        # (price change mid-run, an un-recorded prior step) would otherwise be
-        # stored and poison the next step's prior-sibling subtraction
-        cost = max(0.0, cumulative_cost - prior)
-    node.step_cost(step_id=step_id, cost=cost)

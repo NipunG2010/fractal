@@ -1,17 +1,17 @@
 """Per-iteration cost cap (``max_iter_cost``) enforcement in the run loop.
 
-The loop (``_run.sh``) parses, stores, reads, and *displays* ``--max-iter-cost``
+The loop parses, stores, reads, and *displays* ``--max-iter-cost``
 -- but it must also **enforce** it: when an iteration's accrued spend reaches the
 cap, the remaining steps are steered to ``RESERVE.md`` (the same soft-cap
 steering the cumulative ``max_cost`` drain already applies), never auto-stopping.
 
-``_run.sh``'s budget logic is unreachable except through the loop and the script
-cannot be sourced (interleaved module-scope git/config/validation that
-``exit``s), so this drives the real ``_run.sh`` as a subprocess against a real
+The loop's budget logic is observable only through a real launch, so this
+drives the real ``fractal node _loop`` as a subprocess against a real
 node with a **stubbed ``claude``** -- the smallest hermetic harness: one
 iteration, two steps, no real API calls and no recursion. The stub captures each
 step's prompt and emits a ``stream-json`` ``result`` event carrying a fixed cost
-so ``fractal _stream`` records the step's spend, exactly as a real run would.
+so the loop's stream driver records the step's spend, exactly as a real run
+would.
 
 The observable effect of the cap is that the step *after* the cap is hit
 receives ``RESERVE.md`` appended to its prompt. Step 1 always runs before any
@@ -29,7 +29,7 @@ import pytest
 
 from tests._helpers import _git
 
-from .conftest import _cli_env, _run, _run_reaped, _worktree_root
+from .conftest import _cli_env, _loop_cmd, _run, _run_reaped
 
 __all__ = [
     'test_iter_cost_cap_steers_to_reserve',
@@ -40,12 +40,9 @@ __all__ = [
 # when the loop has flipped the node into reserve (budget) mode
 RESERVE_MARKER = 'Reserve Mode'
 
-# the loop machinery runs from the package, not a per-node copy -- invoke the dev
-# _run.sh directly (it resolves _agent.sh/_commit.sh/modes from the package)
-_LOOP = _worktree_root() / 'fractal' / '_node' / 'scripts' / '_run.sh'
 
 # fake claude on PATH: capture the -p prompt per invocation, then emit a
-# stream-json result carrying $STUB_COST so fractal _stream records the cost
+# stream-json result carrying $STUB_COST so the loop records the cost
 _CLAUDE_STUB = """#!/usr/bin/env bash
 # test stub for claude: capture the -p prompt to a per-call file and emit a
 # stream-json result event so the loop records this step's cost
@@ -63,7 +60,7 @@ done
 PROMPT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -p) PROMPT="${2:-}"; shift 2 ;;
+        --) PROMPT="${2:-}"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -81,12 +78,14 @@ printf '{"type":"result","session_id":"%s","total_cost_usd":%s,"num_turns":1,"du
 
 @pytest.fixture(scope='module')
 def node_env(tmp_path_factory: pytest.TempPathFactory) -> dict:
-    """A real worker node wired for a single, deterministic loop iteration.
+    """Return a real worker node wired for a single, deterministic loop iteration.
 
     Built once (node init is expensive): ``fractal init`` + a ``claude`` worker
     capped at one iteration with sync disabled, its steps replaced by two
     trivial files so the loop makes exactly two agent calls, and a stub
-    ``claude`` on a private bindir.
+    ``claude`` on a private bindir. Every case funnels through ``_run_loop``,
+    which resets the budget caps and uses a fresh capture dir on entry, so
+    cases never inherit a prior run's state.
     """
     root = tmp_path_factory.mktemp('iter_cost')
     _git(root, 'init', '-b', 'main')
@@ -125,7 +124,7 @@ def node_env(tmp_path_factory: pytest.TempPathFactory) -> dict:
         step.unlink()
     (steps_dir / '01-alpha.md').write_text('# Alpha\n\nFirst step.\n', encoding='utf-8')
     (steps_dir / '02-beta.md').write_text('# Beta\n\nSecond step.\n', encoding='utf-8')
-    # the loop runs from the package (see _LOOP), not a per-node copy
+    # the loop runs from the package (see _loop_cmd), not a per-node copy
     # stub claude on a private bindir
     bindir = root / 'bin'
     bindir.mkdir()
@@ -139,11 +138,12 @@ def node_env(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 @pytest.mark.parametrize(
-    ('max_iter_cost', 'stub_cost', 'expect_reserve'),
-    [
+    argnames=('max_iter_cost', 'stub_cost', 'expect_reserve'),
+    argvalues=[
         (0.05, 0.10, True),  # iteration spend $0.10 reaches the $0.05/iter cap
         (10.0, 0.001, False),  # iteration spend $0.001 stays under the $10/iter cap
     ],
+    ids=['reaches_cap', 'under_cap'],
 )
 def test_iter_cost_cap_steers_to_reserve(
     node_env: dict,
@@ -166,11 +166,12 @@ def test_iter_cost_cap_steers_to_reserve(
 
 
 @pytest.mark.parametrize(
-    ('reserve_budget', 'stub_cost', 'expect_reserve'),
-    [
+    argnames=('reserve_budget', 'stub_cost', 'expect_reserve'),
+    argvalues=[
         (0.5, 0.6, True),  # after step 1, remaining $0.4 <= $0.5 reserve (still > 0)
         (0.5, 0.1, False),  # after step 1, remaining $0.9 > $0.5 reserve
     ],
+    ids=['within_reserve', 'above_reserve'],
 )
 def test_reserve_budget_steers_below_buffer(
     node_env: dict,
@@ -216,7 +217,7 @@ def _run_loop(
 
     Sets the given caps for this run and clears the unset ones (the module node
     is shared, so each case starts from a known budget state), runs the real
-    ``_run.sh`` with the stub ``claude`` on ``PATH``, and returns
+    loop entry with the stub ``claude`` on ``PATH``, and returns
     ``{step_number: prompt_text}``.
     """
     root = node_env['root']
@@ -228,7 +229,8 @@ def _run_loop(
         ('max_cost', max_cost),
         ('reserve_budget', reserve_budget),
     ):
-        setting = f'{key}={value if value is not None else "null"}'
+        setting_value = value if value is not None else 'null'
+        setting = f'{key}={setting_value}'
         assert _run(worktree, 'config', '_set', setting).returncode == 0
     # fresh capture dir per run so prompt files do not bleed across cases
     capture = root / f'capture_{max_iter_cost}_{max_cost}_{reserve_budget}_{stub_cost}'
@@ -238,9 +240,11 @@ def _run_loop(
     # run the loop directly (no tmux): stub claude shadows PATH, the loop's own
     # fractal calls resolve to this worktree (PYTHONPATH via _cli_env)
     env = _cli_env(CAPTURE_DIR=f'{capture}', STUB_COST=str(stub_cost))
-    env['PATH'] = f'{node_env["bindir"]}{os.pathsep}{env["PATH"]}'
+    bindir = node_env['bindir']
+    path = env['PATH']
+    env['PATH'] = f'{bindir}{os.pathsep}{path}'
     result = _run_reaped(
-        ['bash', f'{_LOOP}', f'{worktree}'],
+        _loop_cmd(worktree),
         cwd=f'{worktree}',
         env=env,
         timeout=180,

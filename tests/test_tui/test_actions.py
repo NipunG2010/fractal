@@ -25,7 +25,7 @@ __all__ = [
 
 @pytest.fixture
 def stack(pair_tree: pathlib.Path) -> tuple[TuiData, TuiActions, SnapshotBuilder]:
-    """The write stack over the pair tree: data + actions + builder."""
+    """Return a fresh write stack over the pair tree: data + actions + builder."""
     data = TuiData(resolve_node(pair_tree))
     data.refresh_worktrees()
     return data, TuiActions(data), SnapshotBuilder(data, NodePoller(data.db_dir))

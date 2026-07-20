@@ -8,51 +8,75 @@ description: The wiki CLI and the node's two knowledge bases -- project wiki and
 A wiki is an indexed folder tree of `_index.md` files. A node works with
 two:
 
-- **Project wiki** (`$WIKI_DIR`) — shared across nodes; per-branch,
+- **Project wiki** (`$WIKI_DIR`) -- shared across nodes; per-branch,
   reaching others only through merges (use `fractal radio` for live
   coordination). Holds architecture, conventions, and patterns;
   contribute durable project-wide knowledge here.
-- **Memory** (`$MEMORY_DIR`) — this node's private knowledge base. See
+- **Memory** (`$MEMORY_DIR`) -- this node's private knowledge base. See
   the `memory` skill for how to maintain it.
 
 Todo lists follow the same split: a private working checklist lives in
 memory; a task list other nodes should see and track lives in the
-project wiki. Either way it is living state — current open items, pruned
-as they complete — never an append-only log.
+project wiki. Either way it is living state -- current open items,
+pruned as they complete -- never an append-only log.
 
 Run `wiki --help` and `wiki <command> --help` for the CLI (init, update,
 lint, map, search, read). Always pass `--path` (`$WIKI_DIR` or
-`$MEMORY_DIR`) — the wiki CLI does not walk up to find a wiki from the
-node directory. Run `wiki update --path=<dir>` after adding, moving, or
+`$MEMORY_DIR`) -- a bare command resolves the enclosing wiki by walking
+up, else `{cwd}/wiki`, which from the node's cwd is the project wiki at
+best and never memory, so an omitted `--path` silently targets the wrong
+wiki or errors. Run `wiki update --path=<dir>` after adding, moving, or
 deleting pages; `wiki lint --path=<dir>` validates structure.
 
 ## Editing discipline
 
+Name pages and folders in ascii snake_case (`command_core`, not
+`command-core`) -- both wikis enforce identifier-safe names (the project
+wiki's mirror the source modules they document), so `wiki lint` rejects
+hyphens and spaces.
+
 `wiki update` regenerates derived state: each page's entry line in
 `_index.md` (name and description) is pulled from the page's own
-frontmatter, so fix a `desc:` on the page and rerun update — hand edits
-to an index line are overwritten by the next update. `wiki lint` is
-regenerate-and-compare: it prints the diff `wiki update` would apply
-plus any real defects, and separates issues (must fix) from advisory
-notes. Work the loop — edit pages, `wiki update`, `wiki lint` — until
-clean (clean = lint exits 0; scripts branch on the exit code, not the
-prose summary); lint validates structure, not content truth, so verify
-facts against your sources yourself.
+frontmatter, so fix a `desc:` on the page and rerun update -- hand edits
+to an index line are overwritten by the next update, and each page's H1
+is rewritten to its name unless an authored frontmatter `title:`
+supplies the heading, which update keeps and renders as the H1 (index
+entry lines still show the name). `wiki lint` is regenerate-and-compare:
+it prints the diff `wiki update` would apply plus any real defects, and
+separates issues (must fix) from advisory notes. Work the loop -- edit
+pages, `wiki update`, `wiki lint` -- until clean (clean = lint exits 0;
+scripts branch on the exit code, not the prose summary); lint validates
+structure, not content truth, so verify facts against your sources
+yourself.
 
 ## Cross-linking
 
-Cross-reference aggressively — the links between pages are the wiki's
-primary value — but **link only to pages that already exist.** Sibling
+Cross-reference aggressively -- the links between pages are the wiki's
+primary value -- but **link only to pages that already exist.** Sibling
 nodes build their pages in parallel, so a page you would link to may not
 exist yet: defer that forward link rather than emit a wikilink to a
 not-yet-created page. Stale sibling links are an expected transient, not
-a failure — the **parent** reconciles and prunes them when children
-merge up (it reruns `wiki update` and `wiki lint` during integration).
-`wiki lint`'s stale-link warnings on leaf bodies are non-blocking, so
-never stall an iteration chasing them.
+a failure -- `wiki lint` reports a stale link in index or page prose as
+an advisory note (exit 0), so never stall an iteration chasing them.
+Broken links in the generated index link block -- the rows `wiki update`
+maintains -- are the exception: each is a hard issue, fixed by repairing
+the target or removing the row with `wiki update --prune`. The
+**parent** reconciles stale sibling links when children merge up:
+indexes refresh mechanically at commit and merge, so its integration job
+is repairing or pruning what lint reports, not rerunning `wiki update`.
 
 Wikilinks also stay inside the wiki you are writing in. A `[[...]]` link
-targets another page in the same wiki; anything outside it — source
-files, configs, or the other knowledge base (project wiki vs. memory) —
+targets another page in the same wiki; anything outside it -- source
+files, configs, or the other knowledge base (project wiki vs. memory) --
 is referenced in plain text or backticks, never linked. `wiki lint`
-flags out-of-wiki wikilinks as stale.
+notes out-of-wiki wikilinks as stale.
+
+## Scale
+
+A large flat wiki shards into folders: move related pages into a
+subfolder and rerun `wiki update` -- indexes regenerate around the new
+layout, and inbound links the move broke surface as stale-link notes to
+repair. Before dumping a big tree, preflight with `wiki map --stat` (a
+one-line size summary of what the same flags would print) and bound the
+dump with `--depth` and `--desc-limit=<n>` -- descriptions print
+untruncated by default.

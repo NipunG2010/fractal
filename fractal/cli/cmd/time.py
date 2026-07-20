@@ -31,14 +31,11 @@ def time_remaining(app: typer.Typer) -> typer.Typer:
     ) -> None:
         """Print time left before the next timeout fires."""
         node = resolve_target(path, node)
-        remaining = node.time_remaining(scope=scope)
+        remaining = node.time.remaining(scope=scope)
         if remaining is None:
             # None countdown means no deadline is active for the queried
             # scope(s) -- all three by default, one under --scope
-            timeouts = ('timeout', 'iter_timeout', 'step_timeout')
-            if scope is not None:
-                timeouts = ('timeout' if scope == 'run' else f'{scope}_timeout',)
-            if not any(node.config_get(key) for key in timeouts):
+            if node.time.limit(scope) is None:
                 typer.echo('no limit')
             else:
                 typer.echo('not running')
