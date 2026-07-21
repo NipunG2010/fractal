@@ -16,11 +16,6 @@ dependencies = [
     "plasma-fractal==1.0.0",
 ]
 
-[project.optional-dependencies]
-tui = [
-    "plasma-fractal[tui]==1.0.0",
-]
-
 [project.urls]
 Homepage = "https://github.com/plasma-ai/fractal"
 Repository = "https://github.com/plasma-ai/fractal"

@@ -9,17 +9,11 @@ node's agent session, and attach to a node's terminal. Everything else is
 read-only: the cockpit continuously polls the tree and writes only on those
 explicit actions, always as the user (root) node.
 
-Installation and launch
------------------------
+Launch
+------
 
-The TUI is an optional extra. Install it alongside the package:
-
-.. code-block:: console
-
-   $ pip install 'plasma-fractal[tui]'
-
-Without the extra, ``fractal open`` fails with an install hint. Then, from
-anywhere inside an initialized repository:
+The TUI ships with the package. From anywhere inside an initialized
+repository:
 
 .. code-block:: console
 

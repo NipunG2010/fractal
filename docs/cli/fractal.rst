@@ -226,8 +226,7 @@ Refuses when:
    $ fractal open [NODE] [--path <dir>] [--light | --dark]
 
 Open the TUI cockpit (see :doc:`/tui`), anchored on the tree's user node
-and focused on the given node. The TUI is an optional extra: without it the
-command errors and points at ``pip install 'plasma-fractal[tui]'``.
+and focused on the given node.
 
 ``NODE``
    Node branch to focus; a unique trailing segment resolves. Default: the
@@ -243,8 +242,8 @@ command errors and points at ``pip install 'plasma-fractal[tui]'``.
    Open with the dark palette — the default. Mutually exclusive with
    ``--light``.
 
-Refuses when ``--light`` and ``--dark`` are combined, when the optional
-``tui`` extra is not installed, or when the tree has no user node.
+Refuses when ``--light`` and ``--dark`` are combined, or when the tree has
+no user node.
 
 .. code-block:: console
 

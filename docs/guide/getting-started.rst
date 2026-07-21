@@ -37,12 +37,6 @@ separately; with ``uv``, one command covers both:
 
    $ uv tool install plasma-fractal --with-executables-from plasma-wiki
 
-The terminal UI is an optional extra:
-
-.. code-block:: console
-
-   $ pip install 'plasma-fractal[tui]'
-
 Agent skills
 ~~~~~~~~~~~~
 
@@ -241,8 +235,7 @@ From cheapest to richest:
   tmux session (the node must be ``active``); detach with the standard tmux
   detach.
 - ``fractal open`` launches the TUI cockpit — the whole tree, radio traffic,
-  budgets, and event logs on one live screen (requires the ``tui`` extra);
-  see :doc:`/tui`.
+  budgets, and event logs on one live screen; see :doc:`/tui`.
 
 From the repo root, ``fractal node list`` tables every agent node under the
 root with its status, caps, and the age of its last activity, and

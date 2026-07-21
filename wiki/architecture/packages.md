@@ -77,9 +77,8 @@ loop in-process Python (`core/loop.py`), while the surrounding lifecycle
 ## The shim pointer dist
 
 `shim/` at the repo root holds a second, metadata-only PyPI dist named
-`fractal`: no code, just an exact `plasma-fractal==<version>` pin (and a
-matching pinned `tui` extra) that bumps in lockstep with every release.
-Installing `fractal` therefore installs `plasma-fractal`. The build workflow
-gates and builds the shim alongside the main package, and the publish job
-uploads both dists — both PyPI projects trust the same repository, workflow
-file, and environment as their publisher.
+`fractal`: no code, just an exact `plasma-fractal==<version>` pin that bumps in
+lockstep with every release. Installing `fractal` therefore installs
+`plasma-fractal`. The build workflow gates and builds the shim alongside the
+main package, and the publish job uploads both dists — both PyPI projects trust
+the same repository, workflow file, and environment as their publisher.

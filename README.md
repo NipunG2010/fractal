@@ -54,18 +54,6 @@ environment. If you use one of these two methods, you must also install
 `uv tool install plasma-fractal --with-executables-from plasma-wiki` does the
 same in one command.
 
-The terminal UI is optional. To include it, install the `tui` extra:
-
-```bash
-pip install 'plasma-fractal[tui]'
-```
-
-or
-
-```bash
-pip install 'fractal[tui]'
-```
-
 Open the dashboard from your project root with `fractal open` (requires an
 initialized fractal). Pass `--light` if your terminal uses a light color scheme.
 

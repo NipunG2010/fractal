@@ -310,15 +310,8 @@ def open(app: typer.Typer) -> typer.Typer:
         """Open the fractal TUI (the cockpit)."""
         if light and dark:
             raise typer.BadParameter('--light and --dark are mutually exclusive.')
-        # NOTE: import textual lazily: the TUI is an
-        #   optional extra and must stay off cold start
-        try:
-            from fractal.tui import FractalApp, theme
-        except ImportError as e:
-            raise RuntimeError(
-                f'The TUI needs the optional tui extra ({e}); install it'
-                " with `pip install 'plasma-fractal[tui]'` and re-run."
-            ) from None
+        # NOTE: import textual lazily: the TUI must stay off cold start
+        from fractal.tui import FractalApp, theme
 
         # the palette applies before the app constructs (the theme module's
         # tokens are read at render time, so one select re-skins everything)

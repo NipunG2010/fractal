@@ -40,11 +40,8 @@ two names are interchangeable:
 pip install fractal
 ```
 
-installs `plasma-fractal`. The `tui` extra applies as well:
-`pip install 'fractal[tui]'` installs `plasma-fractal[tui]`.
-
-Versions of `fractal` before 1.0.0 were an unrelated package from a previous
-owner of the name; the pointer begins at 1.0.0.
+installs `plasma-fractal`. Versions of `fractal` before 1.0.0 were an unrelated
+package from a previous owner of the name; the pointer begins at 1.0.0.
 
 ## License
 

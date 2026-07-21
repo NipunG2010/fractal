@@ -14,10 +14,11 @@ skill), `util/` (shared utilities), and the node machinery seeds — `_assets/`,
 `_node/`, and `_scripts/` — with the pytest suite in `tests/`.
 
 `shim/` holds the metadata-only `fractal` pointer dist for PyPI: no code, just
-exact `plasma-fractal==<version>` pins that bump in lockstep with every release
-surface. The build workflow gates and builds it alongside the main package, and
-the publish job uploads both dists — both PyPI projects must trust that workflow
-(same repository, workflow file, and environment) as their publisher.
+an exact `plasma-fractal==<version>` pin that bumps in lockstep with every
+release surface. The build workflow gates and builds it alongside the main
+package, and the publish job uploads both dists — both PyPI projects must trust
+that workflow (same repository, workflow file, and environment) as their
+publisher.
 
 `Node` delegates lifecycle operations to the `_scripts/` shell scripts via
 `subprocess.run()`. The iteration loop is in-process Python: `start.sh` execs

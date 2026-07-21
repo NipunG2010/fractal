@@ -226,8 +226,7 @@ def test_version_strings_agree() -> None:
         'shim/pyproject.toml [project] version must match fractal.__version__ '
         '(the pointer dist releases beside the package)'
     )
-    shim_pins = shim['dependencies'] + shim['optional-dependencies']['tui']
-    for pin in shim_pins:
+    for pin in shim['dependencies']:
         assert pin.endswith(f'=={fractal.__version__}'), (
             f'shim pin {pin!r} must pin plasma-fractal=={fractal.__version__} '
             '(the shim resolves to exactly the release it ships with)'

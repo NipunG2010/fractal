@@ -410,12 +410,7 @@ Once the node is running, briefly explain how to interact with it:
   and both are per-run, with no lifetime rollup.
 - **TUI:** For a live view of the whole tree — nodes, runs, costs, and output —
   suggest the user open the dashboard with `fractal open` (run from the repo
-  root). It needs the `tui` extra; if `fractal open` reports it missing, add the
-  extra with the manager used in Step 0 (e.g.
-  `pipx install --force 'plasma-fractal[tui]'` or
-  `uv tool install 'plasma-fractal[tui]' --with-executables-from plasma-wiki` —
-  pipx keeps `wiki` in its own untouched venv, while uv must restate the flag
-  because the reinstall replaces the tool env's exposed executables).
+  root).
 - **Stopping:** From the worktree, three escalation levels:
   - `fractal node finish` — stop after current iteration
   - `fractal node stop` — stop after current step

@@ -15,8 +15,5 @@ def __getattr__(name):
     if name == 'tui':
         import importlib
 
-        try:
-            return importlib.import_module('fractal.tui')
-        except ModuleNotFoundError as e:
-            raise AttributeError from e
+        return importlib.import_module('fractal.tui')
     raise AttributeError(name)

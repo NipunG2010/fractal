@@ -14,13 +14,9 @@ maintainers = [
 ]
 dependencies = [
     "plasma-wiki>=1,<2",
-    "typer>=0.24,<1",
-]
-
-[project.optional-dependencies]
-tui = [
-    "textual>=8,<9",
     "rich>=15,<16",
+    "textual>=8,<9",
+    "typer>=0.24,<1",
 ]
 
 [project.urls]

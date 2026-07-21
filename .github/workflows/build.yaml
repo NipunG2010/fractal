@@ -36,7 +36,7 @@ jobs:
           codex_version = json.load(open('.codex-plugin/plugin.json'))['version']
           cruft = json.load(open('.cruft.json'))['context']['cookiecutter']
           shim = tomllib.load(open('shim/pyproject.toml', 'rb'))['project']
-          shim_pins = shim['dependencies'] + shim['optional-dependencies']['tui']
+          shim_pins = shim['dependencies']
           versions = {
               '__version__': version,
               'pyproject.toml': project_version,
