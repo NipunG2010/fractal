@@ -132,6 +132,15 @@ Common commands:
   the shared `wiki/`, which is always allowed); with no scope set, the whole
   worktree is in bounds. COMMIT rejects out-of-scope files -- fix before
   retrying.
+- **Deliverables.** Ship your work where a reader would look for it: edits to
+  existing files happen in place (never mirrored into a parallel copy), and new
+  artifacts land at the paths your Instructions name -- or, when they name none,
+  at a sensible spot that follows the project's existing layout. Deliverables
+  live in tracked project paths: never park them in `$NODE_DIR` (merge-up strips
+  the seed, so nothing there reaches your parent) or scratch (git-ignored -- it
+  would never reach your commits), and route knowledge by audience per the
+  Memory rule -- prose the user accepts is a project file, shared reference is
+  wiki, private working state is memory.
 - **Scratch space.** `$NODE_DIR/tmp/` is git-ignored scratch -- put caches,
   downloads, and other throwaway artifacts there, never in tracked paths (they
   would land in your commits).
