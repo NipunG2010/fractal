@@ -804,7 +804,7 @@ class FractalApp(App):
             enter = enters.get(self.focus_id)
             if enter:
                 enter()
-                # repaint the border: the focus pane is now entered (coral)
+                # repaint the border: the focus pane is now entered (accent)
                 self.paint_ring()
             event.stop()
         elif key == 'q':
@@ -831,10 +831,10 @@ class FractalApp(App):
         self.paint_ring()
 
     def paint_ring(self: FractalApp) -> None:
-        """Paint the focus pane's border: ring-selected (grey) vs entered (coral).
+        """Paint the focus pane's border: ring-selected (grey) vs entered (accent).
 
         In ``ring`` mode the focus pane is merely selected -- a body-text-grey
-        cursor; once entered (any non-ring mode) it goes coral, so the border
+        cursor; once entered (any non-ring mode) it goes accent, so the border
         alone tells ring navigation apart from being inside a pane.
         """
         entered = self.mode != 'ring'

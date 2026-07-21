@@ -131,7 +131,7 @@ class RadioPane:
     def _filters(self: RadioPane) -> str:
         """Render the channel/show filter chips.
 
-        Each chip reserves its one-space padding in every state -- the coral
+        Each chip reserves its one-space padding in every state -- the accent
         box when focused, an invisible margin otherwise -- so moving the
         focus between the chips never shifts the row.
         """

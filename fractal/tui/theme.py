@@ -17,10 +17,10 @@ Two palettes share one key set: ``dark`` (the default, applied at import) and
 time, so one call before the app constructs re-skins the whole cockpit
 (``fractal open --light/--dark`` picks the palette).
 
-The muted grey is deliberately two tokens: the cool in-card muted is the Rich
+The muted grey is deliberately two tokens: the plain in-card muted is the Rich
 ``dim`` attribute (``DIM``) in the dark palette (a picked grey in the light
-one, where ``dim`` washes toward the background), the warm header/footer grey
-is ``CHROME``.
+one, where ``dim`` washes toward the background), the accent-tinted
+header/footer grey is ``CHROME``.
 """
 
 from __future__ import annotations
@@ -69,35 +69,38 @@ _DARK = {
     'DIM': 'dim',
 }
 
-# the light palette: the same keys (roles documented on _DARK) tuned for a
-# light terminal -- status hues darkened for contrast, text near-black, and
-# the selection washes darker than the surface instead of lighter
+# the light palette: the same keys (roles documented on _DARK) mirroring the
+# dark palette's relations on a light terminal -- status hues darkened for
+# contrast, text near-black, and the selection washes darker than the surface
+# instead of lighter. The accent is teal rather than coral (a warm accent
+# collides with the error red's hue on paper), so the near-grey neutral ramp
+# tints cool toward it, exactly as dark's tints warm toward coral
 _LIGHT = {
-    'PRIMARY': '#ab5f3e',
+    'PRIMARY': '#307988',
     'SUCCESS': '#5f7d42',
     'WARNING': '#96782f',
     'ERROR': '#a5433a',
-    'INK': '#2e2a25',
+    'INK': '#242a2d',
     'BG': 'ansi_default',
-    'SURFACE': '#ece7df',
-    'PANEL': '#e4ded4',
-    'INK_BRIGHT': '#1b1815',
-    'INK_INVERSE': '#f5efe6',
-    'CHROME': '#847d72',
-    'TITLE': '#6e675d',
-    'SEL': '#e0d6c8',
-    'ZONE': '#e8e2d8',
-    'LIT': '#d9c8b2',
-    'LIT_ACTIVE': '#cdb89e',
-    'TRACK': '#d8d2c8',
-    'BORDER': '#b5aea3',
-    'RULE': '#c2bbb0',
-    'OVERLAY': '#f0ebe3',
-    'SCROLL': '#b8b1a6',
-    'SCROLL_HOVER': '#a49d92',
-    'SCROLL_ACTIVE': '#8f887d',
+    'SURFACE': '#e2e7e9',
+    'PANEL': '#d7dee0',
+    'INK_BRIGHT': '#14181a',
+    'INK_INVERSE': '#eaf3f5',
+    'CHROME': '#727d83',
+    'TITLE': '#5e696e',
+    'SEL': '#cdd8db',
+    'ZONE': '#dce3e5',
+    'LIT': '#b2d1d7',
+    'LIT_ACTIVE': '#9ac4cb',
+    'TRACK': '#ccd3d6',
+    'BORDER': '#a4aeb2',
+    'RULE': '#b4bdc0',
+    'OVERLAY': '#e7ecee',
+    'SCROLL': '#aab2b6',
+    'SCROLL_HOVER': '#959ea3',
+    'SCROLL_ACTIVE': '#808a8e',
     # `dim` washes toward a light background; a picked mid grey reads instead
-    'DIM': '#767066',
+    'DIM': '#667075',
 }
 
 _PALETTES = {'dark': _DARK, 'light': _LIGHT}

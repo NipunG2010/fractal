@@ -7,7 +7,7 @@ Screen { background: $background; color: $foreground; layers: base overlay; }
 #top > .pane { height: 100%; }
 .pane { border: round $border-dim; padding: 0 1; background: $background; border-title-color: $title; }
 /* the focus border tells navigation state apart: body-text grey = the ring
-   cursor is on the pane, coral = entered (the keys are inside) */
+   cursor is on the pane, accent = entered (the keys are inside) */
 .pane.ringsel { border: round $foreground; border-title-color: $foreground; }
 .pane.entered { border: round $primary; border-title-color: $primary; }
 #fractal, #radio, #node, #message { border-title-align: center; }
