@@ -1,7 +1,7 @@
 ---
 name: fractal
 description: Hierarchical agent loops with recursive self-organization.
-argument-hint: <name> [<path>] [--scope=<subdirs>] ... [--detached] [--local] [--continue] [--clean]
+argument-hint: '[directive]'
 disable-model-invocation: true
 ---
 
@@ -19,59 +19,59 @@ Your role does not end at launch. The user (root) node has no loop of its own �
 tree, steer it, and relay between it and the user on their behalf. See
 **Operator** below.
 
-## Arguments
+## Directive
 
-Parse the following from `$ARGUMENTS`. The `/fractal` skill routes all the
-configuration to `fractal node init` and passes only `--continue`/`--clean` (if
-present) to `fractal node start` — plus `--max-cost` when it accompanies
-`--continue` (a continue re-arms the cap at start, not init).
+`$ARGUMENTS` is a natural-language directive describing what this fractal should
+do. Interpret it: distill the node's goal, and map anything the user pinned down
+(a name, a budget, a model, limits, ...) onto the parameters below, each of
+which becomes the matching `fractal node init` flag. The `/fractal` skill routes
+all the configuration to `fractal node init` and passes only
+`--continue`/`--clean` (when the directive asks to continue an existing node) to
+`fractal node start` — plus `--max-cost` when it accompanies a continue (a
+continue re-arms the cap at start, not init).
 
-**Init** — all configuration. Set by `fractal node init`, written to
+**Parameters** — all configuration. Set by `fractal node init`, written to
 `config.json`, and editable there before launch:
 
-- **`<name>`**: node name (required; letters, digits, and `_` only — no `-`)
-- **`<path>`**: project root, repo root or monorepo sub-project (default: `.`)
-- **`--title`**: human-readable display name (default: de-slugged node name)
-- **`--scope`**: restrict commits to subdirectories within the worktree
-  (comma-separated, e.g. `--scope=parent/child,tests`; repeated flags tolerated
-  and flattened)
-- **`--base`**: branch to start from (default: current branch)
-- **`--meta`**: target node branch for meta-configuration
-- **`--inherit`**: seed surfaces from the parent node instead of the package
-  seed (comma-separated: `steps`, `scripts`, `skills`, `config`, or `all`);
-  agent config always inherits. A top-level spawn's parent is the user node,
-  which carries no steps, scripts, or skills — the flag is for configured nodes
+- **name**: node name (required; letters, digits, and `_` only — no `-`)
+- **path**: project root, repo root or monorepo sub-project (default: `.`)
+- **title**: human-readable display name (default: de-slugged node name)
+- **scope**: restrict commits to subdirectories within the worktree
+  (comma-separated, e.g. `parent/child,tests`)
+- **base**: branch to start from (default: current branch)
+- **meta**: target node branch for meta-configuration
+- **inherit**: seed surfaces from the parent node instead of the package seed
+  (comma-separated: `steps`, `scripts`, `skills`, `config`, or `all`); agent
+  config always inherits. A top-level spawn's parent is the user node, which
+  carries no steps, scripts, or skills — the parameter is for configured nodes
   spawning children
-- **`--agent`**: agent command; inherits the user node's default when omitted
-- **`--provider`**: provider route for the agent (e.g. `openrouter`); inherits
-  the user node's default when omitted
-- **`--model`**: model override; when omitted, the agent uses its own default
-  model
-- **`--effort`**: reasoning-effort override; when omitted, each agent seed's own
+- **agent**: agent command; inherits the user node's default when omitted
+- **provider**: provider route for the agent (e.g. `openrouter`); inherits the
+  user node's default when omitted
+- **model**: model override; when omitted, the agent uses its own default model
+- **effort**: reasoning-effort override; when omitted, each agent seed's own
   pinned level applies, not the vendor default
-- **`--max-iters`**: per-run iteration cap
-- **`--max-depth`**: maximum child node nesting depth
-- **`--max-children`**: maximum direct child nodes
-- **`--max-descendants`**: maximum total descendant nodes
-- **`--timeout`**: per-run time limit (e.g. `30m`, `1.5h`)
-- **`--iter-timeout`**: per-iteration time limit (e.g. `30m`, `1.5h`)
-- **`--step-timeout`**: per-step time limit (e.g. `30s`, `10m`); caps each step
-- **`--interval`**: fixed iteration schedule (e.g. `1h`)
-- **`--sleep`**: delay between iterations (e.g. `10s`)
-- **`--wait`**: sleep between approval-wait sync invocations (default: `1m`)
-- **`--max-cost`**: cost ceiling in USD per run — runs are isolated, so each
-  launch arms the cap anew; after a budget-ended run, `node start --continue`
-  refuses without an explicit `--max-cost`
-- **`--max-iter-cost`**: per-iteration cost ceiling in USD
-- **`--max-step-cost`**: per-step cost ceiling in USD (warn-only when
-  unenforceable)
-- **`--reserve-budget`**: budget reserved for cleanup; USD or N% of `--max-cost`
+- **max-iters**: per-run iteration cap
+- **max-depth**: maximum child node nesting depth
+- **max-children**: maximum direct child nodes
+- **max-descendants**: maximum total descendant nodes
+- **timeout**: per-run time limit (e.g. `30m`, `1.5h`)
+- **iter-timeout**: per-iteration time limit (e.g. `30m`, `1.5h`)
+- **step-timeout**: per-step time limit (e.g. `30s`, `10m`); caps each step
+- **interval**: fixed iteration schedule (e.g. `1h`)
+- **sleep**: delay between iterations (e.g. `10s`)
+- **wait**: sleep between approval-wait sync invocations (default: `1m`)
+- **max-cost**: cost ceiling in USD per run — runs are isolated, so each launch
+  arms the cap anew; after a budget-ended run, `node start --continue` refuses
+  without an explicit `--max-cost`
+- **max-iter-cost**: per-iteration cost ceiling in USD
+- **max-step-cost**: per-step cost ceiling in USD (warn-only when unenforceable)
+- **reserve-budget**: budget reserved for cleanup; USD or N% of `max-cost`
   (default: 10%)
-- **`--sync`** / **`--no-sync`**: enable (default) or disable radio sync before
-  each step
-- **`--detached`** / **`--no-detached`**: run each step as a separate agent
-  session (default: one continuous session)
-- **`--local`**: skip pushing to remote after each commit
+- **sync**: enable (default) or disable radio sync before each step
+- **detached**: run each step as a separate agent session (default: one
+  continuous session)
+- **local**: skip pushing to remote after each commit
 
 **Start** — `fractal node start` just launches; all run parameters come from
 `config.json`. A `max_cost` in `config.json` must be positive if set; a missing
@@ -83,8 +83,31 @@ present) to `fractal node start` — plus `--max-cost` when it accompanies
 - **`--max-cost`**: with `--continue`, re-arm the cost cap for the new run;
   required when the last run ended on its budget
 
-After parsing, **list the options the user did not specify** (with each one's
-default) so they can see what else is configurable before defining the node.
+After reading the directive, print, in this order:
+
+1. **Suggested NODE.md instructions** — a draft `## Instructions` section
+   distilled from the directive; skip it when no goal can be inferred.
+2. **Suggested NODE.md completion requirement** — a draft
+   `## Completion Requirements` section with concrete, verifiable conditions;
+   skip it when none can be inferred (for open-ended work with no natural
+   stopping point, note instead that the section stays empty and `max-iters`
+   should cap the run).
+3. **Interpreted parameters** — always: a table with one row per **Parameters**
+   entry above, in order, and the value read from the directive; leave the value
+   empty where the directive said nothing (the defaults apply).
+
+Close with what could not be inferred — the last thing you say. If **name** or
+**path** is missing, ask: what should this fractal be named, and where should it
+live? Assume the current directory for **path** when it is a git repo that looks
+like the project in question; ask when it is not a git repo or does not
+naturally look like a project. Then, last of all, ask for any skipped draft:
+what should this fractal do, and what are its completion requirements? Inferred
+or asked, double-check everything with the user — printing the full table last
+is what lets them catch a misinterpreted parameter before anything is created.
+
+Even when a directive is thorough, ask follow-up questions that refine the seed
+— tighter completion conditions, scope, caps — rather than proceeding on the
+directive alone; Step 2's conversation is where these land.
 
 To change a setting after init, edit `<node_dir>/config.json` directly (the node
 reads it at launch), or use `fractal node config set <key>=<value>`. Run
@@ -110,7 +133,7 @@ autonomously.
 
 Resolve these before proceeding:
 
-- **path**: the target path argument, resolved to absolute.
+- **path**: the interpreted path parameter, resolved to absolute.
 
 ### Step 0: Install CLI
 
@@ -133,13 +156,13 @@ further context as needed.
 
 Determine the node's state and proceed accordingly:
 
-1. **`--continue` was specified** — the node already exists. Resolve its
+1. **The directive asks to continue** — the node already exists. Resolve its
    worktree and node directory from `fractal node list --path=<path>`, then skip
    the rest of this step (the repo and node are already set up — no init or
    commit).
 
-2. **No `--continue`, but a node already exists** for this path and name (check
-   `fractal node list --path=<path>`) — **ask the user** what to do:
+2. **No continue intent, but a node already exists** for this path and name
+   (check `fractal node list --path=<path>`) — **ask the user** what to do:
 
    - **Continue** — treat as case 1 (keep state, continue).
    - **Reset** — wipe and recreate: do case 3, adding `--reset` to
@@ -174,9 +197,9 @@ Determine the node's state and proceed accordingly:
    3. `fractal node init <name> ...` (add `--reset` for case 2's Reset) —
       creates the worktree and node directory. `--agent` is optional: when
       omitted, the node automatically inherits the user node's default (the
-      agent set in step 1). Pass the arguments the user specified; if you intend
-      to pass additional options, confirm with the user first. If it fails, stop
-      and report the error.
+      agent set in step 1). Pass the parameters interpreted from the directive;
+      if you intend to pass additional options, confirm with the user first. If
+      it fails, stop and report the error.
 
 The project `wiki/` is **git-tracked** (as are node-branch seeds) — never add it
 to `.gitignore`. The root node's own `.fractal/` is **git-ignored on the
@@ -211,26 +234,30 @@ Obsidian (optional).
 
 ### Step 2: Define the node
 
-If `--continue` was specified, the node is already defined from its previous
-run. Ask the user whether to keep that definition as-is (proceed to next step)
-or update it — revisit the relevant topics below to adjust goals, completion
-requirements, rules, budget, or steps before relaunching.
+If continuing an existing node, it is already defined from its previous run. Ask
+the user whether to keep that definition as-is (proceed to next step) or update
+it — revisit the relevant topics below to adjust goals, completion requirements,
+rules, budget, or steps before relaunching.
 
 Have a conversation with the user to define what this node should do. Work
 through each topic below in order. Ask questions naturally — do not dump all
 topics at once. Wait for the user's response to each before moving on.
 
-**a) Goals and instructions.** Ask the user what the node should accomplish.
-Draw out specifics: what area of the codebase, what kind of work, any
-constraints or preferences. Node configuration is the highest-leverage work — a
-well-configured node runs autonomously for hours; a vague one burns budget. Push
-for specific, verifiable goals rather than transcribing broad statements. Write
-the result into the `## Instructions` section of `<node_dir>/NODE.md`.
+**a) Goals and instructions.** Start from the suggested instructions printed
+when you read the directive (or the user's answer to your closing question when
+no draft was printed) and ask the user what to refine. Draw out specifics: what
+area of the codebase, what kind of work, any constraints or preferences. Node
+configuration is the highest-leverage work — a well-configured node runs
+autonomously for hours; a vague one burns budget. Push for specific, verifiable
+goals rather than transcribing broad statements. Write the result into the
+`## Instructions` section of `<node_dir>/NODE.md`.
 
-**b) Completion requirements.** Ask how the user will know the node is done.
-Help them articulate concrete, verifiable conditions. If the work is open-ended
-with no natural stopping point, suggest leaving this section empty and using
-`--max-iters` to cap the run. Write the result into the
+**b) Completion requirements.** Start from the suggested completion requirement
+printed when you read the directive (or the user's answer to your closing
+question when no draft was printed) and ask how the user will know the node is
+done. Help them articulate concrete, verifiable conditions. If the work is
+open-ended with no natural stopping point, suggest leaving this section empty
+and using `--max-iters` to cap the run. Write the result into the
 `## Completion Requirements` section of `<node_dir>/NODE.md`.
 
 **c) Rules and constraints.** Ask if there are any additional rules beyond the

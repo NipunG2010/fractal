@@ -408,8 +408,8 @@ Event hooks follow a uniform shape: every hook is `on_<event>` with a
 (`core/agent.py`) and `Loop` (`core/loop.py`). When running the audit (the
 `logging_level: int = logging\.` grep count must equal the `def on_` count),
 scope both greps to `fractal/core/` — `tui/` defines Textual message handlers
-(`on_mount`, `on_key`, …) that match `def on_` but are framework callbacks, not
-event hooks.
+(`on_mount`, `on_key`, ...) that match `def on_` but are framework callbacks,
+not event hooks.
 
 ### Shell Scripts (`_scripts/`, `_node/scripts/`)
 
