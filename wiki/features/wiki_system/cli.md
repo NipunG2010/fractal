@@ -23,18 +23,22 @@ interface to both knowledge stores. Its verbs:
   `.wiki/settings.json`, which `--settings` seeds at creation (fractal seeds the
   strict ascii/identifier policy).
 - `wiki read <name>` — print a named entry verbatim with no appended newline, so
-  redirected output round-trips byte-for-byte; `--lines`/`--words`/ `--chars`
-  slice the body by 0-indexed half-open ranges (a slice keeps the frontmatter
-  and appends a trailing newline).
+  redirected output round-trips byte-for-byte for LF files (reads normalize
+  CRLF); `--lines`/`--words`/ `--chars` slice the body by 0-indexed half-open
+  ranges (a slice keeps the frontmatter and appends a trailing newline).
 - `wiki search <pattern> [name]` — regex search, optionally scoped to a subtree;
-  `--field` searches frontmatter fields, `--all` includes non-markdown files.
+  `--field` searches frontmatter fields, `--all` includes non-markdown files,
+  `--ignore-case` drops case, and `--lines`/`--lineno` switch the output from
+  matching page names to matching lines or bare line numbers.
 - `wiki update [name]` — rewrite whatever drifted from the generated form; see
   [[features/wiki_system/index_regeneration]].
 - `wiki lint [name]` — check wiki health; see
   [[features/wiki_system/index_regeneration]].
 - `wiki map [name]` — compact tree overview with descriptions and word counts;
-  `--depth` and `--desc-limit` bound the dump, and `--stat` prints a one-line
-  size summary instead — the cheap probe before dumping a large wiki.
+  `--depth` and `--desc-limit` bound the dump, column toggles (`--no-desc`,
+  `--no-words`, `--category`, `--markdown`) reshape the rows, and `--stat`
+  prints a one-line size summary instead — the cheap probe before dumping a
+  large wiki.
 - `wiki install` — copy the bundled wiki skill into the Claude Code and Codex
   skill directories (home by default, the project with `--project`; `--link`
   symlinks for editable-install development).
@@ -42,7 +46,7 @@ interface to both knowledge stores. Its verbs:
   machinery; see [[features/wiki_system/merge_behavior]].
 - `wiki trust` — record a wiki root as trusted in `~/.wiki/settings.json`. A
   `.wiki/wiki.py` hook runs code with the caller's privileges, so every command
-  refuses to load one from an untrusted root.
+  that resolves a wiki refuses to load one from an untrusted root.
 
 ## Path resolution
 

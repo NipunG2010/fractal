@@ -74,9 +74,10 @@ fractal node init <name> [options]
 ```
 
 This is where the real decisions live. Fractal creates a git worktree under
-`.worktrees/` on a new branch — `<name>` from the root, `<parent>.<name>` when
-run from inside another node, so the branch name always spells the tree path —
-and populates the worktree's `.fractal/<branch>/` directory with the node's
+`.worktrees/` on a new branch named `<parent>.<name>` — the branch it was run
+from plus a dotted segment, so the branch name always spells the tree path from
+the root (a node `wiki` created on `main` runs on branch `main.wiki`) — and
+populates the worktree's `.fractal/<branch>/` directory with the node's
 machinery: step files, scripts, skills, and `config.json`, seeded from the
 package (or from the parent, with `--inherit`).
 

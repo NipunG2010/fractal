@@ -5,7 +5,7 @@ desc: |
   token usage is priced, the run/iteration/step cost cap tiers with their
   reserve window, and the time budget tiers with the pause credit-back.
 created: 2026-07-21T04:35:35Z
-updated: 2026-07-21T05:07:57Z
+updated: 2026-07-21T11:36:38Z
 ---
 
 # features/cost
@@ -20,8 +20,8 @@ remaining headroom is read.
 [[features/cost/measurement|measurement]]: How spend is measured and attributed:
 cost figures flow from agent streams into per-step ledger rows in the central
 database, roll up through iterations and runs, and include descendant nodes
-through the per-run subtree chain. Unknown cost is recorded as untracked, never
-as zero.
+through the per-run subtree chain. Unknowable cost is recorded as null and
+disclosed, never conflated with a genuine zero.
 
 [[features/cost/pricing|pricing]]: How token usage becomes dollars: the cached
 LiteLLM price table, its refresh and staleness semantics, and the unpriced-model

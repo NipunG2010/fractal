@@ -5,7 +5,7 @@ desc: |
   worktree-per-node design, the agent-provider seam, the central per-tree
   database, and the package layout.
 created: 2026-07-21T04:35:35Z
-updated: 2026-07-21T04:47:26Z
+updated: 2026-07-21T11:34:02Z
 ---
 
 # architecture
@@ -17,8 +17,8 @@ seam: what the agent base class owns, the provider name registry, and how the
 backend modules for claude, codex, grok, opencode, and omp slot in.
 
 [[architecture/database|database]]: The central per-tree SQLite database: where
-it lives, how every node resolves it, row ownership, what survives node
-deletion, and the main table families.
+it lives, how every node resolves it, the WAL discipline, row ownership, what
+survives node deletion, and the main table families.
 
 [[architecture/node_tree|node_tree]]: The node tree model: dotted branch naming,
 the parent/child relationship derived from branch names, the passive root (user)
@@ -54,7 +54,7 @@ Read the pages in this order for a ground-up picture:
 - [[architecture/agent_providers]] — the core/impl seam: the provider-agnostic
   agent base class, the name registry, and the backend modules that slot in.
 - [[architecture/database]] — the central per-tree SQLite database: one file per
-  tree in the root node's data directory, row ownership, table families, and
-  what survives node deletion.
+  tree in the root node's data directory, the WAL discipline, row ownership,
+  table families, and what survives node deletion.
 - [[architecture/packages]] — how the code packages, node-machinery seeds, and
   the shim pointer dist fit together.

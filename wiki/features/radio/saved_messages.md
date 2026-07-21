@@ -26,9 +26,11 @@ The saved set is listed with `fractal radio messages --saved` (or
 `feed --saved`; both list the same archive). `--saved` is mutually exclusive
 with the `--read`/`--all` filters — archive rows carry no unread state — and
 supports the usual `--channel`, `--limit`, `--since`, `--recent`,
-`--csv`/`--json` shaping. Rows carry the original sender, channel, and an owner
-column naming the message's source host; the node-filter on the saved listing
-keys on that owner.
+`--csv`/`--json` shaping. Unlike the metadata-only mailbox listings, saved rows
+always include the body — the archive is a snapshot, and listing it is reading
+your own copies. Rows carry the original sender, channel, and an owner column
+naming the message's source host; the feed listing's node-filter keys on that
+owner.
 
 By convention (see the node seed's radio guidance), the archive is the
 cross-iteration action queue: save what needs later work, review the open set

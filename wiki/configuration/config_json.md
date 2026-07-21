@@ -58,7 +58,8 @@ Boolean keys (must be JSON `true`/`false`/`null`):
   **immutable** -- flipping it would let a root branch be started as a loop.
 - `sync` -- SYNC pass before each step. Default when unset: enabled.
 - `detached` -- one agent invocation per step. Default: continuous.
-- `local` -- skip pushing after commits. Latched once true.
+- `local` -- skip pushing after commits. Latched at the init surface: a re-init
+  cannot clear it, and children of a local parent spawn local.
 - `blind` -- subscribe to no radio channels. Default: false.
 
 Integer cap keys (non-negative; `max_iters` strictly positive):
@@ -122,9 +123,16 @@ and the operator-facing `config set` refuses even their first write.
 
 ## When changes take effect
 
-The loop enforces the caps in `config.json`, so a direct config edit is honored
-at the next iteration boundary like an update -- the registry row is back-filled
-from the config with a warning (config wins over a stale registry row).
-Mode-composition and agent-preference keys (`sync`, `detached`, `meta`, `model`,
-`effort`) are pinned when a run launches and hold for that run; they apply from
-the next `fractal node start`. `wait` is re-read during approval waits.
+The loop enforces the caps in `config.json`, so a retune or direct config edit
+reaches a running loop without a restart -- the registry row is back-filled from
+the config with a warning (config wins over a stale registry row). The cost caps
+are re-read at run start, at each iteration top, and by the budget boundary
+probes themselves, so a cap granted mid-iteration reaches the very next probe;
+`max_iters`, `step_timeout`, and `wait` are re-read at each iteration top. A
+malformed live edit warns and keeps the prior value rather than crashing the
+run. Everything else is pinned when a run launches and holds for that run -- the
+mode-composition and agent-preference keys (`sync`, `detached`, `meta`, `agent`,
+`provider`, `model`, `effort`), the run and iteration time budgets and pacing
+(`timeout`, `iter_timeout`, `interval`, `sleep`), and the retry knobs
+(`step_retries`, `step_retry_backoff`) -- and applies from the next
+`fractal node start`.

@@ -57,8 +57,8 @@ The root of every tree is a *user node*: the node anchored on the dotless branch
 the operator ran `fractal init` from (at the repo root, or a sub-project
 directory in a monorepo). It is marked by the `user` flag in its config — not by
 a lifecycle status — and it never iterates: it has a lightweight data directory
-holding only the central database and a radio presence, with no steps, skills,
-or scripts seeded.
+holding only its config, the central database, and a radio presence, with no
+steps, skills, or scripts seeded.
 
 The user node differs from agent nodes in what is legal on it. It cannot be
 started, merged, or deleted, and it accepts only baseline (`--init`) commits —

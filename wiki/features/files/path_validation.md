@@ -39,11 +39,11 @@ Fractal's own content passes this tier: `wiki/` and `.fractal/` are readable
 project state, filtered or collapsed by consumers, not a boundary.
 
 Beyond structure, a read or download serves only what the surface exposes: the
-path must be git-tracked, or — under a `since` scope — part of that anchor's
-changed set, which keeps a deleted file's old content readable without exposing
-anything else. Containment re-checks at the serving boundary: a *tracked*
-symlink whose target escapes the worktree is still not readable or servable
-through it.
+path must be git-tracked — a read under a `since` scope also accepts a member of
+that anchor's changed set, which keeps a deleted file's old content readable
+without exposing anything else. Containment re-checks at the serving boundary: a
+*tracked* symlink whose target escapes the worktree is still not readable or
+servable through it.
 
 ## The writable tier (uploads and pathspec commits)
 

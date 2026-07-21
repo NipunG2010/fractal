@@ -2,9 +2,10 @@
 name: design/budgets
 desc: |
   Why cost ceilings are soft and checked at boundaries rather than enforced
-  by hard kills, why every run keeps a reserve as its wind-down window, why
-  sync is a billed step, and how the run, iteration, and step cap tiers
-  divide the enforcement problem.
+  by hard kills, why every run keeps a reserve as its wind-down window, how
+  a finish landed in the reserve books its terminal status, why sync is a
+  billed step, and how the run, iteration, and step cap tiers divide the
+  enforcement problem.
 created: 2026-07-21T04:48:14Z
 updated: 2026-07-21T04:48:14Z
 ---
@@ -73,6 +74,16 @@ can spend the reserve but never past the ceiling. The reserve is thus not slack
 — it is the budget explicitly priced for the ending: commit, memory, radio
 handoff, the parts that make a budget-ended run resumable and mergeable instead
 of a stranded worktree.
+
+How the ending books depends on why the finish was sent. A deliberate, goal-met
+finish landed during wind-down keeps its `completed` — even when the final drain
+carried spend past the cap, in which case the overshoot figures ride the run row
+so the activity record explains the spend. A budget-stemmed finish books the
+`exited` budget landing instead, and a deliberate finish outranks budget rows
+whichever order the signals arrived, so the same inputs book the same terminal
+status either way round. When the signal store cannot be read, an over-cap
+finish reclassifies as a budget stop — the landing never fails open into a
+goal-met `completed`.
 
 A budget abort also cascades: the tripping loop signals finish recursively, so
 descendants wind down too rather than spending on toward a parent that can no

@@ -36,8 +36,8 @@ Each backend translates the same two overrides into its own CLI dialect:
 | ---------- | ---------- | ----------------------------------- |
 | `claude`   | `--model`  | `--effort`                          |
 | `codex`    | `-m`       | `-c model_reasoning_effort="<lvl>"` |
-| `grok`     | model flag | `--reasoning-effort`                |
-| `opencode` | model flag | `--variant` (a model variant)       |
+| `grok`     | `-m`       | `--reasoning-effort`                |
+| `opencode` | `-m`       | `--variant` (a model variant)       |
 | `omp`      | `--model`  | `--thinking` (a thinking level)     |
 
 For claude the effort flag outranks the settings-file effort level; node
@@ -55,9 +55,13 @@ real served model even for defaulted spawns. Each backend resolves its
 configured model from its own vendor config, best-effort — an unreadable or
 malformed file simply names no model:
 
-- claude walks its settings chain (the node's agent dir, then the user's
-  `~/.claude/settings.json`); the first file naming a model wins.
+- claude walks its settings chain (the node agent dir's local settings over its
+  `settings.json`, then the user's `~/.claude/settings.json`); the first file
+  naming a model wins.
 - codex reads the top-level model from its `config.toml`.
+- grok reads its `config.toml` default, which lives under a models table rather
+  than a top-level key.
+- opencode reads the top-level model from its JSON config file.
 - omp reads its `config.yml` default once a YAML parser is available.
 
 ## Preflight

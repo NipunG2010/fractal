@@ -44,8 +44,9 @@ overrides, and overrides always win over the derived map. The loop passes its
 live state: `STEP_LABEL`, `ITER_LABEL`, `ITER_TIMESTAMP`, `ITER_REF`,
 `TIME_BUDGET`, `COST_BUDGET`, and the run-scoped mode flags (`CONTINUE_MODE`,
 `RESUME_MODE`, `RESERVE_MODE`). A chat renders the same templates with an
-explicit `N/A (chat)` sentinel for each of these -- a clear marker rather than a
-blank or stale value.
+explicit `N/A (chat)` sentinel for the label and budget fields -- a clear marker
+rather than a blank or stale value -- and `false` for the run-scoped mode flags,
+so no run-only mode document ever joins a chat prompt.
 
 ## Modes
 

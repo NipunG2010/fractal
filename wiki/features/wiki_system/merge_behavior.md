@@ -32,14 +32,14 @@ conflict — while authored keys (`title`, `desc`, `created`, `category`, `tags`
 `sources`) get a normal three-way merge that can conflict. On add/add merges
 (both sides created the page) `created` joins the take-ours set, since both
 stamps come from independent update runs. A side whose frontmatter is
-undetectable is treated as unchanged from base, never as a deletion; a side
-missing the `***` separator cannot be split into regions, so it surfaces a
-whole-file conflict with a repair hint. Everything below `***` is authored
-content and merges three-way, with a hint comment planted above add/add body
-conflicts.
+undetectable is treated as unchanged from base, never as a deletion; a side that
+dropped the `***` separator its base carried cannot be split into regions, so it
+surfaces a whole-file conflict with a repair hint. Everything below `***` is
+authored content and merges three-way, with a hint comment planted above add/add
+body conflicts.
 
 Because the link block takes ours, a merge drops the other branch's link rows —
-by design: the next `wiki update` (which every `fractal commit` runs; see
+by design: the next `wiki update` (which the fractal commit pipeline runs; see
 [[features/wiki_system/index_regeneration]]) regenerates the block from the
 merged filesystem, and a merged-in `title` shows in the H1 only after that
 post-merge update.

@@ -5,7 +5,7 @@ desc: |
   durability guarantees, commit and merge discipline, and the lifecycle
   status model.
 created: 2026-07-21T04:35:35Z
-updated: 2026-07-21T04:48:14Z
+updated: 2026-07-21T11:38:35Z
 ---
 
 # design
@@ -14,8 +14,9 @@ updated: 2026-07-21T04:48:14Z
 
 [[design/budgets|budgets]]: Why cost ceilings are soft and checked at boundaries
 rather than enforced by hard kills, why every run keeps a reserve as its
-wind-down window, why sync is a billed step, and how the run, iteration, and
-step cap tiers divide the enforcement problem.
+wind-down window, how a finish landed in the reserve books its terminal status,
+why sync is a billed step, and how the run, iteration, and step cap tiers divide
+the enforcement problem.
 
 [[design/commit_discipline|commit_discipline]]: Why every iteration must commit,
 how scope enforcement and the always-allowed shared wiki divide the worktree,
@@ -42,8 +43,9 @@ prevents; read the relevant page before proposing to change a behavior it
 covers.
 
 - [[design/budgets]] — why cost ceilings are soft and checked at boundaries, the
-  reserve as a priced wind-down window, sync as a billed step, and how the
-  run/iteration/step cap tiers divide enforcement.
+  reserve as a priced wind-down window, how a finish landed there books its
+  terminal status, sync as a billed step, and how the run/iteration/step cap
+  tiers divide enforcement.
 - [[design/durability]] — the pause/resume round-trip guarantee: paused as
   active-like everywhere but execution, parking as a full process exit, deadline
   crediting from pause/resume instants, and the tree-wide latch.

@@ -2,8 +2,8 @@
 name: architecture/database
 desc: |
   The central per-tree SQLite database: where it lives, how every node
-  resolves it, row ownership, what survives node deletion, and the main
-  table families.
+  resolves it, the WAL discipline, row ownership, what survives node
+  deletion, and the main table families.
 created: 2026-07-21T04:47:26Z
 updated: 2026-07-21T04:47:26Z
 ---
@@ -30,16 +30,36 @@ lookup involved, so resolution works the same from any process (CLI, loop, TUI).
 
 The access layer is deliberately thin: a generic table-operation wrapper with no
 domain logic, opening a one-shot handle per operation unless a caller passes an
-explicit transaction connection to make a multi-statement block atomic.
-Connections run in WAL mode with foreign keys enabled and a generous busy
-timeout, so contending writers under wide node fan-out wait for the lock instead
-of failing fast. The schema is applied idempotently from `core/schema.sql` —
-purely additive `IF NOT EXISTS` DDL with a stamped schema version.
+explicit transaction connection to make a multi-statement block atomic. Every
+handle enables foreign keys and carries a generous busy timeout, so contending
+writers under wide node fan-out wait for the lock instead of failing fast. The
+schema is applied idempotently from `core/schema.sql` — purely additive
+`IF NOT EXISTS` DDL with a stamped schema version, so a database created under
+an older schema is rebuilt, never migrated in place.
 
 Row accounting on top of the wrapper goes through the record surface in
 `fractal/core/record.py`: lifecycle transitions funnel through first-writer-wins
 fenced updates, events are point-in-time log entries, and signals are consumable
-control rows.
+control rows. How the loop writes its run, iteration, and step rows through this
+surface is on [[features/loop/accounting]].
+
+## WAL discipline
+
+The journal mode is WAL, stamped once at database creation: the mode persists in
+the file header, and the delete-to-WAL transition takes an exclusive lock, so it
+must never run per-connection under a live fleet. The `-wal`/`-shm` sidecars
+beside the `.db` persist by design — fractal's writable handles disable SQLite's
+close-time checkpoint, because a last-closing writer that checkpoints and
+unlinks the sidecars strands write-denied (sandboxed) readers until a writer
+rebuilds the WAL index.
+
+Consolidation happens instead at quiet boundaries. SQLite's autocheckpoint
+backfills the log as it grows, and an exiting loop runs an explicit truncating
+checkpoint — best-effort, so a busy sibling fleet defers it to the next exiting
+loop — which backfills the WAL into the main file and zeroes the log while
+leaving both sidecars in place. Database creation ends with the same checkpoint,
+so a fresh tree's `.db` is self-contained at rest rather than a bare header page
+whose tables live only in the sidecar.
 
 ## Row ownership
 

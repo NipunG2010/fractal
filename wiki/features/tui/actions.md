@@ -31,13 +31,13 @@ radio pane's detail action bar and the message pane's composer (see
 
 ## Session viewing
 
-From the node pane the cockpit can attach onto the focused node's live tmux
-session. The attach is read-only -- the node's terminal is a window, not a
-control surface -- with `esc` (advertised on the session's status line) as the
-way out; the cockpit suspends for the duration and restores on detach. With no
-running session the cockpit notifies and stays put; when the cockpit itself runs
-inside tmux it switches the client instead of nesting an attach, and that outer
-client carries no read-only leash.
+A cockpit-level key attaches onto the scoped node's live tmux session from
+anywhere on the screen. The attach is read-only -- the node's terminal is a
+window, not a control surface -- with `esc` (advertised on the session's status
+line) as the way out; the cockpit suspends for the duration and restores on
+detach. With no running session the cockpit notifies and stays put; when the
+cockpit itself runs inside tmux it switches the client instead of nesting an
+attach, and that outer client carries no read-only leash.
 
 ## Chat
 

@@ -34,13 +34,13 @@ The iteration prompt hands both locations to the agent as the `WIKI_DIR` and
 `fractal init` creates the project wiki when none exists
 (`fractal/core/worktree.py`): the validated project name becomes the wiki name,
 and the wiki is seeded with the strict ascii/identifier naming policy so project
-pages mirror source-module identifiers. A pre-existing `wiki/` directory that is
-not a wiki (no `.wiki/` marker) is refused, never adopted — the operator must
-convert it explicitly with `wiki init`. The user node's baseline commit
-(`fractal/core/commit.py`) then commits the fresh wiki along with the
-`.gitattributes` merge attribute that `wiki init` writes, so every child branch
-forks from a committed wiki with merge handling in place (see
-[[features/wiki_system/merge_behavior]]).
+pages mirror source-module identifiers. A pre-existing non-empty `wiki/`
+directory that is not a wiki (no `.wiki/` marker) is refused, never adopted —
+the operator must convert it explicitly with `wiki init`; an empty one is
+initialized in place. The user node's baseline commit (`fractal/core/commit.py`)
+then commits the fresh wiki along with the `.gitattributes` merge attribute that
+`wiki init` writes, so every child branch forks from a committed wiki with merge
+handling in place (see [[features/wiki_system/merge_behavior]]).
 
 Memory starts empty; the node lays it out as topical pages as it learns.
 

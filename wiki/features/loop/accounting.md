@@ -39,13 +39,19 @@ One status set (`fractal.constants.STATUSES`) is shared by the node status file
 and every row table, though not every status applies at every level: a run that
 ends without completing is `exited`, never `failed` -- `failed` belongs to
 entity rows like iterations and steps. Exit codes are binary, derived from
-outcome. Events are point-in-time entries with optional step/iteration/run
-lineage: commits, pauses, resumes, and their kin each land as one event, and
-pause/resume event instants credit the paused span back to run and iteration
-deadlines, so a paused node is not billed wall-clock time against its budgets.
-The commit pipeline logs each work commit as an event keyed on the new sha,
-tying git history back to the row that produced it (see
-[[features/loop/commit_pipeline|commit_pipeline]]).
+outcome: `0` marks a designed landing (a completed finish, a requested stop, or
+a budget abort -- exited with exit `0` is how a budget landing is told apart
+from an abnormal end; see [[features/cost/budgets|budgets]]) and `1` marks an
+abnormal one (timeout, a failed final iteration, an unexpected death). A run
+that ends for a reason carries it in the row's metadata, which is what
+`fractal node activity` shows. Events are point-in-time entries with optional
+step/iteration/run lineage: commits, pauses, resumes, and their kin each land as
+one event, and pause/resume event instants credit the paused span back to run
+and iteration deadlines, so a paused node is not billed wall-clock time against
+its budgets (the credit walk's exact semantics live in
+[[features/cost/time_budgets|time_budgets]]). The commit pipeline logs each work
+commit as an event keyed on the new sha, tying git history back to the row that
+produced it (see [[features/loop/commit_pipeline|commit_pipeline]]).
 
 ## Reading the ledger
 

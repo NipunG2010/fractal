@@ -62,11 +62,12 @@ columns; two of its interactions with wiki syntax slip past `wiki lint`, so
 authors write around them:
 
 - **Lone code spans in list items.** A wrapped line consisting solely of a long
-  code span inside a list item masks to blank for the linter, which then
-  misreads the next `-` item as a mangled wrapped list marker. Reword so the
-  code span shares its line with prose instead of standing alone.
+  code span inside a list item masks to blank for the linter, which can then
+  misread a later `-` item in the same block as a mangled wrapped list marker
+  and flag it falsely. Reword so the code span shares its line with prose
+  instead of standing alone.
 - **Wikilinks broken by wrapping.** When the formatter wraps a long-label
-  wikilink mid-link, it escapes the brackets and silently breaks the link — and
-  lint does not catch the escaped form. Keep wikilink labels short enough to
-  survive the 80-column wrap, and after any formatter pass grep the diff for
-  escaped brackets before committing.
+  wikilink mid-link, it escapes the brackets and breaks the link. Lint reports
+  the escaped form as a hard formatter-damage issue, but the repair is manual:
+  keep wikilink labels short enough to survive the 80-column wrap so the damage
+  never lands.

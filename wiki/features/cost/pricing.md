@@ -29,13 +29,15 @@ four outcomes: `fresh` (cache newer than the requested max age, no fetch),
 (fetch failed and no cache exists). The fetch is bounded by a short timeout so a
 stalled network never wedges the loop.
 
-The loop refreshes the table at run start for token-priced agents; there,
-`missing` is a fatal preflight abort (the cost/cap pipeline cannot price usage
-without it) while `stale` degrades to a warning over the cached table
-([[features/cost/budgets|budgets]]). A successful fetch also invalidates the
-in-process memo so the run re-reads the fresh table. Cost-reporting agents read
-the cache only opportunistically, so for them a missing or corrupt cache
-degrades to no pricing -- streams record unpriced, never crash mid-step.
+The loop refreshes the table for token-priced agents at run start and again at
+each iteration top (the latter bounded by a 24-hour max age, so a long-running
+node re-prices against a live table); at both points `missing` is fatal (the
+cost/cap pipeline cannot price usage without a table) while `stale` degrades to
+a warning over the cached table ([[features/cost/budgets|budgets]]). A
+successful fetch also invalidates the in-process memo so the run re-reads the
+fresh table. Cost-reporting agents read the cache only opportunistically, so for
+them a missing or corrupt cache degrades to no pricing -- streams record
+unpriced, never crash mid-step.
 
 ## Model resolution
 

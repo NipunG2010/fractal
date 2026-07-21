@@ -41,6 +41,15 @@ Who sends it matters:
 - **The root.** On the user node, finish is a tree-wide broadcast — the user
   node has no loop of its own, so it signals every active node in the tree.
 
+How the run books depends on why it finished. A deliberate finish lands
+`completed` — even when the signal arrives during reserve wind-down or the spend
+crosses the cap mid-drain, the goal-met landing holds, with the overshoot
+recorded on the run row. A budget stop is not a goal-met completion: the run
+books `exited` (with exit code 0 — a designed stop, not an abnormal death), so a
+parent and `node merge` can tell unfinished work from done. The loop's own
+budget phrases are reserved in `--reason` — a reason carrying them classifies
+the finish as a budget abort — so a node states its met goal in its own words.
+
 A finished node is settled: its worktree and branch remain, holding its
 committed work, ready for review and merge.
 

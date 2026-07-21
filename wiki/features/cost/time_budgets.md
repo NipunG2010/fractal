@@ -70,8 +70,6 @@ opens one (its signal is durable and the loop parks regardless); duplicate
 pauses collapse onto the first and duplicate resumes are inert. Steps need no
 credit-back at all — a step never spans a pause, because the interrupted step
 row closes as paused and resume opens a fresh step row with a fresh deadline.
-The same pause/resume instants are the substrate for pause-aware cost
-attribution described in [[features/cost/measurement|measurement]].
 
 ## Interaction with cost budgets
 

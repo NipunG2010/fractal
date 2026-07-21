@@ -13,8 +13,7 @@ updated: 2026-07-21T04:35:35Z
 
 The wiki is organized by concept and feature surface, not by source layout. This
 table maps each source path to the branch that documents it, ordered by source
-path so a module is found by scanning. Owned by the wiki root; refined as
-branches fill in.
+path so a module is found by scanning. Owned by the wiki root.
 
 | Source path                                                                                        | Wiki branch                                                                                                                           |
 | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
@@ -46,6 +45,7 @@ branches fill in.
 | `fractal/tui/` (chat pane: `fractal/tui/chat.py` → chat)                                           | [[features/tui/panes]], [[features/tui/actions]], [[features/tui/polling]], [[features/chat]]                                         |
 | `fractal/_node/` (seed: NODE.md, steps, scripts, skills, modes, config)                            | [[configuration/steps]], [[configuration/scripts]]                                                                                    |
 | `fractal/skills/fractal/` (the plugin skill driving the operator workflow)                         | [[user_flow]]                                                                                                                         |
+| `shim/` (the metadata-only `fractal` pointer dist at the repo root)                                | [[architecture/packages]]                                                                                                             |
 
 The `wiki` CLI itself is not fractal source — it ships in the separate `wiki`
 package; [[features/wiki_system]] documents how fractal uses it.

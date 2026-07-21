@@ -59,12 +59,13 @@ intent:
   held, drains stay blocked. The rationale — pause is a promise to resume, not
   an exit — is on [[design/durability]].
 - **completed** versus **exited** is the vocabulary's load-bearing distinction:
-  completed means the node itself declared its goal met (a drained finish);
-  exited means the run ended for any structural reason — budget, timeout, max
-  iterations with a failed final iteration, crash. A parent deciding whether to
-  merge, continue, or absorb a child's work reads this one word first, which is
-  why the loop is strict about never letting a structural stop launder into
-  completed.
+  completed means the run did what was asked — the node declared its goal met (a
+  drained finish), or it ran its full configured iteration count with a clean
+  final iteration; exited means the run ended for any structural reason —
+  budget, timeout, max iterations with a failed final iteration, crash. A parent
+  deciding whether to merge, continue, or absorb a child's work reads this one
+  word first, which is why the loop is strict about never letting a failed or
+  budget-cut stop launder into completed.
 
 ## Binary exit codes, derived from outcome
 

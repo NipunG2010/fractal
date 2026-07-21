@@ -94,7 +94,7 @@ class Sessions:
 
         Raises:
             ValueError: If ``agent`` is unsupported, or ``session`` is not a
-                bare session id (anything but ``[A-Za-z0-9-]`` could escape
+                bare session id (anything but ``[A-Za-z0-9_-]`` could escape
                 the transcript directory).
 
         """

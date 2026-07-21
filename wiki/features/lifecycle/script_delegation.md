@@ -36,10 +36,13 @@ lifecycle operation on the tree.
   (`fractal node _loop`) inside it; the loop itself is in-process Python.
 - `pause.sh` reaps the recorded step process group, aborting the in-flight agent
   so the loop can park.
-- `resume.sh` relaunches the loop; the booting loop clears any leftover pause
-  signal files itself, so a bare resume works even after a node transplant.
-- `kill.sh` is a no-op hook — kill is pure bookkeeping plus tmux reaping done by
-  the node machinery itself.
+- `resume.sh` relaunches the loop; the relaunched loop withdraws the run's
+  recorded pause signals itself as it adopts the run, so a bare resume works
+  even after a node transplant.
+- `kill.sh` reaps the node's live process groups — the in-flight agent's
+  recorded step group and the tmux pane's — escalating a polite termination to a
+  forced one, then destroys the tmux session. When nothing is alive (a paused
+  park), it exits cleanly and the kill is pure bookkeeping.
 - `delete.sh` removes one node's worktree, local branch, and remote branch; the
   recursive delete calls it once per node, deepest first.
 

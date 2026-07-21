@@ -4,7 +4,8 @@ desc: |
   How spend is measured and attributed: cost figures flow from agent streams
   into per-step ledger rows in the central database, roll up through
   iterations and runs, and include descendant nodes through the per-run
-  subtree chain. Unknown cost is recorded as untracked, never as zero.
+  subtree chain. Unknowable cost is recorded as null and disclosed, never
+  conflated with a genuine zero.
 created: 2026-07-21T04:49:55Z
 updated: 2026-07-21T04:49:55Z
 ---
@@ -64,13 +65,20 @@ latest recorded run, with no cap (every cap store dies with the node).
 
 Zero and unknowable are never conflated:
 
-- When a scope has steps but none recorded a cost (a token-priced agent with no
-  priced model), `cost spent` prints `untracked` instead of `$0.0000`, and the
-  run scope walks the subtree so a fully-untracked child reads as untracked at
-  its parent. A mixed subtree -- any priced step -- is tracked.
-- Ended steps with `NULL` cost (kills before the first usage flush, pre-stream
-  failures, untracked-agent rows) are silently skipped by the sum, so
-  ledger-facing commands disclose the count on stderr
+- A step the loop closes without ever reaching its launch records an explicit
+  `$0` -- a knowable nothing-spent, never `NULL`.
+- `NULL` cost is reserved for unknowable spend: a launched step whose usage
+  never flushed -- a kill before the first flush, a post-launch death before the
+  stream opened, or an untracked agent's rows. Ended rows only: an open step is
+  merely not priced *yet*.
+- `cost spent` prints `untracked` instead of `$0.0000` when the scope has
+  `NULL`-cost steps and no step recorded a real figure. Zero-cost rows are
+  neutral -- they prove nothing was spent, not that spend was tracked -- so they
+  never flip an otherwise-untracked scope to `$0`. The run scope walks the
+  subtree, so a fully-untracked child reads as untracked at its parent; a mixed
+  subtree -- any real figure -- is tracked.
+- Ended steps with `NULL` cost are silently skipped by the sum, so ledger-facing
+  commands disclose the count on stderr
   (`N unpriced steps (NULL cost) excluded`) while stdout stays parseable.
 
 ## Finality

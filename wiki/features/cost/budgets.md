@@ -15,7 +15,8 @@ updated: 2026-07-21T04:49:55Z
 ***
 
 Cost caps come in three tiers, all stored in node config and re-read at each
-iteration top so a mid-run retune takes effect without a restart:
+iteration top -- and again by the budget probes themselves -- so a mid-run
+retune takes effect without a restart:
 
 - **`max_cost`** -- the per-**run** ceiling. It bounds the run's whole per-run
   subtree ([[features/cost/measurement|measurement]]): the node's own steps plus
@@ -24,9 +25,11 @@ iteration top so a mid-run retune takes effect without a restart:
   only through `node start --continue --max-cost`.
 - **`max_iter_cost`** -- a per-**iteration** cap over that iteration's own steps
   (children not included).
-- **`max_step_cost`** -- a per-**step** cap. Where the provider supports a
-  budget flag the cap is enforced by the agent invocation itself; otherwise it
-  is warn-only for the step.
+- **`max_step_cost`** -- a per-**step** cap. An agent that accepts a budget flag
+  is launched with a per-step leash -- the tightest of the run's
+  remaining-less-reserve, the iteration's live headroom, and this cap -- so the
+  invocation itself bounds in-step overshoot; a non-enforcing agent's cap is
+  warn-only, checked after the step ends.
 
 `fractal node cost remaining` reads the matching headroom: the bare command
 returns `max_cost` minus the current run's subtree spend; `--iter`/`--step`
@@ -62,13 +65,26 @@ reserve state again and, having just run the wind-down, ends the run rather than
 start another iteration that would only re-enter reserve; this boundary stop
 subsumes the hard ceiling. The finish it sends carries a budget-abort reason
 (`cost budget reserve reached`, `subtree cost budget reached`, or
-`cost budget exceeded in finish wind-down`), and a budget-cap stop books a clean
-`exited` run end naming that reason -- a designed landing, never `completed` and
+`cost budget exceeded in finish wind-down`), and a budget abort books a clean
+`exited` run end with exit code `0` naming that reason -- a designed landing,
 never a failure (see [[design/budgets]]).
+
+Only loop-sent budget aborts land `exited`. A deliberate goal-met finish books
+`completed` even when it arrives inside the wind-down and even when spend has
+passed the cap -- the overshoot rides the run row so the spend stays explained
+-- and a deliberate finish outranks a budget abort cascaded from an ancestor,
+whichever order the two signals landed.
 
 Spawn-heavy iterations get a harder backstop: between steps the loop also checks
 the subtree ceiling directly, so a long iteration stops queuing steps as soon as
 descendants blow the budget rather than waiting for the boundary.
+
+Enforcement is only as good as the ledger: armed caps over fully-untracked spend
+([[features/cost/measurement|measurement]]) can never trip, and the loop warns
+once per run; caps paired with an agent that takes no budget flag and no timeout
+draw the same one-time warning, since one runaway step could overshoot every cap
+unbounded. A failed ledger read holds the last good figure rather than
+re-inflating headroom.
 
 ## Preflight guarantees
 

@@ -26,7 +26,9 @@ A channel has two boolean flags:
 
 - **read_only** — only the owner may read. For non-owners this gates the whole
   content surface: reading bodies, viewing threads, reacting, and saving are all
-  refused with a permission error, and such channels cannot be subscribed to.
+  refused with a permission error (thread participants excepted — see
+  [[features/radio/reactions_and_replies]]), and such channels cannot be
+  subscribed to.
 - **write_only** — only the owner may write. A non-owner's direct send into a
   write-only channel is refused; a *reply* to a message found there is instead
   rerouted to the author's inbox (see [[features/radio/reactions_and_replies]]).

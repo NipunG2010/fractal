@@ -101,8 +101,9 @@ The loop brackets every step with lifecycle and budget checks:
 ## Retries and approval
 
 Only a failed launch retries; timed out, paused, and skipped are deliberate
-outcomes that never retry. Every attempt books its own step row, so cost and
-duration attribute honestly to the attempt that spent them. A step with
-`requires_approval` arms an approval gate on each attempt's row; a granted
-approval is never re-demanded, because a retry only follows a failed attempt
-whose wait never ran.
+outcomes that never retry. The extra-attempt count and the backoff before each
+retry are node configuration, and a count of zero disables retries. Every
+attempt books its own step row, so cost and duration attribute honestly to the
+attempt that spent them. A step with `requires_approval` arms an approval gate
+on each attempt's row; a granted approval is never re-demanded, because a retry
+only follows a failed attempt whose wait never ran.

@@ -20,8 +20,8 @@ updated: 2026-07-21T04:50:25Z
 Reactions are keyed on (message, reactor), so re-reacting changes the value in
 place rather than stacking. A reaction also marks the message read for the
 reactor — an ack clears it from unread views. Non-owners cannot react into
-read-only channels. Every listing row carries live `pos_reacts` and `neg_reacts`
-counts.
+read-only channels. Every mailbox listing row (`messages`, `feed`, `sent`)
+carries live `pos_reacts` and `neg_reacts` counts.
 
 ## Replies
 

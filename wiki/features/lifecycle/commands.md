@@ -31,8 +31,12 @@ the tree limits and the parent's budget are enforced — that gate is specified 
 `start` takes an `idle` node into `active`: it opens a run row and launches the
 iteration loop inside a tmux session. `start --continue` re-arms a settled node
 for another run — this re-entry re-checks the width and descendant caps, since
-it returns one unsettled node to the tree exactly as a spawn adds one. A
-tree-wide pause latch makes any start refuse until resume.
+it returns one unsettled node to the tree exactly as a spawn adds one. A run
+that ended on its cost budget never re-arms silently: a bare `--continue`
+refuses, naming the spent and armed figures, until an explicit `--max-cost`
+rides it (applied through the parent's retune — see
+[[features/cost/budgets|budgets]]). A tree-wide pause latch makes any start
+refuse until resume.
 
 ## finish and stop
 
