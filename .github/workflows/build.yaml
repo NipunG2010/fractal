@@ -78,4 +78,4 @@ jobs:
         name: dist
         path: dist/
     # NOTE: publishes both plasma-fractal and fractal (shim)
-    # - uses: pypa/gh-action-pypi-publish@release/v1
+    - uses: pypa/gh-action-pypi-publish@release/v1
