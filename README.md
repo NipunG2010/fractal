@@ -123,45 +123,47 @@ in a tmux session.
 
 Parameters the skill interprets from the directive:
 
-- **name**: node name (required; letters, digits, and `_` only — no `-`)
-- **path**: project root, repo root or monorepo sub-project (default: `.`)
-- **title**: human-readable display name (default: de-slugged node name)
-- **scope**: restrict commits to subdirectories within the worktree
+- **`name`**: node name (required; letters, digits, and `_` only — no `-`)
+- **`path`**: project root, repo root or monorepo sub-project (default: `.`)
+- **`title`**: human-readable display name (default: de-slugged node name)
+- **`scope`**: restrict commits to subdirectories within the worktree
   (comma-separated, e.g. `parent/child,tests`)
-- **base**: branch to start from (default: current branch)
-- **meta**: target node branch for meta-configuration
-- **inherit**: seed surfaces from the parent node instead of the package seed
+- **`base`**: branch to start from (default: current branch)
+- **`meta`**: target node branch for meta-configuration
+- **`inherit`**: seed surfaces from the parent node instead of the package seed
   (comma-separated: `steps`, `scripts`, `skills`, `config`, or `all`); agent
   config always inherits. A top-level spawn's parent is the user node, which
   carries no steps, scripts, or skills — the parameter is for configured nodes
   spawning children
-- **agent**: agent command; inherits the user node's default when omitted
-- **provider**: provider route for the agent (e.g. `openrouter`); inherits the
+- **`agent`**: agent command; inherits the user node's default when omitted
+- **`provider`**: provider route for the agent (e.g. `openrouter`); inherits the
   user node's default when omitted
-- **model**: model override; when omitted, the agent uses its own default model
-- **effort**: reasoning-effort override; when omitted, each agent seed's own
+- **`model`**: model override; when omitted, the agent uses its own default
+  model
+- **`effort`**: reasoning-effort override; when omitted, each agent seed's own
   pinned level applies, not the vendor default
-- **max-iters**: per-run iteration cap
-- **max-depth**: maximum child node nesting depth
-- **max-children**: maximum direct child nodes
-- **max-descendants**: maximum total descendant nodes
-- **timeout**: per-run time limit (e.g. `30m`, `1.5h`)
-- **iter-timeout**: per-iteration time limit (e.g. `30m`, `1.5h`)
-- **step-timeout**: per-step time limit (e.g. `30s`, `10m`); caps each step
-- **interval**: fixed iteration schedule (e.g. `1h`)
-- **sleep**: delay between iterations (e.g. `10s`)
-- **wait**: sleep between approval-wait sync invocations (default: `1m`)
-- **max-cost**: cost ceiling in USD per run — runs are isolated, so each launch
-  arms the cap anew; after a budget-ended run, `node start --continue` refuses
-  without an explicit `--max-cost`
-- **max-iter-cost**: per-iteration cost ceiling in USD
-- **max-step-cost**: per-step cost ceiling in USD (warn-only when unenforceable)
-- **reserve-budget**: budget reserved for cleanup; USD or N% of `max-cost`
+- **`max-iters`**: per-run iteration cap
+- **`max-depth`**: maximum child node nesting depth
+- **`max-children`**: maximum direct child nodes
+- **`max-descendants`**: maximum total descendant nodes
+- **`timeout`**: per-run time limit (e.g. `30m`, `1.5h`)
+- **`iter-timeout`**: per-iteration time limit (e.g. `30m`, `1.5h`)
+- **`step-timeout`**: per-step time limit (e.g. `30s`, `10m`); caps each step
+- **`interval`**: fixed iteration schedule (e.g. `1h`)
+- **`sleep`**: delay between iterations (e.g. `10s`)
+- **`wait`**: sleep between approval-wait sync invocations (default: `1m`)
+- **`max-cost`**: cost ceiling in USD per run — runs are isolated, so each
+  launch arms the cap anew; after a budget-ended run, `node start --continue`
+  refuses without an explicit `--max-cost`
+- **`max-iter-cost`**: per-iteration cost ceiling in USD
+- **`max-step-cost`**: per-step cost ceiling in USD (warn-only when
+  unenforceable)
+- **`reserve-budget`**: budget reserved for cleanup; USD or N% of `max-cost`
   (default: 10%)
-- **sync**: enable (default) or disable radio sync before each step
-- **detached**: run each step as a separate agent session (default: one
+- **`sync`**: enable (default) or disable radio sync before each step
+- **`detached`**: run each step as a separate agent session (default: one
   continuous session)
-- **local**: skip pushing to remote after each commit
+- **`local`**: skip pushing to remote after each commit
 
 ## Development
 
