@@ -57,12 +57,39 @@ class Database:
         sql = self._schema.read_text(encoding='utf-8')
         connection = self.connect()
         try:
+            # stamp WAL once at creation: the mode persists in the file
+            # header, and the delete-to-WAL transition takes an exclusive
+            # lock, so it must never run per-connect under a live fleet
+            connection.execute('PRAGMA journal_mode = WAL')
             connection.executescript(sql)
             # stamp the schema version on an unstamped database only, so a
             # future migration mechanism can key on the stored version
             version, *_ = connection.execute('PRAGMA user_version').fetchone()
             if version == 0:
                 connection.execute('PRAGMA user_version = 1')
+        finally:
+            connection.close()
+        # backfill the schema into the main file: a fresh tree's .db
+        # must be self-contained at rest, not a bare header page whose
+        # tables live only in the -wal
+        self.checkpoint()
+
+    def checkpoint(self: Database) -> None:
+        """Backfill the WAL into the main file and truncate it.
+
+        Writable handles never checkpoint on close (the sidecars must stay
+        put for write-denied readers), and one-shot connections never
+        observe the full backfill that lets SQLite restart the log -- so
+        without an explicit consolidation the WAL only grows and the bare
+        ``.db`` is incomplete at rest. TRUNCATE backfills and zeroes the
+        log while leaving both sidecars in place. Best-effort: a busy
+        fleet defers the consolidation to the next caller.
+        """
+        connection = self.connect()
+        try:
+            connection.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        except sqlite3.OperationalError:
+            pass
         finally:
             connection.close()
 
@@ -74,13 +101,15 @@ class Database:
     ) -> sqlite3.Connection:
         """Open a database connection.
 
-        Sets WAL journal mode and enables foreign keys, and gives every handle a
+        Enables foreign keys (the WAL journal mode is stamped once by
+        ``init`` and persists in the file header) and gives every handle a
         30-second busy timeout (overriding ``sqlite3.connect``'s 5-second
         default) so a contending writer waits for the lock under wide node
         fan-out instead of failing fast and aborting the loop. ``timeout``
         overrides the default -- a UI-thread reader passes a short one so a
-        busy writer never stalls a refresh. Each caller is responsible for
-        closing the returned connection.
+        busy writer never stalls a refresh. Writable handles keep the
+        close-time checkpoint from unlinking the WAL sidecars. Each caller
+        is responsible for closing the returned connection.
 
         Args:
             read_only: Open in read-only mode.
@@ -106,11 +135,16 @@ class Database:
             connection = sqlite3.connect(uri, uri=True, timeout=timeout)
         else:
             connection = sqlite3.connect(f'{self._path}', timeout=timeout)
-        # configure connection -- journal_mode is a write, so only set it on a
-        # writable handle (a read-only connection reads a WAL db fine without it,
-        # and setting it errors when no -wal/-shm sidecar exists)
+        # configure connection -- fractal's own handles never unlink the
+        # -wal/-shm sidecars (a cooperative guarantee: a foreign writable
+        # client closing last can still unlink them once): a last close that
+        # checkpoints and removes them strands write-denied (sandboxed)
+        # readers on SQLITE_CANTOPEN until a writer rebuilds the wal-index,
+        # so writable handles disable the close-time checkpoint; backfill
+        # comes from wal_autocheckpoint (never zero it) plus the explicit
+        # loop-exit checkpoint()
         if not read_only:
-            connection.execute('PRAGMA journal_mode = WAL')
+            connection.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
         connection.execute('PRAGMA foreign_keys = ON')
         connection.row_factory = sqlite3.Row
         return connection

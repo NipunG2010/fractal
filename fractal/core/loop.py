@@ -69,6 +69,10 @@ _BUDGET_REASON_STEMS = (
     'subtree cost budget reached',
     'cost budget exceeded in finish wind-down',
 )
+# the loop-authored reason shape: stem + figures -- classifiers match this,
+# never the bare stem, so agent free text opening with the vocabulary is
+# still a deliberate finish
+_BUDGET_REASON_HEADS = tuple(f'{stem} (spent $' for stem in _BUDGET_REASON_STEMS)
 
 
 class Step:
@@ -331,6 +335,7 @@ class Loop:
         self._budget_hit = False
         self._budget_reason = ''
         self._budget_stem = ''
+        self._cap_overshoot = ''
         self._untracked_warned = False
         self._unreadable_warned = False
         self._soft_cap_warned = False
@@ -349,6 +354,7 @@ class Loop:
         self._step_model = ''
         self._step_effort = ''
         self._step_detached = False
+        self._step_launched = False
         self._step_limit_seconds = 0
         self._step_timeout_effective = self._step_timeout_seconds
         self._step_budget_value: Optional[float] = None
@@ -1600,6 +1606,11 @@ class Loop:
                             exit_code=step_exit_code,
                             metadata=step_reason,
                         )
+                        # a step that never reached its launch spent nothing:
+                        # stamp the knowable zero so NULL cost stays reserved
+                        # for unknowable spend
+                        if not self._step_launched:
+                            node.record.step_cost(step_id=self._step_id, cost=0.0)
                     except Exception:
                         pass
 
@@ -1656,6 +1667,8 @@ class Loop:
                             exit_code=0,
                             metadata=f'failed on {step_name}',
                         )
+                        # never launched, so the spend is a knowable zero
+                        node.record.step_cost(step_id=missed_id, cost=0.0)
                     except Exception:
                         pass
                 if started:
@@ -1683,6 +1696,10 @@ class Loop:
         """
         node = self.node
         step_event = self.on_step(step=self._step_label)
+        # tracks whether this step reached its agent launch: a pre-launch return
+        # spent nothing, so its row's cost is a knowable zero -- NULL cost stays
+        # reserved for unknowable spend (a kill before the first stream flush)
+        self._step_launched = False
 
         def close(result: StepResult) -> StepResult:
             """Fire the terminal pairing for this step's attribution."""
@@ -1839,6 +1856,7 @@ class Loop:
 
         self._step_model = step_model
         self._step_effort = step_effort
+        self._step_launched = True
         return close(self._launch(step, prompt, agent=agent, budget=budget))
 
     def _build_step_prompt(self: Loop, step: Step) -> str:
@@ -2334,6 +2352,12 @@ class Loop:
         node = self.node
         saved_label = self._step_label
         saved_step_id = self._step_id
+        # an approval-wait sync runs between a work step's launch and its
+        # close: the sync's _run_step resets _step_launched, and a pre-launch
+        # sync return (budget skip) would leave it False -- the work step's
+        # close would then stamp 0.0 over its real flushed cost, so restore
+        # the caller's flag after the sync's own zero-stamp check
+        saved_launched = self._step_launched
         print()
         print(f'--- SYNC ({label}) ---')
         self._step_label = f'SYNC ({label})'
@@ -2381,6 +2405,11 @@ class Loop:
             if result.status == 'failed':
                 sync_reason = f'sync failed (exit {result.exit_code})'
                 self._fail_reason = None
+            # a budget-skipped waiting sync books completed like any other,
+            # but the skip must leave a ledger trace (the strict path labels
+            # the identical skip 'over budget')
+            elif result.status == 'skipped':
+                sync_reason = 'sync skipped (over budget)'
         if self._step_id is not None:
             try:
                 node.record.step_end(
@@ -2389,6 +2418,10 @@ class Loop:
                     exit_code=sync_exit_code,
                     metadata=sync_reason,
                 )
+                # a sync that never reached its launch spent nothing: stamp the
+                # knowable zero so NULL cost stays reserved for unknowable spend
+                if not self._step_launched:
+                    node.record.step_cost(step_id=self._step_id, cost=0.0)
             except Exception:
                 pass
 
@@ -2397,6 +2430,7 @@ class Loop:
         sync_step_id = self._step_id
         self._step_label = saved_label
         self._step_id = saved_step_id
+        self._step_launched = saved_launched
         return result, duration, sync_step_id
 
     def _wait_for_children(self: Loop, context: str) -> bool:
@@ -3066,41 +3100,78 @@ class Loop:
             self._force_commit('final')
 
         # over-cap sweep: the in-loop budget checks disarm once a finish
-        # signal is set (they exist to send one), so a self-signalled finish
-        # that crossed the cap reaches here with the budget flag clear and
-        # would close as a goal-met completed -- reclassify before the
-        # terminal blocks read it
+        # signal is set (they exist to send one), so a finish that crossed
+        # the cap reaches here with the budget flag clear -- classify it by
+        # its reason: a deliberate (non-budget-stemmed) finish keeps its
+        # goal-met completed landing with the overshoot recorded on the run
+        # row, while a budget-stemmed finish falls through to the sweeps
+        # below for reclassification with its own figured attribution
+        # fetch the run's finish rows once (newest first), shared by every
+        # sweep below: finish rows can land in any order (a cascade arriving
+        # during a goal-met drain), so classification prefers a deliberate
+        # row wherever one exists instead of trusting arrival order -- the
+        # same inputs must book the same terminal status either way round;
+        # an unreadable store reads as unreadable, never as deliberate
+        finish_deliberate: Optional[str] = None
+        finish_budget = ''
+        finish_readable = True
+        if self._signal('finish'):
+            try:
+                finish_rows = node.record.signals(
+                    run_id=self._run_id,
+                    signal='finish',
+                )
+            except Exception:
+                finish_readable = False
+            else:
+                for finish_row in finish_rows:
+                    reason = finish_row['metadata'] or ''
+                    if _is_budget_reason(reason):
+                        if not finish_budget:
+                            finish_budget = reason
+                    elif finish_deliberate is None:
+                        finish_deliberate = reason
+
         cap_unflagged = not self._budget_hit and self._max_cost is not None
         if cap_unflagged and self._signal('finish'):
             spent = self._run_spent()
             if spent is not None and spent >= float(self._max_cost):
-                print(
-                    f'=== Cost budget exceeded in finish wind-down'
-                    f' (${spent:.4f} of ${self._max_cost_label} spent) ==='
-                )
-                self._budget_hit = True
-                self._budget_reason = 'cost budget exceeded in finish wind-down'
-                self._budget_stem = self._budget_reason
+                if not finish_readable:
+                    # unreadable signal store: deterministic budget
+                    # reclassification -- an over-cap finish must never
+                    # fail open into a goal-met completed
+                    print(
+                        f'=== Cost budget exceeded in finish wind-down'
+                        f' (${spent:.4f} of ${self._max_cost_label} spent) ==='
+                    )
+                    self._budget_hit = True
+                    self._budget_reason = 'cost budget exceeded in finish wind-down'
+                    self._budget_stem = self._budget_reason
+                elif finish_deliberate is not None:
+                    print(
+                        f'=== Cost budget exceeded in finish wind-down'
+                        f' (${spent:.4f} of ${self._max_cost_label} spent);'
+                        f' deliberate finish -- completing ==='
+                    )
+                    self._cap_overshoot = (
+                        f'cost budget exceeded in finish wind-down'
+                        f' (spent ${spent:.4f} >= ${self._max_cost_label} max)'
+                    )
 
         # cascaded-budget sweep: an ancestor's budget abort propagates finish
         # to every active descendant, but the budget flag stays local to the
         # tripping loop -- without this the killed descendant closes as a
         # goal-met completed; the propagated reason carries the budget prefix
         # plus the `(via finish of <branch>)` attribution, so reclassify
-        # exactly those (a non-budget finish stays normal), relabeling with
-        # this run's own child-scope figures -- the ancestor's figures name
-        # its scope, not this run's; the signal row keeps the propagated
-        # reason as the honest record of what was sent
-        if not self._budget_hit:
-            try:
-                finish_reason = (
-                    node.record.signal_get('finish', run_id=self._run_id) or ''
-                )
-            except Exception:
-                finish_reason = ''
-            if _is_cascaded_budget_reason(finish_reason):
+        # exactly those, relabeling with this run's own child-scope figures
+        # -- the ancestor's figures name its scope, not this run's; the
+        # signal row keeps the propagated reason as the honest record of
+        # what was sent. A deliberate row outranks every budget row: a node
+        # that met its goal keeps completed whichever order the rows landed
+        if not self._budget_hit and finish_deliberate is None and finish_budget:
+            if _is_cascaded_budget_reason(finish_budget):
                 print(
-                    f'=== Budget abort cascaded from an ancestor ({finish_reason}) ==='
+                    f'=== Budget abort cascaded from an ancestor ({finish_budget}) ==='
                 )
                 self._budget_hit = True
                 spent = self._run_spent()
@@ -3108,11 +3179,11 @@ class Loop:
                 if self._max_cost is not None:
                     figures += f' of ${self._max_cost_label}'
                 self._budget_reason = (
-                    f'ancestor budget abort: {finish_reason}; this run spent {figures}'
+                    f'ancestor budget abort: {finish_budget}; this run spent {figures}'
                 )
-                attribution = finish_reason[finish_reason.index('(via finish of ') :]
+                attribution = finish_budget[finish_budget.index('(via finish of ') :]
                 self._budget_stem = f'ancestor budget abort {attribution}'
-            elif finish_reason.startswith(_BUDGET_REASON_STEMS):
+            else:
                 # parked-abort sweep: a pause can park the run between a
                 # self-sent budget finish and its landing, and the abort
                 # flags die with the parked loop process -- the resumed
@@ -3120,11 +3191,11 @@ class Loop:
                 # stop sits below the over-cap threshold, so re-adopt the
                 # abort from the signal row (its persisted record) to keep
                 # the exited/0 landing
-                print(f'=== Budget abort resumed from park ({finish_reason}) ===')
+                print(f'=== Budget abort resumed from park ({finish_budget}) ===')
                 self._budget_hit = True
-                self._budget_reason = finish_reason
+                self._budget_reason = finish_budget
                 # the stem is the reason's figure-free head
-                self._budget_stem = finish_reason.split(' (', 1)[0]
+                self._budget_stem = finish_budget.split(' (', 1)[0]
 
         exit_reason = None
         if self._budget_hit:
@@ -3163,6 +3234,10 @@ class Loop:
                 node.record.signal_set('exit', exit_reason)
             except Exception:
                 pass
+        elif self._cap_overshoot:
+            # the goal-met finish keeps its completed landing; the overshoot
+            # figures ride the run row so `node activity` explains the spend
+            exit_reason = self._cap_overshoot
 
         if self._budget_hit:
             # budget landing: a budget stop is not a goal-met completion --
@@ -3209,9 +3284,9 @@ class Loop:
         except Exception:
             pass
 
-        # carry the run's exit reason (set above for a non-finish exit) so
-        # `node activity` shows why the run ended; a clean finish leaves the
-        # reason unset -> no metadata
+        # carry the run's exit reason (set above for a non-finish exit or
+        # a cap-overshot finish) so `node activity` shows why the run ended;
+        # a clean finish leaves the reason unset -> no metadata
         try:
             node.record.run_end(
                 run_id=self._run_id,
@@ -3274,6 +3349,15 @@ class Loop:
             # the crash-path twin of the terminal cascade's notice, mirroring
             # the reason this branch just recorded
             self._send_exit_notice('exited', 'Loop exited abnormally')
+        # consolidate the WAL at this fleet-quiet boundary: close-time
+        # checkpoints are disabled (db.py keeps the sidecars for write-denied
+        # readers), so without this the log only ever grows and the bare .db
+        # is incomplete at rest -- best-effort, a live sibling fleet defers
+        # it to the next exiting loop
+        try:
+            node.db.checkpoint()
+        except Exception:
+            pass
 
     def _commit_check(self: Loop) -> bool:
         """Return whether the worktree is clean (the porcelain backstop check)."""
@@ -3505,13 +3589,23 @@ class LoopStepFailureEvent(FailureEvent):
 # ------ helper functions
 
 
+def _is_budget_reason(reason: str, /) -> bool:
+    """Return whether a finish reason is a loop-authored budget abort.
+
+    Matches the loop's own reason shape -- a budget stem followed by its
+    figures -- so an agent's free-text reason that merely opens with the
+    vocabulary never classifies as a budget abort.
+    """
+    return reason.startswith(_BUDGET_REASON_HEADS)
+
+
 def _is_cascaded_budget_reason(reason: str, /) -> bool:
     """Return whether a finish reason is an ancestor's cascaded budget abort.
 
     Fan-out always carries the tripping ancestor's raw reason, so the
-    match is an exact budget-stem prefix plus the fan-out attribution.
+    match is the loop-authored budget shape plus the fan-out attribution.
     """
-    return '(via finish of ' in reason and reason.startswith(_BUDGET_REASON_STEMS)
+    return '(via finish of ' in reason and _is_budget_reason(reason)
 
 
 def _boot_env(node: Node, *, detached: bool, meta: str) -> dict[str, str]:

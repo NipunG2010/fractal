@@ -18,6 +18,13 @@ instructions override the current step:
    ```
 
 The loop decides at this iteration's boundary whether the run ends or continues
--- do **not** run `fractal node finish` yourself, and do not defer wind-down
-work past this iteration: it may never run. Budget semantics live in the
-`fractal` skill's Cost section.
+-- do not defer wind-down work past this iteration: it may never run. Do **not**
+run `fractal node finish` yourself, with one exception: if your charter's
+requirements are already fully verified, finish deliberately with a short
+goal-met reason (`fractal node finish --reason="<what was verified>"`) -- the
+run then books `completed` even if spend crosses the cap during the drain, with
+the overshoot recorded on the run row. The loop's own abort phrases
+(`cost budget ... (spent $...)`, `subtree cost budget ... (spent $...)`) are
+reserved -- a reason bearing one classifies the finish as a budget abort -- so
+write your reason in your own words. Budget semantics live in the `fractal`
+skill's Cost section.

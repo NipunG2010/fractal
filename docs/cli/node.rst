@@ -199,9 +199,9 @@ Cost caps must satisfy ``step <= iter <= run`` ordering. Spawn caps
 remaining budget) are enforced at init, and spawning refuses under a paused
 ancestor or a tree-wide pause latch. An existing node refuses without
 ``--reset``, and ``--reset`` itself refuses over an active or paused node.
-Two advisories ride stderr without blocking: a node with neither
+One advisory rides stderr without blocking: a node with neither
 ``--max-cost`` nor ``--max-iters`` warns that it can run and spend without
-bound, and a single-word name without ``--title`` suggests setting one.
+bound.
 
 .. code-block:: console
 

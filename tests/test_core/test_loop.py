@@ -52,6 +52,7 @@ __all__ = [
     'test_step_budget_math_binds_the_tightest_cap',
     'test_run_spent_counts_recorded_cost_only',
     'test_budget_skipped_sync_books_stopped',
+    'test_budget_skipped_steps_record_knowable_zero',
     'test_run_remaining_floors_at_zero_without_a_last_reading',
     'test_soft_cap_warning_fires_once_for_unbraked_caps',
     'test_step_budget_reserve_window_floors_at_remaining',
@@ -77,7 +78,8 @@ __all__ = [
     'test_finalize_terminal_cascade_matrix',
     'test_stop_during_finish_drain_books_stopped',
     'test_pre_iteration_finish_drain_uses_the_run_wall_not_the_iter_deadline',
-    'test_finalize_reclassifies_budget_overruns_on_finish',
+    'test_finalize_classifies_over_cap_finishes_by_reason',
+    'test_deliberate_finish_survives_a_wind_down_budget_trip',
     'test_finalize_park_leaves_rows_open',
     'test_crash_exit_closes_the_open_iteration_and_step_rows',
     'test_run_fires_hook_pairings_off_stdout',
@@ -886,6 +888,32 @@ def test_budget_skipped_sync_books_stopped(loop_node: Node) -> None:
     assert rows[0]['status'] == 'stopped'
     assert rows[0]['exit_code'] == 0
     assert rows[0]['metadata'] == 'over budget'
+    # never launched, so the row carries the knowable zero -- the sync is
+    # priced (free), never disclosed as unpriced
+    assert rows[0]['cost'] == 0.0
+    assert node.cost.unpriced(iter_id=loop._iter_id) == 0
+
+
+def test_budget_skipped_steps_record_knowable_zero(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-launch budget skip prices every row at the knowable zero.
+
+    A step that never reaches its launch spent nothing -- the row carries
+    an explicit 0.0 so spend sums stay exact and ``unpriced`` (NULL cost:
+    spend unknowable) discloses nothing. NULL stays reserved for launched
+    steps whose usage never flushed.
+    """
+    monkeypatch.setenv('_NODE', '')
+    # a drained leash skips every launch (work steps and syncs alike)
+    monkeypatch.setattr(MockLoop, '_step_budget', lambda self: 0.0)
+    loop = MockLoop(loop_node)
+    assert loop.run() == 0
+    steps = loop_node.db.read('steps', where={'run_id': loop._run_id})
+    assert steps
+    assert all(row['cost'] == 0.0 for row in steps)
+    assert loop_node.cost.unpriced(run_id=loop._run_id) == 0
 
 
 def test_run_remaining_floors_at_zero_without_a_last_reading(
@@ -1357,6 +1385,8 @@ def test_step_failure_books_never_run_steps_and_a_described_backstop(
     by_name = {row['step_name']: row for row in rows}
     review = by_name['REVIEW']
     assert (review['status'], review['metadata']) == ('stopped', 'failed on EXECUTE')
+    # a never-run tail row spent nothing: priced as the knowable zero
+    assert review['cost'] == 0.0
 
     def _log(fmt: str) -> str:
         result = subprocess.run(
@@ -2001,27 +2031,55 @@ def test_pre_iteration_finish_drain_uses_the_run_wall_not_the_iter_deadline(
     assert (run['status'], run['exit_code']) == ('completed', 0)
 
 
-def test_finalize_reclassifies_budget_overruns_on_finish(loop_node: Node) -> None:
-    """The over-cap, cascaded, and parked budget sweeps reclassify a finish.
+def test_finalize_classifies_over_cap_finishes_by_reason(loop_node: Node) -> None:
+    """Over the cap, a finish lands by its reason: deliberate completes.
 
     The in-loop budget checks disarm once a finish signal exists, so a
-    self-signalled finish that crossed the cap, a budget finish cascaded
-    from an ancestor, and a self-sent budget finish resumed from a pause
-    park (the abort flags die with the parked process) all reach the
-    cascade budget-clean and would close as goal-met ``completed``
-    without the sweeps.
+    finish that crossed the cap reaches the terminal sweeps with the budget
+    flag clear. A deliberate (non-budget-stemmed) finish keeps its goal-met
+    ``completed`` landing with the overshoot recorded on the run row;
+    budget-stemmed finishes fall through to the cascaded/parked sweeps,
+    which book ``exited`` with their own figured attribution.
     """
     node = loop_node
-    # over-cap sweep: finish set, spend past the cap (back-dated cost rows)
+    # deliberate finish over the cap: goal-met completed, overshoot recorded
     _configure(node, max_cost=5.0)
     loop = MockLoop(node)
     loop._run_id = node.record.run_start()
-    node.record.signal_set('finish', 'wind down')
+    node.record.signal_set('finish', 'requirements verified: all surfaces delivered')
     _record_step_cost(node, run_id=loop._run_id, cost=6.0)
     assert loop._finalize() == 0
     row = node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert (row['status'], row['exit_code']) == ('completed', 0)
+    assert row['metadata'] == (
+        'cost budget exceeded in finish wind-down (spent $6.0000 >= $5.0 max)'
+    )
+    # a cascaded budget finish whose run also crossed its own cap books
+    # exited via the cascaded sweep, with this run's own child-scope figures
+    over = MockLoop(node)
+    over._run_id = node.record.run_start()
+    reason = (
+        'cost budget reserve reached (spent $9 >= $5 max) (via finish of main.parent)'
+    )
+    node.record.signal_set('finish', reason)
+    _record_step_cost(node, run_id=over._run_id, cost=6.0)
+    assert over._finalize() == 0
+    row = node.db.read('runs', where={'run_id': over._run_id})[0]
     assert (row['status'], row['exit_code']) == ('exited', 0)
-    assert row['metadata'] == 'cost budget exceeded in finish wind-down'
+    assert row['metadata'] == (
+        f'ancestor budget abort: {reason}; this run spent $6.0000 of $5.0'
+    )
+    # a bare self-sent stem over the full cap lands via the parked sweep,
+    # keeping its persisted reason
+    bare = MockLoop(node)
+    bare._run_id = node.record.run_start()
+    reason = 'cost budget reserve reached (spent $6.0000 >= $5.0 max - $0.5 reserve)'
+    node.record.signal_set('finish', reason)
+    _record_step_cost(node, run_id=bare._run_id, cost=6.0)
+    assert bare._finalize() == 0
+    row = node.db.read('runs', where={'run_id': bare._run_id})[0]
+    assert (row['status'], row['exit_code']) == ('exited', 0)
+    assert row['metadata'] == reason
     # cascaded-budget sweep: an ancestor's propagated budget finish
     # reclassifies too, relabeled with this run's own child-scope figures
     # (the ancestor's figures name its scope, not this run's)
@@ -2061,6 +2119,68 @@ def test_finalize_reclassifies_budget_overruns_on_finish(loop_node: Node) -> Non
     assert clean._finalize() == 0
     row = node.db.read('runs', where={'run_id': clean._run_id})[0]
     assert (row['status'], row['exit_code']) == ('completed', 0)
+    # arrival order never decides: a cascade landing on top of a deliberate
+    # goal-met finish books the same completed landing as the reverse order
+    _configure(node, max_cost=5.0)
+    raced = MockLoop(node)
+    raced._run_id = node.record.run_start()
+    node.record.signal_set('finish', 'requirements verified before the cascade')
+    node.record.signal_set(
+        'finish',
+        'cost budget reserve reached (spent $9 >= $5 max) (via finish of main.parent)',
+    )
+    _record_step_cost(node, run_id=raced._run_id, cost=6.0)
+    assert raced._finalize() == 0
+    row = node.db.read('runs', where={'run_id': raced._run_id})[0]
+    assert (row['status'], row['exit_code']) == ('completed', 0)
+    assert row['metadata'] == (
+        'cost budget exceeded in finish wind-down (spent $6.0000 >= $5.0 max)'
+    )
+
+
+def test_deliberate_finish_survives_a_wind_down_budget_trip(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A goal-met finish keeps ``completed`` through a wind-down budget trip.
+
+    A node whose requirements verify during the wind-down finishes
+    deliberately; spend then crosses the cap before the next probe, but the
+    probes stay disarmed on the pending finish and the terminal sweep must
+    not reclassify the goal-met run -- the overshoot rides the run row
+    instead, and the deliberate reason survives on the signal row.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _configure(loop_node, max_cost=5.0)
+
+    class _FinishThenOvershoot(MockLoop):
+        """Signal a deliberate finish and cross the cap after step one."""
+
+        def _launch(
+            self: _FinishThenOvershoot,
+            step: Step,
+            prompt: str,
+            *,
+            agent: Any,
+            budget: Optional[float],
+        ) -> StepResult:
+            result = super()._launch(step, prompt, agent=agent, budget=budget)
+            if len(self.launched) == 1:
+                self.node.record.signal_set('finish', 'requirements met')
+                _record_step_cost(self.node, run_id=self._run_id, cost=6.0)
+            return result
+
+    loop = _FinishThenOvershoot(loop_node)
+    assert loop.run() == 0
+    run = loop_node.db.read('runs', where={'run_id': loop._run_id})[0]
+    assert (run['status'], run['exit_code']) == ('completed', 0)
+    assert run['metadata'] == (
+        'cost budget exceeded in finish wind-down (spent $6.0000 >= $5.0 max)'
+    )
+    assert loop_node.status() == 'completed'
+    # the deliberate reason survives on the append-only signal row
+    finish_reason = loop_node.record.signal_get('finish', run_id=loop._run_id)
+    assert finish_reason == 'requirements met'
 
 
 def test_finalize_park_leaves_rows_open(

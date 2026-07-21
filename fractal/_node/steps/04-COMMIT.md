@@ -17,7 +17,10 @@ requires_approval: false
 
 2. Commit: `fractal commit "<short lowercase summary>"` -- this checks scope,
    lints, stages, commits, and pushes (unless `--local` was passed to
-   initialization). Fix and retry on lint failure.
+   initialization). Fix and retry on lint failure. Hook reformats of project
+   files are auto-retried once -- review what they changed (`git diff HEAD~`). A
+   hook rewrite of `wiki/` or `.fractal/` pages fails the commit instead: those
+   are fractal-owned -- never run project format hooks over them.
 
    The summary is wrapped as `<branch>: iteration <run>.<iter> (<summary>)` --
    pass only the bare summary. A message containing the branch name or the word

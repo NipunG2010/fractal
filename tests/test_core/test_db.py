@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import pathlib
+import shutil
+import sqlite3
 import threading
 
 import pytest
@@ -22,6 +24,8 @@ __all__ = [
     'test_where_none_filters_match_null_columns',
     'test_connect_sets_generous_busy_timeout',
     'test_connect_timeout_override_wins',
+    'test_wal_sidecars_persist_across_last_close',
+    'test_checkpoint_truncates_wal_and_keeps_the_db_complete',
     'test_concurrent_writers_serialize',
     'test_transaction_commits_and_rolls_back',
     'test_update_reports_rowcount_for_compare_and_swap',
@@ -363,6 +367,65 @@ def test_connect_timeout_override_wins(database: Database) -> None:
         finally:
             connection.close()
         assert timeout_ms == 2000
+
+
+def test_wal_sidecars_persist_across_last_close(database: Database) -> None:
+    """The WAL sidecars survive every last close, keeping readers attachable.
+
+    Stock SQLite checkpoints and unlinks ``-wal``/``-shm`` on a database's
+    last close; a write-denied (sandboxed) reader landing in that gap gets
+    ``SQLITE_CANTOPEN`` until a writer rebuilds the wal-index. Writable
+    handles disable the close-time checkpoint, so the sidecars created at
+    init persist -- and the mode comes from the file header, never a
+    per-connect re-stamp.
+    """
+    # a one-shot write whose close is the process's last connection
+    database.write(_run(), 'runs')
+    wal = database.path.with_name(f'{database.path.name}-wal')
+    shm = database.path.with_name(f'{database.path.name}-shm')
+    assert wal.exists()
+    assert shm.exists()
+    # a read-only one-shot attaches to the stable wal-index and sees the row
+    connection = database.connect(read_only=True)
+    try:
+        count = connection.execute('SELECT COUNT(*) AS n FROM runs').fetchone()['n']
+    finally:
+        connection.close()
+    assert count == 1
+    # the mode is inherited pragma-free on a fresh writable handle
+    connection = database.connect()
+    try:
+        mode, *_ = connection.execute('PRAGMA journal_mode').fetchone()
+    finally:
+        connection.close()
+    assert mode == 'wal'
+
+
+def test_checkpoint_truncates_wal_and_keeps_the_db_complete(
+    database: Database,
+) -> None:
+    """``checkpoint`` backfills and zeroes the WAL, sidecars left in place.
+
+    Close-time checkpoints are disabled, so recent commits live only in
+    the ``-wal`` until an explicit consolidation -- after it, the bare
+    ``.db`` alone is a complete database at rest while the sidecars stay
+    put for write-denied readers.
+    """
+    database.write(_run(), 'runs')
+    wal = database.path.with_name(f'{database.path.name}-wal')
+    assert wal.stat().st_size > 0
+    database.checkpoint()
+    assert wal.exists()
+    assert wal.stat().st_size == 0
+    # the bare .db alone is now the complete database
+    bare = database.path.parent / 'bare.db'
+    shutil.copyfile(database.path, bare)
+    connection = sqlite3.connect(f'file:{bare}?mode=ro&immutable=1', uri=True)
+    try:
+        count, *_ = connection.execute('SELECT COUNT(*) FROM runs').fetchone()
+    finally:
+        connection.close()
+    assert count == 1
 
 
 # ------ concurrency and transactions

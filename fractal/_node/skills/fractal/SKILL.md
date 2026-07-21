@@ -64,35 +64,36 @@ but monitor (`fractal node cost spent`, `fractal node cost breakdown`) and kill
 over-spenders. Caps are **soft** -- a child is not *hard*-stopped when it nears
 `--max-cost`; once it drains into the reserve it gets cleanup guidance to wind
 down the remainder of the current iteration cheaply, then the loop ends its run
-at that iteration's boundary (the child does not run `finish` itself) -- but a
-single iteration or its subtree can still overshoot, so reining in an
+at that iteration's boundary (the child runs `finish` itself only when its
+requirements already verify -- the reserve guidance's goal-met exception) -- but
+a single iteration or its subtree can still overshoot, so reining in an
 over-spender is on you, the parent. Price a cap as solve + wind-down + reserve:
 a clean finish costs a full iteration of close overhead on top of the last unit
 of work (typically a few dollars per leaf child -- environment- and
 model-specific), so a cap sized to the solve alone strands a *done* child
-`exited` at the reserve boundary instead of `completed`. Size `--max-iter-cost`
-to one wind-down pass as well: the iteration cap, not the run-level cap, is what
-bounds each close attempt. Iteration caps bind at step boundaries, never
-mid-step -- plan each iteration to end under the cap, and read a trip as
-disclosure that an iteration ran hot, not as a hard stop. If a done child
-strands anyway, prefer raise-cap + continue + stop over a full re-finish -- the
-re-finish re-pays the whole close severalfold and can still near-miss -- and
-treat `exited` with recorded DB finish signals as a defensible terminal once the
-work is merged and verified. Child-side corollary: `fractal node cost remaining`
-reports against `--max-cost`, NOT against (`--max-cost` - reserve); a node
-inside the reserve band reads positive remaining and plans an iteration the loop
-will never grant. Plan your last productive iteration against (`--max-cost` -
-reserve), and if you intend to signal `finish`, fire it BEFORE draining into the
-reserve -- wind-down work scheduled for "next iteration" does not happen.
-In-step overshoot is bounded for claude children (each step runs under a hard
-per-invocation budget and stops cleanly at it), but the run-level cap stays
-soft. A child's spend (including its sync) counts against your own budget. Some
-agents report cost directly; others report token usage, priced from published
-rates -- so a cost cap on a token-reporting child requires a (priced) `--model`
-(the run fails on the first step otherwise). claude, grok, opencode, and omp
-report cost directly; codex reports tokens. A claude child routed through
-openrouter is priced from tokens too, so under a cap it also needs an explicit
-priced `--model`.
+`exited` at the reserve boundary instead of `completed` unless it finishes
+deliberately in the wind-down. Size `--max-iter-cost` to one wind-down pass as
+well: the iteration cap, not the run-level cap, is what bounds each close
+attempt. Iteration caps bind at step boundaries, never mid-step -- plan each
+iteration to end under the cap, and read a trip as disclosure that an iteration
+ran hot, not as a hard stop. If a done child strands anyway, prefer raise-cap +
+continue + stop over a full re-finish -- the re-finish re-pays the whole close
+severalfold and can still near-miss -- and treat `exited` with recorded DB
+finish signals as a defensible terminal once the work is merged and verified.
+Child-side corollary: `fractal node cost remaining` reports against
+`--max-cost`, NOT against (`--max-cost` - reserve); a node inside the reserve
+band reads positive remaining and plans an iteration the loop will never grant.
+Plan your last productive iteration against (`--max-cost` - reserve), and if you
+intend to signal `finish`, fire it BEFORE draining into the reserve -- wind-down
+work scheduled for "next iteration" does not happen. In-step overshoot is
+bounded for claude children (each step runs under a hard per-invocation budget
+and stops cleanly at it), but the run-level cap stays soft. A child's spend
+(including its sync) counts against your own budget. Some agents report cost
+directly; others report token usage, priced from published rates -- so a cost
+cap on a token-reporting child requires a (priced) `--model` (the run fails on
+the first step otherwise). claude, grok, opencode, and omp report cost directly;
+codex reports tokens. A claude child routed through openrouter is priced from
+tokens too, so under a cap it also needs an explicit priced `--model`.
 
 Every dollar figure you read has a scope; know it before comparing two.
 Budget-guard figures, recorded run-end reasons, and `fractal node cost spent` /
@@ -296,10 +297,12 @@ seed; once done, merge it and launch the target.
 
 ## Monitor and control
 
-- **Status:** `fractal node list`, `fractal node status <branch>`. A node that
-  hits its `--max-cost` reports `exited` (exit 0 -- a designed landing, not a
-  crash) even if it finished and signalled `finish` -- a deliberate under-claim
-  (a budget-*aborted* node must never read `completed`). So treat a capped
+- **Status:** `fractal node list`, `fractal node status <branch>`. A node whose
+  run ends on its `--max-cost` reports `exited` (exit 0 -- a designed landing,
+  not a crash) -- a deliberate under-claim (a budget-*aborted* node must never
+  read `completed`). The one exception: a node whose requirements verified and
+  that ran a deliberate goal-met `finish` books `completed` even when the drain
+  crossed the cap, with the overshoot recorded on the run row. So treat a capped
   node's `exited` as "inspect the work", not "failed": check its memory/plans
   and merge if the work is done. Verify a child's *executable* artifacts --
   checkers, scripts, anything you will run -- from a clean checkout of its

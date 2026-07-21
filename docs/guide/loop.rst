@@ -438,7 +438,12 @@ A budget end always lands the run as ``exited`` with **exit code 0** — the
 completed run and a crash. The recorded reason names which bound tripped
 (e.g. ``cost budget reserve reached``, ``subtree cost budget reached``). A
 node whose run ended on budget refuses a bare ``fractal node start
---continue``; pass ``--max-cost`` to arm the next run explicitly.
+--continue``; pass ``--max-cost`` to arm the next run explicitly. One
+carve-out: a node whose requirements verified may finish deliberately during
+the wind-down, and that run books ``completed`` even when the drain crossed
+the cap — the overshoot rides the run row's metadata (``cost budget exceeded
+in finish wind-down (spent $X >= $Y max)``), so budget vocabulary in run
+metadata alone no longer implies a budget landing.
 
 Pricing and untracked spend
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~

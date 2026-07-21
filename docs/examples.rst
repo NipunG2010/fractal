@@ -110,10 +110,9 @@ directory at ``.worktrees/main.hello/.fractal/main.hello/`` seeded with
 The caps are the load-bearing part of this command. The script never creates
 an uncapped node: the defaults are unlimited, and one iteration is several
 agent invocations, so ``--max-iters=2`` and ``--max-cost=5.0`` bound the demo
-to two iterations or five dollars, whichever comes first. The command prints a
-stderr advisory about the single-word name lacking a ``--title`` — expected,
-and harmless for a throwaway node. See :doc:`/configuration` for
-the full option surface and :doc:`/cli/node` for the command reference.
+to two iterations or five dollars, whichever comes first. See
+:doc:`/configuration` for the full option surface and :doc:`/cli/node` for
+the command reference.
 
 Authoring the mission
 ~~~~~~~~~~~~~~~~~~~~~

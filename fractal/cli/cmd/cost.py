@@ -145,8 +145,9 @@ def cost_spent(app: typer.Typer) -> typer.Typer:
             typer.echo('untracked')
         else:
             typer.echo(f'${spent:.{_DECIMAL_PRECISION}f}')
-            # disclose the SUM's silent gap (ended steps with NULL cost: kills
-            # before the first usage flush) on stderr; stdout stays parseable
+            # disclose the SUM's silent gap (ended steps with NULL cost:
+            # launched steps whose usage never flushed, e.g. kills before
+            # the first flush) on stderr; stdout stays parseable
             unpriced = node.cost.unpriced(**kwargs, max_depth=max_depth)
             if unpriced:
                 s = 's' if unpriced != 1 else ''

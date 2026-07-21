@@ -165,12 +165,15 @@ class Cost:
 
         A token-priced agent with no priced model records ``NULL`` cost,
         so its spend sums to ``0`` yet is not actually ``$0``. Returns ``True``
-        when the scope has steps but none recorded a cost, letting the CLI show
-        ``untracked`` instead of ``$0`` so a parent can tell "spent nothing" from
-        "untrackable". The run scope mirrors ``spent``: it walks the per-run
-        subtree (to ``max_depth``) so a fully-untracked child reads as untracked
-        at the parent, not as ``$0`` -- a mixed subtree (any priced step) is
-        tracked. The iteration/step scope is own steps only (no children).
+        when the scope has unknowable (``NULL``-cost) steps and none recorded
+        a real figure, letting the CLI show ``untracked`` instead of ``$0`` so
+        a parent can tell "spent nothing" from "untrackable". Zero-cost rows
+        (never-launched steps, and a flushed genuine $0) are neutral: they
+        prove nothing spent, not that spend was tracked. The run scope mirrors
+        ``spent``: it walks the per-run subtree (to ``max_depth``) so a
+        fully-untracked child reads as untracked at the parent, not as ``$0``
+        -- a mixed subtree (any real figure) is tracked. The iteration/step
+        scope is own steps only (no children).
 
         Args:
             run_id: A run to scope to; the current run if omitted.
@@ -180,7 +183,7 @@ class Cost:
                 (``None`` all descendants, ``0`` this node only).
 
         Returns:
-            ``True`` if the scope has steps and every one recorded ``NULL`` cost.
+            ``True`` if the scope has ``NULL``-cost steps and no real figure.
 
         """
         # iteration/step scope: own steps only (children not applicable,
@@ -191,21 +194,23 @@ class Cost:
             else:
                 where, param = 'iter_id = ?', iter_id
             query = (
-                'SELECT COUNT(*) AS total, COUNT(cost) AS priced'
+                'SELECT COUNT(*) - COUNT(cost) AS unknown,'
+                ' COUNT(CASE WHEN cost > 0 THEN 1 END) AS figured'
                 f' FROM steps WHERE {where}'
             )
             if rows := self.db.read(query=query, params=(param,)):
-                return rows[0]['total'] > 0 and rows[0]['priced'] == 0
+                return rows[0]['unknown'] > 0 and rows[0]['figured'] == 0
             return False
         # run scope: count the per-run subtree's steps like spent so an
         # untracked child's NULL-cost steps aren't read as a genuine $0
         row = self._scoped(
-            'COUNT(*) AS total, COUNT(s.cost) AS priced',
+            'COUNT(*) - COUNT(s.cost) AS unknown,'
+            ' COUNT(CASE WHEN s.cost > 0 THEN 1 END) AS figured',
             run_id=run_id,
             max_depth=max_depth,
         )
         if row:
-            return row['total'] > 0 and row['priced'] == 0
+            return row['unknown'] > 0 and row['figured'] == 0
         return False
 
     def unpriced(
@@ -219,10 +224,15 @@ class Cost:
         """Count a scope's ended steps that recorded no cost.
 
         ``SUM()`` skips NULL-cost rows without a trace, so ledger-facing
-        readings disclose this count when nonzero: kills before the first
-        usage flush (marked ``unpriced`` on their metadata), pre-stream
-        failures, and untracked-agent rows. Ended rows only -- an open step
-        is merely not priced *yet*. Scopes mirror ``spent``.
+        readings disclose this count when nonzero. NULL means the spend is
+        unknowable -- a launched step whose usage never flushed: kills before
+        the first usage flush (marked ``unpriced`` on their metadata),
+        post-launch pre-stream deaths, and untracked-agent rows. A step the
+        loop closes without reaching its launch records an explicit zero
+        instead (out-of-band crash heals still land here: a healed
+        pre-launch row is indistinguishable from a launched pre-stream
+        death). Ended rows only -- an open step is merely not priced *yet*.
+        Scopes mirror ``spent``.
 
         Args:
             run_id: A run to scope to; the current run if omitted.

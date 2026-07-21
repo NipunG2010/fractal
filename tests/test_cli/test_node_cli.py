@@ -39,7 +39,6 @@ __all__ = [
     'test_space_joined_scope_normalizes_on_read',
     'test_init_reserve_budget_defaults_to_ten_percent',
     'test_init_title_override_is_stored_verbatim',
-    'test_init_single_word_name_without_title_warns',
     'test_node_init_requires_agent',
     'test_init_uses_central_db',
     'test_init_reset_reinitializes_node',
@@ -340,37 +339,6 @@ def test_init_title_override_is_stored_verbatim(repo: dict) -> None:
     assert _config(node, 'title') == 'Data Pipeline v2'
     # clean up so the shared module fixture is left as other tests expect
     assert _run(root, 'node', 'delete', 'main.pipeline', '--force').returncode == 0
-
-
-@pytest.mark.parametrize(
-    argnames=('name', 'title_flags', 'warns'),
-    argvalues=[
-        ('solo', [], True),
-        ('solo', ['--title', 'Solo Effort'], False),
-        ('two_words', [], False),
-    ],
-    ids=['single_word_untitled', 'single_word_titled', 'multi_word'],
-)
-def test_init_single_word_name_without_title_warns(
-    repo: dict,
-    name: str,
-    title_flags: list[str],
-    warns: bool,
-) -> None:
-    """A single-word name with no ``--title`` warns; a title or separator is quiet.
-
-    A separator-less name de-slugs to itself capitalized, so the default
-    title is indistinguishable from the slug in every title surface -- init
-    flags it on stderr (advisory, the node is still created) and points at
-    ``node update --title``. An explicit ``--title`` or a multi-word name
-    resolves to a real title, so neither warns.
-    """
-    root = repo['root']
-    spawn = _run(root, 'node', 'init', name, '--agent', 'claude', *title_flags)
-    assert spawn.returncode == 0, spawn.stderr
-    assert ('single-word name without --title' in spawn.stderr) == warns, spawn.stderr
-    # clean up so the shared module fixture is left as other tests expect
-    assert _run(root, 'node', 'delete', f'main.{name}', '--force').returncode == 0
 
 
 def test_node_init_requires_agent(repo: dict) -> None:

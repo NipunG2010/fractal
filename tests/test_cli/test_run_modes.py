@@ -124,7 +124,7 @@ __all__ = [
     'test_iter_cost_reserve_continues_next_iteration',
     'test_step_header_stays_self_consistent_across_midrun_retune',
     'test_goal_finish_records_completed',
-    'test_self_finish_over_cap_records_exited',
+    'test_self_finish_over_cap_completes_with_overshoot',
     'test_cascaded_budget_finish_records_exited',
     'test_codex_preflight_probe_aborts_on_model_rejection',
     'test_codex_preflight_failure_is_loud_and_recoverable',
@@ -2291,19 +2291,18 @@ def test_goal_finish_records_completed(repo: dict) -> None:
     assert run == 'completed/0', (run, result.stdout)
 
 
-def test_self_finish_over_cap_records_exited(repo: dict) -> None:
-    """A self-signalled finish whose run crossed the cap ends ``exited``/0.
+def test_self_finish_over_cap_completes_with_overshoot(repo: dict) -> None:
+    """A deliberate finish whose run crossed the cap ends ``completed``/0.
 
     The in-loop budget checks skip once a finish signal is set (they exist to
     send one), so a node that signals ``finish`` itself and then crosses
-    ``--max-cost`` reaches the terminal block with ``BUDGET_HIT`` false --
-    which, keyed on ``BUDGET_HIT`` alone, would be recorded ``completed``/0,
-    hiding the overrun from parents and ``node merge``. Over-cap is a budget
-    abort whatever set the finish: with a $0.50 cap and a $1.00 gate step,
-    finish is set while the step parks (the ceiling is disarmed from then on),
-    the over-budget commit step is skipped (its own guard), and the run must
-    close ``exited``/0 -- the shape of ``test_goal_finish_records_completed``
-    with the cap crossed.
+    ``--max-cost`` reaches the terminal block with ``BUDGET_HIT`` false. A
+    deliberate (non-budget-stemmed) finish is a goal-met landing whatever the
+    drain spent: with a $0.50 cap and a $1.00 gate step, finish is set while
+    the step parks (the ceiling is disarmed from then on), the over-budget
+    commit step is skipped (its own guard), and the run closes
+    ``completed``/0 with the overshoot recorded on the run row -- the shape
+    of ``test_goal_finish_records_completed`` with the cap crossed.
     """
     node = _make_node(
         repo=repo,
@@ -2333,8 +2332,9 @@ def test_self_finish_over_cap_records_exited(repo: dict) -> None:
     # (the over-budget commit step is skipped), and no in-loop abort fired
     assert len(calls) == 1, (calls, result.stdout)
     assert 'Subtree cost budget reached' not in result.stdout, result.stdout
-    # over-cap is a budget abort, not a goal-met completion, whatever set finish
-    assert _run(worktree, 'node', 'status').stdout.strip().startswith('exited'), (
+    # a deliberate finish keeps its goal-met landing; the overshoot rides
+    # the run row instead of reclassifying the run
+    assert _run(worktree, 'node', 'status').stdout.strip().startswith('completed'), (
         result.stdout
     )
     run = (
@@ -2342,13 +2342,15 @@ def test_self_finish_over_cap_records_exited(repo: dict) -> None:
             worktree,
             'db',
             '_query',
-            "SELECT status || '/' || exit_code FROM runs ORDER BY rowid DESC LIMIT 1",
+            "SELECT status || '/' || exit_code || '/' || metadata FROM runs"
+            ' ORDER BY rowid DESC LIMIT 1',
             '--csv',
         )
         .stdout.strip()
         .splitlines()[-1]
     )
-    assert run == 'exited/0', (run, result.stdout)
+    overshoot = 'cost budget exceeded in finish wind-down (spent $1.0000 >= $0.5 max)'
+    assert run == f'completed/0/{overshoot}', (run, result.stdout)
 
 
 @pytest.mark.parametrize(

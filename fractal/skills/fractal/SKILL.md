@@ -150,6 +150,15 @@ pipx install plasma-wiki
 (`uv tool install plasma-fractal --with-executables-from plasma-wiki` does the
 same in one command.)
 
+Users install with any manager (uv tool, pipx, pyenv, a project venv, system
+pip), so before installing, check what's already there by **running** it —
+`fractal --version && wiki --version` — never by name resolution alone: a pyenv
+shim for a non-activated env resolves on `PATH` but fails at exec. If a working
+install lives off `PATH`, use its absolute paths wherever this skill says
+`fractal` or `wiki` for the rest of the session. Only your own shell needs this
+care — fractal resolves its helper CLIs from its own installation, so node-side
+commands work regardless.
+
 ### Step 1: Initialize
 
 The node's `<node_dir>/skills/fractal/SKILL.md` documents spawn mechanics, child
@@ -362,6 +371,13 @@ fractal commit "configure <name>" --init
 fractal node start
 ```
 
+When the project runs a markdown formatter hook, expect `fractal commit --init`
+to refuse if the hook rewrites a seed file — follow the error's remediation.
+Never run project format hooks over `.fractal/` seed files yourself: step
+frontmatter (`requires_approval:`, `agent:`, `timeout:`, ...) is load-bearing, a
+generic mdformat destroys it, and `pre-commit run --files` reports success on
+untracked files even while rewriting them.
+
 All run parameters were set at init (in `config.json`); `start` takes no config
 arguments — only `--continue` (plus `--clean` to discard uncommitted project
 files, and `--max-cost` to re-arm the cap after a budget-ended run) when
@@ -394,8 +410,12 @@ Once the node is running, briefly explain how to interact with it:
   and both are per-run, with no lifetime rollup.
 - **TUI:** For a live view of the whole tree — nodes, runs, costs, and output —
   suggest the user open the dashboard with `fractal open` (run from the repo
-  root). It needs the `tui` extra; if `fractal open` reports it missing,
-  `pipx install 'plasma-fractal[tui]'` adds it.
+  root). It needs the `tui` extra; if `fractal open` reports it missing, add the
+  extra with the manager used in Step 0 (e.g.
+  `pipx install --force 'plasma-fractal[tui]'` or
+  `uv tool install 'plasma-fractal[tui]' --with-executables-from plasma-wiki` —
+  pipx keeps `wiki` in its own untouched venv, while uv must restate the flag
+  because the reinstall replaces the tool env's exposed executables).
 - **Stopping:** From the worktree, three escalation levels:
   - `fractal node finish` — stop after current iteration
   - `fractal node stop` — stop after current step

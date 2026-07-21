@@ -333,15 +333,6 @@ def node_init(app: typer.Typer) -> typer.Typer:
                     ' and spend without bound.',
                     err=True,
                 )
-        # a single-word name de-slugs to itself capitalized, leaving the
-        # default title indistinguishable from the slug -- warn on stderr
-        # (advisory, never a block); core stays quiet for programmatic callers
-        if title is None and '-' not in name and '_' not in name:
-            typer.echo(
-                'Warning: single-word name without --title; set one later'
-                ' with fractal node update --title=<title>.',
-                err=True,
-            )
 
     return app
 
@@ -408,7 +399,11 @@ def node_finish(app: typer.Typer) -> typer.Typer:
     node_help = 'Target node branch (default: this node).'
     node = typer.Argument(None, help=node_help)
     # reason option
-    reason_help = 'Optional reason for finishing.'
+    reason_help = (
+        'Optional reason for finishing. The loop-authored budget phrases'
+        ' (`cost budget ... (spent $...)`) are reserved and classify the'
+        ' finish as a budget abort.'
+    )
     reason = typer.Option(None, '--reason', help=reason_help)
     # cancel flag
     cancel_help = 'Withdraw the pending finish signal instead of sending one.'
@@ -1028,7 +1023,7 @@ def node_chat(app: typer.Typer) -> typer.Typer:
 
 def node_update(app: typer.Typer) -> typer.Typer:
     """Register the ``update`` command."""
-    # node argument
+    # node argument (deliberately explicit)
     node_help = 'Target child node branch.'
     node = typer.Argument(..., help=node_help)
     # title option
