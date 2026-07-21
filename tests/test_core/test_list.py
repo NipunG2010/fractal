@@ -9,9 +9,11 @@ column with its staleness flag.
 from __future__ import annotations
 
 import pathlib
+from typing import Optional
 
 import pytest
 
+from fractal.constants import SOCKET_FILE
 from fractal.core.node import Node
 from tests._helpers import _past_timestamp
 
@@ -24,6 +26,7 @@ __all__ = [
     'test_list_live_trusts_real_state',
     'test_list_live_relabels_crashed_active',
     'test_list_live_reads_booting_idle_as_active',
+    'test_list_live_confirms_relabels_on_recorded_socket',
     'test_list_renders_config_caps_over_stale_registry',
     'test_list_decorates_exited_with_run_reason',
     'test_list_flags_orphan_rows',
@@ -159,6 +162,38 @@ def test_list_live_reads_booting_idle_as_active(
     monkeypatch.setattr('fractal.util.tmux.probe', frozenset)
     live = {row['node']: row['status'] for row in parent.list(live=True)}
     assert live[child.branch] == 'idle'
+
+
+def test_list_live_confirms_relabels_on_recorded_socket(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--live`` confirms each relabel on the node's recorded socket.
+
+    The batched ambient probe only nominates candidates: a loop alive on
+    the tmux server recorded at boot (``.socket``) is invisible to a
+    shell resolving a different server, and relabeling from that ambient
+    answer alone would echo a live loop as ``exited`` -- and let a
+    finishing ancestor's drain miss a child booting on the recorded
+    server.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    socket_file = child.node_dir / SOCKET_FILE
+    socket_file.write_text('other-sock\n', encoding='utf-8')
+
+    def probe(socket: Optional[str] = None) -> frozenset[str]:
+        if socket == 'other-sock':
+            return frozenset({child.tmux_session})
+        return frozenset()
+
+    monkeypatch.setattr('fractal.util.tmux.probe', probe)
+    # the active child stays active -- the recorded socket confirms it lives
+    live = {row['node']: row['status'] for row in parent.list(live=True)}
+    assert live[child.branch] == 'active'
+    # the boot window on the recorded socket reads active the same way
+    child.status_set('idle')
+    live = {row['node']: row['status'] for row in parent.list(live=True)}
+    assert live[child.branch] == 'active'
 
 
 def test_list_renders_config_caps_over_stale_registry(

@@ -23,6 +23,7 @@ from fractal.constants import PAUSE_ABORT_FILE, PGID_FILE, SOCKET_FILE, STEP_PGI
 from fractal.exceptions import AgentStreamError, _Abort
 
 from . import commit, pricing, render, worktree
+from .config import DEFAULT_RESERVE_FRACTION
 from .event import FailureEvent, InitialEvent, TerminalEvent
 
 if typing.TYPE_CHECKING:
@@ -332,6 +333,7 @@ class Loop:
         self._budget_stem = ''
         self._untracked_warned = False
         self._unreadable_warned = False
+        self._soft_cap_warned = False
         # last good ledger readings -- a failed read falls back to these,
         # never to the full cap
         self._last_run_spent: Optional[float] = None
@@ -356,6 +358,9 @@ class Loop:
         self._sync_file = self._modes_dir / 'SYNC.md'
         # whether any step will need the pricing cache (resolved in preflight)
         self._needs_pricing = False
+        # armed caps with a non-enforcing agent and no timeout have no
+        # in-step brake -- disclose the unbounded-overshoot exposure once
+        self._warn_soft_cap()
 
     @functools.cached_property
     def logger(self: Loop) -> logging.Logger:
@@ -458,10 +463,9 @@ class Loop:
         # relabeled; (a SIGTERM kill is handled by kill.sh's Python; a
         # SIGKILL / host crash can't run this -- those are the job of
         # Node._reconcile_status at the next reject-active op)
-        # NOTE: the finally also runs on KeyboardInterrupt -- a deliberate
-        #   parity delta from the untrapped shell fatal-signal path, so an
-        #   attached-pane Ctrl-C stamps `exited` instead of waiting for
-        #   reconcile
+        # NOTE: the finally also runs on KeyboardInterrupt -- a deliberate parity
+        #   delta from the untrapped shell fatal-signal path, so an attached-pane
+        #   Ctrl-C stamps `exited` instead of waiting for reconcile
         try:
             if self._park_if_latched():
                 return 0
@@ -569,7 +573,10 @@ class Loop:
             self._abort_preflight(reason)
 
     def _abort_preflight(
-        self: Loop, reason: str, *, force_record: bool = False
+        self: Loop,
+        reason: str,
+        *,
+        force_record: bool = False,
     ) -> None:
         """Abort a failed preflight loudly and recoverably.
 
@@ -836,7 +843,7 @@ class Loop:
             if self._iter > 0:
                 try:
                     self._max_iters = int(node.config.get('max_iters') or -1)
-                except ValueError:
+                except (TypeError, ValueError, OverflowError):
                     print(
                         'Warning: max_iters must be an integer;'
                         ' keeping the previous value',
@@ -907,8 +914,8 @@ class Loop:
                 if self._wait_seconds <= 0:
                     self._wait_seconds = 60
 
-            # build the time-budget label from whichever timeouts are
-            # set (run/iter/step)
+            # build the time-budget label from whichever of the
+            # run/iter/step timeouts are set
             time_budget = ''
             if self._timeout:
                 time_budget = f'{self._timeout} total'
@@ -938,6 +945,8 @@ class Loop:
                         file=sys.stderr,
                     )
                 self._reconcile_caps()
+                # a cap granted mid-run can arm the soft-cap exposure late
+                self._warn_soft_cap()
 
             self._build_cost_budget()
 
@@ -1112,9 +1121,10 @@ class Loop:
             print()
             if iter_failed:
                 print(f'=== Iteration {self._iter_label} failed ({iter_duration}s) ===')
+                error = RuntimeError(iter_reason or 'iteration failed')
                 self.on_iteration_failure(
                     initial_event=iteration_event,
-                    error=RuntimeError(iter_reason or 'iteration failed'),
+                    error=error,
                 )
             else:
                 print(
@@ -1985,11 +1995,13 @@ class Loop:
         # only an enforcing agent takes the hard per-step budget flag; the
         # cap stays soft (warn-only) for the rest
         budget_arg = budget if agent.enforces_budget else None
+        model = self._step_model or None
+        effort = self._step_effort or None
         invocation = agent.invocation(
             prompt,
             session=session,
-            model=self._step_model or None,
-            effort=self._step_effort or None,
+            model=model,
+            effort=effort,
             budget=budget_arg,
             env=self._agent_env(self._step_label),
         )
@@ -2268,11 +2280,12 @@ class Loop:
             )
         # a budget stop reported on the stream keeps its attribution even
         # when the agent exits 0
+        budget_stopped = result is not None and result.budget_stopped
         return StepResult(
             status='completed',
             session=session_out,
             cost=cost_out,
-            budget_stopped=result is not None and result.budget_stopped,
+            budget_stopped=budget_stopped,
         )
 
     def _consume_pause_abort(self: Loop) -> bool:
@@ -2304,7 +2317,8 @@ class Loop:
             close: Closing banner label when it differs from ``label``
                 (the approval-wait sync).
             strict: Record the full status vocabulary (timeout ->
-                ``exited``, failure or budget skip -> ``failed``) and
+                ``exited``, failure -> ``failed``, budget skip ->
+                ``stopped`` flagging ``'over budget'``) and
                 leave the closing banner to the caller -- the before-step
                 sync; the lenient waits record ``completed`` for anything
                 but a pause (a genuinely failed launch keeps ``completed``
@@ -2346,7 +2360,14 @@ class Loop:
                 sync_status, sync_exit_code = 'exited', 1
             elif result.status == 'paused':
                 sync_status, sync_exit_code = 'paused', 0
-            elif result.status in ('failed', 'skipped'):
+            elif result.status == 'skipped':
+                # over budget: the sync was skipped, not run -- book it like
+                # the work step it precedes (stopped, reason flagged), so the
+                # activity log reads one cleanly-labeled budget stop, never
+                # an unexplained failure beside it
+                sync_status, sync_exit_code = 'stopped', 0
+                sync_reason = 'over budget'
+            elif result.status == 'failed':
                 sync_status, sync_exit_code = 'failed', 1
             else:
                 sync_status, sync_exit_code = 'completed', 0
@@ -2580,7 +2601,7 @@ class Loop:
         # here so the RESERVE nudge fires before the ceiling however
         # max_cost was set
         if reserve is None and self._max_cost is not None:
-            reserve = 0.1 * float(self._max_cost)
+            reserve = DEFAULT_RESERVE_FRACTION * float(self._max_cost)
             self._reserve_label = f'{reserve:.6g}'
         else:
             self._reserve_label = f'{reserve}' if reserve is not None else '0'
@@ -2634,6 +2655,10 @@ class Loop:
         spend is untracked. A failed read warns and returns the last
         good reading -- never ``None``, which reads as untracked and
         would disarm the budget probes for a mere contention window.
+        Cost is recorded, never estimated: an ended step with a NULL
+        cost (killed before its usage flush) counts as zero, not an
+        imputed per-step figure -- NULL is the ledger's honest signal
+        that no cost was recorded.
         """
         try:
             spent = self.node.cost.spent(run_id=self._run_id)
@@ -2650,17 +2675,21 @@ class Loop:
 
         A failed read derives from the last good spend reading -- never
         the full cap, which would size the per-step leash as if nothing
-        were spent while the ledger is merely contended.
+        were spent while the ledger is merely contended. With no last good
+        reading either (a failed read before the run's first successful
+        probe -- the resume path meets prior spend on a cold in-memory
+        cache), the leash floors at 0 and the step skips to retry next
+        probe, rather than handing out the untouched cap over real spend.
         """
         try:
             remaining = self.node.cost.remaining(run_id=self._run_id)
         except Exception:
             self._warn_unreadable_spend()
-            remaining = None
-            if self._last_run_spent is not None:
-                remaining = float(self._max_cost or 0) - self._last_run_spent
+            if self._last_run_spent is None:
+                return 0.0
+            remaining = float(self._max_cost or 0) - self._last_run_spent
         if remaining is None:
-            remaining = float(self._max_cost or 0)
+            return 0.0
         return round(max(0.0, remaining), 4)
 
     def _step_budget(self: Loop) -> Optional[float]:
@@ -2816,6 +2845,35 @@ class Loop:
         self._budget_hit = True
         self._budget_reason = reason
         self._budget_stem = stem
+
+    def _warn_soft_cap(self: Loop) -> None:
+        """Scream once per run when armed caps have no in-step brake.
+
+        A non-enforcing agent takes no per-step budget flag, so its cap
+        is checked only between steps -- with no run/iter/step timeout
+        either, one runaway step can overshoot every cap unbounded while
+        the loop waits on the process. Advisory only; the remedy it
+        names (``--step-timeout``) is the existing in-step brake.
+        """
+        if self._soft_cap_warned:
+            return
+        caps = (self._max_cost, self._max_iter_cost, self._max_step_cost)
+        if all(cap is None for cap in caps) or self._agent.enforces_budget:
+            return
+        timeouts = (
+            self._run_timeout_seconds,
+            self._iter_timeout_seconds,
+            self._step_timeout_seconds,
+        )
+        if any(seconds > 0 for seconds in timeouts):
+            return
+        self._soft_cap_warned = True
+        print(
+            f'WARNING: cost caps are set but {self._agent.name} does not'
+            ' enforce a per-step budget and no timeout is configured; one'
+            ' runaway step can overshoot the caps unbounded -- set'
+            ' --step-timeout to bound it.'
+        )
 
     def _warn_untracked_spend(self: Loop) -> None:
         """Scream once per run when armed caps read untracked spend.

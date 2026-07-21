@@ -75,10 +75,10 @@ def test_event_description_folds_messages(
     message: Optional[str | list[str]],
     folded: str,
 ) -> None:
-    """Description is ``{name} : {source!r}`` plus the folded message lines."""
+    """Description is ``{name} : {source class}`` plus the folded messages."""
     emitter = _Emitter()
     event = SampleCallEvent(emitter, message)
-    assert event.description == f'SAMPLE_CALL_EVENT : {emitter!r}{folded}'
+    assert event.description == f'SAMPLE_CALL_EVENT : _Emitter{folded}'
 
 
 def test_terminal_event_computes_duration() -> None:
@@ -127,7 +127,3 @@ class _Emitter:
     def __init__(self: _Emitter) -> None:
         """Initialize ``_Emitter``."""
         self.state = 'ready'
-
-    def __repr__(self: _Emitter) -> str:
-        """Return a state-keyed repr for description assertions."""
-        return f'_Emitter(state={self.state!r})'

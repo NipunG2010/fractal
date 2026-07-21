@@ -59,6 +59,36 @@ _LOADED: dict[pathlib.Path, Optional[Exception]] = {}
 _SESSION_CHARS = re.compile(r'[A-Za-z0-9_-]+')
 
 
+def command_base(command: str) -> str:
+    """Return an agent command's base word, refusing shell quoting.
+
+    Commands split on whitespace into argv words (:attr:`Agent.parts`)
+    with no shell interpretation, so a quoted argument would silently
+    mangle into garbage words (``--flag "two words"`` becomes
+    ``['--flag', '"two', 'words"']``) deep inside the loop's tmux pane,
+    after start already printed its success -- refuse quoting at the
+    accept-time gates instead, where the error still reaches the
+    caller's terminal.
+
+    Args:
+        command: Full agent command (e.g. ``'claude --some-flag'``).
+
+    Returns:
+        The command's first whitespace-separated word.
+
+    Raises:
+        ValueError: If the command carries a quote or backslash.
+
+    """
+    if any(char in command for char in '\'"\\'):
+        raise ValueError(
+            f'Unsupported agent command: {command!r} (commands split on'
+            ' whitespace only -- quotes and backslashes are not supported).'
+        )
+    base_word, *_ = command.split()
+    return base_word
+
+
 def resolve(name: str, *, root: Optional[pathlib.Path] = None) -> type[Agent]:
     """Return the ``Agent`` class registered for a base command.
 
@@ -501,9 +531,7 @@ class Agent:
 
             def _invocation(self, prompt, *, mode, session, model, effort, budget):
                 argv = (*self.parts, '-p', prompt, '--resume', session)
-                return Invocation(
-                    agent=self.name, argv=argv, cwd=self.node.worktree
-                )
+                return Invocation(agent=self.name, argv=argv, cwd=self.node.worktree)
         """
         raise AbstractMethodError(self)
 
@@ -706,7 +734,10 @@ class Agent:
             def _record_session(self, step_id, session, *, model, detached):
                 host.sessions.mirror(session)
                 super()._record_session(
-                    step_id, session, model=model, detached=detached
+                    step_id=step_id,
+                    session=session,
+                    model=model,
+                    detached=detached,
                 )
         """
         # stamp the step row (always -- detached suppresses only the map write)

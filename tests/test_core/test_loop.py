@@ -26,6 +26,7 @@ from fractal.core.event import Event
 from fractal.core.loop import Loop, Step, StepResult
 from fractal.core.node import Node
 from fractal.exceptions import _Abort
+from fractal.impl.claude import ClaudeAgent
 from tests._helpers import _age_run, _past_timestamp
 
 from ._agents import SampleAgent
@@ -49,6 +50,10 @@ __all__ = [
     'test_preflight_aborts_on_a_non_utf8_step_file',
     'test_park_if_latched_walks_ancestors_with_resume_exemption',
     'test_step_budget_math_binds_the_tightest_cap',
+    'test_run_spent_counts_recorded_cost_only',
+    'test_budget_skipped_sync_books_stopped',
+    'test_run_remaining_floors_at_zero_without_a_last_reading',
+    'test_soft_cap_warning_fires_once_for_unbraked_caps',
     'test_step_budget_reserve_window_floors_at_remaining',
     'test_boundary_checks_read_live_caps',
     'test_untracked_spend_under_caps_warns_once',
@@ -287,10 +292,16 @@ def test_step_timeout_frontmatter_substitutes_at_launch(
     assert '02-EXECUTE.md' in err
 
 
+@pytest.mark.parametrize(
+    argnames='bad_max_iters',
+    argvalues=['two', [20]],
+    ids=['non-int-string', 'non-scalar'],
+)
 def test_malformed_midrun_retune_warns_and_keeps_the_previous_value(
     loop_node: Node,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture,
+    bad_max_iters: Any,
 ) -> None:
     """A malformed mid-run config edit warns and keeps the prior values.
 
@@ -298,8 +309,8 @@ def test_malformed_midrun_retune_warns_and_keeps_the_previous_value(
     of ``max_iters``/``step_timeout``/``wait`` and the cost-cap reads
     (the iteration top and both budget probes) must warn and fall back
     on a hand-edit the launch validation never saw (a bare number, a
-    non-integer, a non-numeric cap), never crash the run and lose the
-    remaining iterations.
+    non-integer, a non-scalar JSON value, a non-numeric cap), never
+    crash the run and lose the remaining iterations.
     """
     monkeypatch.setenv('_NODE', '')
     _configure(loop_node, max_iters=2, step_timeout='30s')
@@ -313,7 +324,7 @@ def test_malformed_midrun_retune_warns_and_keeps_the_previous_value(
             """Break the config mid-run, then run the scripted outcome."""
             _configure(
                 self.node,
-                max_iters='two',
+                max_iters=bad_max_iters,
                 step_timeout='600',
                 wait='soon',
                 max_cost='25 USD',
@@ -809,6 +820,131 @@ def test_step_budget_math_binds_the_tightest_cap(loop_node: Node) -> None:
     _configure(node, max_cost=10.0, max_iter_cost=1.0, max_step_cost=0.25)
     loop._read_cost_caps()
     assert loop._step_budget() == pytest.approx(0.25)
+
+
+def _record_killed_step(node: Node, *, run_id: int, iter: int) -> None:
+    """Record one ended NULL-cost (killed-before-flush) step in ``run_id``."""
+    iter_id = node.record.iter_start(run_id=run_id, iter=iter)
+    step_id = node.record.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=1,
+        step_name='EXECUTE',
+    )
+    node.record.step_end(step_id=step_id, status='killed', exit_code=1)
+
+
+def test_run_spent_counts_recorded_cost_only(loop_node: Node) -> None:
+    """Ended steps with NULL cost count as zero -- never an estimate.
+
+    A step killed before its usage flush records NULL cost: the ledger's
+    honest signal that no cost was recorded. The budget probes enforce
+    the recorded SUM alone -- no per-step figure is imputed to rows the
+    ledger cannot price, so bookkeeping rows (never-run tails, skips,
+    pre-launch failures) can never fabricate a budget stop.
+    """
+    node = loop_node
+    _configure(node, max_cost=10.0, max_step_cost=1.0)
+    loop = MockLoop(node)
+    loop._run_id = node.record.run_start()
+    loop._read_cost_caps()
+    _record_step_cost(node, run_id=loop._run_id, cost=2.0, iter=1)
+    for i in (2, 3, 4):
+        _record_killed_step(node, run_id=loop._run_id, iter=i)
+    assert loop._run_spent() == pytest.approx(2.0)
+    assert loop._run_remaining() == pytest.approx(8.0)
+
+
+def test_budget_skipped_sync_books_stopped(loop_node: Node) -> None:
+    """A budget-skipped SYNC row reads like the step it precedes.
+
+    Over budget, skipped work steps record ``stopped`` flagging 'over
+    budget'; the interleaved SYNC row must match, so the activity log
+    shows one cleanly-labeled budget stop instead of an unexplained
+    ``failed`` beside it.
+    """
+    node = loop_node
+    _configure(node, max_cost=1.0)
+    loop = MockLoop(node)
+    loop._run_id = node.record.run_start()
+    loop._iter_id = node.record.iter_start(run_id=loop._run_id, iter=1)
+    loop._read_cost_caps()
+    # drain the budget so the sync launch is skipped, never run
+    step_id = node.record.step_start(
+        iter_id=loop._iter_id,
+        run_id=loop._run_id,
+        step=1,
+        step_name='PLAN',
+    )
+    node.record.step_cost(step_id=step_id, cost=1.5)
+    node.record.step_end(step_id=step_id, status='completed', exit_code=0)
+    # the SYNC step reads the always-present package seed (never written here --
+    # _sync_file resolves to the shared _node/modes/SYNC.md)
+    result, _, sync_step_id = loop._sync(step_num=1, label='before PLAN', strict=True)
+    assert result.status == 'skipped'
+    rows = node.db.read('steps', where={'step_id': sync_step_id})
+    assert rows[0]['status'] == 'stopped'
+    assert rows[0]['exit_code'] == 0
+    assert rows[0]['metadata'] == 'over budget'
+
+
+def test_run_remaining_floors_at_zero_without_a_last_reading(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed read with no last-good spend floors the leash at 0, not the cap.
+
+    The resume path meets prior spend on a cold in-memory cache; granting
+    the untouched cap there would size one step's leash as if nothing were
+    spent. With no last-good reading the remaining floors at 0 so the step
+    skips and retries next probe.
+    """
+    node = loop_node
+    _configure(node, max_cost=10.0)
+    loop = MockLoop(node)
+    loop._run_id = node.record.run_start()
+    loop._read_cost_caps()
+
+    def boom(*args: object, **kwargs: object) -> float:
+        raise sqlite3.OperationalError('database is locked')
+
+    monkeypatch.setattr(node.cost, 'remaining', boom)
+    # _last_run_spent is still None (no successful probe yet) -> floor at 0
+    assert loop._last_run_spent is None
+    assert loop._run_remaining() == 0.0
+
+
+def test_soft_cap_warning_fires_once_for_unbraked_caps(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Armed caps + non-enforcing agent + no timeout warn once at boot.
+
+    A non-enforcing agent's per-step cap is checked only between steps, so
+    with no timeout either, one runaway step can overshoot every cap
+    unbounded -- the boot discloses the exposure once and names the remedy
+    (``--step-timeout``); an enforcing agent or any armed timeout silences
+    it.
+    """
+    node = loop_node
+    monkeypatch.setattr(MockLoop, '_preflight', lambda self: None)
+    # force the flag off on the backend class before construction, so the
+    # warning rides its production call site (the end of ``__init__``)
+    monkeypatch.setattr(ClaudeAgent, 'enforces_budget', False)
+    # capped, non-enforcing, no timeouts: construction warns
+    _configure(node, max_cost=10.0)
+    loop = MockLoop(node)
+    out = capsys.readouterr().out
+    assert 'overshoot' in out
+    assert '--step-timeout' in out
+    # once per run: the iteration-top re-check stays silent
+    loop._warn_soft_cap()
+    assert 'overshoot' not in capsys.readouterr().out
+    # any armed timeout silences a fresh boot
+    _configure(node, max_cost=10.0, step_timeout='30s')
+    MockLoop(node)
+    assert 'overshoot' not in capsys.readouterr().out
 
 
 def test_step_budget_reserve_window_floors_at_remaining(loop_node: Node) -> None:

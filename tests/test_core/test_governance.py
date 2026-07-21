@@ -31,6 +31,7 @@ __all__ = [
     'test_init_registers_child',
     'test_spawn_event_recorded_on_parent',
     'test_child_pending_lists_direct_children_only',
+    'test_child_pending_skips_stranded_gates',
     'test_max_depth_enforcement',
     'test_max_children_counts_only_unsettled',
     'test_max_depth_ancestor_enforcement',
@@ -203,6 +204,42 @@ def test_child_pending_lists_direct_children_only(
     # the parent sees only its direct child's gated step
     pending = parent.child_pending()
     assert [row['branch'] for row in pending] == [child.branch]
+
+
+def test_child_pending_skips_stranded_gates(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``child_pending`` lists only gates a live wait can still release.
+
+    A step killed, crash-reconciled, or wound down in reserve mode closes
+    terminal with ``approved=''`` still set -- nothing will ever read an
+    approval aimed at it, so the lister skips it; a paused step stays
+    listed (approving while parked is the resume flow) and an active one
+    is the ordinary mid-wait gate.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    run_id = _active_run(child)
+    iter_id = child.record.iter_start(run_id=run_id, iter=1)
+
+    def gate(step: int, name: str) -> int:
+        step_id = child.record.step_start(
+            iter_id=iter_id,
+            run_id=run_id,
+            step=step,
+            step_name=name,
+        )
+        child.record.step_pending(step_id=step_id)
+        return step_id
+
+    waiting = gate(1, 'REVIEW')
+    parked = gate(2, 'AUDIT')
+    child.record.step_end(step_id=parked, status='paused', exit_code=0)
+    stranded = gate(3, 'SHIP')
+    child.record.step_end(step_id=stranded, status='killed', exit_code=1)
+
+    pending = {row['step_id'] for row in parent.child_pending()}
+    assert pending == {waiting, parked}
 
 
 # ------ spawn gates

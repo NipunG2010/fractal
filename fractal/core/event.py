@@ -86,14 +86,16 @@ class Event:
     def description(self: Event) -> str:
         """Return event description.
 
-        Composes ``{name} : {source!r}`` plus optional
-        message on new line when ``message`` is set.
+        Composes ``{name} : {source class name}`` plus optional
+        message on new line when ``message`` is set -- the class name
+        is the friendly label for every emitting source, never a raw
+        object repr.
 
         Returns:
             Full event description for logging.
 
         """
-        result = f'{self.name} : {self.source!r}'
+        result = f'{self.name} : {type(self.source).__name__}'
         if message := self.message:
             if isinstance(message, list):
                 if any('\n' in part for part in message):

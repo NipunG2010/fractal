@@ -26,6 +26,7 @@ import subprocess
 import pytest
 
 import fractal
+from fractal.constants import STATUSES
 from fractal.core.node import Node
 from tests._helpers import _git
 
@@ -43,6 +44,7 @@ __all__ = [
     'test_init_uses_central_db',
     'test_init_reset_reinitializes_node',
     'test_init_rejects_negative_limits',
+    'test_init_rejects_non_positive_max_iters',
     'test_init_rejects_iter_cost_without_max_cost',
     'test_init_from_worktree_nests_under_that_node',
     'test_child_spawn_nests_under_parent',
@@ -57,6 +59,7 @@ __all__ = [
     'test_list_filters_by_retired_and_depth',
     'test_list_status_count_and_live',
     'test_list_rejects_invalid_filters',
+    'test_list_rejects_unknown_status',
     'test_list_whole_tree_from_a_non_init_checkout',
     'test_status_reports_idle_from_anywhere',
     'test_rm_rf_worktree_lists_orphan_then_force_deletes',
@@ -74,6 +77,7 @@ __all__ = [
     'test_update_rejects_iter_cost_on_uncapped_child',
     'test_cost_breakdown_rows_sum_to_spent_with_a_deleted_descendant',
     'test_cost_family_answers_for_a_deleted_target',
+    'test_cost_family_refuses_a_live_ambiguous_short_name',
     'test_version_flag_reports_a_version',
     'test_table_commands_document_piped_csv_default',
     'test_commit_help_states_message_requirement',
@@ -486,6 +490,30 @@ def test_init_rejects_iter_cost_without_max_cost(repo: dict, flag: str) -> None:
     assert ok.returncode == 0, ok.stderr
     # clean up so the shared module fixture is left as other tests expect
     assert _run(root, 'node', 'delete', 'main.capped2', '--force').returncode == 0
+
+
+@pytest.mark.parametrize(argnames='value', argvalues=['0', '-3'])
+def test_init_rejects_non_positive_max_iters(repo: dict, value: str) -> None:
+    """``init`` rejects a non-positive ``--max-iters`` (``BadParameter``, exit 2).
+
+    A non-positive cap reads as unlimited in the loop, so 0 would build a
+    node that iterates without bound instead of never -- the CLI refuses it
+    with the config setter's phrasing before any node is created.
+    """
+    root = repo['root']
+    result = _run(
+        root,
+        'node',
+        'init',
+        'noiter',
+        '--agent',
+        'claude',
+        '--max-iters',
+        value,
+    )
+    assert result.returncode == 2, result.stderr
+    assert 'greater than 0' in (result.stdout + result.stderr)
+    assert not (root / '.worktrees' / 'main.noiter').exists()
 
 
 def test_init_from_worktree_nests_under_that_node(repo: dict) -> None:
@@ -949,6 +977,27 @@ def test_list_rejects_invalid_filters(repo: dict) -> None:
         bad_depth = _run(root, 'node', 'list', '--max-depth', depth)
         assert bad_depth.returncode == 2, depth
         assert 'max-depth' in (bad_depth.stdout + bad_depth.stderr)
+
+
+def test_list_rejects_unknown_status(repo: dict) -> None:
+    """``list`` refuses an unknown ``--status`` chunk, naming the valid set.
+
+    Statuses are a closed set, and an unknown filter would return an empty
+    listing indistinguishable from no matching nodes (a typo silently reads
+    as "nothing to steer"). Each comma-separated chunk validates
+    (``BadParameter``, exit 2); every real status -- and the listing's own
+    ``orphan`` relabel -- still passes.
+    """
+    root = repo['root']
+    # a bare typo and a typo'd chunk inside a multi-status filter both refuse
+    for status in ('bogus', 'active,bogus'):
+        rejected = _run(root, 'node', 'list', '--status', status)
+        assert rejected.returncode == 2, status
+        assert 'bogus' in (rejected.stdout + rejected.stderr)
+    # every known status still filters cleanly
+    for status in (*STATUSES, 'orphan'):
+        listed = _run(root, 'node', 'list', '--status', status, '--csv')
+        assert listed.returncode == 0, status
 
 
 def test_list_whole_tree_from_a_non_init_checkout(repo: dict) -> None:
@@ -1469,9 +1518,11 @@ def test_cost_family_answers_for_a_deleted_target(repo: dict) -> None:
     Deleting a node clears its registry rows, but its runs/steps history
     persists -- and grading reads costs after pruning (metrics.md), so
     ``cost spent``/``breakdown``/``remaining <branch>`` must answer from
-    history rather than dying at worktree resolution. ``remaining`` reports
-    ``no budget`` because both cap stores (config file and registry row) die
-    with the node. Cleans up its own worker node.
+    history rather than dying at worktree resolution, for the full branch
+    and for the same unique short names live resolution accepts.
+    ``remaining`` reports ``no budget`` because both cap stores (config
+    file and registry row) die with the node. Cleans up its own worker
+    node.
     """
     root = repo['root']
     # build a worker with a cap, record one run's spend, then delete it
@@ -1502,10 +1553,59 @@ def test_cost_family_answers_for_a_deleted_target(repo: dict) -> None:
     remaining = _run(root, 'node', 'cost', 'remaining', 'main.gone')
     assert remaining.returncode == 0, remaining.stderr
     assert remaining.stdout.strip() == 'no budget'
-    # a branch with no recorded run keeps the not-found error (typo guard)
-    missing = _run(root, 'node', 'cost', 'spent', 'main.nonesuch')
-    assert missing.returncode == 2
-    assert 'No node found' in (missing.stdout + missing.stderr)
+    # a short name answers through the same history: the registry-side
+    # expansion dies with the registry row, so the trailing segment
+    # resolves against the recorded runs instead
+    short = _run(root, 'node', 'cost', 'spent', 'gone')
+    assert short.returncode == 0, short.stderr
+    assert short.stdout.strip() == '$2.5000'
+    short_remaining = _run(root, 'node', 'cost', 'remaining', 'gone')
+    assert short_remaining.returncode == 0, short_remaining.stderr
+    assert short_remaining.stdout.strip() == 'no budget'
+    # a branch with no recorded run keeps the not-found error (typo
+    # guard), full name or short
+    for name in ('main.nonesuch', 'nonesuch'):
+        missing = _run(root, 'node', 'cost', 'spent', name)
+        assert missing.returncode == 2, name
+        assert 'No node found' in (missing.stdout + missing.stderr)
+
+
+def test_cost_family_refuses_a_live_ambiguous_short_name(
+    repo: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A short name matching two live nodes refuses -- history never answers.
+
+    The deleted-branch fallback answers when the registry rows died with
+    the node; two LIVE same-leaf twins are the registry's own ambiguity
+    refusal, and one-sided run history must not silently pick a twin --
+    the ledger would attribute the wrong node's spend. Cleans up its own
+    parent nodes.
+    """
+    root = repo['root']
+    # two live parents, each with a same-leaf child; only one child runs
+    for parent in ('t1', 't2'):
+        Node(root).init(name=parent, agent='claude')
+        parent_wt = root / '.worktrees' / f'main.{parent}'
+        node_dir = parent_wt / '.fractal' / f'main.{parent}'
+        monkeypatch.setenv('_NODE', f'{node_dir}')
+        Node(root).init(name='same', agent='claude')
+        monkeypatch.delenv('_NODE')
+    twin = Node(root / '.worktrees' / 'main.t1.same')
+    run_id = twin.record.run_start()
+    _record_step_cost(twin, run_id=run_id, cost=1.25)
+    # the short name refuses as ambiguous despite the one-sided history
+    for verb in ('spent', 'remaining'):
+        result = _run(root, 'node', 'cost', verb, 'same')
+        assert result.returncode == 2, verb
+        assert 'Ambiguous node name' in (result.stdout + result.stderr)
+    # the full branch still answers
+    full = _run(root, 'node', 'cost', 'spent', 'main.t1.same')
+    assert full.returncode == 0, full.stderr
+    assert full.stdout.strip() == '$1.2500'
+    # clean up so the shared fixture is left as other tests expect
+    for parent in ('main.t1', 'main.t2'):
+        assert _run(root, 'node', 'delete', parent, '--force').returncode == 0
 
 
 # ------ top-level
@@ -1580,9 +1680,10 @@ def test_list_csv_columns_stable_empty_vs_populated(repo: dict) -> None:
     leak.
     """
     root = repo['root']
-    # populated (the fixture's worker nodes) and empty (an unmatched filter)
+    # populated (the fixture's worker nodes) and empty (a valid filter no
+    # node ever matches -- 'failed' is entity-row only, never a node status)
     populated = _run(root, 'node', 'list', '--all', '--csv').stdout
-    empty = _run(root, 'node', 'list', '--status', 'nonesuch', '--csv').stdout
+    empty = _run(root, 'node', 'list', '--status', 'failed', '--csv').stdout
     # the header does not drift between a populated and an empty result
     header = populated.splitlines()[0]
     assert header == empty.splitlines()[0]

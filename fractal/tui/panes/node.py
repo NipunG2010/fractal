@@ -43,9 +43,9 @@ _SIGNAL_ING = {
 }
 
 # config chips: config.json keys in schema order, minus the keys the card
-# already shows as a denominator (max_iters in `iter n/m`, the six cap keys in
-# the measures matrix). agent/model are NOT excluded -- the card shows the
-# current step's agent/model, the chips show the node default (they can differ).
+# already shows as a denominator (max_iters in `iter n/m`, the six cap keys
+# in the measures matrix); agent/model are NOT excluded -- the card shows the
+# current step's agent/model, the chips show the node default (they can differ)
 _CONFIG_ORDER = (
     'title',
     'user',
@@ -203,15 +203,21 @@ class NodePane:
             cost_run = run['spend']
             cost_iter = it['cost_raw'] if it else None
         measures = dict(snap.measures)
+        iter_num = it['iter'] if it else None
+        step_num = step['step'] if step else None
+        step_name = step['name'] if step else None
+        elapsed_iter = self._to_date(it, t) if level >= 3 else self._span(it)
+        elapsed_run = self._to_date(run, t) if level >= 2 else self._span(run)
+        cost_step = step['cost_raw'] if step else None
         measures.update(
             run=run['number'],
-            iter=it['iter'] if it else None,
-            step=step['step'] if step else None,
-            step_name=step['name'] if step else None,
+            iter=iter_num,
+            step=step_num,
+            step_name=step_name,
             elapsed_step=self._span(step),
-            elapsed_iter=self._to_date(it, t) if level >= 3 else self._span(it),
-            elapsed_run=self._to_date(run, t) if level >= 2 else self._span(run),
-            cost_step=step['cost_raw'] if step else None,
+            elapsed_iter=elapsed_iter,
+            elapsed_run=elapsed_run,
+            cost_step=cost_step,
             cost_iter=cost_iter,
             cost_run=cost_run,
         )
@@ -432,8 +438,8 @@ class NodePane:
         bar_w = fractal.tui.theme.BAR_W
         budget = max(8, avail - 2 * gap - 2 * bar_w)
         if el_fig + co_fig > budget:
-            # over-long figures truncate (ellipsis) rather than pushing the
-            # gauges out
+            # over-long figures truncate (ellipsis) rather than
+            # pushing the gauges out
             el_fig = min(el_fig, max(4, budget // 3))
             co_fig = max(4, budget - el_fig)
         # header: blank corner over the scope labels, then the metric columns

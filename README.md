@@ -66,7 +66,8 @@ or
 pip install 'fractal[tui]'
 ```
 
-Open the dashboard from your project root with `fractal open`.
+Open the dashboard from your project root with `fractal open` (requires an
+initialized fractal). Pass `--light` if your terminal uses a light color scheme.
 
 ### Skill
 
@@ -83,9 +84,9 @@ codex plugin marketplace add plasma-ai/plugins
 codex plugin add fractal@plasma
 ```
 
-Another install route is from the CLI, which copies (or symlinks) the skills
-(fractal and wiki) into `~/.claude/skills` and `~/.agents/skills` (add
-`--project` for the current project only):
+Another install route is from the CLI, which copies (or symlinks) the fractal
+and wiki skills into `~/.claude/skills` and `~/.agents/skills` (add `--project`
+for the current project only):
 
 ```bash
 fractal install [--link]

@@ -47,7 +47,12 @@ class TreeRow(Horizontal):
     """
 
     def __init__(
-        self: TreeRow, head: str, hang: str, label: str, *, classes: str
+        self: TreeRow,
+        head: str,
+        hang: str,
+        label: str,
+        *,
+        classes: str,
     ) -> None:
         """Initialize the row from its head, hang, and label markup."""
         super().__init__(classes=classes)

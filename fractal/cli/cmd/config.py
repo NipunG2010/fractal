@@ -250,8 +250,8 @@ def _config_set(
     # a root node and latch the tree-wide pause; init/internal writes (`config
     # _set`, check=False) set these once at bootstrap, so they keep the
     # first-write exemption but still can't change a set value; checked upfront
-    # so a multi-key set stays atomic (no earlier key lands when a later one is
-    # rejected)
+    # so a multi-key set stays atomic (no earlier key lands when a
+    # later one is rejected)
     for key, value in config.items():
         if key in IMMUTABLE_KEYS:
             current = node.config.get(key)

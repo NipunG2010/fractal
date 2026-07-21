@@ -60,8 +60,8 @@ NODE_VERB = {
 
 # the (glyph, color-token name) per lifecycle status, keyed through the real
 # vocabulary -- a status added to fractal.constants.STATUSES without a style
-# row here fails loudly at import instead of quietly rendering as idle.
-# Colors are stored by token NAME and resolved per call: a palette selected
+# row here fails loudly at import instead of quietly rendering as idle;
+# colors are stored by token NAME and resolved per call: a palette selected
 # after import (theme.select) must still color the dots
 _STYLE_ROWS = {
     'active': (theme.DOT_ON, 'SUCCESS'),

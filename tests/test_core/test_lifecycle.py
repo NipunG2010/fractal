@@ -8,12 +8,16 @@ merge-to-parent semantics.
 from __future__ import annotations
 
 import fcntl
+import os
 import pathlib
+import signal
 import subprocess
+import time
 from typing import NoReturn, Optional
 
 import pytest
 
+from fractal.constants import PGID_FILE
 from fractal.core.node import Node
 from tests._helpers import _git, _stub_run_script
 
@@ -42,6 +46,7 @@ __all__ = [
     'test_stop_rejects_non_active',
     'test_signal_rejects_active_node_without_run',
     'test_finish_accepts_reason',
+    'test_kill_vets_recorded_group_before_script',
     'test_kill_sets_killed_status',
     'test_kill_marks_all_active',
     'test_kill_keeps_loop_terminal_status_when_raced',
@@ -61,6 +66,7 @@ __all__ = [
     'test_kill_reaps_booting_descendant',
     'test_merge_lifecycle',
     'test_merge_no_op_when_nothing_to_merge',
+    'test_merge_surfaces_script_notices',
     'test_merge_excludes_merged_node_seed',
     'test_merge_excludes_subproject_node_seed',
     'test_merge_refreshes_parent_wiki_indexes',
@@ -196,9 +202,10 @@ def test_start_continue_from_terminal(
     node.config.set('max_cost', 1.0)
     # set the node to a terminal status
     node.status_set(status)
-    # verify continue works (stub shell script)
-    _stub_run_script(monkeypatch, node)
+    # verify continue launches (stub shell script)
+    run_scripts = _stub_run_script(monkeypatch, node)
     node.start(continue_run=True)
+    assert run_scripts
 
 
 def test_start_continue_re_arms_after_drained_run(
@@ -438,6 +445,55 @@ def test_finish_accepts_reason(
 
 
 # ------ kill
+
+
+@pytest.mark.parametrize(
+    argnames='recycled',
+    argvalues=[True, False],
+    ids=['recycled', 'recorded'],
+)
+def test_kill_vets_recorded_group_before_script(
+    node_with_db: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    recycled: bool,
+) -> None:
+    """Kill drops a recycled ``.pgid`` record before the script's fallback reap.
+
+    ``kill.sh`` falls back to the recorded process group when the pane
+    lookup is empty, gating on liveness alone -- a pid the OS recycled to
+    an unrelated same-user group answers that probe and would draw the
+    TERM/KILL. The pre-vet arbitrates identity the way ``_reap_orphan``
+    does (a leader younger than its record marks a recycled pid) and
+    unlinks the stale record, so the script only ever sees vetted files;
+    a genuine record survives for the fallback to use.
+    """
+    node = node_with_db
+    node.status_set('active')
+    node.record.run_start()
+    # a live same-user group standing in for the recorded one; backdating
+    # the record makes the leader postdate it, i.e. a recycled pid
+    leader = subprocess.Popen(['sleep', '300'], start_new_session=True)
+    pgid_file = node.node_dir / PGID_FILE
+    try:
+        pgid_file.write_text(f'{leader.pid}\n', encoding='utf-8')
+        if recycled:
+            stale = time.time() - 3600
+            os.utime(pgid_file, (stale, stale))
+        _stub_run_script(monkeypatch, node)
+        node.kill()
+        if recycled:
+            # the stale record was dropped and the stranger spared
+            assert not pgid_file.exists()
+            assert leader.poll() is None
+        else:
+            # the genuine record survives for the script's fallback
+            assert pgid_file.exists()
+    finally:
+        try:
+            os.killpg(leader.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        leader.wait()
 
 
 def test_kill_sets_killed_status(
@@ -866,11 +922,30 @@ def test_merge_no_op_when_nothing_to_merge(git_repo: pathlib.Path) -> None:
     commits_after_first = _rev_count(git_repo, 'main')
 
     # second merge has nothing new -- a clean no-op, not a RuntimeError
-    result = child_node.merge()
-    assert 'Nothing to merge' in result
+    output, _ = child_node.merge()
+    assert 'Nothing to merge' in output
 
     # no spurious empty commit landed on the parent
     assert _rev_count(git_repo, 'main') == commits_after_first
+
+
+def test_merge_surfaces_script_notices(git_repo: pathlib.Path) -> None:
+    """Merge returns merge.sh's success-path stderr warnings beside the output.
+
+    A child worktree left dirty at merge time makes ``merge.sh`` skip
+    advancing the branch's merge-base and warn on stderr while exiting 0;
+    the pair return surfaces the warning (the CLI echoes it to stderr)
+    instead of dropping it with the CompletedProcess -- the operator's
+    only explanation for a later re-merge re-diffing from the fork point.
+    """
+    project_dir, _ = _init_and_commit(git_repo, 'feature')
+    child_node = Node(project_dir)
+    # dirty the child so the merge-base advance is skipped with a warning
+    drift = project_dir / 'feature.txt'
+    drift.write_text('uncommitted drift\n', encoding='utf-8')
+    output, notices = child_node.merge()
+    assert output
+    assert 'skipped advancing' in notices
 
 
 def test_merge_excludes_merged_node_seed(git_repo: pathlib.Path) -> None:
@@ -907,8 +982,8 @@ def test_merge_excludes_merged_node_seed(git_repo: pathlib.Path) -> None:
     # re-merging re-stages the seed (the parent still lacks it), strips it, and
     # finds nothing new -- the strip degrades to the clean no-op path, not an
     # empty-commit crash
-    result = child_node.merge()
-    assert 'Nothing to merge' in result
+    output, _ = child_node.merge()
+    assert 'Nothing to merge' in output
 
 
 def test_merge_excludes_subproject_node_seed(git_repo: pathlib.Path) -> None:
@@ -954,8 +1029,8 @@ def test_merge_excludes_subproject_node_seed(git_repo: pathlib.Path) -> None:
     assert tracked.stdout.strip() == ''
 
     # re-merging re-stages only the seed, strips it, and degrades to a no-op
-    result = Node(worktree).merge()
-    assert 'Nothing to merge' in result
+    output, _ = Node(worktree).merge()
+    assert 'Nothing to merge' in output
 
 
 def test_merge_refreshes_parent_wiki_indexes(git_repo: pathlib.Path) -> None:
@@ -1093,8 +1168,8 @@ def test_merge_refuses_settled_child_into_a_running_target(
     parent.status_set('active')
     node_dir = parent_wt / '.fractal' / 'main.parent'
     monkeypatch.setenv('_NODE', f'{node_dir}')
-    result = child.merge()
-    assert 'Squash-merged' in result
+    output, _ = child.merge()
+    assert 'Squash-merged' in output
     assert (parent_wt / 'work.txt').is_file()
 
 

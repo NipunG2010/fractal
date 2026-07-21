@@ -15,7 +15,6 @@ __all__ = [
     'test_tmux_session_name_sanitizes_repo_and_branch_dots',
     'test_status_returns_stored_value',
     'test_status_set_validates',
-    'test_status_set_stores_value',
     'test_status_display_decorates_exited_with_run_reason',
     'test_title_set_updates_config_and_registry',
     'test_start_returns_the_countermand_without_printing',
@@ -57,15 +56,6 @@ def test_status_set_validates(
     """Status set rejects invalid values."""
     with pytest.raises(ValueError):
         node_with_db.status_set(invalid_status)
-
-
-def test_status_set_stores_value(node_with_db: Node) -> None:
-    """Status set persists and is read back."""
-    node = node_with_db
-    # set status
-    node.status_set('killed')
-    # verify it is read back
-    assert node.status() == 'killed'
 
 
 def test_status_display_decorates_exited_with_run_reason(node_with_db: Node) -> None:

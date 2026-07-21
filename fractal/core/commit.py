@@ -229,8 +229,8 @@ def commit(
         '--',
         *_STAGE_EXCLUDES,
     ]
-    # raw bytes, decoded here -- run()'s strip would eat a first path's
-    # leading whitespace
+    # raw bytes, decoded here -- run()'s strip would eat a first
+    # path's leading whitespace
     raw = fractal.util.git.run_bytes(cmd, cwd=worktree) or b''
     ignored = os.fsdecode(raw)
     skipped = 0

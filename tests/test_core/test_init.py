@@ -55,8 +55,10 @@ __all__ = [
     'test_child_inherits_config_preferences_not_caps',
     'test_init_requires_resolvable_agent',
     'test_init_refuses_unsupported_agent',
+    'test_init_refuses_unsupported_provider',
+    'test_init_refuses_quoted_agent_command',
     'test_init_requires_project_wiki',
-    'test_init_names_a_missing_base_branch',
+    'test_init_refuses_a_base_without_a_worktree',
     'test_init_rejects_inside_worktrees',
     'test_user_init_repairs_stranded_database',
     'test_user_init_rejects_second_project_on_same_branch',
@@ -784,6 +786,45 @@ def test_init_refuses_unsupported_agent(git_repo: pathlib.Path) -> None:
         Node(git_repo).init(name='task')
 
 
+def test_init_refuses_unsupported_provider(git_repo: pathlib.Path) -> None:
+    """An explicit ``--provider`` the agent cannot route refuses at init.
+
+    An unsupported route would store fine and the node would silently spend
+    vendor-native -- refused like an agent typo, naming the supported set,
+    with nothing left behind. Only the explicit flag refuses: an inherited
+    default keeps its silent drop onto agents that cannot take it.
+    """
+    Node(git_repo).init(agent='claude', user=True)
+    # a route-less agent (grok) declares no providers, so any route refuses
+    with pytest.raises(ValueError, match="Unsupported provider: 'openrouter'"):
+        Node(git_repo).init(name='task', agent='grok', provider='openrouter')
+    # a routed agent still refuses a route it does not declare
+    with pytest.raises(ValueError, match='supported: openrouter'):
+        Node(git_repo).init(name='task', provider='bogus')
+    # nothing landed -- no worktree, no registry row
+    assert not (git_repo / '.worktrees' / 'main.task').exists()
+    assert not Node(git_repo).db.exists('nodes', where={'node': 'main.task'})
+
+
+def test_init_refuses_quoted_agent_command(git_repo: pathlib.Path) -> None:
+    """Shell quoting in an ``--agent`` command refuses at the accept gates.
+
+    Agent commands split on whitespace with no shell interpretation, so a
+    quoted argument would mangle into garbage argv words at loop boot,
+    deep inside the tmux pane -- the same vanishing-pane failure class as
+    a typo'd name, refused at the same gates with nothing stored.
+    """
+    quoted = 'claude --append-system-prompt "be terse"'
+    with pytest.raises(ValueError, match='commands split on whitespace'):
+        Node(git_repo).init(agent=quoted, user=True)
+    Node(git_repo).init(agent='claude', user=True)
+    with pytest.raises(ValueError, match='commands split on whitespace'):
+        Node(git_repo).init(name='task', agent=quoted)
+    # nothing landed -- no worktree, no registry row
+    assert not (git_repo / '.worktrees' / 'main.task').exists()
+    assert not Node(git_repo).db.exists('nodes', where={'node': 'main.task'})
+
+
 # ------ preconditions
 
 
@@ -835,19 +876,33 @@ def test_init_requires_project_wiki(tmp_path: pathlib.Path) -> None:
         node.init(name='bad')
 
 
-def test_init_names_a_missing_base_branch(git_repo: pathlib.Path) -> None:
-    """A ``--base`` typo names the missing branch, not a missing wiki.
+def test_init_refuses_a_base_without_a_worktree(git_repo: pathlib.Path) -> None:
+    """A ``--base`` with no checked-out worktree refuses at init, naming both.
 
-    The wiki precondition reads through the base ref, so a nonexistent
-    branch would fail that check for a missing-ref reason and prescribe
-    creating a wiki -- the wrong remedy for a typo. The ref check runs
-    first and names the real problem.
+    The base is also the squash-merge target: ``merge.sh`` squashes inside
+    the base's worktree, so a worktree-less base (a typo, or a branch
+    nothing has checked out) would only fail at merge time, long after init
+    printed its success. The refusal names the branch and the worktree
+    requirement -- never a missing wiki (the wiki precondition reads through
+    the base ref, so it would misdiagnose a typo) -- and leaves nothing
+    behind; a worktree-backed base (another node's branch) still passes.
     """
     node = Node(git_repo)
     node.init(agent='claude', user=True)
-    with pytest.raises(RuntimeError, match="does_not_exist' does not exist") as err:
-        node.init(name='task', base='does_not_exist')
-    assert 'wiki' not in str(err.value)
+    # a typo'd base and a real-but-unattended branch refuse the same way
+    _git(git_repo, 'branch', 'unattended')
+    for base in ('does_not_exist', 'unattended'):
+        with pytest.raises(ValueError, match='no checked-out worktree') as err:
+            node.init(name='task', base=base)
+        assert base in str(err.value)
+        assert 'wiki' not in str(err.value)
+    # nothing landed -- no worktree, no registry row
+    assert not (git_repo / '.worktrees' / 'main.task').exists()
+    assert not node.db.exists('nodes', where={'node': 'main.task'})
+    # a base with a checked-out worktree still passes
+    node.init(name='anchor')
+    node.init(name='task', base='main.anchor')
+    assert (git_repo / '.worktrees' / 'main.task').exists()
 
 
 def test_init_rejects_inside_worktrees(

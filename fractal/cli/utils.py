@@ -186,7 +186,10 @@ class StreamRenderer:
     cost facts render nothing (they are recorded, not displayed). Tracks
     the open text run (a delta without a trailing newline) so tool headers
     and closing summaries start below it, and ``close()`` ends a truncated
-    stream on a fresh line with the ``-- $?`` placeholder summary.
+    stream on a fresh line with the ``-- $?`` placeholder summary. Every
+    write flushes: piped stdout is block-buffered while the driving
+    command's stderr echoes are write-through, so an unflushed line would
+    land out of order in a merged capture.
     """
 
     def __init__(self: StreamRenderer) -> None:
@@ -239,7 +242,7 @@ class StreamRenderer:
                 summary = ', '.join(parts)
             else:
                 summary = cost_str
-            print(f'\n{_DIM}-- {summary}{_RESET}')
+            print(f'\n{_DIM}-- {summary}{_RESET}', flush=True)
             self._resulted = True
         # stream-borne errors (some agents report failures on the JSON stream,
         # not stderr, so without this a failed turn leaves no explanation)
@@ -263,14 +266,14 @@ class StreamRenderer:
             return
         self._break()
         if not self._resulted:
-            print(f'\n{_DIM}-- $?{_RESET}')
+            print(f'\n{_DIM}-- $?{_RESET}', flush=True)
         self._open = False
         self._resulted = False
 
     def _break(self: StreamRenderer) -> None:
         """Close an open text run on a fresh line (a visual break)."""
         if self._streaming:
-            print()
+            print(flush=True)
             self._streaming = False
 
 
@@ -580,6 +583,9 @@ def resolve_ledger_target(
     ``(caller, branch, latest_run)`` -- how the fallback applies stays per
     command (``remaining`` reports ``no budget`` without delegating;
     ``spent``/``breakdown`` substitute ``latest_run`` for an absent scope).
+    The fallback accepts the same unique short names live resolution does:
+    the registry rows that expansion consults die with the node, so the
+    trailing segment expands against the recorded runs instead.
 
     Args:
         path: Caller's worktree directory (absolute or relative).
@@ -592,7 +598,8 @@ def resolve_ledger_target(
 
     Raises:
         typer.BadParameter: If resolution fails and the branch never
-            recorded a run (there is no history to answer from).
+            recorded a run (there is no history to answer from), or a
+            short name matches several live or recorded branches.
 
     """
     # a deleted branch fails resolution: answer through the caller (shared db)
@@ -603,7 +610,35 @@ def resolve_ledger_target(
         if node is None:
             raise
         caller = resolve_node(path)
+        # a live-ambiguous short name re-raises the refusal: the fallback
+        # answers for deleted branches, never over live twins the registry
+        # itself refused to pick between
+        live = []
+        for row in caller.list(all_nodes=True):
+            *_, leaf = row['node'].rsplit('.', 1)
+            if leaf == node:
+                live.append(row['node'])
+        if len(live) > 1:
+            raise
         latest = caller.record.run_latest(branch=node)
+        if latest is None:
+            # expand a short name against the recorded runs -- a unique
+            # trailing-segment match answers, ambiguity refuses (mirroring
+            # _resolve_node_name, whose registry rows died with the node)
+            matches = []
+            for branch in caller.record.run_branches():
+                *_, leaf = branch.rsplit('.', 1)
+                if leaf == node:
+                    matches.append(branch)
+            if len(matches) > 1:
+                options = ', '.join(sorted(matches))
+                raise typer.BadParameter(
+                    f'Ambiguous node name {node!r} (matches: {options}).'
+                    f' Use the full branch.'
+                ) from None
+            if len(matches) == 1:
+                (node,) = matches
+                latest = caller.record.run_latest(branch=node)
         if latest is None:
             raise
         return caller, node, latest

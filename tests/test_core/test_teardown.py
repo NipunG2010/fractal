@@ -11,9 +11,11 @@ import os
 import pathlib
 import shutil
 import subprocess
+from typing import Optional
 
 import pytest
 
+from fractal.constants import SOCKET_FILE
 from fractal.core.node import Node
 from tests._helpers import _stub_run_script
 
@@ -45,6 +47,8 @@ __all__ = [
     'test_delete_locked_worktree_aborts_before_remote',
     'test_teardown_running_preflight_precedes_paused_settle',
     'test_teardown_refuses_on_inconclusive_tmux_probe',
+    'test_teardown_refuses_session_alive_on_recorded_socket',
+    'test_destroy_rejects_from_inside_worktree',
     'test_teardown_locked_preflight_precedes_paused_settle',
     'test_destroy_lifecycle',
     'test_destroy_prunes_phantom_node_branches',
@@ -692,6 +696,63 @@ def test_teardown_refuses_on_inconclusive_tmux_probe(
     # nothing was torn down
     assert runner.worktree.is_dir()
     assert runner.status() == 'active'
+
+
+def test_teardown_refuses_session_alive_on_recorded_socket(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The teardown pre-flight probes each node's recorded socket.
+
+    A loop's session lives on the tmux server recorded at boot
+    (``.socket``); a shell resolving a different server reads a
+    definitive-empty ambient answer there, and a teardown trusting it
+    would remove worktrees, branches, and (destroy) the central DB out
+    from under a live, spending loop.
+    """
+    node = Node(git_repo)
+    node.init(agent='claude', user=True)
+    node.init(name='runner')
+    runner = Node(git_repo / '.worktrees' / 'main.runner')
+    runner.status_set('active')
+    # the loop's session is alive on its recorded socket only -- the
+    # ambient server answers definitively empty
+    socket_file = runner.node_dir / SOCKET_FILE
+    socket_file.write_text('other-sock\n', encoding='utf-8')
+
+    def probe(socket: Optional[str] = None) -> frozenset[str]:
+        if socket == 'other-sock':
+            return frozenset({runner.tmux_session})
+        return frozenset()
+
+    monkeypatch.setattr('fractal.util.tmux.probe', probe)
+    with pytest.raises(RuntimeError, match='still running in tmux'):
+        Node.destroy(git_repo)
+    with pytest.raises(RuntimeError, match='still running in tmux'):
+        Node.reset(git_repo)
+    # nothing was torn down
+    assert runner.worktree.is_dir()
+    assert runner.status() == 'active'
+
+
+def test_destroy_rejects_from_inside_worktree(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Destroy refuses when cwd is inside a node worktree.
+
+    Git cannot remove a worktree the caller occupies -- the same
+    pre-flight delete and reset carry, so a destroy run from inside a
+    node worktree refuses with nothing settled or torn down.
+    """
+    node = Node(git_repo)
+    node.init(agent='claude', user=True)
+    node.init(name='task')
+    task_wt = git_repo / '.worktrees' / 'main.task'
+    monkeypatch.chdir(task_wt)
+    with pytest.raises(RuntimeError, match='current worktree from inside it'):
+        Node.destroy(git_repo)
+    assert task_wt.is_dir()
 
 
 def test_teardown_locked_preflight_precedes_paused_settle(

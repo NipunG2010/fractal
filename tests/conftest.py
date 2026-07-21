@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
 import shutil
@@ -11,6 +12,8 @@ import tempfile
 from collections.abc import Iterator
 
 import pytest
+
+import fractal
 
 # the suite drives the installed fractal console script as a subprocess (and
 # the loop shells out to it on every step), which coverage's in-process tracer
@@ -58,6 +61,36 @@ def _isolate_loop_env() -> Iterator[None]:
         monkeypatch.delenv(var, raising=False)
     yield
     monkeypatch.undo()
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _package_seeds_stay_pristine() -> Iterator[None]:
+    """Fail the session when a test mutates the package's seed trees.
+
+    The loop resolves shared seed files (modes, steps, scripts) straight
+    from the installed package, so a test that writes through such a path
+    (e.g. via ``loop._sync_file``) corrupts the working tree for every
+    later test and every live run. Digest the seed trees before and after
+    the session and fail loudly on drift, naming the class of mistake.
+    """
+    package = pathlib.Path(fractal.__file__).parent
+    seeds = ('_assets', '_node', '_scripts', 'skills')
+
+    def digest() -> str:
+        sha = hashlib.sha256()
+        for seed in seeds:
+            for path in sorted((package / seed).rglob('*')):
+                if path.is_file():
+                    sha.update(str(path.relative_to(package)).encode())
+                    sha.update(path.read_bytes())
+        return sha.hexdigest()
+
+    before = digest()
+    yield
+    assert digest() == before, (
+        'package seed trees (_assets/_node/_scripts/skills) were modified by'
+        ' the test suite -- a test wrote through a package path'
+    )
 
 
 @pytest.fixture(scope='session', autouse=True)

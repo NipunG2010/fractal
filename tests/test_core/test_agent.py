@@ -36,6 +36,7 @@ __all__ = [
     'test_supported_defaults_to_the_shipped_backends',
     'test_register_and_resolve_an_injected_backend',
     'test_resolve_rejects_an_unknown_agent',
+    'test_command_base_refuses_shell_quoting',
     'test_deployment_hook_file_overrides_a_default',
     'test_explicit_registration_beats_the_hook_file',
     'test_broken_hook_file_fails_every_resolve',
@@ -107,6 +108,28 @@ def test_resolve_rejects_an_unknown_agent(registry: dict[str, Any]) -> None:
     """An unknown base command raises naming the supported set."""
     with pytest.raises(ValueError, match="Unsupported agent: 'ghost'"):
         agent.resolve('ghost')
+
+
+@pytest.mark.parametrize(
+    argnames='command',
+    argvalues=[
+        'claude --flag "two words"',
+        "claude --flag 'two words'",
+        'claude --flag two\\ words',
+    ],
+    ids=['double-quoted', 'single-quoted', 'backslash'],
+)
+def test_command_base_refuses_shell_quoting(command: str) -> None:
+    """``command_base`` refuses quoting instead of mangling argv words.
+
+    Commands split on whitespace with no shell interpretation, so quoting
+    would silently produce garbage words deep inside the loop's pane --
+    the boundary refuses it while a plain multi-word command resolves to
+    its base word.
+    """
+    with pytest.raises(ValueError, match='split on whitespace'):
+        agent.command_base(command)
+    assert agent.command_base('claude --some-flag') == 'claude'
 
 
 def test_deployment_hook_file_overrides_a_default(

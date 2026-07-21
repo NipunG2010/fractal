@@ -363,16 +363,22 @@ class Node:
             pgid_file = self.node_dir / name
             if not pgid_file.exists():
                 continue
-            # trust the record only while its group is still alive
+            # trust the record only while its group is still alive; a record
+            # a rival reconciler already swept reads as gone
             try:
+                recorded_at = pgid_file.stat().st_mtime
                 pgid = int(pgid_file.read_text(encoding='utf-8').strip())
                 os.killpg(pgid, 0)
-            except (ValueError, ProcessLookupError, PermissionError):
+            except (
+                FileNotFoundError,
+                ValueError,
+                ProcessLookupError,
+                PermissionError,
+            ):
                 pgid = 0
-            # aliveness is not identity: a recycled pid answers the probe
-            # from an unrelated group -- spare any group younger than its
-            # record
-            if pgid > 0 and not _recorded_group(pgid, pgid_file.stat().st_mtime):
+            # aliveness is not identity: a recycled pid answers the probe from
+            # an unrelated group -- spare any group younger than its record
+            if pgid > 0 and not _recorded_group(pgid, recorded_at):
                 pgid = 0
             # reap the group and audit the reap
             if pgid > 0:
@@ -581,7 +587,7 @@ class Node:
             Script output.
 
         """
-        from .agent import resolve
+        from .agent import command_base, resolve
 
         # coerce path to a str -- downstream '.' comparisons and persisted
         # caches expect the string form
@@ -660,6 +666,17 @@ class Node:
                 scope = [f'{FRACTAL_FOLDER}/{meta}']
             else:
                 scope = [f'{target_project}/{FRACTAL_FOLDER}/{meta}']
+        # the base is also the squash-merge target: merge.sh squashes inside
+        # the base's checked-out worktree, so a worktree-less base (a typo,
+        # or a branch nothing has checked out) would only fail at merge time,
+        # long after init printed its success -- refuse now, naming the
+        # requirement
+        if base and fractal.util.git.find_worktree(self.repo_dir, base) is None:
+            raise ValueError(
+                f'Base branch {base!r} has no checked-out worktree.'
+                ' The base is the squash-merge target, so it must be'
+                ' checked out in this repository.'
+            )
         # prefer the calling node (_NODE) so an agent's child nests under it,
         # not the repo-root user node; fall back to self for a top-level spawn
         parent = self.resolve_caller()
@@ -740,7 +757,7 @@ class Node:
         # -- a junk name would store fine and kill the loop at boot inside
         # the tmux pane, after start already printed its success, so the
         # typo refuses here with the registry's supported-list error
-        base_word, *_ = agent.split()
+        base_word = command_base(agent)
         resolved = resolve(base_word, root=parent.db.path.parent)
         # inherit the provider route the same way, materializing it only when
         # the child's agent supports routes -- an openrouter-defaulting
@@ -753,6 +770,15 @@ class Node:
                     break
             if provider is not None and provider not in resolved.providers:
                 provider = None
+        # an explicit route the backend does not support would store fine
+        # and silently spend vendor-native -- refuse like the agent typo
+        # above, naming the supported set (only the explicit flag refuses;
+        # the inherited default keeps its silent drop)
+        elif provider not in resolved.providers:
+            supported_providers = ', '.join(resolved.providers) or 'none'
+            raise ValueError(
+                f'Unsupported provider: {provider!r} (supported: {supported_providers})'
+            )
         # inherit the parent's preference config when requested -- explicit
         # flags win, values land in the child's config as a spawn-time
         # snapshot, and budget-class keys (costs, iters, depth/children,
@@ -981,12 +1007,16 @@ class Node:
                 raise
         # surface the summary + any notices, but drop the per-artifact
         # "Created ..." progress lines that flood logs under wide fan-out
-        # (errors don't come back through stdout here -- a failed init raises)
-        return '\n'.join(
+        # (errors don't come back through stdout here -- a failed init raises);
+        # success-path warnings ride stderr and would vanish with the
+        # CompletedProcess, so they append below the summary
+        summary = '\n'.join(
             line
             for line in result.stdout.strip().splitlines()
             if not line.startswith('Created ')
         )
+        notices = result.stderr.strip()
+        return f'{summary}\n{notices}' if notices else summary
 
     def _init_user(
         self: Node,
@@ -1016,7 +1046,7 @@ class Node:
             Confirmation message.
 
         """
-        from .agent import resolve
+        from .agent import command_base, resolve
 
         # alias branch
         branch = self.branch
@@ -1074,7 +1104,7 @@ class Node:
         # DB's future home, derivable pre-init) is consulted for a hook
         # file when present -- a fresh init has none, so built-ins gate
         if agent is not None:
-            base_word, *_ = agent.split()
+            base_word = command_base(agent)
             resolve(base_word, root=self.node_dir)
         # idempotent: an existing user node is not clobbered, but a partial
         # prior init (config.json written before db/radio/wiki) is repaired
@@ -1108,9 +1138,9 @@ class Node:
         # refuse if another active fractal on this machine shares this repo's
         # tmux namespace: node sessions and `node kill` resolve by the global
         # name '<repo-basename> (<branch>)', so two fractals under one basename
-        # collide and a kill can cross-fire onto the other tree. tmux names
+        # collide and a kill can cross-fire onto the other tree -- tmux names
         # carry no repo path, but this fractal does not exist yet, so any live
-        # session under our basename is necessarily a different repo's.
+        # session under our basename is necessarily a different repo's
         repo_name = self.repo_dir.name.replace('.', '-').replace(':', '-')
         sessions = fractal.util.tmux.probe()
         if sessions is not None:
@@ -1249,7 +1279,7 @@ class Node:
             retune echo, the continue-from-killed countermand).
 
         """
-        from .agent import resolve
+        from .agent import command_base, resolve
 
         # reject user nodes
         if self.is_user:
@@ -1424,7 +1454,7 @@ class Node:
         agent = self.config.get('agent')
         if not agent:
             raise ValueError('No agent configured; set --agent at node init.')
-        base_word, *_ = agent.split()
+        base_word = command_base(agent)
         resolve(base_word, root=self.db.path.parent)
         # a blind node reads no channels -- sweep any subscriptions that
         # landed between init (which seeds none) and this launch
@@ -1903,6 +1933,20 @@ class Node:
             # set signal and log event; the tmux kill runs outside the lock
             event_id = self.record.event_start('kill', metadata=label)
             self.record.signal_set('kill', label)
+        # vet the recorded process groups before the script's fallback reap:
+        # kill.sh gates on liveness alone, and a recycled id (the OS re-issued
+        # a dead group's id to an unrelated same-user group) answers that
+        # probe -- drop any record whose live group is not the one it named
+        # (see _recorded_group), so the fallback only ever sees vetted files
+        for name in (PGID_FILE, STEP_PGID_FILE):
+            pgid_file = self.node_dir / name
+            try:
+                recorded_at = pgid_file.stat().st_mtime
+                pgid = int(pgid_file.read_text(encoding='utf-8').strip())
+            except (FileNotFoundError, ValueError):
+                continue
+            if not _recorded_group(pgid, recorded_at):
+                pgid_file.unlink(missing_ok=True)
         try:
             result = self._run_script('kill.sh', f'{self._root}')
         except Exception:
@@ -2175,7 +2219,7 @@ class Node:
             return self.config.get('root')
         return None
 
-    def merge(self: Node) -> str:
+    def merge(self: Node) -> tuple[str, str]:
         """Squash-merge the node's branch into its merge target.
 
         ``merge.sh`` resolves the target -- the node's configured ``base`` if
@@ -2193,7 +2237,8 @@ class Node:
         its settled children as part of its normal iteration.
 
         Returns:
-            Script output.
+            Tuple of script output and collected stderr notices (e.g. a
+            skipped merge-base advance).
 
         """
         # reject user nodes
@@ -2238,7 +2283,10 @@ class Node:
         # run merge script -- merge.sh resolves the target and logs the
         # merge event on it (it's the single source of truth for the target)
         result = self._run_script('merge.sh', f'{self._root}')
-        return result.stdout.strip()
+        # success-path warnings ride stderr (e.g. a skipped merge-base
+        # advance predicting spurious re-merge diffs) and would vanish with
+        # the CompletedProcess -- return them beside the output
+        return result.stdout.strip(), result.stderr.strip()
 
     def delete(self: Node) -> tuple[str, str]:
         """Recursively remove the node and its whole subtree.
@@ -2617,6 +2665,24 @@ class Node:
         # central DB with the user node's data dir, so the phantom prune
         # below must read the branch list while it still exists
         registry = node.db.read('nodes') if node.exists() else []
+        # refuse if the caller stands inside a node worktree -- git cannot
+        # remove a worktree the caller occupies
+        cwd = pathlib.Path.cwd().resolve()
+        for _, worktree_path in fractal.util.git.worktree_map(node.repo_dir).items():
+            worktree_dir = worktree_path.resolve()
+            if worktree_dir == node.repo_dir.resolve():
+                continue
+            if cwd == worktree_dir or worktree_dir in cwd.parents:
+                raise RuntimeError(
+                    'Cannot destroy the current worktree from inside it.'
+                    ' Run from the repo root.'
+                )
+        # reconcile crashed nodes so their orphaned process groups reap while
+        # the .pgid records still exist (the script removes them with the
+        # worktrees; a headless agent would otherwise keep spending unseen)
+        if node.exists():
+            for _, descendant in node._live_descendants(status='active'):
+                descendant._reconcile_status()
         result = Node._guarded_teardown(
             node,
             'destroy.sh',
@@ -2759,18 +2825,21 @@ class Node:
             # (the user node runs no loop, so only descendants can hold a
             # session): one pass per guard, mirroring the script's ordering
             descendants = node._live_descendants()
-            # one batched tmux probe for the whole set (mirrors _heal_crashed);
-            # an inconclusive probe means any node may still be running, so the
-            # irreversible teardown refuses rather than tearing down blind
-            sessions = fractal.util.tmux.probe()
-            if sessions is None:
-                raise RuntimeError(
-                    f'Cannot {verb}: the tmux probe failed (tmux list-sessions'
-                    ' gave no answer), so nodes may still be running. Restore'
-                    ' tmux visibility and retry.'
-                )
+            # probe each node's recorded socket, never the ambient one alone:
+            # a session alive on the socket the loop recorded at boot is
+            # invisible to a shell resolving a different server (see
+            # _tmux_session_exists); an inconclusive probe means the node may
+            # still be running, so the irreversible teardown refuses rather
+            # than tearing down blind
             for _, descendant in descendants:
-                if descendant.tmux_session in sessions:
+                alive = descendant._tmux_session_exists()
+                if alive is None:
+                    raise RuntimeError(
+                        f'Cannot {verb}: the tmux probe failed (tmux list-sessions'
+                        ' gave no answer), so nodes may still be running. Restore'
+                        ' tmux visibility and retry.'
+                    )
+                if alive:
                     raise RuntimeError(
                         f'Cannot {verb}: node is still running in tmux'
                         f' ({descendant.tmux_session}). Kill it first with:'
@@ -2950,15 +3019,18 @@ class Node:
             # ('active' with no live tmux session) to 'exited' and a booting idle
             # node (live session) to 'active' -- display-only, mirroring the TUI
             # snapshot reconcile, so --live is the authoritative
-            # settled-vs-crashed view (one tmux probe for the whole subtree); an
-            # inconclusive probe (no tmux answer) proves nothing, so the stored
-            # status stands
+            # settled-vs-crashed view; the batched probe only nominates
+            # candidates, and each relabel confirms on the node's recorded
+            # socket (a tmux answer is evidence about one server only -- see
+            # _tmux_session_exists); an inconclusive probe (no tmux answer)
+            # proves nothing, so the stored status stands
             sessions = fractal.util.tmux.probe()
             rows = []
             for row, node in self._live_descendants(max_depth=max_depth):
                 if sessions is not None:
                     if _base_status(row.get('status')) == 'active':
-                        if node.tmux_session not in sessions:
+                        unlisted = node.tmux_session not in sessions
+                        if unlisted and node._tmux_session_exists() is False:
                             row = {**row, 'status': 'exited'}
                     # a started child holds 'idle' until its loop stamps
                     # 'active' after preflight, but its session is already
@@ -2967,7 +3039,7 @@ class Node:
                     # seconds earlier; a sessionless idle node (spawned, never
                     # started) stays idle and never blocks a drain
                     elif _base_status(row.get('status')) == 'idle':
-                        if node.tmux_session in sessions:
+                        if node.tmux_session in sessions or node._tmux_session_exists():
                             row = {**row, 'status': 'active'}
                 rows.append(row)
         else:
@@ -3705,7 +3777,8 @@ class Node:
     def child_pending(self: Node) -> list[dict]:
         """List direct children's steps awaiting this node's approval.
 
-        One row per direct-child step with ``approved=''`` (pending), as
+        One row per direct-child step awaiting approval -- ``approved=''``
+        on an ``active`` or ``paused`` step row -- as
         ``{'branch', 'step_id', 'step', 'step_name'}``. Only direct children
         are listed -- the steps this node can actually approve.
 
@@ -3717,6 +3790,13 @@ class Node:
         for row in self.child_list(max_depth=1) or []:
             branch = row['node']
             for step in self.db.read('steps', where={'node': branch, 'approved': ''}):
+                # a gate releases only into a live wait: 'active' is mid-wait
+                # and 'paused' is parked (approving while parked is the resume
+                # flow) -- any other terminal stranded its gate (a kill, a
+                # crash reconcile, a reserve wind-down), so listing it would
+                # offer an approval nothing will ever read
+                if step['status'] not in ('active', 'paused'):
+                    continue
                 pending = {
                     'branch': branch,
                     'step_id': step['step_id'],
@@ -3837,7 +3917,7 @@ class Node:
                 the base command has no registered backend.
 
         """
-        from .agent import resolve
+        from .agent import command_base, resolve
 
         # resolve the command, refusing an agentless node
         command = command or self.agent_effective()
@@ -3849,7 +3929,7 @@ class Node:
         # threading the tree root so a deployment hook file's subclasses win
         # across processes (imported at call time -- node.py never imports
         # agent.py at runtime, keeping the node<->seam boundary one-way)
-        name, *_ = command.split()
+        name = command_base(command)
         if provider is None:
             provider = self.provider_effective()
         return resolve(name, root=self.db.path.parent)(self, command, provider)

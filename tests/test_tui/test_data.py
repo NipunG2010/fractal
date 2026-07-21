@@ -37,6 +37,7 @@ __all__ = [
     'test_step_denominator_scopes_to_each_run',
     'test_measures_tolerate_a_numeric_config_duration',
     'test_measures_tolerate_a_string_cost_cap',
+    'test_measures_tolerate_a_mangled_max_iters',
     'test_build_tolerates_a_mangled_config',
     'test_build_tolerates_an_undecodable_status',
     'test_sync_folds_into_its_step',
@@ -385,6 +386,39 @@ def test_measures_tolerate_a_string_cost_cap(pair_tree: pathlib.Path) -> None:
     # the build completes; the unparseable cost reads as no cap
     measures = builder.build('main.alpha').measures
     assert measures['cap_run_cost'] is None
+
+
+@pytest.mark.parametrize(
+    argnames='mangled',
+    argvalues=['lots', float('inf')],
+    ids=['string', 'infinity'],
+)
+def test_measures_tolerate_a_mangled_max_iters(
+    pair_tree: pathlib.Path,
+    mangled: object,
+) -> None:
+    """A malformed ``max_iters`` in config.json degrades to no cap, never a crash.
+
+    config.json is agent-editable, so a self-tuning node may write a string
+    ``max_iters`` -- or a JSON ``Infinity``, which ``int()`` rejects with
+    OverflowError rather than ValueError. The measures matrix compares the
+    cap against zero, so ``_measures`` must coerce -- an uncoerced value
+    would crash the cockpit build, the iteration sibling of the crashes
+    above.
+    """
+    alpha = Node(pair_tree / '.worktrees' / 'main.alpha')
+    config_path = alpha.node_dir / 'config.json'
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    config['max_iters'] = mangled  # never the int the counter renders
+    config_path.write_text(json.dumps(config), encoding='utf-8')
+    with deterministic_core() as clock:
+        clock.at(100.0)
+        alpha.record.run_start()
+    data = TuiData(resolve_node(pair_tree))
+    builder = SnapshotBuilder(data, NodePoller(data.db_dir), now=lambda: NOW_EPOCH)
+    # the build completes; the unparseable count reads as no cap
+    measures = builder.build('main.alpha').measures
+    assert measures['iter_max'] is None
 
 
 @pytest.mark.parametrize(

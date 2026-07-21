@@ -464,6 +464,21 @@ class Record:
             rows = self.db.read('runs', where={'node': branch}, limit=1)
         return rows[0]['run_id'] if rows else None
 
+    def run_branches(self: Record) -> list[str]:
+        """Return every branch with a recorded run, one entry per branch.
+
+        The companion to :meth:`run_latest` for deleted nodes: registry
+        rows die with the node while its runs persist keyed by branch
+        text, so this is the name pool a short-name lookup expands
+        against.
+
+        Returns:
+            Distinct branch names from the runs table.
+
+        """
+        rows = self.db.read(query='SELECT DISTINCT node FROM runs')
+        return [row['node'] for row in rows]
+
     def iter_start(
         self: Record,
         *,

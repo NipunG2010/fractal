@@ -244,6 +244,7 @@ class SnapshotBuilder:
         tree = self._tree_rows(scope)
         total, active = self._counts()
         feed = self._feed(subtree) if want_feed else ()
+        saved = self._archive.get(root, ()) if want_archive else ()
         snapshot = Snapshot(
             repo=self._data.repo_dir.name,
             scope=scope,
@@ -258,7 +259,7 @@ class SnapshotBuilder:
             channels=shaped['channels'],
             messages=self._radio.get(scope, ()),
             feed=feed,
-            saved=self._archive.get(root, ()) if want_archive else (),
+            saved=saved,
             geometry=geometry,
         )
         self._snapshot = snapshot
@@ -505,10 +506,8 @@ class SnapshotBuilder:
         spends = self._run_spends(scope, [run['run_id'] for run in runs])
         measures = self._measures(
             runs=runs,
-            iters=iters,
             steps=steps,
             config=config,
-            scope=scope,
             run=run,
             it=it,
             step=step,
@@ -550,10 +549,8 @@ class SnapshotBuilder:
         self: SnapshotBuilder,
         *,
         runs: list[dict],
-        iters: list[dict],
         steps: list[dict],
         config: dict,
-        scope: str,
         run: Optional[dict],
         it: Optional[dict],
         step: Optional[dict],
@@ -568,8 +565,16 @@ class SnapshotBuilder:
         if run is None:
             return None
         it_steps = [s for s in steps if it and s['iter_id'] == it['iter_id']]
-        max_iters = config.get('max_iters')
-        iter_max = max_iters if max_iters is not None and max_iters >= 0 else None
+        # max_iters is agent-editable like the caps below -- coerce, so a
+        # mistyped value reads as no cap (the int sibling of _cost_or_none);
+        # OverflowError covers a JSON Infinity, which int() rejects with
+        # neither TypeError nor ValueError
+        try:
+            iter_max = int(config.get('max_iters'))  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            iter_max = None
+        if iter_max is not None and iter_max < 0:
+            iter_max = None
         return {
             'run': len(runs),
             'iter': it['iter'] if it else None,
@@ -731,18 +736,17 @@ class SnapshotBuilder:
             kids = self._children.get(branch, [])
             brief = self._brief.get(branch, {'status': 'idle', 'signal': ''})
             name = display_name_of(branch, self._titles.get(branch))
-            rows.append(
-                {
-                    'branch': branch,
-                    'name': name + user_tag(branch, self._data.root_branch),
-                    'depth': depth,
-                    'status': brief['status'],
-                    'signal': brief['signal'],
-                    'is_user': branch == self._data.root_branch,
-                    'is_focused': branch == scope,
-                    'has_kids': bool(kids),
-                }
-            )
+            row = {
+                'branch': branch,
+                'name': name + user_tag(branch, self._data.root_branch),
+                'depth': depth,
+                'status': brief['status'],
+                'signal': brief['signal'],
+                'is_user': branch == self._data.root_branch,
+                'is_focused': branch == scope,
+                'has_kids': bool(kids),
+            }
+            rows.append(row)
             for kid in kids:
                 walk(kid, depth + 1)
 
@@ -1124,24 +1128,23 @@ def _history(
                 started_at = min(
                     (step['started_at'], *(s['started_at'] for s in syncs))
                 )
-                step_rows.append(
-                    {
-                        'label': label,
-                        'status': step['status'],
-                        'step': step['step'],
-                        'name': step['step_name'],
-                        'agent': step['agent'],
-                        'model': step['model'],
-                        'cost': fmt.money(sum(costs) if costs else None),
-                        'cost_raw': sum(costs) if costs else None,
-                        'session': step['session'],
-                        'started': parse_ts(started_at),
-                        'duration': span(started_at, step['ended_at']),
-                        'run_id': step['run_id'],
-                        'iter_id': step['iter_id'],
-                        'step_id': step['step_id'],
-                    }
-                )
+                step_row = {
+                    'label': label,
+                    'status': step['status'],
+                    'step': step['step'],
+                    'name': step['step_name'],
+                    'agent': step['agent'],
+                    'model': step['model'],
+                    'cost': fmt.money(sum(costs) if costs else None),
+                    'cost_raw': sum(costs) if costs else None,
+                    'session': step['session'],
+                    'started': parse_ts(started_at),
+                    'duration': span(started_at, step['ended_at']),
+                    'run_id': step['run_id'],
+                    'iter_id': step['iter_id'],
+                    'step_id': step['step_id'],
+                }
+                step_rows.append(step_row)
             # chronological listing (a merged step sorts at its sync's start);
             # the running spend then reads "through this row, syncs included"
             step_rows.sort(key=lambda row: row['started'])
@@ -1151,38 +1154,36 @@ def _history(
                 row['iter_spend'] = iter_spend
             iter_cost = sum(s['cost'] or 0 for s in it_steps)
             iter_num = it['iter']
-            iter_rows.append(
-                {
-                    'label': f'iter {iter_num}',
-                    'status': it['status'],
-                    'iter': it['iter'],
-                    'cost': fmt.money(iter_cost),
-                    'cost_raw': iter_cost,
-                    'session': _iter_session(it, it_steps),
-                    'step': step_disp,
-                    'started': parse_ts(it['started_at']),
-                    'duration': span(it['started_at'], it['ended_at']),
-                    'steps': tuple(step_rows),
-                    'run_id': it['run_id'],
-                    'iter_id': it['iter_id'],
-                }
-            )
+            iter_row = {
+                'label': f'iter {iter_num}',
+                'status': it['status'],
+                'iter': it['iter'],
+                'cost': fmt.money(iter_cost),
+                'cost_raw': iter_cost,
+                'session': _iter_session(it, it_steps),
+                'step': step_disp,
+                'started': parse_ts(it['started_at']),
+                'duration': span(it['started_at'], it['ended_at']),
+                'steps': tuple(step_rows),
+                'run_id': it['run_id'],
+                'iter_id': it['iter_id'],
+            }
+            iter_rows.append(iter_row)
         own_cost = runcost.get(run['run_id'], (None, 0.0))[1]
         # the run's display session is its newest iteration's
         session = next((row['session'] for row in iter_rows if row['session']), None)
-        result.append(
-            {
-                'label': f'run {total - index}',
-                'status': run['status'],
-                'number': total - index,
-                'cost': fmt.money(own_cost),
-                'session': session,
-                'started': parse_ts(run['started_at']),
-                'duration': span(run['started_at'], run['ended_at']),
-                'iters': tuple(iter_rows),
-                'run_id': run['run_id'],
-            }
-        )
+        run_row = {
+            'label': f'run {total - index}',
+            'status': run['status'],
+            'number': total - index,
+            'cost': fmt.money(own_cost),
+            'session': session,
+            'started': parse_ts(run['started_at']),
+            'duration': span(run['started_at'], run['ended_at']),
+            'iters': tuple(iter_rows),
+            'run_id': run['run_id'],
+        }
+        result.append(run_row)
     return tuple(result)
 
 
@@ -1213,28 +1214,27 @@ def _log(rows: list[dict], run_ids: list[int], branch: str) -> tuple[dict, ...]:
             'run': run_numbers.get(row['run_id']),
         }
         number = numbers.get(kind)
-        result.append(
-            {
-                'kind': kind,
-                'n': number,
-                'run_n': run_numbers.get(row['run_id']),
-                'iter_n': row['iter_n'],
-                'step_n': row['step_n'],
-                'branch': branch,
-                'name': row['step_name'] if kind == 'step' else None,
-                'event': row['event'],
-                'status': row['status'],
-                'exit_code': row['exit_code'],
-                'duration': row['duration'],
-                'cost': row['cost'],
-                'metadata': row['metadata'] or '',
-                'created_at': parse_ts(row['timestamp']),
-                'run_id': row['run_id'],
-                'iter_id': row['iter_id'],
-                'step_id': row['step_id'],
-                'event_id': row['event_id'],
-            }
-        )
+        log_row = {
+            'kind': kind,
+            'n': number,
+            'run_n': run_numbers.get(row['run_id']),
+            'iter_n': row['iter_n'],
+            'step_n': row['step_n'],
+            'branch': branch,
+            'name': row['step_name'] if kind == 'step' else None,
+            'event': row['event'],
+            'status': row['status'],
+            'exit_code': row['exit_code'],
+            'duration': row['duration'],
+            'cost': row['cost'],
+            'metadata': row['metadata'] or '',
+            'created_at': parse_ts(row['timestamp']),
+            'run_id': row['run_id'],
+            'iter_id': row['iter_id'],
+            'step_id': row['step_id'],
+            'event_id': row['event_id'],
+        }
+        result.append(log_row)
     return tuple(result)
 
 

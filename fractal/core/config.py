@@ -290,9 +290,17 @@ class Config:
         max_iter_cost = config.get('max_iter_cost')
         max_step_cost = config.get('max_step_cost')
         reserve_budget = config.get('reserve_budget')
-        # a ceiling must be positive (0/negative degenerates the subtree check)
-        if max_cost is not None and max_cost <= 0:
-            raise ValueError('max_cost must be greater than 0.')
+        # a ceiling must be positive: 0/negative degenerates the subtree check,
+        # and a non-positive per-iter/step cap floors the step leash at 0 so
+        # every step skips 'over budget' -- an empty-iteration spin that books
+        # a dishonest 'over budget' on a run that never spent
+        for cap_key, cap in (
+            ('max_cost', max_cost),
+            ('max_iter_cost', max_iter_cost),
+            ('max_step_cost', max_step_cost),
+        ):
+            if cap is not None and cap <= 0:
+                raise ValueError(f'{cap_key} must be greater than 0.')
         # a per-iter/step cap with no run ceiling can't be enforced (once the
         # per-iter budget drains, later steps run unbounded) -- init rejects
         # the combination, so the file re-check must too

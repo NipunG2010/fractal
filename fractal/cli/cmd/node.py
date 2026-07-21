@@ -19,6 +19,7 @@ from fractal.cli.utils import (
     resolve_node,
     resolve_target,
 )
+from fractal.constants import STATUSES
 from fractal.core.agent import seed_agents
 from fractal.core.loop import Loop
 from fractal.core.node import Node
@@ -253,6 +254,11 @@ def node_init(app: typer.Typer) -> typer.Typer:
                 raise typer.BadParameter('--max-iter-cost requires --max-cost.')
             if max_step_cost is not None:
                 raise typer.BadParameter('--max-step-cost requires --max-cost.')
+        # max_iters must be positive like the config setter enforces -- a
+        # non-positive cap reads as unlimited in the loop, so 0 would build
+        # a node that iterates without bound instead of never
+        if max_iters is not None and max_iters <= 0:
+            raise typer.BadParameter('--max-iters must be greater than 0.')
         require_non_negative(
             max_iters=max_iters,
             max_depth=max_depth,
@@ -545,9 +551,12 @@ def node_merge(app: typer.Typer) -> typer.Typer:
     ) -> None:
         """Squash-merge a node's branch into its parent."""
         node = resolve_target(path, node)
-        output = node.merge()
+        output, notices = node.merge()
         if output:
             typer.echo(output)
+        # success-path warnings ride stderr so piped stdout stays parseable
+        if notices:
+            typer.echo(notices, err=True)
 
     return app
 
@@ -797,6 +806,19 @@ def node_list(app: typer.Typer) -> typer.Typer:
         require_non_negative(max_depth=max_depth)
         if status == '':
             raise typer.BadParameter('--status cannot be empty.')
+        # statuses are a closed set -- an unknown chunk would filter to an
+        # empty listing indistinguishable from no matching nodes, so each
+        # comma-separated chunk validates against the set ('orphan' is the
+        # listing's own worktree-gone relabel, filterable like the rest)
+        if status:
+            valid = (*STATUSES, 'orphan')
+            for chunk in status.split(','):
+                chunk = chunk.strip()
+                if chunk and chunk not in valid:
+                    options = ', '.join(valid)
+                    raise typer.BadParameter(
+                        f'Unknown status: {chunk!r}. Valid statuses: {options}.'
+                    )
         # a whole-tree listing (no explicit branch) of a path with no
         # fractal root is "no nodes", not an error; must report an empty
         # list (exit 0) on the uninitialized case rather than hard-failing

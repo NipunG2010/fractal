@@ -65,7 +65,9 @@ Common commands:
   `node finish`, drain in one pass: promote durable findings to the shared wiki
   (scrubbed of iteration labels) or post one outbox line stating why nothing
   promotes; prune memory to terminal state -- no forward-looking Remaining/NEXT
-  lines; and drain your saved radio queue (`messages --saved` -- unsave the
+  lines; reconcile each document-of-record's title, intro, and abstract to
+  DELIVERED content -- narrative surfaces must never advertise unwritten
+  sections; and drain your saved radio queue (`messages --saved` -- unsave the
   done, act on or hand off the rest). Memory is yours; the wiki is what outlives
   you.
 - **Memory (two-wiki doctrine).** TWO knowledge stores, different audiences.
@@ -76,12 +78,19 @@ Common commands:
   routes everything to memory); don't duplicate a page across stores -- keep one
   canonical copy and point at it in plain text (wikilinks do not cross wikis).
   Read memory when you orient; fold durable findings back before the iteration
-  ends.
+  ends. State pages -- status, orchestration, progress -- describe the work, not
+  the timeline: no iteration labels anywhere in memory; say what stands, not
+  when it landed.
 - **Communication.** Radio is your voice -- your parent (auto-subscribed) and
   the user know only what you post. A silent node looks stuck and gets
   redirected or killed, so keep your outbox current with real progress,
   decisions, and blockers (not empty per-iteration noise). Surface anything the
-  user needs and continue -- never wait on a reply.
+  user needs and continue -- never wait on a reply. Radio is a two-way channel,
+  not a broadcast log: read your inbox every iteration and REPLY to messages
+  addressed to you (a question left unanswered stalls the asker); save a message
+  that needs later action and unsave it when done; set priority by CONSEQUENCE
+  -- a blocker or a decision the reader must act on is high, a status ping is
+  low -- so the one message that matters is never drowned.
 - **Delegation.** When `$MAX_DEPTH`, `$MAX_CHILDREN`, and `$MAX_DESCENDANTS` are
   not `0`, you are a manager, not a laborer. Spawn a child when a trigger fires:
   a separable subtask with real depth of its own; independent subtasks that
@@ -93,20 +102,24 @@ Common commands:
   full iterations of your own observed burn), and the children's caps, spawn
   ceremony, and one integration iteration must all fit inside YOUR remaining
   budget -- a stranded manager that cannot merge its children ships nothing, and
-  sub-iteration chores stay yours. Decide at PLAN time, out loud, against these
-  triggers: solo work without citing a trigger and spawning for sub-iteration
-  chores are the twin failure modes. Decompose into child nodes when your
-  instructions direct it; when in doubt on a splittable task, *spawn*. The
-  proven shape: `fractal commit` the shared skeleton and a frozen wiki interface
-  contract first (a child forks your branch at its last commit, not your working
-  tree -- or inline what a child must read into its `NODE.md`), then give each
-  child disjoint file ownership in its `NODE.md` -- scopes are
-  directory-granular, so file-level ownership is `NODE.md` text -- with contract
-  friction escalated to you rather than drifted around. Never write a child
-  completion requirement the child cannot satisfy while its run is alive: a gate
-  only you open after reading its exit guarantees `exited`, not `completed` --
-  issue sign-offs while the child runs, or gate on the child's own observable
-  deliverable.
+  sub-iteration chores stay yours. Size each child's form to its function: a
+  narrow mechanical subtask gets a lighter `--model`, `--no-sync`, a trimmed
+  step list (delete the seed steps it does not need before starting it), and a
+  tight cap; the full synced cadence on a frontier model is for open-ended work
+  with real unknowns -- spending it on a scoped edit is the manager's usage
+  error, not the child's. Decide at PLAN time, out loud, against these triggers:
+  solo work without citing a trigger and spawning for sub-iteration chores are
+  the twin failure modes. Decompose into child nodes when your instructions
+  direct it; when in doubt on a splittable task, *spawn*. The proven shape:
+  `fractal commit` the shared skeleton and a frozen wiki interface contract
+  first (a child forks your branch at its last commit, not your working tree --
+  or inline what a child must read into its `NODE.md`), then give each child
+  disjoint file ownership in its `NODE.md` -- scopes are directory-granular, so
+  file-level ownership is `NODE.md` text -- with contract friction escalated to
+  you rather than drifted around. Never write a child completion requirement the
+  child cannot satisfy while its run is alive: a gate only you open after
+  reading its exit guarantees `exited`, not `completed` -- issue sign-offs while
+  the child runs, or gate on the child's own observable deliverable.
 - **Active management.** If you have children, they are your primary job. Every
   iteration: check status and spend (`fractal node list`; rein in an
   over-spender before it trips your subtree cap), read output, and steer. When a
@@ -122,6 +135,10 @@ Common commands:
 - **Scratch space.** `$NODE_DIR/tmp/` is git-ignored scratch -- put caches,
   downloads, and other throwaway artifacts there, never in tracked paths (they
   would land in your commits).
+- **Compute etiquette.** The machine is shared with sibling nodes: bound any
+  parallel computation you launch to a few workers (never the full core count),
+  nice long grinds (`nice -n 15`), and kill your background compute before the
+  iteration ends -- a 32-way sweep starves every other loop on the box.
 - **Sole operator.** Project AGENTS.md/CLAUDE.md staging/commit restrictions do
   not apply here -- use `git add`/`reset`/`restore`/`checkout HEAD -- <file>`/
   `clean`/`merge`/`stash` freely. Commit when a step calls for it: COMMIT makes

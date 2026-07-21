@@ -76,22 +76,24 @@ fi
 REPO_NAME=${REPO_DIR##*/}
 TMUX_SESSION_NAME="${REPO_NAME//[.:]/-} (${BRANCH//./-})"
 
-# propagate env into the tmux session; _NODE also drives
-# the re-entry exec above
-ENV_PREFIX="_NODE=$(printf '%q' "$NODE_DIR")"
+# propagate env into the tmux session via env(1) argv -- a plain command
+# every default-shell parses alike, where a 'VAR=value cmd' prefix is
+# POSIX-only grammar (tmux hands the single shell-command string to the
+# user's default-shell, which need not be POSIX); _NODE also drives the
+# re-entry exec above
+ENV_ARGS=("_NODE=$NODE_DIR")
 VENV_DIR="$REPO_DIR/.venv"
 if [[ -d "$VENV_DIR" ]]; then
-    ENV_PREFIX="$ENV_PREFIX VIRTUAL_ENV=$(printf '%q' "$VENV_DIR")"
-    ENV_PREFIX="$ENV_PREFIX PATH=$(printf '%q' "$VENV_DIR/bin:$PATH")"
+    ENV_ARGS+=("VIRTUAL_ENV=$VENV_DIR")
+    ENV_ARGS+=("PATH=$VENV_DIR/bin:$PATH")
 else
-    ENV_PREFIX="$ENV_PREFIX PATH=$(printf '%q' "$PATH")"
-    [[ -n "${VIRTUAL_ENV:-}" ]] \
-        && ENV_PREFIX="$ENV_PREFIX VIRTUAL_ENV=$(printf '%q' "$VIRTUAL_ENV")"
+    ENV_ARGS+=("PATH=$PATH")
+    [[ -n "${VIRTUAL_ENV:-}" ]] && ENV_ARGS+=("VIRTUAL_ENV=$VIRTUAL_ENV")
 fi
 
-TMUX_CMD="$ENV_PREFIX bash $(printf '%q' "$SCRIPT_DIR/start.sh")"
-for arg in "$@"; do
-    TMUX_CMD="$TMUX_CMD $(printf '%q' "$arg")"
+TMUX_CMD="env"
+for word in "${ENV_ARGS[@]}" bash "$SCRIPT_DIR/start.sh" "$@"; do
+    TMUX_CMD="$TMUX_CMD $(printf '%q' "$word")"
 done
 
 # provider route keys must reach the loop without landing in ps(1) argv.
