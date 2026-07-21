@@ -314,9 +314,9 @@ against. Comparisons read against the declared baseline, never against stale
 round figures.
 
 **e) Remote pushing.** Nodes push their branch to `origin` after each commit by
-default; `--local` keeps commits local. If the repo has an `origin` remote
-configured (e.g. GitHub), confirm which the user wants. With no remote the push
-is skipped automatically, so move on.
+default; `--local` keeps commits local. Err on the side of `--local`: pass it
+unless the user has made it clear they want commits pushed to the remote. With
+no remote the push is skipped automatically, so move on.
 
 **f) Iteration steps.** Briefly explain how each iteration works: sync runs
 automatically before each numbered step to handle radio communication (inbox,
