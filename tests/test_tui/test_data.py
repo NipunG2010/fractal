@@ -41,6 +41,7 @@ __all__ = [
     'test_build_tolerates_a_mangled_config',
     'test_build_tolerates_an_undecodable_status',
     'test_sync_folds_into_its_step',
+    'test_drain_sync_lists_standalone',
     'test_open_spans_tick_through_a_sync_window',
     'test_user_root_degrades',
     'test_codex_carries_no_cost_or_sessions',
@@ -495,6 +496,59 @@ def test_sync_folds_into_its_step(builder: SnapshotBuilder) -> None:
         3,
         'start',
     )
+
+
+def test_drain_sync_lists_standalone(pair_tree: pathlib.Path) -> None:
+    """Drain-wait syncs keep their own explorer rows, in chronological place.
+
+    Only a step's own pre-step sync (recorded with that step's number) folds
+    into it: the step-0 drain passes between REVIEW and COMMIT list as
+    standalone ``sync`` rows owning their time and cost, and COMMIT's row
+    reads only its own.
+    """
+    alpha = Node(pair_tree / '.worktrees' / 'main.alpha')
+    with deterministic_core() as clock:
+        clock.at(600.0)
+        run_id = alpha.record.run_start()
+        clock.at(590.0)
+        iter_id = alpha.record.iter_start(run_id=run_id, iter=1)
+        # REVIEW settles, two drain-wait passes run, then COMMIT lands
+        seeded = (
+            (4, 'REVIEW', 580.0, 520.0, 0.10),
+            (0, 'SYNC', 510.0, 480.0, 0.03),
+            (0, 'SYNC', 470.0, 450.0, 0.02),
+            (5, 'COMMIT', 440.0, 400.0, 0.05),
+        )
+        for step, name, started, ended, cost in seeded:
+            clock.at(started)
+            step_id = alpha.record.step_start(
+                iter_id=iter_id,
+                run_id=run_id,
+                step=step,
+                step_name=name,
+            )
+            alpha.record.step_cost(step_id=step_id, cost=cost)
+            clock.at(ended)
+            alpha.record.step_end(step_id=step_id, status='completed', exit_code=0)
+        clock.at(390.0)
+        alpha.record.iter_end(iter_id=iter_id, status='completed', exit_code=0)
+        alpha.record.run_end(run_id=run_id, status='completed', exit_code=0)
+    data = TuiData(resolve_node(pair_tree))
+    builder = SnapshotBuilder(data, NodePoller(data.db_dir), now=lambda: NOW_EPOCH)
+    snap = builder.build('main.alpha')
+    steps = snap.history[0]['iters'][0]['steps']
+    assert [row['label'] for row in steps] == [
+        'step 4: REVIEW',
+        'sync',
+        'sync',
+        'step 5: COMMIT',
+    ]
+    # each row owns its span and cost; COMMIT absorbs no drain pass
+    costs = [row['cost_raw'] for row in steps]
+    assert costs == pytest.approx([0.10, 0.03, 0.02, 0.05])
+    assert [row['duration'] for row in steps] == [60.0, 30.0, 20.0, 40.0]
+    # the running spend still reads "through this row, syncs included"
+    assert steps[-1]['iter_spend'] == pytest.approx(0.20)
 
 
 def test_open_spans_tick_through_a_sync_window(pair_tree: pathlib.Path) -> None:

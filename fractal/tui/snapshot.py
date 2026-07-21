@@ -1054,9 +1054,10 @@ def _history(
 
     Labels are final display strings (``run 2`` / ``iter 3`` / ``step 1:
     PREPARE`` / ``sync``); every row carries its database ids so the explorer
-    and the event-log reveal address exact entities. A step's preceding sync
-    passes fold into it (time spans both, costs sum) rather than listing
-    separately.
+    and the event-log reveal address exact entities. A step's own pre-step
+    sync folds into it (time spans both, costs sum) rather than listing
+    separately; drain-wait syncs list as standalone ``sync`` rows in
+    chronological place.
     """
     iters_by_run: dict[int, list[dict]] = {}
     for it in iters:
@@ -1085,12 +1086,11 @@ def _history(
                 step_disp = f'{step_name} {step_num}/{total_steps}'
             else:
                 step_disp = 'done'
-            # each numbered step absorbs the sync passes that precede it: by
-            # recorded number when it matches a numbered step, else (step-0
-            # rows -- drain-wait passes) the next numbered step to start; a
-            # sync with no following step stays a standalone `sync` row
-            numbered_steps = [s for s in it_steps if s['step_name'] != _SYNC_NAME]
-            numbers = {s['step'] for s in numbered_steps}
+            # each numbered step absorbs the sync passes that share its
+            # recorded number (its pre-step sync); the step-0 drain-wait
+            # passes precede no step, so they keep standalone `sync` rows
+            # owning their time and cost
+            numbers = {s['step'] for s in it_steps if s['step_name'] != _SYNC_NAME}
             folded: dict[int, list[dict]] = {}
             standalone: set[int] = set()
             for s in it_steps:
@@ -1098,13 +1098,6 @@ def _history(
                     continue
                 if s['step'] in numbers:
                     folded.setdefault(s['step'], []).append(s)
-                    continue
-                following = [
-                    n for n in numbered_steps if n['started_at'] >= s['started_at']
-                ]
-                if following:
-                    target = min(following, key=lambda n: n['started_at'])
-                    folded.setdefault(target['step'], []).append(s)
                 else:
                     standalone.add(s['step_id'])
             step_rows = []
