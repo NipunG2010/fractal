@@ -10,8 +10,8 @@ __all__ = [
     'Row',
 ]
 
-# filesystem path accepted at boundaries
+#: filesystem path accepted at boundaries
 PathLike = Union[str, os.PathLike]
 
-# database row (a sqlite3.Row surfaced as a plain dict)
+#: database row (a sqlite3.Row surfaced as a plain dict)
 Row = dict[str, Any]
