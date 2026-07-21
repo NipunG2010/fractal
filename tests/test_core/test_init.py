@@ -32,6 +32,7 @@ from .conftest import (
 __all__ = [
     'test_init_creates_node_structure',
     'test_init_scope_places_node_dir_at_project_root',
+    'test_init_sets_the_worktree_commit_identity',
     'test_init_populates_skills_and_supports_reset',
     'test_reset_reseeds_scripts',
     'test_reset_clears_stale_registry_caps',
@@ -172,6 +173,32 @@ def test_init_scope_places_node_dir_at_project_root(git_repo: pathlib.Path) -> N
     # config records scope as a list of roots
     scoped_node = Node(project_dir)
     assert scoped_node.config.get('scope') == ['packages/core']
+
+
+def test_init_sets_the_worktree_commit_identity(git_repo: pathlib.Path) -> None:
+    """A node's commits are authored under its dotted name, the user's email.
+
+    Init writes a worktree-scoped ``user.name`` so every commit the node
+    makes attributes to the node itself (author-based membership for changed
+    listings); the unset email inherits the user's own.
+    """
+    node = Node(git_repo)
+    node.init(agent='claude', user=True)
+    output = node.init(name='task')
+    project_dir = _parse_project_dir(output)
+    branch = _resolve_branch(project_dir)
+    # the worktree-scoped identity is the dotted node name
+    name = _git(project_dir, 'config', '--worktree', 'user.name')
+    assert name.stdout.strip() == branch
+    # a commit in the worktree carries the node's name and the user's email
+    (project_dir / 'work.txt').write_text('output\n', encoding='utf-8')
+    _git(project_dir, 'add', 'work.txt')
+    _git(project_dir, 'commit', '-m', 'work')
+    author = _git(project_dir, 'log', '-1', '--format=%an %ae')
+    assert author.stdout.strip() == f'{branch} test@test.com'
+    # the main checkout keeps the user's own identity
+    author = _git(git_repo, 'log', '-1', '--format=%an')
+    assert author.stdout.strip() == 'Test'
 
 
 def test_init_populates_skills_and_supports_reset(git_repo: pathlib.Path) -> None:

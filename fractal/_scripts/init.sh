@@ -488,6 +488,13 @@ fi
 # incarnation diffs against
 FORK_SHA="$(git -C "$WORKTREE_DIR" rev-parse HEAD)"
 
+# set per-node commit identity: a worktree-scoped user.name (the dotted node
+# name) attributes every commit the node makes to the node itself, while the
+# unset email inherits the user's own; set on reuse too, so a pre-existing
+# worktree picks the identity up on its next re-init
+git -C "$REPO_DIR" config extensions.worktreeConfig true
+git -C "$WORKTREE_DIR" config --worktree user.name "$BRANCH"
+
 if [[ "$PROJECT_PATH" == "." ]]; then
     NODE_DIR="$WORKTREE_DIR/.fractal/$BRANCH"
 else
