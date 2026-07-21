@@ -304,7 +304,12 @@ config commit: the tip sha plus the baseline figures the comparison will read
 against. Comparisons read against the declared baseline, never against stale
 round figures.
 
-**e) Iteration steps.** Briefly explain how each iteration works: sync runs
+**e) Remote pushing.** Nodes push their branch to `origin` after each commit by
+default; `--local` keeps commits local. If the repo has an `origin` remote
+configured (e.g. GitHub), confirm which the user wants. With no remote the push
+is skipped automatically, so move on.
+
+**f) Iteration steps.** Briefly explain how each iteration works: sync runs
 automatically before each numbered step to handle radio communication (inbox,
 feed, parent directives), then the step itself executes. The default steps are
 prepare, plan, execute, review, and commit — but steps can be added, removed, or
@@ -324,16 +329,16 @@ isolates a single step in its own session within a continuous node, and
 `requires_approval: true` holds the loop after the step completes until the
 operator approves it (`fractal node pending`/`approve`).
 
-**f) Environment setup.** Ask if the project needs environment preparation
+**g) Environment setup.** Ask if the project needs environment preparation
 (virtual environments, dependencies, containers, build steps). If so, edit
 `<node_dir>/scripts/setup.sh`. It runs automatically at the start of every
 iteration and must be idempotent.
 
-**g) Validation and testing.** Mention that `<node_dir>/scripts/lint.sh` runs
+**h) Validation and testing.** Mention that `<node_dir>/scripts/lint.sh` runs
 before each commit, and `<node_dir>/scripts/test.sh` is called by the agent
 during execution. Ask if the user wants to configure either.
 
-**h) Review.** Once all sections are defined, print the final contents of
+**i) Review.** Once all sections are defined, print the final contents of
 `<node_dir>/NODE.md` so the user can review it. Ask if anything needs
 adjustment. Iterate until the user is satisfied.
 
