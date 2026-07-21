@@ -69,11 +69,6 @@ class Node:
     work (git, tmux) to ``_scripts/``.
     """
 
-    # collaborator classes
-    # NOTE: singular dunder slots per collaborator-slots; a hosted app
-    #   overrides these to intercept configuration or persistence without
-    #   subclassing every consumer (the agent axis is NOT a slot -- it
-    #   overrides through the seam registry; see :meth:`agent`)
     __config__: type[Config] = Config
     __cost__: type[Cost] = Cost
     __files__: type[Files] = Files

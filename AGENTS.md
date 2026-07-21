@@ -393,13 +393,19 @@ See `pyproject.toml` for formatter/linter config.
   work), while `delete` — agent-reachable — refuses over them.
 - **Project-files surface:** `node.files` (the `Files` facade in
   `core/files.py`) exposes a node's work product to consumers: git-tracked files
-  minus machinery (any `.fractal` component, the project wiki, `.git`,
-  `.worktrees` — matched casefolded), with `since` anchors
-  (`base`/`commit`/`iteration`/`run`) resolved from the node's own event log so
-  diffs survive merges, node-scoped and floored at the newest `init` event.
-  Every caller-supplied path validates through `Files._validate_relpath`;
-  transcripts resolve per agent via `Agent.transcript`, fronted by
-  `node.sessions`.
+  including `wiki/` and `.fractal/` (consumers filter or collapse machinery;
+  only `.git`/`.worktrees` components are structurally unreachable, matched
+  casefolded). A `since` listing is the node's own contribution — files its own
+  first-parent, no-merge commits touched (merged-in content never lists;
+  per-worktree `user.name` identity backs future author attribution) with net
+  diff counts — and `Files.history` is the same walk per file. Anchors
+  (`base`/`commit`/`iteration`/`run`) resolve from the node's own record — init
+  fork sha, commit events, and an author-time window match for eventless commits
+  — node-scoped and floored at the newest `init` event, so diffs survive merges
+  and re-inits. Reads validate through `Files._validate_relpath` (structural
+  tier); uploads through `_validate_writable`, which additionally refuses
+  `.fractal` (the wiki stays uploadable). Transcripts resolve per agent via
+  `Agent.transcript`, fronted by `node.sessions`.
 
 ### Event Hooks
 

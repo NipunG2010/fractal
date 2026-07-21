@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import io
 import os
 import pathlib
@@ -52,15 +53,18 @@ class Files:
         path: Optional[str] = None,
         since: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """List the node's project files (git-tracked, minus fractal machinery).
+        """List the node's project files (git-tracked, machinery included).
 
-        The work-product surface: every git-tracked file in the worktree
-        except fractal's own paths (any ``.fractal`` component and the
-        project's wiki) -- the git-ignored runtime (``.db``/``.status``/logs)
-        never appears in a tracked listing. With ``since`` the set is instead
-        the node's own changes (a ``<anchor>...HEAD`` diff, the anchor
-        resolved by :meth:`_diff_anchor`), for nodes that edit an existing
-        repo in place rather than producing new files.
+        The work-product surface: every git-tracked file in the worktree --
+        the git-ignored runtime (``.db``/``.status``/logs) never appears in a
+        tracked listing, and ``wiki/``/``.fractal/`` entries list like any
+        other content (consumers filter or collapse them). With ``since`` the
+        set is instead the node's own contribution: files its own commits
+        touched (a first-parent walk from the ``since`` anchor -- a tree at
+        ``HEAD`` contains everything ever merged in, so without the walk content
+        synced from the parent, and through it siblings, would read as this
+        node's output) carrying the net line counts of a ``<anchor>...HEAD``
+        diff.
 
         Args:
             path: Restrict to a worktree-relative subtree; all files if
@@ -74,7 +78,8 @@ class Files:
             changed listing's entries also carry ``change`` (``added``/
             ``modified``/``deleted``) and ``additions``/``deletions`` line
             counts (``None`` for a binary file); a deleted file is kept
-            (``size`` ``0``) so its removal can render.
+            (``size`` ``0``) so its removal can render, and a touched file
+            with no net change (self-corrections cancel) drops out.
 
         """
         # candidate paths: the full tracked set, or this node's changes with
@@ -109,17 +114,32 @@ class Files:
             for status, rel in zip(fields[::2], fields[1::2]):
                 changes.setdefault(rel, {'additions': None, 'deletions': None})
                 changes[rel]['change'] = kinds.get(status[:1], 'modified')
-            candidates = list(changes)
+            # membership: only files this node's own commits touched --
+            # --first-parent keeps merged-in side histories out of the range
+            # and --no-merges drops the merge commits themselves, while a
+            # squash-merged child (an ordinary commit on this line) rightly
+            # stays; counts remain the net diff above, so a merged-in file
+            # never lists and a touched one shows what the diff view renders
+            cmd = [
+                'log',
+                '--first-parent',
+                '--no-merges',
+                '--name-only',
+                '--no-renames',
+                '--format=',
+                '-z',
+                f'{anchor}..{head}',
+            ]
+            raw = fractal.util.git.run_bytes(cmd, cwd=self.worktree) or b''
+            touched = {rel for rel in os.fsdecode(raw).split('\0') if rel}
+            candidates = [rel for rel in changes if rel in touched]
         else:
             cmd = ['ls-files', '-z']
             raw = fractal.util.git.run_bytes(cmd, cwd=self.worktree) or b''
             out = os.fsdecode(raw)
             candidates = [rel for rel in out.split('\0') if rel]
-        # drop machinery and out-of-scope entries, then stat what's on disk;
-        # comparisons casefold -- APFS matches names case-insensitively
-        project = self._node.project_path
-        prefix = '' if project == '.' else f'{project}/'
-        wiki_prefix = f'{prefix}wiki/'.casefold()
+        # drop structurally unsafe and out-of-scope entries, then stat what's
+        # on disk; comparisons casefold -- APFS matches case-insensitively
         if path:
             subtree = path.rstrip('/')
             scope = f'{subtree}/'
@@ -127,19 +147,14 @@ class Files:
             scope = ''
         files = []
         for rel in candidates:
-            # skip fractal machinery: any .fractal or .git component (sibling
-            # projects' committed seeds included), a leading .worktrees, and
-            # the project's wiki -- matching _validate_relpath, so the listing
-            # never names an entry read()/path() would refuse
+            # skip only what _validate_relpath structurally refuses (so the
+            # listing never names an entry read()/path() would reject): a
+            # .git component, a leading .worktrees (sibling node worktrees on
+            # the user node), and leading pathspec magic -- wiki/ and
+            # .fractal/ list like any other tracked content
             parts = rel.casefold().split('/')
-            if FRACTAL_FOLDER in parts or '.git' in parts:
+            if '.git' in parts or parts[0] == WORKTREES_FOLDER:
                 continue
-            if parts[0] == WORKTREES_FOLDER:
-                continue
-            if rel.casefold().startswith(wiki_prefix):
-                continue
-            # a leading ':' is pathspec magic _validate_relpath refuses (glob
-            # chars stay: every downstream git call takes paths literally)
             if rel.startswith(':'):
                 continue
             if scope and not rel.startswith(scope):
@@ -180,7 +195,7 @@ class Files:
         """Read a project file's content (validated, capped).
 
         Only files the project surface exposes are readable: the path must be
-        clear of machinery (:meth:`_validate_relpath`) and either git-tracked
+        structurally safe (:meth:`_validate_relpath`) and either git-tracked
         or, given ``since``, part of that anchor's changed set -- so a deleted
         file's old content stays readable without exposing anything else.
         ``before`` reads the file as it was at the ``since`` anchor (via
@@ -331,7 +346,9 @@ class Files:
         worktree-relative path (parents created), joining the tracked listing
         only once committed -- via :meth:`commit`, promptly: on a scoped
         node an uncommitted out-of-scope upload fails the loop's next commit
-        scope check, which diffs untracked files too.
+        scope check, which diffs untracked files too. Uploads validate at the
+        write tier (:meth:`_validate_writable`): ``.fractal`` paths refuse,
+        the wiki accepts.
 
         Args:
             path: Worktree-relative destination path.
@@ -350,7 +367,7 @@ class Files:
             raise RuntimeError(
                 'Cannot write to a paused node. Resume or kill it first.'
             )
-        norm = self._validate_relpath(path)
+        norm = self._validate_writable(path)
         # atomic write, so a concurrent download never streams a half-written upload
         abs_path = self.worktree / norm
         abs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -394,7 +411,7 @@ class Files:
             raise ValueError('Please pass at least one path.')
         if not message:
             raise ValueError('Please pass a commit message.')
-        norm = [self._validate_relpath(entry) for entry in paths]
+        norm = [self._validate_writable(entry) for entry in paths]
         # literal pathspec magic: a glob char in an uploaded name must not
         # widen or empty the match
         specs = [f':(literal){entry}' for entry in norm]
@@ -449,22 +466,98 @@ class Files:
                     continue
         return buffer.getvalue()
 
+    def history(
+        self: Files,
+        path: str,
+        *,
+        since: str = 'base',
+    ) -> list[dict[str, Any]]:
+        """List the node's own commits that touched one file, newest first.
+
+        The per-file trail behind a changed listing: the same first-parent,
+        no-merges walk as :meth:`list`'s membership, scoped to one path -- so
+        history shows exactly the commits that made the file a member, never
+        a merge or merged-in side history. Each entry carries the commit's
+        own line counts for the file (unlike the listing's net counts), so
+        the trail sums the work over time.
+
+        Args:
+            path: Worktree-relative file path.
+            since: History scope -- ``base`` (default), ``commit``,
+                ``iteration``, or ``run`` (see :meth:`list`).
+
+        Returns:
+            ``[{sha, instant, subject, additions, deletions}]`` newest first
+            -- ``instant`` is the commit's author time (ISO 8601), the counts
+            per-commit numstat (``None`` for binary); empty when the scope
+            has no anchor or no own commit touched the file.
+
+        """
+        norm = self._validate_relpath(path)
+        anchor = self._diff_anchor(since)
+        if not anchor:
+            return []
+        # own commits touching the path, newest-first; the leading 0x01
+        # separates records so a subject is never mistaken for a numstat line
+        cmd = [
+            'log',
+            '--first-parent',
+            '--no-merges',
+            '--no-renames',
+            '--numstat',
+            '--format=%x01%H%x09%at%x09%s',
+            f'{anchor}..HEAD',
+            '--',
+            f':(literal){norm}',
+        ]
+        raw = fractal.util.git.run_bytes(cmd, cwd=self.worktree) or b''
+        out = os.fsdecode(raw)
+        entries = []
+        for record in filter(None, out.split('\x01')):
+            header, _, stats = record.partition('\n')
+            sha, _, rest = header.partition('\t')
+            epoch, _, subject = rest.partition('\t')
+            if not sha or not epoch.isdigit():
+                continue
+            # the record's one numstat line ('-' marks a binary file)
+            additions = None
+            deletions = None
+            for line in stats.splitlines():
+                added, _, remainder = line.partition('\t')
+                deleted, _, rel = remainder.partition('\t')
+                if rel:
+                    additions = int(added) if added.isdigit() else None
+                    deletions = int(deleted) if deleted.isdigit() else None
+                    break
+            entry = {
+                'sha': sha,
+                'instant': _instant(int(epoch)),
+                'subject': subject,
+                'additions': additions,
+                'deletions': deletions,
+            }
+            entries.append(entry)
+        return entries
+
     def _diff_anchor(self: Files, since: str) -> Optional[str]:
         """Resolve the ref a changed-files listing diffs ``<ref>...HEAD`` against.
 
         ``since`` picks the scope of "this node's changes": ``base`` (the
         whole contribution since the node's fork point), ``commit`` (the
         previous commit), ``iteration``/``run`` (the most recent iteration or
-        run that committed). Anchors resolve from the node's own event log,
-        not branch refs: the commit script records a ``commit`` event per save
-        (``metadata`` is the sha, tagged with run/iter lineage) and init
-        records the fork sha, so every anchor is a fixed point in the node's
-        own history that survives the node being merged into its parent -- a
+        run that committed). Anchors resolve from the node's own record, not
+        branch refs: init records the fork sha and the commit pipeline logs a
+        ``commit`` event per save (``metadata`` is the sha, tagged with
+        run/iter lineage), so every anchor is a fixed point in the node's own
+        history that survives the node being merged into its parent -- a
         parent-branch anchor would collapse to empty once the parent absorbs
-        the commits. Every query is node-scoped (the DB is tree-central: an
-        unscoped ``MAX`` would anchor on a sibling's commit) and floored at
-        the newest ``init`` event, so a re-init of a deleted branch name never
-        reads a dead incarnation's events.
+        the commits. The ``iteration``/``run`` scopes walk the node's own
+        commits (:meth:`_commit_lineage`), so a raw agent commit the pipeline
+        never evented still lands on the run that made it. Every query is
+        node-scoped (the DB is tree-central: an unscoped read would anchor on
+        a sibling's commit) and floored at the newest ``init`` event, so a
+        re-init of a deleted branch name never reads a dead incarnation's
+        events.
 
         Args:
             since: Diff scope -- ``base``, ``commit``, ``iteration``, or
@@ -472,7 +565,8 @@ class Files:
 
         Returns:
             A git ref, or ``None`` when the scope has no anchor (``commit`` on
-            a root commit; ``iteration``/``run`` when no commit was logged).
+            a root commit; ``iteration``/``run`` when nothing attributable
+            was committed).
 
         """
         if since not in ('base', 'commit', 'iteration', 'run'):
@@ -518,40 +612,154 @@ class Files:
                 return None
             cmd = ['merge-base', base, 'HEAD']
             return fractal.util.git.run(cmd, cwd=self.worktree, check=False) or None
-        # iteration/run: the first commit event of the most recent scope that
-        # committed -- the outer select and the MAX subquery are both
-        # node-scoped and incarnation-floored
+        # iteration/run: walk the node's own commits for the most recent
+        # scope that committed -- events resolve a commit's scope where the
+        # pipeline logged one, and a time-window match covers the rest
         column = 'iter_id' if since == 'iteration' else 'run_id'
-        query = (
-            "SELECT metadata FROM events WHERE event = 'commit' AND node = ?"
-            f' AND event_id > ({floor})'
-            f' AND {column} = (SELECT MAX({column}) FROM events'
-            f" WHERE event = 'commit' AND node = ? AND event_id > ({floor}))"
-            ' ORDER BY event_id ASC LIMIT 1'
+        return self._commit_lineage(column)
+
+    def _commit_lineage(self: Files, column: str) -> Optional[str]:
+        """Anchor the newest committed run/iteration by walking own commits.
+
+        Resolves each of the node's own commits (first-parent, no merges,
+        bounded at the incarnation's ``base`` anchor) to a run or iteration:
+        through its ``commit`` event when the pipeline logged one, else by
+        matching the commit's author time against the scope rows'
+        ``started_at``/``ended_at`` windows -- author time survives rebases
+        and amends but is fresh on a squash, so adopted work lands on the
+        adopting run. The newest resolvable commit names the scope, and the
+        anchor sits just before that scope's oldest commit -- a fixed point a
+        later merge into the parent cannot move. A commit matching no scope
+        (an upload, a between-runs save) is skipped, not misattributed.
+
+        Args:
+            column: Scope id column -- ``run_id`` or ``iter_id``.
+
+        Returns:
+            A git ref, or ``None`` when no own commit resolves to a scope.
+
+        """
+        # bound the walk at the incarnation's fork: everything before it is
+        # a parent's (or dead namesake's) history
+        base = self._diff_anchor('base')
+        if not base:
+            return None
+        # own commits newest-first, with author epochs
+        cmd = ['log', '--first-parent', '--no-merges', '--format=%H %at']
+        cmd += [f'{base}..HEAD']
+        out = fractal.util.git.run(cmd, cwd=self.worktree, check=False) or ''
+        commits = []
+        for line in out.splitlines():
+            sha, _, epoch = line.partition(' ')
+            if sha and epoch.isdigit():
+                commits.append((sha, int(epoch)))
+        if not commits:
+            return None
+        branch = self._node.branch
+        floor = (
+            'SELECT COALESCE(MAX(event_id), 0) FROM events'
+            " WHERE event = 'init' AND node = ?"
         )
-        rows = self.db.read(query=query, params=(branch, branch, branch, branch))
-        first = rows[0]['metadata'] if rows and rows[0]['metadata'] else None
-        if first:
-            # anchor just before the scope's first commit -- a fixed point a
-            # later merge into the parent cannot move
-            return f'{first}^'
-        return None
+        # evented commits carry their scope id directly
+        query = (
+            f'SELECT metadata, {column} FROM events'
+            f" WHERE event = 'commit' AND node = ? AND event_id > ({floor})"
+        )
+        rows = self.db.read(query=query, params=(branch, branch))
+        evented = {
+            row['metadata']: row[column]
+            for row in rows
+            if row['metadata'] and row[column] is not None
+        }
+        # scope windows for the eventless, newest scope first -- author
+        # epochs are whole seconds, so starts truncate to match (a commit in
+        # a scope's opening second must not fall before it) and a same-second
+        # overlap resolves to the newer scope (an open scope is unbounded)
+        table = 'iters' if column == 'iter_id' else 'runs'
+        query = (
+            f'SELECT {column}, started_at, ended_at FROM {table}'
+            f' WHERE node = ? ORDER BY {column} DESC'
+        )
+        windows = []
+        for row in self.db.read(query=query, params=(branch,)):
+            started = int(_epoch(row['started_at']))
+            ended = _epoch(row['ended_at']) if row['ended_at'] else None
+            windows.append((row[column], started, ended))
+        # resolve newest-first: the first resolvable commit names the scope,
+        # and the scope's oldest commit sets the anchor
+        scope = None
+        oldest = None
+        for sha, epoch in commits:
+            resolved = evented.get(sha)
+            if resolved is None:
+                for scope_id, started, ended in windows:
+                    if started <= epoch and (ended is None or epoch <= ended):
+                        resolved = scope_id
+                        break
+            if resolved is None:
+                continue
+            if scope is None:
+                scope = resolved
+            if resolved == scope:
+                oldest = sha
+        if oldest is None:
+            return None
+        return f'{oldest}^'
 
     def _validate_relpath(self: Files, path: str) -> str:
-        """Validate a worktree-relative project path for reading or writing.
+        """Validate a worktree-relative project path (the structural tier).
 
-        The safety boundary for every caller-supplied file path: the path must
-        stay inside the worktree and clear of fractal machinery. Rejected are
-        absolute paths and ``..`` traversal; a leading ``:`` (pathspec magic
-        -- glob characters are legal name characters, taken literally by
-        every downstream git call); any ``.git`` or ``.fractal``
-        component (in a linked worktree ``.git`` is a *file* whose overwrite
-        hijacks the gitdir, and sibling projects' committed seeds are
-        machinery too); a leading ``.worktrees`` (on the user node the
-        worktree is the repo root, so it would reach into sibling nodes); and
-        the project's wiki. Comparisons casefold -- APFS matches names
+        The safety boundary for every caller-supplied file path: the path
+        must stay inside the worktree. Rejected are absolute paths and ``..``
+        traversal; a leading ``:`` (pathspec magic -- glob characters are
+        legal name characters, taken literally by every downstream git call);
+        any ``.git`` component (in a linked worktree ``.git`` is a *file*
+        whose overwrite hijacks the gitdir); and a leading ``.worktrees`` (on
+        the user node the worktree is the repo root, so it would reach into
+        sibling nodes). Comparisons casefold -- APFS matches names
         case-insensitively, so ``.GIT`` names the same entry there; rejecting
-        a literal ``.GIT`` file on a case-sensitive host is the accepted cost.
+        a literal ``.GIT`` file on a case-sensitive host is the accepted
+        cost. Fractal's own content (``wiki/``, ``.fractal/``) passes: it is
+        readable project state, filtered or collapsed by consumers, not a
+        boundary; the write tier (:meth:`_validate_writable`) is stricter.
+
+        Args:
+            path: Worktree-relative file path.
+
+        Returns:
+            The normalized (POSIX) worktree-relative path.
+
+        Raises:
+            ValueError: If ``path`` escapes the worktree.
+
+        """
+        rel = pathlib.PurePosixPath(path)
+        if not path or rel.is_absolute() or not rel.parts or '..' in rel.parts:
+            raise ValueError(f'Invalid file path: {path!r}')
+        # no leading pathspec magic; glob chars are legal name chars that
+        # every downstream pathspec disarms with :(literal)
+        if path.startswith(':'):
+            raise ValueError(f'Invalid file path: {path!r}')
+        # structural machinery components, casefolded
+        parts = tuple(part.casefold() for part in rel.parts)
+        if '.git' in parts or parts[0] == WORKTREES_FOLDER:
+            raise ValueError(f'Cannot touch fractal machinery: {path!r}')
+        # containment: a symlinked intermediate directory must not escape
+        if not (self.worktree / rel).resolve().is_relative_to(self.worktree):
+            raise ValueError(f'Invalid file path: {path!r}')
+        return rel.as_posix()
+
+    def _validate_writable(self: Files, path: str) -> str:
+        """Validate a worktree-relative path for the upload tier.
+
+        Everything the structural tier rejects, plus any ``.fractal``
+        component: a foreign tree's ``.fractal/`` is stale machinery a
+        wholesale project upload works better without, and a raw-bytes
+        overwrite of a live ``.fractal/<branch>/config.json`` would corrupt a
+        running node's caps -- the one path where an upload reaches the
+        control plane rather than content. The project wiki stays writable:
+        it is project content the user owns, and uploading an existing
+        project must carry its wiki.
 
         Args:
             path: Worktree-relative file path.
@@ -563,30 +771,43 @@ class Files:
             ValueError: If ``path`` escapes the worktree or names machinery.
 
         """
-        rel = pathlib.PurePosixPath(path)
-        if not path or rel.is_absolute() or not rel.parts or '..' in rel.parts:
-            raise ValueError(f'Invalid file path: {path!r}')
-        # no leading pathspec magic; glob chars are legal name chars that
-        # every downstream pathspec disarms with :(literal)
-        if path.startswith(':'):
-            raise ValueError(f'Invalid file path: {path!r}')
-        # machinery components, casefolded
-        parts = tuple(part.casefold() for part in rel.parts)
-        if '.git' in parts or FRACTAL_FOLDER in parts or parts[0] == WORKTREES_FOLDER:
+        posix = self._validate_relpath(path)
+        parts = tuple(part.casefold() for part in posix.split('/'))
+        if FRACTAL_FOLDER in parts:
             raise ValueError(f'Cannot touch fractal machinery: {path!r}')
-        # the project's wiki (project-relative) is fractal-managed context
-        project = self._node.project_path
-        prefix = '' if project == '.' else f'{project}/'
-        posix = rel.as_posix()
-        wiki_prefix = f'{prefix}wiki'.casefold()
-        folded = posix.casefold()
-        if folded == wiki_prefix or folded.startswith(f'{wiki_prefix}/'):
-            raise ValueError(f'Cannot touch fractal machinery: {path!r}')
-        # containment: a symlinked intermediate directory must not escape
-        if not (self.worktree / rel).resolve().is_relative_to(self.worktree):
-            raise ValueError(f'Invalid file path: {path!r}')
         return posix
 
     def _not_readable(self: Files, path: str) -> ValueError:
         """Build the unreadable-project-file error."""
         return ValueError(f'Not a readable project file: {path!r}')
+
+
+# ------ helper functions
+
+
+def _epoch(instant: str, /) -> float:
+    """Convert a row instant (ISO 8601, millisecond precision) to an epoch.
+
+    Args:
+        instant: A ``started_at``/``ended_at`` value.
+
+    Returns:
+        Seconds since the epoch.
+
+    """
+    parsed = dt.datetime.strptime(instant, '%Y-%m-%dT%H:%M:%S.%fZ')
+    return parsed.replace(tzinfo=dt.UTC).timestamp()
+
+
+def _instant(epoch: int, /) -> str:
+    """Convert a commit's author epoch to a row-format instant.
+
+    Args:
+        epoch: Seconds since the epoch (git ``%at``, whole seconds).
+
+    Returns:
+        ISO 8601 UTC timestamp, millisecond precision.
+
+    """
+    moment = dt.datetime.fromtimestamp(epoch, dt.UTC)
+    return moment.strftime('%Y-%m-%dT%H:%M:%S.') + '000Z'
