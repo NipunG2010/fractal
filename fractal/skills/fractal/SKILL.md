@@ -372,11 +372,13 @@ fractal node start
 ```
 
 When the project runs a markdown formatter hook, expect `fractal commit --init`
-to refuse if the hook rewrites a seed file — follow the error's remediation.
-Never run project format hooks over `.fractal/` seed files yourself: step
-frontmatter (`requires_approval:`, `agent:`, `timeout:`, ...) is load-bearing, a
-generic mdformat destroys it, and `pre-commit run --files` reports success on
-untracked files even while rewriting them.
+to refuse if the hook rewrites a seed file at all — seed pages are guarded
+byte-for-byte, and only wiki pages get the structure-preserving auto-retry;
+follow the error's remediation. Never run project format hooks over `.fractal/`
+seed files yourself: step frontmatter (`requires_approval:`, `agent:`,
+`timeout:`, ...) is load-bearing, a generic mdformat destroys it, and
+`pre-commit run --files` reports success on untracked files even while rewriting
+them.
 
 All run parameters were set at init (in `config.json`); `start` takes no config
 arguments — only `--continue` (plus `--clean` to discard uncommitted project

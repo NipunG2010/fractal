@@ -4,7 +4,7 @@ desc: |
   Inter-node messaging: channels, routing and defaults, subscriptions and
   feeds, read receipts, saved messages, and message discipline.
 created: 2026-07-21T04:50:25Z
-updated: 2026-07-21T04:50:58Z
+updated: 2026-07-21T14:07:58Z
 ---
 
 # features/radio
@@ -24,8 +24,9 @@ are passive, the read command writes per-reader receipts for exactly what it
 displays, and reacting or replying also marks the parent read.
 
 [[features/radio/routing|routing]]: The two writing verbs and their routing
-contracts: send targets any writable channel, post is the quiet publicly
-readable subset, and each defaults its channel by target.
+contracts: send targets any writable channel and defaults a named target to its
+inbox, while post is the quiet publicly readable subset that defaults its
+channel by target.
 
 [[features/radio/saved_messages|saved_messages]]: The saved-message archive: an
 owned snapshot that survives unsend, serving as a node's cross-iteration action
@@ -49,7 +50,7 @@ The surface splits into:
 - [[features/radio/channels]] — the default channel set, permission flags,
   custom channels, and channel deletion.
 - [[features/radio/routing]] — the `send` and `post` verbs, their routing
-  dimensions and per-target channel defaults, and the stderr routing echo.
+  dimensions and channel defaults, and the stderr routing echo.
 - [[features/radio/subscriptions_and_feeds]] — subscriptions, auto-wiring at
   node creation, blind nodes, and the merged feed view.
 - [[features/radio/read_receipts]] — passive listings versus the receipt-writing

@@ -60,11 +60,19 @@ legitimate.
 A sweep that stages nothing is a tolerated no-op, reported rather than failed.
 If a pre-commit hook mutates files and aborts, the pipeline re-stages and
 retries the commit once -- but only when a pre-commit config exists and
-re-staging actually changes the index. The commit event is logged from a single
-emit point keyed on the new sha, so the retry never double-logs (no event for
-`--init`, whose baseline has no run lineage), and a failed event insert warns
-rather than blocking the save. A `--force` commit -- the loop's backstop save --
-passes `--no-verify` so a failing or mutating hook can neither block nor rewrite
-the save, and folds the staged-sweep warnings plus a capped diffstat into its
-body so the backstop describes what it saved from git history alone. `--check`
-commits nothing and errors if uncommitted changes exist.
+re-staging actually changes the index. Wiki pages (the project wiki and the node
+memory wiki) join the retry only when the rewrite preserves wiki structure --
+wikilinks, frontmatter, and separators -- and, on a work commit, only when each
+touched wiki root that linted clean before the rewrite still lints clean after
+it (a pre-existing lint failure is surfaced as a notice and tolerated, mirroring
+the pipeline's own lint step); every other node-data page keeps byte-identity,
+so any hook rewrite there is refused. A rewrite that breaks a gate is restored
+to its authored bytes and fails the commit with remediation guidance. The commit
+event is logged from a single emit point keyed on the new sha, so the retry
+never double-logs (no event for `--init`, whose baseline has no run lineage),
+and a failed event insert warns rather than blocking the save. A `--force`
+commit -- the loop's backstop save -- passes `--no-verify` so a failing or
+mutating hook can neither block nor rewrite the save, and folds the staged-sweep
+warnings plus a capped diffstat into its body so the backstop describes what it
+saved from git history alone. `--check` commits nothing and errors if
+uncommitted changes exist.

@@ -74,6 +74,10 @@ skills.
 Prerequisites
 -------------
 
+- **Python 3.12+ with SQLite 3.35 or newer** — the central database relies
+  on SQLite features (upsert ``RETURNING``, close-time checkpoint control)
+  present in every Python 3.12+ standard build; a custom interpreter linked
+  against an older SQLite is not supported.
 - **git** — fractal anchors to a git repository; ``fractal init`` bootstraps
   one when run outside a repo (``git init`` on a project-named branch plus an
   initial commit of an empty ``.gitignore``), and refuses a detached

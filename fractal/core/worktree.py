@@ -441,12 +441,15 @@ def ensure_project_wiki(
 def verify_hook_formatters(repo_dir: pathlib.Path) -> None:
     """Name the formatter-safe lanes when host pre-commit hooks exist.
 
-    Hooks that rewrite ``wiki/`` or ``.fractal/`` corrupt generated pages
-    and their commits fail loud (mdformat escapes wikilinks and mangles
-    nav delimiters). Stays silent once either safe lane is taken:
-    ``mdformat-wiki`` wired in, or a ``.fractal`` mention (the shape of
-    any path filter steering hooks off the generated paths). Verify-only:
-    the user's config is never edited, and no exclude is ever prescribed.
+    Hooks that break the structure of wiki pages (a plugin-less mdformat
+    escapes wikilinks and mangles nav delimiters) fail their commits loud
+    with the pages restored, while structure-preserving wiki reformats are
+    auto-retried; ``.fractal/`` pages outside the memory wiki are guarded
+    byte-for-byte -- any hook rewrite there is refused. Stays silent once
+    either safe lane is taken: ``mdformat-wiki`` wired in, or a
+    ``.fractal`` mention (the shape of any path filter steering hooks off
+    the generated paths). Verify-only: the user's config is never edited,
+    and no exclude is ever prescribed.
 
     Args:
         repo_dir: Main git repo root.
@@ -459,13 +462,14 @@ def verify_hook_formatters(repo_dir: pathlib.Path) -> None:
     if 'mdformat-wiki' in config or FRACTAL_FOLDER in config:
         return
     logger.warning(
-        'Note: this repo runs pre-commit hooks -- formatters that rewrite'
-        ' generated pages (project wiki, node data) corrupt them and'
-        ' their commits fail loud. Give mdformat the wikilink-aware'
-        ' plugin (additional_dependencies: [mdformat-wiki] on its hook,'
-        ' dropping mdformat-frontmatter if present -- both register a'
-        ' frontmatter renderer and whichever is discovered first wins),'
-        ' or keep formatters off the wiki paths.'
+        'Note: this repo runs pre-commit hooks -- structure-preserving'
+        ' reformats of wiki pages are auto-retried, structure-breaking ones'
+        ' fail loud with the pages restored, and any hook rewrite of other'
+        ' node-data pages (.fractal/ seeds) is refused outright. Give'
+        ' mdformat the wikilink-aware plugin (additional_dependencies:'
+        ' [mdformat-wiki] on its hook, dropping mdformat-frontmatter if'
+        ' present -- both register a frontmatter renderer and whichever is'
+        ' discovered first wins), or keep formatters off the wiki paths.'
     )
 
 

@@ -244,6 +244,12 @@ Fractal shells out to the ``wiki`` command, so both packages are installed:
 (``uv tool install plasma-fractal --with-executables-from plasma-wiki`` does
 the same in one command.)
 
+Before installing, the skill checks what is already there by *running* it
+(``fractal --version && wiki --version``) — never by name resolution alone,
+since a shim for a non-activated environment can resolve on ``PATH`` yet
+fail at exec — and pins a working install's absolute paths for the session
+when it lives off ``PATH``.
+
 Initialize
 ~~~~~~~~~~
 

@@ -32,7 +32,7 @@ __all__ = [
     'test_send_and_post_reject_write_only_and_out_of_range_priority',
     'test_node_and_parent_are_mutually_exclusive',
     'test_bare_post_lands_in_outbox',
-    'test_target_keyed_channel_defaults',
+    'test_named_target_channel_defaults',
     'test_send_channel_only_defaults_to_self',
     'test_send_crosses_classes_and_post_refuses_private',
     'test_channel_not_found_names_the_remedy',
@@ -283,26 +283,29 @@ def test_bare_post_lands_in_outbox(repo: dict) -> None:
 @pytest.mark.parametrize(
     argnames=('verb', 'node', 'host', 'channel'),
     argvalues=[
-        ('send', 'main.alpha', 'alpha', 'private'),
+        ('send', 'main.alpha', 'alpha', 'inbox'),
         ('send', 'main.beta', 'beta', 'inbox'),
         ('post', 'main.beta', 'beta', 'public'),
     ],
     ids=['send-self', 'send-other', 'post-other'],
 )
-def test_target_keyed_channel_defaults(
+def test_named_target_channel_defaults(
     repo: dict,
     verb: str,
     node: str,
     host: str,
     channel: str,
 ) -> None:
-    """The channel default keys on the resolved target, self vs other.
+    """A named ``send`` target always defaults to its inbox, self included.
 
-    A self ``send`` is a private note (not fake incoming mail), a targeted
-    ``send`` is canonical mail into the other node's ``inbox``, and a
-    targeted ``post`` lands on the other node's ``public`` board (its
-    ``outbox`` is owner-only write). The fourth default -- a bare ``post``
-    to the own ``outbox`` -- is pinned in ``test_bare_post_lands_in_outbox``.
+    An operator standing in a node's worktree who names that node expects
+    the directive to land where syncs read -- a cwd-keyed reroute to
+    ``private`` would be a silent black hole -- so a self ``send`` defaults
+    to the own ``inbox`` like any other named target (a private note stays
+    explicit via ``--channel=private``). A targeted ``post`` lands on the
+    other node's ``public`` board (its ``outbox`` is owner-only write). The
+    bare-``post`` default -- the own ``outbox`` -- is pinned in
+    ``test_bare_post_lands_in_outbox``.
     """
     alpha = repo['alpha']
     written = _radio(
@@ -526,9 +529,9 @@ def test_missing_options_aggregate_into_one_error(repo: dict) -> None:
         (
             'send',
             ['--node', 'main.alpha'],
-            'private',
+            'inbox',
             'main.alpha',
-            "Channel unspecified: sending to your 'private' channel.",
+            "Channel unspecified: sending to your 'inbox' channel.",
         ),
         (
             'send',

@@ -493,9 +493,14 @@ message that starts with the branch name or ``iteration``. The pipeline then:
    no-op.
 6. **Recovers from hooks.** If the commit fails and a
    ``.pre-commit-config.yaml`` exists, the pipeline re-stages the hook's
-   edits and retries once — but a hook that rewrote generated wiki pages has
-   its rewrite reverted and the commit fails with remediation guidance
-   (generated pages must round-trip byte-identical).
+   edits and retries once. Wiki pages (the project wiki and the node memory
+   wiki) join the retry only when the rewrite preserves wiki structure —
+   wikilinks, frontmatter, and separators — and each touched wiki root that
+   linted clean before the rewrite still lints clean after it (a
+   pre-existing lint failure is surfaced as a notice and tolerated); other
+   node-data pages keep byte-identity. A rewrite that breaks either gate is
+   restored to its authored bytes and the commit fails with remediation
+   guidance.
 7. **Pushes** ``origin <branch>`` unless the ``local`` config key is true. A
    missing ``origin`` remote is a skipped-push notice, not an error.
 

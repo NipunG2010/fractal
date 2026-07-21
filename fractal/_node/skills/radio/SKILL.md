@@ -34,13 +34,13 @@ subset, writing publicly readable channels only (`outbox`, `public`; custom
 channels obey their own flags) and refusing privately readable ones naming
 `radio send`. A bare `fractal radio post` (no `--node`/`--parent`/`--channel`)
 lands in your own `outbox` -- the report-upward default; a fully bare `send`
-errors. The channel default keys on the target: `send` to another node defaults
-to their `inbox`, to yourself `private` (a self-note); `post` defaults to your
-own `outbox`, or to another node's `public` board (their `outbox` is owner-only
-write); a `send` naming only a channel targets yourself. Explicit `--channel`
-always wins. Every send or post echoes its resolved channel and target on
-stderr; `send` also names each dimension it defaulted in one extra stderr line,
-while `post` stays quiet.
+errors. `send` defaults to the target's `inbox` for every named target, your own
+node included (a self-note is explicit: `--channel=private`); `post` defaults to
+your own `outbox`, or to another node's `public` board (their `outbox` is
+owner-only write); a `send` naming only a channel targets yourself. Explicit
+`--channel` always wins. Every send or post echoes its resolved channel and
+target on stderr; `send` also names each dimension it defaulted in one extra
+stderr line, while `post` stays quiet.
 
 Run `fractal radio --help` and `fractal radio <command> --help` for the CLI.
 

@@ -3,14 +3,16 @@
 Node worktrees share the host repo's ``.git/hooks``, so every fractal commit
 contends with whatever hooks the user installed. These tests build real
 repos with raw hook scripts and pin the ownership split: hook edits to code
-paths are re-staged and committed (hooks own code formatting), hook edits to
-generated pages (``wiki/``, ``.fractal/``) are never committed -- the commit
-restores the staged bytes and fails with actionable guidance -- and
-``--force`` bypasses hooks entirely so the loop's save-the-work backstop
-cannot be defeated by a failing hook. Also pinned: ``fractal init`` names
-the formatter-safe lanes when a host hook config exists, and a commit whose
-event insert fails names the lost record in its returned notices instead of
-losing it silently.
+paths are re-staged and committed (hooks own code formatting); hook rewrites
+of wiki pages (the project wiki and the node memory wiki) ride the same
+retry only when they preserve wiki structure and the touched roots still
+lint clean, and are otherwise restored with actionable guidance; every
+other guarded page (``.fractal/`` seeds) keeps byte-identity -- any rewrite
+restores and fails; and ``--force`` bypasses hooks entirely so the loop's
+save-the-work backstop cannot be defeated by a failing hook. Also pinned:
+``fractal init`` names the formatter-safe lanes when a host hook config
+exists, and a commit whose event insert fails names the lost record in its
+returned notices instead of losing it silently.
 """
 
 from __future__ import annotations
@@ -28,8 +30,20 @@ from tests._helpers import _git
 from .conftest import _run
 
 __all__ = [
-    'test_commit_never_recommits_hook_mutated_wiki_pages',
+    'test_commit_restores_structure_breaking_wiki_rewrites',
     'test_commit_retries_hook_formatted_code_paths',
+    'test_commit_retries_structure_preserving_wiki_rewrites',
+    'test_commit_accepts_healthy_bare_bracket_escapes',
+    'test_commit_restores_wikilink_escaping_rewrites',
+    'test_commit_lint_backstop_catches_value_mutations',
+    'test_commit_removes_hook_added_guarded_pages',
+    'test_commit_restores_hook_deleted_guarded_pages',
+    'test_commit_restores_seed_frontmatter_mutations',
+    'test_commit_restores_single_invariant_violations',
+    'test_user_init_retries_structure_preserving_rewrites',
+    'test_commit_lint_backstop_covers_the_memory_root',
+    'test_commit_restores_machine_file_rewrites_under_wiki_roots',
+    'test_commit_tolerates_pre_existing_lint_failures',
     'test_force_commit_bypasses_a_failing_hook',
     'test_commit_warns_when_the_commit_event_is_not_recorded',
     'test_commit_hints_when_ignore_rules_skip_files',
@@ -57,6 +71,149 @@ if grep -q 'unformatted' tool.py 2>/dev/null; then
 fi
 exit 0
 """
+# structure-preserving formatter: swaps the marker word in place, keeping the
+# frontmatter fence, every wikilink, and the *** separator intact (a rewrap)
+_REWRAP_FORMATTER_HOOK = """\
+#!/usr/bin/env bash
+if grep -q 'unformatted' wiki/_index.md 2>/dev/null; then
+    sed -i.bak 's/unformatted/reflowed/' wiki/_index.md
+    rm -f wiki/_index.md.bak
+    exit 1
+fi
+exit 0
+"""
+# wiki-aware formatter's healthy escape: a bare non-wikilink '[[' becomes
+# '[\\[' (the raw opener count drops; the normalized count is unchanged)
+_BARE_ESCAPE_FORMATTER_HOOK = """\
+#!/usr/bin/env bash
+if grep -qF 'unformatted [[bare' wiki/_index.md 2>/dev/null; then
+    python3 -c "
+import pathlib
+p = pathlib.Path('wiki/_index.md')
+t = p.read_text()
+p.write_text(t.replace('unformatted [[bare', 'formatted [\\\\\\\\[bare'))
+"
+    exit 1
+fi
+exit 0
+"""
+# structure-blind formatter: escapes a real wikilink ('\\[[' appears), the
+# damage the escaped-opener invariant exists to catch
+_LINK_ESCAPING_FORMATTER_HOOK = """\
+#!/usr/bin/env bash
+if grep -qF '[[a/_index|a/]]' wiki/_index.md 2>/dev/null; then
+    python3 -c "
+import pathlib
+p = pathlib.Path('wiki/_index.md')
+t = p.read_text()
+p.write_text(t.replace('[[a/_index|a/]]', '\\\\\\\\[[a/_index|a/]\\\\\\\\]'))
+"
+    exit 1
+fi
+exit 0
+"""
+# value-mutating formatter: breaks a wikilink TARGET behind unchanged
+# structure (same opener count, fence, separators) -- only lint sees it
+_TARGET_MUTATING_FORMATTER_HOOK = """\
+#!/usr/bin/env bash
+if grep -qF '[[a/_index|a/]]' wiki/_index.md 2>/dev/null; then
+    python3 -c "
+import pathlib
+p = pathlib.Path('wiki/_index.md')
+t = p.read_text()
+p.write_text(t.replace('[[a/_index|a/]]', '[[missing/_index|a/]]'))
+"
+    exit 1
+fi
+exit 0
+"""
+# hook that ADDS a page under the guarded wiki prefix -- never a formatting
+# rewrite, so the gate must remove it or a bare retry lands it ungated
+_PAGE_ADDING_HOOK = """\
+#!/usr/bin/env bash
+if [ ! -f wiki/injected.md ]; then
+    printf 'injected\\n' >wiki/injected.md
+    exit 1
+fi
+exit 0
+"""
+# hook that DELETES a guarded page -- the restore must bring it back
+_PAGE_DELETING_HOOK = """\
+#!/usr/bin/env bash
+if [ -f wiki/_index.md ]; then
+    rm wiki/_index.md
+    exit 1
+fi
+exit 0
+"""
+# hook that flips load-bearing seed frontmatter behind an intact fence --
+# byte-identity is the seed pages' guard, so any rewrite is damage
+_SEED_MUTATING_HOOK = """\
+#!/usr/bin/env bash
+STEP=.fractal/main.task/steps/04-COMMIT.md
+if grep -q 'requires_approval: false' "$STEP" 2>/dev/null; then
+    python3 -c "
+import pathlib
+p = pathlib.Path('.fractal/main.task/steps/04-COMMIT.md')
+t = p.read_text()
+p.write_text(t.replace('requires_approval: false', 'requires_approval: true'))
+"
+    exit 1
+fi
+exit 0
+"""
+# single-invariant violations: each hook breaks exactly one structural
+# invariant, so deleting any one check from the gate fails its test
+_SEPARATOR_DROPPING_HOOK = """\
+#!/usr/bin/env bash
+if grep -qx '\\*\\*\\*' wiki/_index.md 2>/dev/null; then
+    python3 -c "
+import pathlib
+p = pathlib.Path('wiki/_index.md')
+t = p.read_text()
+p.write_text(t.replace('\\n***\\n', '\\n'))
+"
+    exit 1
+fi
+exit 0
+"""
+_FENCE_BREAKING_HOOK = """\
+#!/usr/bin/env bash
+if head -1 wiki/_index.md 2>/dev/null | grep -qx -- '---'; then
+    python3 -c "
+import pathlib
+p = pathlib.Path('wiki/_index.md')
+t = p.read_text()
+p.write_text(t.replace('---\\n', '- - -\\n', 1))
+"
+    exit 1
+fi
+exit 0
+"""
+_LINK_DROPPING_HOOK = """\
+#!/usr/bin/env bash
+if grep -qF '[[a/_index|a/]]' wiki/_index.md 2>/dev/null; then
+    python3 -c "
+import pathlib
+p = pathlib.Path('wiki/_index.md')
+t = p.read_text()
+p.write_text(t.replace('[[a/_index|a/]]', 'a/'))
+"
+    exit 1
+fi
+exit 0
+"""
+# hook that rewrites a machine file under the wiki root -- markdown
+# invariants are vacuous for JSON, so byte-identity is its only guard
+_MACHINE_FILE_MUTATING_HOOK = """\
+#!/usr/bin/env bash
+SETTINGS=wiki/.wiki/settings.json
+if [ -f "$SETTINGS" ] && ! grep -qF '{}' "$SETTINGS" 2>/dev/null; then
+    printf '{}\\n' >"$SETTINGS"
+    exit 1
+fi
+exit 0
+"""
 # a hard-failing hook that never mutates (a lint gate rejecting the commit)
 _REJECTING_HOOK = """\
 #!/usr/bin/env bash
@@ -76,15 +233,15 @@ _AUTHORED_PAGE = '---\nname: wiki\n---\n# wiki\n\nunformatted [[a/_index|a/]]\n\
 # ------ worker commits (commit.commit)
 
 
-def test_commit_never_recommits_hook_mutated_wiki_pages(
+def test_commit_restores_structure_breaking_wiki_rewrites(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A hook rewrite of a wiki page fails the commit and restores the page.
+    """A structure-breaking hook rewrite fails the commit and restores the page.
 
-    Generated pages must round-trip byte-identical (mdformat's rewrite
-    corrupts them for the wiki tooling), so the hook-mutation retry must
-    never re-stage them -- the commit fails with guidance, the authored bytes
-    are restored, and nothing lands on the branch.
+    A whole-page overwrite destroys the frontmatter fence, the wikilinks,
+    and the ``***`` separator at once -- the structural gate refuses it, the
+    commit fails with guidance, the authored bytes are restored, and nothing
+    lands on the branch.
     """
     repo = _hooked_repo(tmp_path / 'guarded', _WIKI_FORMATTER_HOOK)
     assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
@@ -130,6 +287,352 @@ def test_commit_retries_hook_formatted_code_paths(tmp_path: pathlib.Path) -> Non
     assert result.returncode == 0, result.stderr
     committed = _git(task, 'show', 'HEAD:tool.py').stdout
     assert committed == 'FORMATTED = True\n'
+
+
+def test_commit_retries_structure_preserving_wiki_rewrites(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A hook rewrite that preserves wiki structure is re-staged and committed.
+
+    Byte-identity is not required of generated pages: a wiki-aware formatter
+    legitimately rewraps prose, so a rewrite keeping the frontmatter fence,
+    every wikilink, and the ``***`` separators rides the retry like any code
+    reformat, and the hook's bytes land on the branch.
+    """
+    repo = _hooked_repo(tmp_path / 'rewrap', _REWRAP_FORMATTER_HOOK)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    task = repo / '.worktrees' / 'main.task'
+    page = task / 'wiki' / '_index.md'
+    page.write_text(_AUTHORED_PAGE, encoding='utf-8')
+    result = _run(task, 'commit', 'wiki work')
+    assert result.returncode == 0, result.stderr
+    committed = _git(task, 'show', 'HEAD:wiki/_index.md').stdout
+    assert 'reflowed' in committed
+    assert '[[a/_index|a/]]' in committed
+
+
+def test_commit_accepts_healthy_bare_bracket_escapes(
+    tmp_path: pathlib.Path,
+) -> None:
+    r"""A wiki-aware escape of a bare non-wikilink ``[[`` rides the retry.
+
+    The raw opener count drops when ``[[`` prose becomes ``[\[``, but the
+    normalized count is unchanged -- a correctly configured repo must never
+    dead-end on its own formatter's canonical output.
+    """
+    repo = _hooked_repo(tmp_path / 'escape', _BARE_ESCAPE_FORMATTER_HOOK)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    task = repo / '.worktrees' / 'main.task'
+    page = task / 'wiki' / '_index.md'
+    page.write_text(
+        '---\nname: wiki\n---\n# wiki\n\nunformatted [[bare brackets\n\n***\n',
+        encoding='utf-8',
+    )
+    result = _run(task, 'commit', 'wiki work')
+    assert result.returncode == 0, result.stderr
+    committed = _git(task, 'show', 'HEAD:wiki/_index.md').stdout
+    assert '[\\[bare' in committed
+
+
+def test_commit_restores_wikilink_escaping_rewrites(
+    tmp_path: pathlib.Path,
+) -> None:
+    r"""A hook that escapes a real wikilink is refused and the page restored.
+
+    Escaping ``[[x]]`` to ``\[[x]\]`` preserves the raw opener count, so
+    the escaped-opener invariant is what catches it: new ``\[[`` bytes are
+    damage, the authored page is restored, and nothing lands.
+    """
+    repo = _hooked_repo(tmp_path / 'mangle', _LINK_ESCAPING_FORMATTER_HOOK)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    task = repo / '.worktrees' / 'main.task'
+    page = task / 'wiki' / '_index.md'
+    page.write_text(_AUTHORED_PAGE, encoding='utf-8')
+    # the pipeline refreshes the page before staging, so the bytes the gate
+    # must restore are the wiki tooling's own refreshed output
+    subprocess.run(
+        ['wiki', 'update', f'--path={task / "wiki"}'],
+        capture_output=True,
+        check=True,
+    )
+    authored = page.read_text(encoding='utf-8')
+    head = _git(task, 'rev-parse', 'HEAD').stdout.strip()
+    result = _run(task, 'commit', 'wiki work')
+    assert result.returncode != 0
+    assert 'generated pages' in result.stderr
+    assert page.read_text(encoding='utf-8') == authored
+    assert _git(task, 'rev-parse', 'HEAD').stdout.strip() == head
+
+
+def test_commit_lint_backstop_catches_value_mutations(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A structure-preserving rewrite that breaks wiki integrity is refused.
+
+    Mutating a wikilink's target keeps every structural invariant, so the
+    lint backstop is the layer that catches it: the touched wiki root fails
+    ``wiki lint``, the page is restored, and the error carries the lint
+    finding.
+    """
+    repo = _hooked_repo(tmp_path / 'target', _TARGET_MUTATING_FORMATTER_HOOK)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    task = repo / '.worktrees' / 'main.task'
+    # a real linked page so the wiki lints clean before the hook's damage
+    linked = task / 'wiki' / 'a'
+    linked.mkdir()
+    (linked / '_index.md').write_text(
+        '---\nname: a\n---\n# a\n\n***\n',
+        encoding='utf-8',
+    )
+    page = task / 'wiki' / '_index.md'
+    page.write_text(_AUTHORED_PAGE.replace('unformatted ', ''), encoding='utf-8')
+    # the pipeline refreshes the page before staging, so the bytes the gate
+    # must restore are the wiki tooling's own refreshed output
+    subprocess.run(
+        ['wiki', 'update', f'--path={task / "wiki"}'],
+        capture_output=True,
+        check=True,
+    )
+    authored = page.read_text(encoding='utf-8')
+    head = _git(task, 'rev-parse', 'HEAD').stdout.strip()
+    result = _run(task, 'commit', 'wiki work')
+    assert result.returncode != 0
+    assert 'wiki integrity' in result.stderr
+    assert page.read_text(encoding='utf-8') == authored
+    assert _git(task, 'rev-parse', 'HEAD').stdout.strip() == head
+
+
+def test_commit_removes_hook_added_guarded_pages(tmp_path: pathlib.Path) -> None:
+    """A page a hook ADDS under a guarded prefix is removed, never committed.
+
+    An added page has no authored bytes to restore, so its restore is
+    removal -- left in place (or crashed over), the very next bare commit
+    would land the hook-generated page with no gate at all.
+    """
+    repo = _hooked_repo(tmp_path / 'added', _PAGE_ADDING_HOOK)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    task = repo / '.worktrees' / 'main.task'
+    (task / 'wiki' / '_index.md').write_text(_AUTHORED_PAGE, encoding='utf-8')
+    head = _git(task, 'rev-parse', 'HEAD').stdout.strip()
+    result = _run(task, 'commit', 'wiki work')
+    assert result.returncode != 0
+    assert 'generated pages' in result.stderr
+    assert not (task / 'wiki' / 'injected.md').exists()
+    staged = _git(task, 'diff', '--cached', '--name-only').stdout
+    assert 'injected.md' not in staged
+    assert _git(task, 'rev-parse', 'HEAD').stdout.strip() == head
+
+
+def test_commit_restores_hook_deleted_guarded_pages(tmp_path: pathlib.Path) -> None:
+    """A guarded page a hook DELETES is restored and the commit fails."""
+    repo = _hooked_repo(tmp_path / 'deleted', _PAGE_DELETING_HOOK)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    task = repo / '.worktrees' / 'main.task'
+    page = task / 'wiki' / '_index.md'
+    page.write_text(_AUTHORED_PAGE, encoding='utf-8')
+    subprocess.run(
+        ['wiki', 'update', f'--path={task / "wiki"}'],
+        capture_output=True,
+        check=True,
+    )
+    authored = page.read_text(encoding='utf-8')
+    head = _git(task, 'rev-parse', 'HEAD').stdout.strip()
+    result = _run(task, 'commit', 'wiki work')
+    assert result.returncode != 0
+    assert 'generated pages' in result.stderr
+    assert page.read_text(encoding='utf-8') == authored
+    assert _git(task, 'rev-parse', 'HEAD').stdout.strip() == head
+
+
+def test_commit_restores_seed_frontmatter_mutations(tmp_path: pathlib.Path) -> None:
+    """A hook flip of load-bearing seed frontmatter is refused byte-for-byte.
+
+    Seed pages keep byte-identity: their frontmatter is machine input the
+    loop executes (approval gates, per-step overrides), no lint validates
+    it, and a silent flip would run the node on hook-mutated config.
+    """
+    repo = _hooked_repo(tmp_path / 'seed', _SEED_MUTATING_HOOK)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    task = repo / '.worktrees' / 'main.task'
+    step = task / '.fractal' / 'main.task' / 'steps' / '04-COMMIT.md'
+    authored = step.read_text(encoding='utf-8')
+    (task / 'wiki' / '_index.md').write_text(_AUTHORED_PAGE, encoding='utf-8')
+    head = _git(task, 'rev-parse', 'HEAD').stdout.strip()
+    result = _run(task, 'commit', 'wiki work')
+    assert result.returncode != 0
+    assert 'generated pages' in result.stderr
+    assert step.read_text(encoding='utf-8') == authored
+    assert _git(task, 'rev-parse', 'HEAD').stdout.strip() == head
+
+
+@pytest.mark.parametrize(
+    argnames=('name', 'hook'),
+    argvalues=[
+        ('separator', _SEPARATOR_DROPPING_HOOK),
+        ('fence', _FENCE_BREAKING_HOOK),
+        ('opener', _LINK_DROPPING_HOOK),
+    ],
+    ids=['separator-drop', 'fence-break', 'opener-loss'],
+)
+def test_commit_restores_single_invariant_violations(
+    tmp_path: pathlib.Path,
+    name: str,
+    hook: str,
+) -> None:
+    """Each structural invariant refuses a rewrite violating only itself.
+
+    The hooks break exactly one invariant apiece -- the ``***`` separator
+    count, the frontmatter fence, and the wikilink opener count -- so every
+    check in the gate is individually load-bearing (a whole-page mangle
+    exercises them all at once and would mask a deleted check).
+    """
+    repo = _hooked_repo(tmp_path / name, hook)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    task = repo / '.worktrees' / 'main.task'
+    page = task / 'wiki' / '_index.md'
+    page.write_text(_AUTHORED_PAGE.replace('unformatted ', ''), encoding='utf-8')
+    subprocess.run(
+        ['wiki', 'update', f'--path={task / "wiki"}'],
+        capture_output=True,
+        check=True,
+    )
+    authored = page.read_text(encoding='utf-8')
+    head = _git(task, 'rev-parse', 'HEAD').stdout.strip()
+    result = _run(task, 'commit', 'wiki work')
+    assert result.returncode != 0
+    assert 'generated pages' in result.stderr
+    assert page.read_text(encoding='utf-8') == authored
+    assert _git(task, 'rev-parse', 'HEAD').stdout.strip() == head
+
+
+def test_user_init_retries_structure_preserving_rewrites(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The baseline gates every rewrite and retries structure-preserving ones.
+
+    A wiki-aware rewrap during ``commit --init`` re-stages and retries into
+    a single baseline commit, and the pathspec'd commit leaves unrelated
+    user-staged work staged and out of the baseline.
+    """
+    repo = _hooked_repo(tmp_path / 'baseline', _REWRAP_FORMATTER_HOOK)
+    (repo / 'wiki' / '_index.md').write_text(_AUTHORED_PAGE, encoding='utf-8')
+    (repo / 'unrelated.txt').write_text('user work\n', encoding='utf-8')
+    _git(repo, 'add', 'unrelated.txt')
+    result = _run(repo, 'commit', 'configure', '--init')
+    assert result.returncode == 0, result.stderr
+    committed = _git(repo, 'show', 'HEAD:wiki/_index.md').stdout
+    assert 'reflowed' in committed
+    # the user's staged work survives the retry and stays out of the baseline
+    staged = _git(repo, 'diff', '--cached', '--name-only').stdout
+    assert 'unrelated.txt' in staged
+    shown = subprocess.run(
+        ['git', 'show', 'HEAD:unrelated.txt'],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert shown.returncode != 0
+
+
+def test_commit_lint_backstop_covers_the_memory_root(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The lint backstop also guards the node memory wiki root."""
+    hook = _TARGET_MUTATING_FORMATTER_HOOK.replace(
+        'wiki/_index.md',
+        '.fractal/main.task/memory/_index.md',
+    )
+    repo = _hooked_repo(tmp_path / 'memory', hook)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    task = repo / '.worktrees' / 'main.task'
+    memory = task / '.fractal' / 'main.task' / 'memory'
+    (memory / 'a').mkdir()
+    (memory / 'a' / '_index.md').write_text(
+        '---\nname: a\n---\n# a\n\n***\n',
+        encoding='utf-8',
+    )
+    page = memory / '_index.md'
+    page.write_text(
+        '---\nname: memory\n---\n# memory\n\n[[a/_index|a/]]\n\n***\n',
+        encoding='utf-8',
+    )
+    subprocess.run(
+        ['wiki', 'update', f'--path={memory}'],
+        capture_output=True,
+        check=True,
+    )
+    authored = page.read_text(encoding='utf-8')
+    head = _git(task, 'rev-parse', 'HEAD').stdout.strip()
+    result = _run(task, 'commit', 'memory work')
+    assert result.returncode != 0
+    assert 'wiki integrity' in result.stderr
+    assert page.read_text(encoding='utf-8') == authored
+    assert _git(task, 'rev-parse', 'HEAD').stdout.strip() == head
+
+
+def test_commit_restores_machine_file_rewrites_under_wiki_roots(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A hook rewrite of a non-markdown file under a wiki root is refused.
+
+    Markdown invariants are vacuous for machine files (a wholesale JSON
+    rewrite keeps every count at zero), so byte-identity is their guard --
+    the structure-judged tier covers only ``.md`` pages under the roots.
+    """
+    repo = _hooked_repo(tmp_path / 'machine', _MACHINE_FILE_MUTATING_HOOK)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    task = repo / '.worktrees' / 'main.task'
+    settings = task / 'wiki' / '.wiki'
+    settings.mkdir(exist_ok=True)
+    machine = settings / 'settings.json'
+    machine.write_text('{"theme": "authored"}\n', encoding='utf-8')
+    authored = machine.read_text(encoding='utf-8')
+    head = _git(task, 'rev-parse', 'HEAD').stdout.strip()
+    result = _run(task, 'commit', 'wiki work')
+    assert result.returncode != 0
+    assert 'generated pages' in result.stderr
+    assert machine.read_text(encoding='utf-8') == authored
+    assert _git(task, 'rev-parse', 'HEAD').stdout.strip() == head
+
+
+def test_commit_tolerates_pre_existing_lint_failures(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A pre-existing lint failure soft-warns instead of blaming the hook.
+
+    The backstop restores and fails only when a touched root linted clean
+    before the hook's rewrite; a root that was already dirty keeps the
+    pipeline's soft-warn tolerance, the healthy rewrite rides the retry,
+    and the notice rides the commit output.
+    """
+    repo = _hooked_repo(tmp_path / 'predirty', _REWRAP_FORMATTER_HOOK)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    task = repo / '.worktrees' / 'main.task'
+    # build a resolved link row, then break its target -- damage the wiki
+    # tooling cannot heal, so the root is lint-dirty before the hook runs
+    linked = task / 'wiki' / 'a'
+    linked.mkdir()
+    (linked / '_index.md').write_text(
+        '---\nname: a\n---\n# a\n\n***\n',
+        encoding='utf-8',
+    )
+    page = task / 'wiki' / '_index.md'
+    page.write_text(_AUTHORED_PAGE, encoding='utf-8')
+    subprocess.run(
+        ['wiki', 'update', f'--path={task / "wiki"}'],
+        capture_output=True,
+        check=True,
+    )
+    updated = page.read_text(encoding='utf-8')
+    page.write_text(
+        updated.replace('[[a/_index|a/]]', '[[missing/_index|a/]]'),
+        encoding='utf-8',
+    )
+    result = _run(task, 'commit', 'wiki work')
+    assert result.returncode == 0, result.stderr
+    committed = _git(task, 'show', 'HEAD:wiki/_index.md').stdout
+    assert 'reflowed' in committed
+    assert 'pre-existing' in result.stdout + result.stderr
 
 
 def test_force_commit_bypasses_a_failing_hook(tmp_path: pathlib.Path) -> None:

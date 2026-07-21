@@ -133,9 +133,7 @@ def radio_send(app: typer.Typer) -> typer.Typer:
     parent_help = 'Send to parent node (mutex with --node).'
     parent = typer.Option(False, '--parent', help=parent_help)
     # channel option
-    channel_help = (
-        "Channel name (default: 'inbox', or 'private' when the target is yourself)."
-    )
+    channel_help = "Channel name (default: 'inbox')."
     channel = typer.Option(None, '--channel', help=channel_help)
     # subject option
     subject_help = 'Message subject (required).'
@@ -177,11 +175,14 @@ def radio_send(app: typer.Typer) -> typer.Typer:
                 message += " To report out, use 'fractal radio post'."
             raise typer.BadParameter(message)
         radio = Radio(resolve_node(path))
-        # the channel default keys on the target: another node's mail lands
-        # in its inbox; a self-send is a private note, not fake incoming mail
+        # a named target always defaults to its inbox -- the channel syncs
+        # read -- even when the target is this node (an operator standing in
+        # a node's worktree names it expecting a directive to land, and a
+        # cwd-keyed reroute to 'private' is a silent black hole); a private
+        # note stays available explicitly via --channel=private
         channel_defaulted = channel is None
         if channel is None:
-            channel = 'private' if node == radio.node.branch else 'inbox'
+            channel = 'inbox'
         target_defaulted = not node and not parent
         message_uuid, target, channel = radio.send(
             node=node,

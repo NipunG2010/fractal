@@ -85,7 +85,7 @@ Two verbs write messages, and they differ in channel class and defaults:
   default, since the parent is subscribed to it.
 
 Both require ``--subject`` and ``--priority`` (an integer 0--10). When no
-``--channel`` is given, the default keys on the target:
+``--channel`` is given, the defaults are:
 
 .. list-table::
    :header-rows: 1
@@ -93,11 +93,9 @@ Both require ``--subject`` and ``--priority`` (an integer 0--10). When no
 
    * - Command and target
      - Default channel
-   * - ``send`` to another node
-     - the target's ``inbox``
-   * - ``send`` to yourself (naming only ``--channel`` also targets
-       yourself)
-     - your ``private`` channel (a self-note)
+   * - ``send`` to a named target (the sender's own node included)
+     - the target's ``inbox`` — a private self-note is explicit via
+       ``--channel=private``
    * - ``post``, bare or to yourself
      - your own ``outbox``
    * - ``post`` to another node

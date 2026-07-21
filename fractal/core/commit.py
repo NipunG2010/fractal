@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import os
+import pathlib
 import re
 import shutil
 import subprocess
+import tarfile
+import tempfile
 import typing
 from collections.abc import Callable
 from typing import Optional
@@ -468,9 +472,17 @@ def commit_user_init(node: Node, message: str) -> str:
         _commit_paths()
     except RuntimeError as error:
         # a formatting hook may have rewritten the staged pages in the
-        # working tree (mdformat escapes wikilinks); restore-and-fail, never
-        # retry -- a bare retry would hand corrupted pages that commit cleanly
-        _hook_retry(node, _stage_paths, _commit_paths, error, generated=(), retry=False)
+        # working tree: every rewritten path is gated -- a wiki-page rewrite
+        # that preserves structure is re-staged and retried once, and any
+        # other rewrite restores the authored bytes and fails
+        _hook_retry(
+            node,
+            _stage_paths,
+            _commit_paths,
+            error,
+            generated=(f'{wiki}/', f'{seed}/'),
+            retry=False,
+        )
     return f'Committed user node baseline on {node.branch}.'
 
 
@@ -636,36 +648,41 @@ def _hook_retry(
     commit: Callable[[], str],
     error: RuntimeError,
     *,
-    generated: tuple[str, ...],
+    generated: tuple[str, str],
     retry: bool,
 ) -> str:
     """Recover from a git hook that mutated files during a failed commit.
 
-    One implementation, two policies: a work commit (``retry=True``)
-    re-stages the hook's edits and retries once -- hooks own code
-    formatting, so re-committing their code edits is safe -- while a
-    user-init baseline (``retry=False``) never retries. Either way, hook
-    rewrites of generated pages (under the ``generated`` prefixes;
-    everything, when never retrying) belong to the wiki tooling and must
-    round-trip byte-identical: a rewrite there is corruption (mdformat
-    escapes wikilinks and mangles nav delimiters), so the authored bytes
-    are restored and the commit fails with remediation guidance.
+    Hooks own formatting, so a rewrite is re-staged and the commit retried
+    once -- for guarded pages (under the ``generated`` prefixes;
+    everything, on the ``retry=False`` baseline) only after the rewrite
+    proves harmless. Wiki pages (the project wiki and the node memory
+    wiki) are judged on structure: a wiki-aware formatter legitimately
+    rewraps prose, while a structure-blind one escapes wikilinks and
+    mangles frontmatter and separators. Every other guarded page keeps
+    byte-identity -- seed frontmatter is load-bearing machine input no
+    lint can validate, so any rewrite there is damage. A violation
+    restores the authored bytes (removal, for a page the hook added) and
+    fails the commit with remediation guidance; work commits additionally
+    lint the touched wiki roots, blaming the hook only when the root
+    linted clean before the rewrite.
 
     Args:
         node: The node whose worktree is mid-commit.
         stage: Re-runs the caller's staging.
         commit: Re-runs the caller's commit.
         error: The original commit failure.
-        generated: Path prefixes owned by the wiki tooling.
-        retry: Retry the commit once when the hook's edits are confined
-            to code paths.
+        generated: Path prefixes owned by the wiki tooling, ordered: the
+            project-wiki prefix first, the node-data prefix second.
+        retry: Gate only the ``generated`` prefixes (a work commit);
+            ``False`` gates every rewritten path (the baseline).
 
     Returns:
         The retried commit's output.
 
     Raises:
-        RuntimeError: When re-staging changes nothing, the hook rewrote
-            generated pages, or the retried commit fails again.
+        RuntimeError: When re-staging changes nothing, the hook broke a
+            guarded page's structure, or the retried commit fails again.
 
     """
     worktree = node.worktree
@@ -688,32 +705,263 @@ def _hook_retry(
     cmd = ['diff-tree', '--name-only', '-r', '-z', tree_before, tree_after]
     raw = fractal.util.git.run_bytes(cmd, cwd=worktree) or b''
     mutated = os.fsdecode(raw).split('\0')
-    rewritten = [
+    # gate the guarded rewrites in two tiers: markdown under a wiki root
+    # (the project wiki and the node memory wiki) is judged on structure --
+    # a wiki-aware formatter rewrapping prose is formatting and rides the
+    # retry -- while every other guarded page (seed steps, node config, and
+    # the machine files inside the roots) keeps byte-identity: load-bearing
+    # machine input no lint can validate, so any rewrite there is damage
+    wiki_prefix, fractal_prefix = generated
+    memory_prefix = f'{fractal_prefix}{node.branch}/memory/'
+    wiki_rooted = (wiki_prefix, memory_prefix)
+    guarded = [
         path for path in mutated if path and (not retry or path.startswith(generated))
     ]
-    if rewritten:
+    structural = [
+        path
+        for path in guarded
+        if path.startswith(wiki_rooted) and path.endswith('.md')
+    ]
+    broken = [
+        path
+        for path in structural
+        if not _structure_preserved(node, tree_before, tree_after, path)
+    ]
+    byte_gated = [path for path in guarded if path not in structural]
+    damaged = broken + byte_gated
+    if damaged:
         # the pre-retry tree still holds the authored bytes, so restore them
         # -- leaving the rewrite in place would hand a bare retry corrupted
-        # pages that commit cleanly
-        for path in rewritten:
-            fractal.util.git.run(['checkout', tree_before, '--', path], cwd=worktree)
-        listing = ', '.join(rewritten)
+        # pages that commit cleanly; a page the hook ADDED has no authored
+        # bytes, so its restore is removal (a crash here would leave it
+        # staged for the next bare commit to land ungated)
+        for path in damaged:
+            if _tree_bytes(node, tree_before, path) is None:
+                fractal.util.git.run(
+                    ['rm', '-f', '--', f':(literal){path}'],
+                    cwd=worktree,
+                )
+            else:
+                fractal.util.git.run(
+                    ['checkout', tree_before, '--', f':(literal){path}'],
+                    cwd=worktree,
+                )
+        # name each tier's refusal for what it is -- the wiki remediation
+        # is meaningless for a byte-guarded seed page and vice versa
+        details = []
+        if broken:
+            details.append(
+                f'wiki pages with broken structure: {", ".join(broken)}'
+                ' (hook rewrites of wiki pages must preserve wikilinks,'
+                ' frontmatter, and *** separators -- give mdformat the'
+                ' wikilink-aware plugin (additional_dependencies:'
+                ' [mdformat-wiki] on its hook, dropping mdformat-frontmatter'
+                ' if present -- both register a frontmatter renderer and'
+                ' whichever is discovered first wins), or keep formatters'
+                ' off the wiki paths)'
+            )
+        if byte_gated:
+            details.append(
+                f'byte-guarded pages: {", ".join(byte_gated)}'
+                ' (seed and machine pages must never be rewritten by hooks'
+                ' -- keep formatters off the .fractal/ paths)'
+            )
+        detail = '; '.join(details)
         raise RuntimeError(
             'Commit failed after a git hook rewrote generated pages'
-            f' (restored, not committed): {listing}.'
-            ' Generated pages must round-trip byte-identical -- give'
-            ' mdformat the wikilink-aware plugin (additional_dependencies:'
-            ' [mdformat-wiki] on its hook, dropping mdformat-frontmatter'
-            ' if present -- both register a frontmatter renderer and'
-            ' whichever is discovered first wins), or keep formatters off'
-            ' the wiki paths.'
+            f' (restored, not committed): {detail}.'
         ) from error
+    # semantic backstop (work commits only -- a baseline wiki lints dirty by
+    # design, so a baseline value mutation is an accepted, unlintable
+    # residual): a rewrite can preserve structure yet still mutate
+    # frontmatter values behind an intact fence, damage `wiki update` then
+    # propagates into parent link rows and lint.sh only soft-warns -- so
+    # lint every wiki root the hook touched, blaming the hook only for the
+    # roots that linted clean before its rewrite (a pre-existing failure
+    # keeps the pipeline's soft-warn tolerance instead of dead-ending every
+    # commit)
+    notices: list[str] = []
+    if retry:
+        roots = set()
+        for path in guarded:
+            if path.startswith(wiki_prefix):
+                roots.add(wiki_prefix.rstrip('/'))
+            elif path.startswith(memory_prefix):
+                roots.add(memory_prefix.rstrip('/'))
+        if roots:
+            env = fractal.util.system.prepend_bin_path()
+            wiki_cli = shutil.which('wiki', path=env['PATH'])
+            failing: dict[str, str] = {}
+            for root in sorted(roots):
+                if wiki_cli is None or not (worktree / root / '_index.md').is_file():
+                    continue
+                result = subprocess.run(
+                    [wiki_cli, 'lint', f'--path={worktree / root}'],
+                    capture_output=True,
+                    text=True,
+                    cwd=worktree,
+                    env=env,
+                )
+                if result.returncode == 0:
+                    continue
+                detail = '\n'.join(
+                    stream.strip()
+                    for stream in (result.stdout, result.stderr)
+                    if stream.strip()
+                )
+                if not _lints_clean_at(node, tree_before, root, wiki_cli, env):
+                    notices.append(
+                        f'Warning: wiki lint fails under {root} (pre-existing,'
+                        f' not the hook rewrite): {detail}'
+                    )
+                    continue
+                failing[root] = detail
+            if failing:
+                # accumulate before restoring so a failure in one root never
+                # leaves another root's integrity-breaking rewrite staged
+                prefixes = tuple(f'{root}/' for root in failing)
+                restored = [p for p in guarded if p.startswith(prefixes)]
+                for path in restored:
+                    fractal.util.git.run(
+                        ['checkout', tree_before, '--', f':(literal){path}'],
+                        cwd=worktree,
+                    )
+                listing = ', '.join(restored)
+                findings = '; '.join(
+                    f'{root}: {detail}' for root, detail in sorted(failing.items())
+                )
+                raise RuntimeError(
+                    'Commit failed: a git hook rewrite broke wiki integrity'
+                    f' (restored, not committed): {listing}.'
+                    f' wiki lint reports: {findings}'
+                ) from error
     try:
-        return commit()
+        committed = commit()
     except RuntimeError as e:
         raise RuntimeError(
             f'Commit still failed after re-staging hook changes: {e}'
         ) from e
+    # ride the soft-warn notices on the commit output so they land on the
+    # pipeline's reporting channel, not a stderr side stream
+    if notices:
+        return '\n'.join([*notices, committed])
+    return committed
+
+
+def _structure_preserved(
+    node: Node,
+    tree_before: str,
+    tree_after: str,
+    path: str,
+) -> bool:
+    r"""Whether a hook's rewrite of a guarded page preserved wiki structure.
+
+    Compares the authored bytes against the rewrite on the invariants a
+    structure-blind formatter breaks -- the wikilink opener count
+    (normalized: a wiki-aware formatter's healthy ``[\[`` escape of bare
+    non-wikilink brackets never reads as a lost opener), newly escaped
+    wikilink openers (``\[[``), the count of ``***`` separator lines, and
+    the leading frontmatter fence -- so a wiki-aware rewrap passes while an
+    escaping or mangling rewrite fails. A page the hook added or deleted
+    (present on only one side) is never a formatting rewrite, so it fails
+    the gate.
+
+    Args:
+        node: The node whose worktree is mid-commit.
+        tree_before: Tree holding the authored bytes.
+        tree_after: Tree holding the hook's rewrite.
+        path: The rewritten path, relative to the worktree.
+
+    Returns:
+        ``True`` if the rewrite preserved every invariant.
+
+    """
+    before = _tree_bytes(node, tree_before, path)
+    after = _tree_bytes(node, tree_after, path)
+    if before is None or after is None:
+        return False
+    # fold the healthy bare-bracket escape back before counting openers, so
+    # only a real loss or gain of wikilink openers fails
+    folded_before = before.replace(b'[\\[', b'[[')
+    folded_after = after.replace(b'[\\[', b'[[')
+    if folded_before.count(b'[[') != folded_after.count(b'[['):
+        return False
+    # a structure-blind formatter escapes real wikilinks; new escaped
+    # openers are damage even when the raw opener count survives -- checked
+    # on the folded bytes so a double-escape collapses into the same shape
+    if folded_after.count(b'\\[[') > folded_before.count(b'\\[['):
+        return False
+    seps_before = sum(1 for line in before.splitlines() if line.strip() == b'***')
+    seps_after = sum(1 for line in after.splitlines() if line.strip() == b'***')
+    if seps_before != seps_after:
+        return False
+    return before.startswith(b'---\n') == after.startswith(b'---\n')
+
+
+def _tree_bytes(node: Node, tree: str, path: str) -> Optional[bytes]:
+    """Return ``path``'s blob bytes in ``tree``, or ``None`` when absent.
+
+    Args:
+        node: The node whose worktree holds the trees.
+        tree: Tree to read from.
+        path: Path relative to the worktree.
+
+    Returns:
+        The blob's bytes, or ``None`` when the tree has no such path.
+
+    """
+    return fractal.util.git.run_bytes(
+        ['cat-file', 'blob', f'{tree}:{path}'],
+        cwd=node.worktree,
+    )
+
+
+def _lints_clean_at(
+    node: Node,
+    tree: str,
+    root: str,
+    wiki_cli: str,
+    env: dict[str, str],
+) -> bool:
+    """Whether the wiki root under ``root`` linted clean at ``tree``.
+
+    Materializes the tree's root into a temp dir (``git archive``) and lints
+    it there, so a pre-existing failure -- one the pipeline soft-warns on
+    every ordinary commit -- is never blamed on a hook rewrite. An
+    unreadable state reads as dirty: the caller then treats the failure as
+    pre-existing and proceeds, matching the pipeline's lint tolerance.
+
+    Args:
+        node: The node whose worktree holds the tree.
+        tree: Tree to materialize the root from.
+        root: Wiki root path, relative to the worktree.
+        wiki_cli: Resolved ``wiki`` executable.
+        env: Environment for the lint invocation.
+
+    Returns:
+        ``True`` if the root existed at ``tree`` and linted clean.
+
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = subprocess.run(
+            ['git', 'archive', tree, '--', f':(literal){root}'],
+            capture_output=True,
+            cwd=node.worktree,
+        )
+        if archive.returncode != 0:
+            return False
+        try:
+            with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as bundle:
+                bundle.extractall(tmp, filter='data')
+        except (tarfile.TarError, OSError, ValueError):
+            return False
+        result = subprocess.run(
+            [wiki_cli, 'lint', f'--path={pathlib.Path(tmp) / root}'],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return result.returncode == 0
 
 
 def _push(node: Node) -> Optional[str]:

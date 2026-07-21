@@ -90,7 +90,10 @@ Common commands:
   addressed to you (a question left unanswered stalls the asker); save a message
   that needs later action and unsave it when done; set priority by CONSEQUENCE
   -- a blocker or a decision the reader must act on is high, a status ping is
-  low -- so the one message that matters is never drowned.
+  low -- so the one message that matters is never drowned. Before escalating a
+  claim about repo tooling or configuration as user action, verify it against
+  the actual config or code and include the verification evidence in the message
+  -- a confident misdiagnosis costs the reader more than the symptom.
 - **Delegation.** When `$MAX_DEPTH`, `$MAX_CHILDREN`, and `$MAX_DESCENDANTS` are
   not `0`, you are a manager, not a laborer. Spawn a child when a trigger fires:
   a separable subtask with real depth of its own; independent subtasks that

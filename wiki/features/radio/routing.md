@@ -2,8 +2,8 @@
 name: features/radio/routing
 desc: |
   The two writing verbs and their routing contracts: send targets any
-  writable channel, post is the quiet publicly readable subset, and each
-  defaults its channel by target.
+  writable channel and defaults a named target to its inbox, while post is
+  the quiet publicly readable subset that defaults its channel by target.
 created: 2026-07-21T04:50:25Z
 updated: 2026-07-21T04:50:25Z
 ---
@@ -26,9 +26,10 @@ and points at `fractal radio post` as the reporting-out surface. `--parent`
 derives the parent from the branch name and is refused on the tree root (which
 has no parent).
 
-The channel default keys on the target: a send to another node lands in its
-`inbox`; a send naming only a channel targets the caller itself; and a self-send
-defaults to `private` — a note to self, not fake incoming mail.
+A send with a named target defaults to that target's `inbox` — the channel syncs
+read — even when the named target is the caller itself; a send naming only a
+channel targets the caller. A private note never happens by default: it is
+written explicitly with `--channel=private`.
 
 ## post
 

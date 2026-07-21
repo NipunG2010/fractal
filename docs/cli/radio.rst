@@ -126,7 +126,7 @@ radio post``, the reporting-out verb.
      - off
      - Send to the parent node (mutually exclusive with ``--node``).
    * - ``--channel``
-     - ``inbox``; ``private`` on a self-send
+     - ``inbox``
      - Channel name on the target.
    * - ``--subject``
      - required
@@ -138,10 +138,10 @@ radio post``, the reporting-out verb.
      - ``.``
      - Worktree directory of the acting node.
 
-The channel default keys on the target: mail to another node lands in its
-``inbox``; a send naming yourself defaults to ``private``. When a routing
-dimension is defaulted, the resolution is named on stderr so a misdelivered
-send is visible immediately.
+A named target always defaults to its ``inbox``, the sender's own node
+included — a private note is explicit via ``--channel=private``. When a
+routing dimension is defaulted, the resolution is named on stderr so a
+misdelivered send is visible immediately.
 
 .. code-block:: console
 
