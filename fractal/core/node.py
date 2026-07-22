@@ -19,6 +19,8 @@ from fractal.constants import (
     CONFIG_FILE,
     DB_FILE,
     FRACTAL_FOLDER,
+    HEADLESS_FILE,
+    HEADLESS_LOG,
     PAUSED_FILE,
     PGID_FILE,
     PROJECT_FOLDER,
@@ -294,14 +296,46 @@ class Node:
             return None
         return self.tmux_session in sessions
 
+    @property
+    def headless(self: Node) -> bool:
+        """Return whether this node uses the detached process backend."""
+        return (self.node_dir / HEADLESS_FILE).is_file()
+
+    def _headless_process_exists(self: Node) -> bool:
+        """Return whether the node's recorded headless process group is alive.
+
+        The launcher records the group before it execs the loop, closing the
+        boot window where an ``idle`` node is already running. The record's
+        timestamp also fences PID reuse through :func:`_recorded_group`, so a
+        stale marker never makes an unrelated same-user process look like this
+        node's loop.
+        """
+        pgid_file = self.node_dir / PGID_FILE
+        try:
+            recorded_at = pgid_file.stat().st_mtime
+            pgid = int(pgid_file.read_text(encoding='utf-8').strip())
+            os.killpg(pgid, 0)
+        except (FileNotFoundError, ValueError, ProcessLookupError):
+            return False
+        except PermissionError:
+            return True
+        return _recorded_group(pgid, recorded_at)
+
+    def _loop_exists(self: Node) -> Optional[bool]:
+        """Return whether this node's selected runtime still hosts its loop."""
+        if self.headless:
+            return self._headless_process_exists()
+        return self._tmux_session_exists()
+
     def _reconcile_status(self: Node) -> None:
         """Stamp a crashed-but-active node ``exited``.
 
         A loop that dies without ending (a hard kill, a direct
-        ``tmux kill-session``, a host crash) leaves the ``.status`` file
-        ``active`` with no tmux session, wedging the reject-active guards. The
-        one-loop-per-node invariant (``start.sh`` refuses to launch while the
-        session exists) makes a missing session proof the loop is gone, so
+        ``tmux kill-session``, a headless process death, a host crash) leaves
+        the ``.status`` file ``active`` with no live runtime, wedging the
+        reject-active guards. The one-loop-per-node invariant (``start.sh``
+        refuses to launch while the runtime exists) makes a missing runtime
+        proof the loop is gone, so
         stamp the same honest terminal :meth:`Record.run_start` uses for a
         stranded run -- both the ``.status`` file and the crashed run's
         still-open runs/iters/steps rows, so a later merge/delete/retire (none
@@ -330,7 +364,7 @@ class Node:
             return
         if self.status() != 'active':
             return
-        if self._tmux_session_exists() is False:
+        if self._loop_exists() is False:
             self._reap_orphan()
             self.record.close_open('exited')
             self.status_set('exited')
@@ -345,8 +379,9 @@ class Node:
         The loop records its process group at run start (``.pgid``) and
         each agent invocation's own group
         (``.step_pgid``); both are removed on any in-band exit, so a file
-        that outlives the tmux session marks an out-of-band pane death (tmux
-        kill/crash, host OOM) whose agent may still be running -- and
+        that outlives the loop runtime marks an out-of-band death (tmux
+        kill/crash, headless process death, host OOM) whose agent may still be
+        running -- and
         spending -- headless. The reap follows ``kill.sh``'s TERM-grace-KILL
         cadence and logs an ``orphan`` event naming each reaped pgid.
         Best-effort: a dead, recycled, or foreign group reads as already
@@ -1238,12 +1273,13 @@ class Node:
         continue_run: bool = False,
         clean: bool = False,
         max_cost: Optional[float] = None,
+        headless: bool = False,
     ) -> str:
-        """Launch the node in a tmux session.
+        """Launch the node loop in tmux or a detached process group.
 
-        Creates a tmux session (or window if already inside
-        tmux) that runs the iteration loop. All run parameters
-        are read from ``config.json`` (set at init or edited
+        Creates a tmux session, or an independent process group in headless
+        mode, that runs the iteration loop. All run parameters are read from
+        ``config.json`` (set at init or edited
         before launch); ``continue_run`` (with its optional ``max_cost``
         retune) is the only launch-time action.
 
@@ -1268,6 +1304,8 @@ class Node:
             max_cost: New cost cap in USD for the continued run, applied
                 through the parent's retune; required when the last run
                 ended on its cost budget.
+            headless: Launch without tmux and capture output to the node's
+                ``headless.log`` file.
 
         Returns:
             Script output, prefixed by any launch-time notices (the
@@ -1304,22 +1342,6 @@ class Node:
             raise RuntimeError(
                 f'Cannot start under a paused node ({latched}). Resume it first.'
             )
-        # refuse a foreign tmux-session collision on a fresh start: a
-        # first-start node has no session of its own, so a live session under
-        # its name belongs to another fractal sharing this repo's basename,
-        # and `node kill`/attach would resolve ambiguously across both; a
-        # continue is exempt -- its own session may legitimately be present,
-        # and start.sh's exact-name check still backstops that path
-        if not continue_run:
-            session = self.tmux_session
-            sessions = fractal.util.tmux.probe()
-            if sessions is not None and session in sessions:
-                raise RuntimeError(
-                    f'Cannot start: the tmux session {session!r} is already'
-                    f' active for another fractal (a repository sharing this'
-                    f' basename and node name). Stop it, or rename one'
-                    f' repository directory.'
-                )
         # launch-time notices (the retune echo, the kill countermand) ride
         # the returned confirmation -- core never prints; the CLI echoes it
         notices: list[str] = []
@@ -1459,6 +1481,8 @@ class Node:
         args = [f'{self._root}']
         if continue_run:
             args.append('--continue')
+        if headless:
+            args.append('--headless')
         # ensure git excludes
         self._git_exclude()
         if continue_run:
@@ -1513,8 +1537,29 @@ class Node:
                     )
                 raise
         else:
-            # run script
-            result = self._run_script('start.sh', *args)
+            # serialize the boot handoff across runtime backends: the loop
+            # remains idle until its own preflight stamps active, so the lock
+            # closes the window where concurrent starts could both launch
+            with worktree.lock(self.repo_dir):
+                current_status = self.status()
+                if current_status != 'idle':
+                    raise RuntimeError(
+                        f'Cannot start from status: {current_status!r}.'
+                        f' Use --continue to restart.'
+                    )
+                # a first-start node has no tmux session of its own, so this
+                # exact name belongs to another fractal sharing the repo name;
+                # the check also stops a headless launch racing a tmux boot
+                session = self.tmux_session
+                sessions = fractal.util.tmux.probe()
+                if sessions is not None and session in sessions:
+                    raise RuntimeError(
+                        f'Cannot start: the tmux session {session!r} is already'
+                        f' active for another fractal (a repository sharing this'
+                        f' basename and node name). Stop it, or rename one'
+                        f' repository directory.'
+                    )
+                result = self._run_script('start.sh', *args)
         # log the lineage only after start.sh returns, on both paths -- the
         # continue arm rolls a failed launch back to the settled status (a
         # lock-time event would survive that rollback as a phantom), so the
@@ -1534,6 +1579,11 @@ class Node:
         # validate status
         if self.status() != 'active':
             raise RuntimeError('Cannot attach: node is not active.')
+        if self.headless:
+            raise RuntimeError(
+                'Cannot attach to a headless node; follow its log instead:'
+                f' tail -f {self.node_dir / HEADLESS_LOG}'
+            )
         # run attach script, then attach to the tmux session (named by start.sh);
         # the interactive handoff bypasses _run_script: tmux owns the terminal,
         # so output is not captured and tmux reports its own errors
@@ -1815,7 +1865,7 @@ class Node:
         """Return whether ``current`` admits a kill of this node.
 
         ``active`` and ``paused`` always do. ``idle`` does only while the
-        node's tmux session is live -- a boot in flight (``start.sh``
+        node's loop runtime is live -- a boot in flight (``start.sh``
         created the session, the loop's preflight has not stamped
         ``active`` yet), which a status read alone cannot tell from a
         never-started node. An inconclusive probe reads as no session:
@@ -1830,12 +1880,12 @@ class Node:
         """
         if current in ('active', 'paused'):
             return True
-        return current == 'idle' and bool(self._tmux_session_exists())
+        return current == 'idle' and bool(self._loop_exists())
 
     def kill(self: Node, reason: Optional[str] = None) -> str:
         """Kill the node and its active or paused descendants (children first).
 
-        Reaps each tmux session and marks its active rows ``killed``. Paused
+        Reaps each loop runtime and marks its active rows ``killed``. Paused
         nodes are killable -- the escape hatch for a parked subtree; with no
         loop alive the kill is pure bookkeeping (``kill.sh`` no-ops and the
         open rows close ``killed``). A booting node -- session up, ``active``
@@ -2639,7 +2689,7 @@ class Node:
         ``.worktrees/``, deletes the user node's data directory, and strips
         fractal's block from the repo's ``info/exclude``. Committed artifacts
         (the project wiki, baseline commits) and remote branches are left in
-        place. Refuses while any node's tmux session is alive; paused nodes
+        place. Refuses while any node's loop runtime is alive; paused nodes
         are killed as part of the teardown -- the caller's confirmation
         authorized discarding the frozen mid-step work their parked
         worktrees hold.
@@ -2704,7 +2754,7 @@ class Node:
         branches and clears the node registry, while the user node's data --
         config, memory, and the central database with every history row --
         plus the wiki and baseline commits survive, so fresh nodes spawn
-        immediately after. Refuses while any node's tmux session is alive;
+        immediately after. Refuses while any node's loop runtime is alive;
         paused nodes are killed as part of the teardown -- the caller's
         confirmation authorized discarding the frozen mid-step work their
         parked worktrees hold.
@@ -2785,7 +2835,7 @@ class Node:
         """Run a tree-teardown script behind the pre-flight, settle, and flock.
 
         The shared ``destroy``/``reset`` shape. Pre-flights the script's
-        own refusals first -- a live tmux session or a locked worktree
+        own refusals first -- a live loop runtime or a locked worktree
         anywhere in the tree -- because the paused settle below is
         irreversible (the kills close the parked runs), so a teardown the
         script would refuse must abort here with nothing touched. Then
@@ -2827,18 +2877,23 @@ class Node:
             # still be running, so the irreversible teardown refuses rather
             # than tearing down blind
             for _, descendant in descendants:
-                alive = descendant._tmux_session_exists()
+                alive = descendant._loop_exists()
                 if alive is None:
                     raise RuntimeError(
-                        f'Cannot {verb}: the tmux probe failed (tmux list-sessions'
-                        ' gave no answer), so nodes may still be running. Restore'
-                        ' tmux visibility and retry.'
+                        f'Cannot {verb}: the runtime probe gave no answer, so'
+                        ' nodes may still be running. Restore tmux visibility'
+                        ' and retry.'
                     )
                 if alive:
+                    runtime = (
+                        f'headless (log: {descendant.node_dir / HEADLESS_LOG})'
+                        if descendant.headless
+                        else f'in tmux ({descendant.tmux_session})'
+                    )
                     raise RuntimeError(
-                        f'Cannot {verb}: node is still running in tmux'
-                        f' ({descendant.tmux_session}). Kill it first with:'
-                        f' fractal node kill {descendant.branch}.'
+                        f'Cannot {verb}: node is still running {runtime}.'
+                        f' Kill it first with: fractal node kill'
+                        f' {descendant.branch}.'
                     )
             for _, descendant in descendants:
                 git_dir = fractal.util.git.run(
@@ -2976,7 +3031,7 @@ class Node:
 
         Queries the ``nodes`` table with optional depth and
         status filters. A crashed-but-active row (worktree present, no live
-        tmux session) is reconciled -- persisted via
+        loop runtime) is reconciled -- persisted via
         :meth:`_reconcile_status`, not just relabeled -- before listing, so
         the fleet's default steering read never echoes a dead loop as
         ``active``. Cap columns render each present child's live config
@@ -2993,8 +3048,8 @@ class Node:
                 (overrides the retired/all default).
             live: Reconcile each row against the child's real
                 ``.status()``, dropping descendants whose worktree is gone,
-                relabeling a crashed ``active`` node (no live tmux session)
-                to ``exited``, and a booting ``idle`` node (live session,
+                relabeling a crashed ``active`` node (no live loop runtime)
+                to ``exited``, and a booting ``idle`` node (live runtime,
                 the loop not yet stamped) to ``active`` (the authoritative
                 view). Read-only -- it does not persist the relabel.
             decorated: Append each active descendant's pending stop/finish
@@ -3022,20 +3077,26 @@ class Node:
             sessions = fractal.util.tmux.probe()
             rows = []
             for row, node in self._live_descendants(max_depth=max_depth):
-                if sessions is not None:
-                    if _base_status(row.get('status')) == 'active':
-                        unlisted = node.tmux_session not in sessions
-                        if unlisted and node._tmux_session_exists() is False:
-                            row = {**row, 'status': 'exited'}
+                current = _base_status(row.get('status'))
+                if node.headless:
+                    alive: Optional[bool] = node._headless_process_exists()
+                elif sessions is None:
+                    alive = None
+                elif node.tmux_session in sessions:
+                    alive = True
+                else:
+                    alive = node._tmux_session_exists()
+                if current == 'active':
+                    if alive is False:
+                        row = {**row, 'status': 'exited'}
                     # a started child holds 'idle' until its loop stamps
                     # 'active' after preflight, but its session is already
                     # live -- read the boot window as 'active', so a finishing
                     # ancestor's drain never completes over a child started
                     # seconds earlier; a sessionless idle node (spawned, never
                     # started) stays idle and never blocks a drain
-                    elif _base_status(row.get('status')) == 'idle':
-                        if node.tmux_session in sessions or node._tmux_session_exists():
-                            row = {**row, 'status': 'active'}
+                elif current == 'idle' and alive:
+                    row = {**row, 'status': 'active'}
                 rows.append(row)
         else:
             rows = self.child_list(max_depth=max_depth)
@@ -3170,13 +3231,12 @@ class Node:
         """Persist the reconcile for crashed-but-active rows (the shared pass).
 
         Reads are where staleness is observed: a row still ``active`` with no
-        live tmux session is healed through the child's own
+        live runtime is healed through the child's own
         :meth:`_reconcile_status` (persisted, not just relabeled) and re-read.
-        The tmux probe is paid only while something reads ``active`` (one
-        batched probe for the whole set); a row without a live node (worktree
-        gone) passes through untouched. An inconclusive probe (no answer from
-        tmux) heals nothing -- stamping live loops ``exited`` on a blind host
-        would reap them.
+        Tmux nodes share one batched probe; headless nodes use their recorded
+        process groups. A row without a live node (worktree gone) passes
+        through untouched. An inconclusive tmux probe heals nothing --
+        stamping live loops ``exited`` on a blind host would reap them.
 
         Args:
             pairs: ``(row, node)`` per registry row -- ``node`` is ``None``
@@ -3189,12 +3249,13 @@ class Node:
         if not any(_base_status(row.get('status')) == 'active' for row, _ in pairs):
             return pairs
         sessions = fractal.util.tmux.probe()
-        if sessions is None:
-            return pairs
         healed = []
         for row, node in pairs:
             if _base_status(row.get('status')) == 'active' and node is not None:
-                if node.exists() and node.tmux_session not in sessions:
+                absent = node.headless and not node._headless_process_exists()
+                if sessions is not None and not node.headless:
+                    absent = node.tmux_session not in sessions
+                if node.exists() and absent:
                     node._reconcile_status()
                     row = {**row, 'status': node.status()}
             healed.append((row, node))

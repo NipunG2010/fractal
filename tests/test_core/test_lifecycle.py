@@ -37,11 +37,13 @@ __all__ = [
     'test_start_rejects_non_positive_max_cost',
     'test_start_only_from_idle',
     'test_start_continue_from_terminal',
+    'test_start_headless_selects_detached_backend',
     'test_start_continue_re_arms_after_drained_run',
     'test_start_continue_refuses_after_budget_end',
     'test_start_continue_rolls_back_retune_on_refusal_or_failed_launch',
     'test_start_without_max_cost_warns_and_runs',
     'test_start_continue_reconciles_crashed_active',
+    'test_headless_liveness_reconciles_a_dead_process_group',
     'test_finish_rejects_non_active',
     'test_stop_rejects_non_active',
     'test_signal_rejects_active_node_without_run',
@@ -206,6 +208,45 @@ def test_start_continue_from_terminal(
     run_scripts = _stub_run_script(monkeypatch, node)
     node.start(continue_run=True)
     assert run_scripts
+
+
+def test_start_headless_selects_detached_backend(
+    node_with_db: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A headless start delegates the backend choice to ``start.sh``.
+
+    The core launch keeps the same validation and event boundary as tmux; the
+    sole process-layer delta is the explicit flag passed to the lifecycle
+    script, where the detached group and output capture are established.
+    """
+    node = node_with_db
+    node.config.set('max_cost', 1.0)
+    run_scripts = _stub_run_script(monkeypatch, node)
+    node.start(headless=True)
+    assert run_scripts == [('start.sh', f'{node._root}', '--headless')]
+
+
+def test_headless_liveness_reconciles_a_dead_process_group(
+    node_with_db: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead headless group heals through the normal crashed-loop path."""
+    node = node_with_db
+    node.status_set('active')
+    run_id = node.record.run_start()
+    (node.node_dir / '.headless').write_text('headless\n', encoding='utf-8')
+    (node.node_dir / '.pgid').write_text('4242\n', encoding='utf-8')
+
+    def dead_group(pgid: int, sig: int) -> NoReturn:
+        raise ProcessLookupError
+
+    monkeypatch.setattr('fractal.core.node.os.killpg', dead_group)
+    node._reconcile_status()
+    assert node.status() == 'exited'
+    run = node.db.read('runs', where={'run_id': run_id})[0]
+    assert run['status'] == 'exited'
+    assert not (node.node_dir / '.pgid').exists()
 
 
 def test_start_continue_re_arms_after_drained_run(

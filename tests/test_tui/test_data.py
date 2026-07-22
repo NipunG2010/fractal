@@ -30,6 +30,7 @@ __all__ = [
     'test_display_name_of',
     'test_tree_topology_and_flags',
     'test_tree_shows_crashed_active_as_exited',
+    'test_tree_keeps_live_headless_node_active',
     'test_crash_between_quiet_builds_reconciles_to_exited',
     'test_active_card_streams_live_state',
     'test_settled_card_is_a_time_machine',
@@ -124,6 +125,24 @@ def test_tree_shows_crashed_active_as_exited(
     assert snap.counts == (9, 4)
     # display only: the stored status file still reads active
     assert data.status('main.gamma') == 'active'
+
+
+def test_tree_keeps_live_headless_node_active(
+    data: TuiData,
+    builder: SnapshotBuilder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live headless process group is authoritative without tmux."""
+    branch = 'main.gamma'
+    node_dir = data.node_dir(branch)
+    assert node_dir is not None
+    (node_dir / '.headless').write_text('headless\n', encoding='utf-8')
+    (node_dir / '.pgid').write_text('4242\n', encoding='utf-8')
+    monkeypatch.setattr(data, 'live_sessions', frozenset)
+    monkeypatch.setattr('fractal.tui.data.os.killpg', lambda pgid, signal: None)
+    snap = builder.build('main')
+    statuses = {row['branch']: row['status'] for row in snap.tree}
+    assert statuses[branch] == 'active'
 
 
 def test_crash_between_quiet_builds_reconciles_to_exited(

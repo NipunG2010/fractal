@@ -32,8 +32,9 @@ lifecycle operation on the tree.
 
 ## What the scripts do
 
-- `start.sh` launches the run's tmux session and execs the iteration loop
-  (`fractal node _loop`) inside it; the loop itself is in-process Python.
+- `start.sh` launches the run's tmux session or, with `--headless`, a detached
+  process group whose output lands in `headless.log`, then execs the iteration
+  loop (`fractal node _loop`) inside it; the loop itself is in-process Python.
 - `pause.sh` reaps the recorded step process group, aborting the in-flight agent
   so the loop can park.
 - `resume.sh` relaunches the loop; the relaunched loop withdraws the run's
@@ -51,7 +52,8 @@ lifecycle operation on the tree.
 The loop and its scripts coordinate through small marker files in the node
 directory, all git-ignored via the repository's exclude file (kept in lockstep
 with the marker set): `.status` (the current status), `.session` and `.socket`
-(tmux coordinates), `.pgid` and `.step_pgid` (process groups for pause/kill
-reaping), `.paused` (the tree-wide pause latch beside the central database) and
-`.pause_abort`. Signals the loop observes — finish, stop, pause — take effect at
-iteration or step boundaries; the escalation path that does not wait is kill.
+(tmux coordinates), `.headless` (the selected detached backend), `.pgid` and
+`.step_pgid` (process groups for liveness and pause/kill reaping), `.paused`
+(the tree-wide pause latch beside the central database) and `.pause_abort`.
+Signals the loop observes — finish, stop, pause — take effect at iteration or
+step boundaries; the escalation path that does not wait is kill.
