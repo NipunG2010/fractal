@@ -199,7 +199,7 @@ def test_parser_flushes_cost_per_turn(monkeypatch: pytest.MonkeyPatch) -> None:
         pytest.approx(_USAGE_SECOND_COST),
     ]
     # each turn's result carries the recorded turn cost (the renderer's
-    # '-- $X.XXXX' close reads it off the event)
+    # '— $X.XXXX' close reads it off the event)
     assert [event.cost for event in events if event.kind == 'result'] == costs
 
 
@@ -295,14 +295,14 @@ def test_events_render_through_the_production_renderer_codex(
     assert 'Done.' in captured.out
     # the turn closes on the recorded turn cost alone -- '$?' when there is
     # no cost fact, never $0 and never the wall time
-    assert '-- $?' in captured.out
+    assert '— $?' in captured.out
     assert 'agent error: rate limited' in captured.err
 
 
 def test_renderer_closes_a_truncated_stream_with_the_placeholder_summary(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A stream killed before ``turn.completed`` still closes on ``-- $?``.
+    """A stream killed before ``turn.completed`` still closes on ``— $?``.
 
     A truncated stream carries no result frame, so nothing prints the
     closing summary; ``close()`` -- called by the driving command after the
@@ -322,7 +322,7 @@ def test_renderer_closes_a_truncated_stream_with_the_placeholder_summary(
             render(event)
     render.close()
     out = capsys.readouterr().out
-    assert '-- $?' in out
+    assert '— $?' in out
 
 
 def test_compute_cost_prices_the_cached_subset(

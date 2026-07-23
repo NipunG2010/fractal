@@ -44,7 +44,7 @@ def console_script(name: str) -> str:
     if found is not None:
         return found
     raise RuntimeError(
-        f'No {name!r} executable found -- install it into the running environment.'
+        f'No {name!r} executable found — install it into the running environment.'
     )
 
 

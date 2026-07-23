@@ -1061,7 +1061,7 @@ class Node:
         if '/' in branch:
             raise ValueError(
                 f'Cannot initialize a user node on branch {branch!r}:'
-                " branch names containing '/' are not supported -- switch"
+                " branch names containing '/' are not supported — switch"
                 ' to a slash-free branch and re-run init.'
             )
         # default the path to self._root relative to the repo root; coerce to a
@@ -1085,7 +1085,7 @@ class Node:
             if existing != path:
                 raise ValueError(
                     f'A fractal already exists on branch {branch!r} for project'
-                    f' {existing!r}; one branch maps to a single project --'
+                    f' {existing!r}; one branch maps to a single project —'
                     ' use a separate branch.'
                 )
         # derive the project name from the repo dir (dashes -> _, validated as an
@@ -1146,7 +1146,7 @@ class Node:
                     f'Another active fractal already uses the tmux name'
                     f' {repo_name!r} (session {clash!r}). Two fractals sharing a'
                     f' repository basename collide on node sessions and'
-                    f' `node kill` -- rename this repository directory or stop'
+                    f' `node kill` — rename this repository directory or stop'
                     f' that fractal first.'
                 )
         # write the project cache first so node_dir resolves under <project>/

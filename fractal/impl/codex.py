@@ -274,7 +274,7 @@ class CodexAgent(Agent):
                 raise RuntimeError(
                     f'codex preflight failed for model {model!r}\n'
                     f'(exit {process.returncode}):{detail}\n'
-                    "Check codex's output for the cause -- common ones:"
+                    "Check codex's output for the cause — common ones:"
                     ' an invalid or expired OPENROUTER_API_KEY (check the'
                     ' OpenRouter dashboard), account data-policy settings'
                     ' excluding the model, or a slug OpenRouter does not'
@@ -283,7 +283,7 @@ class CodexAgent(Agent):
             raise RuntimeError(
                 f'codex preflight failed for model {model!r}\n'
                 f'(exit {process.returncode}):{detail}\n'
-                "Check codex's output for the cause -- common ones:"
+                "Check codex's output for the cause — common ones:"
                 ' expired/invalid auth (re-run codex login), network or'
                 ' rate-limit errors (retry), or a model unavailable to this'
                 ' account (some ChatGPT-plan accounts lack access to some'

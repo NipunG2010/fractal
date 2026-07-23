@@ -83,7 +83,7 @@ def command_base(command: str) -> str:
     if any(char in command for char in '\'"\\'):
         raise ValueError(
             f'Unsupported agent command: {command!r} (commands split on'
-            ' whitespace only -- quotes and backslashes are not supported).'
+            ' whitespace only — quotes and backslashes are not supported).'
         )
     base_word, *_ = command.split()
     return base_word

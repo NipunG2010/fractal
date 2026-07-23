@@ -58,7 +58,7 @@ def test_renderer_keeps_piped_output_ordered_with_stderr() -> None:
     merged = result.stdout
     assert result.returncode == 0, merged
     # reply, then closing summary, then the session line -- in write order
-    assert merged.index('streamed reply') < merged.index('-- ')
-    assert merged.index('-- ') < merged.index('session: abc')
+    assert merged.index('streamed reply') < merged.index('— ')
+    assert merged.index('— ') < merged.index('session: abc')
     # the session line starts on its own line, never mid-reply
     assert '\nsession: abc' in merged

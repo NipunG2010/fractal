@@ -186,7 +186,7 @@ class StreamRenderer:
     cost facts render nothing (they are recorded, not displayed). Tracks
     the open text run (a delta without a trailing newline) so tool headers
     and closing summaries start below it, and ``close()`` ends a truncated
-    stream on a fresh line with the ``-- $?`` placeholder summary. Every
+    stream on a fresh line with the ``— $?`` placeholder summary. Every
     write flushes: piped stdout is block-buffered while the driving
     command's stderr echoes are write-through, so an unflushed line would
     land out of order in a merged capture.
@@ -242,7 +242,7 @@ class StreamRenderer:
                 summary = ', '.join(parts)
             else:
                 summary = cost_str
-            print(f'\n{_DIM}-- {summary}{_RESET}', flush=True)
+            print(f'\n{_DIM}— {summary}{_RESET}', flush=True)
             self._resulted = True
         # stream-borne errors (some agents report failures on the JSON stream,
         # not stderr, so without this a failed turn leaves no explanation)
@@ -258,7 +258,7 @@ class StreamRenderer:
 
         Called by the driving command after the stream drains -- a truncated
         stream (killed before its result frame) otherwise leaves the cursor
-        mid-line and shows no closing summary, so the ``-- $?`` placeholder
+        mid-line and shows no closing summary, so the ``— $?`` placeholder
         marks the unaccounted turn. Idempotent, and resets for the next
         stream (the loop reuses one renderer across steps).
         """
@@ -266,7 +266,7 @@ class StreamRenderer:
             return
         self._break()
         if not self._resulted:
-            print(f'\n{_DIM}-- $?{_RESET}', flush=True)
+            print(f'\n{_DIM}— $?{_RESET}', flush=True)
         self._open = False
         self._resulted = False
 

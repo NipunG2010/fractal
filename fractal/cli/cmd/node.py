@@ -172,7 +172,7 @@ def node_init(app: typer.Typer) -> typer.Typer:
     wait = typer.Option(None, '--wait', help=wait_help)
     # max cost option
     max_cost_help = (
-        'Maximum cost in USD per run -- runs are isolated, so each launch'
+        'Maximum cost in USD per run — runs are isolated, so each launch'
         ' arms the cap anew; after a budget-ended run, `node start'
         ' --continue` refuses without an explicit --max-cost.'
     )
@@ -329,7 +329,7 @@ def node_init(app: typer.Typer) -> typer.Typer:
                     tracked = True
             if tracked:
                 typer.echo(
-                    'Warning: no --max-cost/--max-iters -- this node can run'
+                    'Warning: no --max-cost/--max-iters — this node can run'
                     ' and spend without bound.',
                     err=True,
                 )
@@ -345,8 +345,8 @@ def node_start(app: typer.Typer) -> typer.Typer:
     # continue flag
     continue_help = (
         'Continue a stopped/exited node (further iterations): the launch'
-        ' restores the worktree -- uncommitted project files refuse without'
-        ' --clean -- and a budget-ended run refuses without an explicit'
+        ' restores the worktree — uncommitted project files refuse without'
+        ' --clean — and a budget-ended run refuses without an explicit'
         ' --max-cost.'
     )
     continue_ = typer.Option(False, '--continue', help=continue_help)
@@ -1031,7 +1031,7 @@ def node_update(app: typer.Typer) -> typer.Typer:
     title = typer.Option(None, '--title', help=title_help)
     # max cost option
     max_cost_help = (
-        'Child maximum cost in USD per run -- runs are isolated, so each'
+        'Child maximum cost in USD per run — runs are isolated, so each'
         ' launch arms the cap anew; after a budget-ended run, `node start'
         ' --continue` refuses without an explicit --max-cost.'
     )
