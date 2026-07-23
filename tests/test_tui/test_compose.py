@@ -300,6 +300,7 @@ async def test_radio_send_writes_a_message(pair_tree: pathlib.Path) -> None:
         pane.send_body()
         await pilot.pause()
         assert body.text == ''  # the body cleared after the send
+        assert app.query_one('#m_subject', Input).value == ''  # so did the subject
     data = TuiData(resolve_node(pair_tree))
     data.refresh_worktrees()
     connection = data.connect()
@@ -338,11 +339,16 @@ async def test_radio_reply_threads_under_the_parent(pair_tree: pathlib.Path) -> 
         pane.refresh_visibility()
         app.query_one('#m_channel', Input).value = 'public'
         app.query_one('#m_thread', Input).value = parent  # a uuid -> reply path
+        app.query_one('#m_subject', Input).value = 'Re: topic'
         await pilot.press('down', 'enter')
         body = app.query_one('#m_body', TextArea)
         body.text = 'looks good'
         pane.send_body()
         await pilot.pause()
+        # the landed reply consumed its thread and subject -- the next send
+        # starts fresh instead of threading under the same parent
+        assert app.query_one('#m_thread', Input).value == theme.EMPTY
+        assert app.query_one('#m_subject', Input).value == ''
     data = TuiData(root)
     data.refresh_worktrees()
     connection = data.connect()
@@ -381,6 +387,8 @@ async def test_radio_send_failure_surfaces_a_warning(
         await pilot.pause()
         # the failure surfaced as a notify naming the bad channel
         assert any('nope' in note for note in notes)
+        # the subject survived the failure for a fix-and-resend
+        assert app.query_one('#m_subject', Input).value == 'x'
     # nothing landed in any node's database (the send was rejected)
     data = TuiData(resolve_node(pair_tree))
     data.refresh_worktrees()

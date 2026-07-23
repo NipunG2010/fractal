@@ -684,7 +684,7 @@ class MessagePane:
         """Write a real radio message.
 
         A threaded reply when the thread field carries a uuid, else a send;
-        failures surface as a notify.
+        failures surface as a notify and keep the fields for a re-send.
         """
         target = self.node or self.app.scope
         subject = self.app.query_one('#m_subject', Input).value.strip() or text[:42]
@@ -710,6 +710,10 @@ class MessagePane:
         except (ValueError, PermissionError, sqlite3.Error) as error:
             self.app.notify(str(error), severity='warning')
             return
+        # the landed message consumes its subject and thread -- a leftover
+        # thread would silently re-thread the next send under the same parent
+        self.app.query_one('#m_subject', Input).value = ''
+        self.app.query_one('#m_thread', Input).value = fractal.tui.theme.EMPTY
         self.app.notify(
             f'radio {kind} {fractal.tui.theme.RIGHT} {leaf_of(target)}'
             f' {fractal.tui.theme.SEP} {channel}'
