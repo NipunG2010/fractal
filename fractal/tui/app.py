@@ -399,9 +399,9 @@ class FractalApp(App):
     def scope_to(self: FractalApp, branch: str) -> None:
         """Re-point the cockpit at ``branch``: every pane follows."""
         self.scope = branch
-        # the user (root) node defaults to the descendants log view, every
-        # other node to its own activity (set before the log builds)
-        self.node_pane.sub_log = branch == self.data.root_branch
+        # the log scope restores the branch's remembered choice
+        # (set before the log builds)
+        self.node_pane.sub_log = self.node_pane.log_scope(branch)
         self._build()
         self._resize()
         self._set_header()

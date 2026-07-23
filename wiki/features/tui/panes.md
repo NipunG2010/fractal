@@ -36,7 +36,10 @@ so moving focus never triggers reads.
 - **Node pane** -- the focused node's card: status, the run/iter/step line,
   agent/model/session, measures, and config chips; below it a run -> iteration
   -> step explorer and a unified activity timeline. The card, the explorer, and
-  the event log are three sub-zones sharing the pane.
+  the event log are three sub-zones sharing the pane. A toggle scopes the
+  timeline to the node's own events or all descendants merged: a first visit
+  defaults the user (root) node to descendants and every other node to its own
+  activity, and a toggled choice sticks per node for the session.
 - **Radio pane** -- three sources over the scoped node's radio: its own
   messages, the cross-subtree feed (every descendant's public/outbox posts), and
   the archive of saved messages. A zone ladder (source tabs, filters, rows)
