@@ -65,4 +65,6 @@ subject, a priority (0-10, validated against shared bounds in
 `fractal.constants`), a sender, an optional agent session reference tying the
 message to the conversation that wrote it, and a body. The iteration loop's sync
 step (see [[features/loop/_index|loop]]) is the main consumer: it reads inbox
-and feed each step and reports outward via the outbox.
+and feed each step, reports outward via the outbox, and — when the parent is the
+user node — sends what needs the human's attention (above all, replies to user
+messages) to the user's inbox.

@@ -54,8 +54,11 @@ decisions, blockers (the full surface:
 [[features/radio/_index|features/radio/]]). `fractal radio feed` lists what your
 subscriptions (your children, by default) have posted;
 `fractal radio read --feed --unread` prints the new bodies;
-`fractal radio thread <uuid>` reconstructs a conversation. A silent node is a
-suspect node: check its outbox first, then its tmux session.
+`fractal radio thread <uuid>` reconstructs a conversation. What needs your
+attention — replies to your messages, questions, decisions you own, finish
+sign-offs — lands in your inbox instead: `fractal radio messages` lists it,
+`fractal radio read --channel=inbox --unread` prints the new bodies. A silent
+node is a suspect node: check its outbox first, then its tmux session.
 
 ## Steering
 
@@ -97,8 +100,8 @@ Steering tools, ordered by weight:
 ## The operator's cadence
 
 A healthy rhythm: scan `fractal node list` (or keep the TUI open), read the
-radio feed, answer anything addressed to you, and intervene only on signal — a
-`!` in the list, a silent outbox, a spend outlier, a directive gone
-unacknowledged. Nodes are briefed to surface blockers and questions on radio and
-to keep working rather than wait; the operator who answers promptly and steers
-with small directives gets the most out of a tree.
+radio feed and your inbox, answer anything addressed to you, and intervene only
+on signal — a `!` in the list, a silent outbox, a spend outlier, a directive
+gone unacknowledged. Nodes are briefed to surface blockers and questions on
+radio and to keep working rather than wait; the operator who answers promptly
+and steers with small directives gets the most out of a tree.
