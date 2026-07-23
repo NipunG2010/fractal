@@ -501,19 +501,42 @@ class FractalApp(App):
         self.message_pane.compose_chat(row, session=session)
 
     def start_chat(self: FractalApp, prompt: str) -> None:
-        """Run one chat turn against the scoped node.
+        """Run or queue one chat turn against the scoped node.
 
-        Resolves the transport (fork the live session, resume, or fresh) and
-        spawns the agent into the chat worker. Every outcome lands in the
-        transcript; chat never writes radio.
+        Posts the prompt to the transcript at once. A turn already in flight
+        queues the send (FIFO, dispatched when that turn finishes) rather than
+        racing it; an idle chat dispatches immediately. The send carries the
+        branch (and session) it was typed against, so a re-scope before it runs
+        cannot redirect it. Every outcome lands in the transcript; chat never
+        writes radio.
         """
         branch = self.scope
         pane = self.message_pane
-        pane.post(branch, 'you', prompt)
-        card = self.snapshot.card or {}
-        status = card.get('status', 'idle')
-        agent = card.get('agent') or ''
         explicit = pane.session if pane.session and pane.session != '-' else None
+        pane.post(branch, 'you', prompt)
+        # a turn already streaming: queue this send behind it (the queued 'you'
+        # line above shows it pending) -- on_chat_done dispatches the next
+        if self.chat.turn is not None:
+            self.chat.enqueue(branch, prompt, explicit)
+            return
+        self._dispatch_chat(branch, prompt, explicit)
+
+    def _dispatch_chat(
+        self: FractalApp,
+        branch: str,
+        prompt: str,
+        explicit: Optional[str],
+    ) -> None:
+        """Resolve the transport for one send and spawn its turn.
+
+        The send's branch anchors everything -- transcript, node, and transport
+        -- so a queued send dispatches against the branch it was typed on even
+        after the cockpit re-scoped away. Only ever entered with no turn in
+        flight (an idle ``start_chat`` or a ``ChatDone`` draining the queue), so
+        it never races a live turn.
+        """
+        pane = self.message_pane
+        status, agent, detached = self._chat_state(branch)
         own_chat = explicit is not None and explicit == self.chat.session(branch)
         live = None
         if status in ('active', 'paused'):
@@ -521,7 +544,7 @@ class FractalApp(App):
         transport = resolve_transport(
             agent=agent,
             status=status,
-            detached=bool(card.get('detached')),
+            detached=detached,
             live_session=live,
             session=explicit,
             own_chat=own_chat,
@@ -534,6 +557,7 @@ class FractalApp(App):
         node = self.data.node(branch)
         if node is None:
             pane.post(branch, 'error', f'{theme.WARN} node unavailable')
+            self._dispatch_queued()
             return
         # boundary guard: the node's live state can flip between resolve and
         # build (.status/.session are external); the backend is resolved here
@@ -545,14 +569,45 @@ class FractalApp(App):
             agent = node.agent(command.agent)
         except (ValueError, RuntimeError) as error:
             pane.post(branch, 'error', f'{theme.WARN} {error}')
+            self._dispatch_queued()
             return
         pane.post(branch, 'meta', f'{theme.SEP} {transport.label}')
-        self._cancel_turn()
         turn = self._turn_factory(command, agent)
         turn_id = self.chat.begin(branch, turn)
-        pane.show_pending()
+        # the spinner only pins under the transcript that is on screen; an
+        # off-scope turn's pending re-shows when the user scopes back to it
+        if branch == self.scope:
+            pane.show_pending()
         self._spinner.resume()
         self._chat_worker(turn, branch, turn_id)
+
+    def _dispatch_queued(self: FractalApp) -> None:
+        """Dispatch the next queued send (FIFO), against the branch it was typed on."""
+        queued = self.chat.dequeue()
+        if queued is not None:
+            branch, prompt, explicit = queued
+            self._dispatch_chat(branch, prompt, explicit)
+
+    def _chat_state(self: FractalApp, branch: str) -> tuple[str, str, bool]:
+        """Return the ``(status, agent, detached)`` a send resolves transport with.
+
+        The scoped branch reads its live card; a queued send dispatching
+        against an off-scope branch reads that branch's own status and config
+        directly (no snapshot for it is on hand).
+        """
+        if branch == self.scope:
+            card = self.snapshot.card or {}
+            return (
+                card.get('status', 'idle'),
+                card.get('agent') or '',
+                bool(card.get('detached')),
+            )
+        config = self.data.config(branch)
+        return (
+            self.data.status(branch),
+            config.get('agent') or '',
+            bool(config.get('detached')),
+        )
 
     def _live_session(self: FractalApp, branch: str, agent: str) -> Optional[str]:
         """Look up the node's newest woven session (read-only, at send time)."""
@@ -612,12 +667,42 @@ class FractalApp(App):
             pane.post(branch, 'meta', event.text)
 
     def on_chat_done(self: FractalApp, message: ChatDone) -> None:
-        """Clear the in-flight turn (and its spinner) when its worker finishes."""
+        """Clear the finished turn, then dispatch the next queued send."""
         # only the live turn's own done clears it -- a stale done from a
         # superseded turn would orphan the new turn's subprocess
         if self.chat.is_current(message.turn_id):
             self.chat.finish(message.turn_id)
             self.message_pane.clear_pending()
+            # the turn is done: the next queued send starts on its own branch
+            self._dispatch_queued()
+
+    def interrupt_chat(self: FractalApp) -> None:
+        """Interrupt the in-flight chat turn.
+
+        Kills the streaming turn (``_cancel_turn`` notes the ``cancelled``
+        line). A lone queued send goes back into the composer for editing
+        rather than firing unbidden; several queued sends dispatch at once as
+        one combined turn (their ``you`` lines already read in order).
+        """
+        if self.chat.turn is None:
+            return
+        self._cancel_turn()
+        dropped = self.chat.clear_queue()
+        if not dropped:
+            return
+        if len(dropped) == 1:
+            branch, prompt, _ = dropped[0]
+            self.message_pane.recall_send(branch, prompt)
+            return
+        # combine the first branch's sends into one turn, oldest first; a send
+        # queued against another branch stays parked for the done-drain
+        branch = dropped[0][0]
+        combined = [entry for entry in dropped if entry[0] == branch]
+        for entry in dropped:
+            if entry[0] != branch:
+                self.chat.enqueue(*entry)
+        prompt = '\n\n'.join(entry[1] for entry in combined)
+        self._dispatch_chat(branch, prompt, combined[0][2])
 
     def on_unmount(self: FractalApp) -> None:
         """Kill any in-flight chat turn on shutdown (no orphan agents)."""
@@ -653,7 +738,8 @@ class FractalApp(App):
         hints = (
             f'{theme.LEFT}{theme.RIGHT} panes {theme.SEP} {theme.RET} enter'
             f' {theme.SEP} arrows move {theme.SEP} esc back'
-            f' {theme.SEP} {theme.CTRL}a attach {theme.SEP} {theme.CTRL}q quit'
+            f' {theme.SEP} {theme.CTRL}a attach {theme.SEP} {theme.CTRL}g interrupt'
+            f' {theme.SEP} {theme.CTRL}q quit'
         )
         grid.add_row(
             Text.from_markup(f'[{theme.DIM}]{hints}[/]'),
@@ -667,6 +753,12 @@ class FractalApp(App):
         # the whole screen, not a pane); typing surfaces keep their own ^a
         if event.key == 'ctrl+a':
             self.attach_node()
+            event.stop()
+            return
+        # ^g interrupts the in-flight chat turn from anywhere (^i is Tab in
+        # most terminal encodings, so it cannot serve as a distinct key)
+        if event.key == 'ctrl+g':
+            self.interrupt_chat()
             event.stop()
             return
         handlers = {

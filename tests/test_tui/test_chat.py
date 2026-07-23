@@ -16,6 +16,7 @@ import sys
 from typing import Optional
 
 import pytest
+from textual.widgets import TextArea
 
 import fractal.core.agent
 from fractal.cli.utils import resolve_node
@@ -48,7 +49,12 @@ __all__ = [
     'test_chat_turn_surfaces_launch_failure_as_an_error_event',
     'test_chat_turn_degrades_a_raising_parser',
     'test_chat_controller_owns_the_turn_lifecycle',
+    'test_chat_controller_queues_sends_fifo',
     'test_chat_controller_clocks_the_watchdog',
+    'test_second_send_queues_behind_the_in_flight_turn',
+    'test_queued_send_dispatches_against_the_branch_it_was_typed_on',
+    'test_interrupt_recalls_a_lone_queued_send_to_the_composer',
+    'test_interrupt_dispatches_several_queued_sends_as_one_turn',
     'test_sessionless_chat_spawns_fresh_never_radio',
     'test_live_chat_writes_nothing',
     'test_stale_done_does_not_clear_the_new_turn',
@@ -452,6 +458,26 @@ def test_chat_controller_owns_the_turn_lifecycle() -> None:
     assert chat.turn is None
 
 
+def test_chat_controller_queues_sends_fifo() -> None:
+    """The queue is FIFO and branch-stamped; ``clear_queue`` drops every entry.
+
+    Sends typed while a turn is in flight park on the controller in order, each
+    carrying the branch and session it was typed against, and drain oldest
+    first; an interrupt clears the lot and hands back what it dropped.
+    """
+    chat = ChatController(now=lambda: 0.0)
+    chat.enqueue('main.alpha', 'first', None)
+    chat.enqueue('main.beta', 'second', 'sess-b')
+    assert chat.dequeue() == ('main.alpha', 'first', None)
+    chat.enqueue('main.alpha', 'third', None)
+    # the third parks behind the still-queued second (oldest first)
+    assert chat.dequeue() == ('main.beta', 'second', 'sess-b')
+    # clear_queue drains the rest and reports them; a drained queue yields None
+    assert chat.clear_queue() == [('main.alpha', 'third', None)]
+    assert chat.dequeue() is None
+    assert chat.clear_queue() == []
+
+
 def test_chat_controller_clocks_the_watchdog() -> None:
     """``idle`` measures the injected clock since ``begin``; ``touch`` re-arms it."""
     clock = {'at': 0.0}
@@ -567,14 +593,178 @@ async def test_stale_done_does_not_clear_the_new_turn(
         # is never the live turn's) arrives late
         app.on_chat_done(ChatDone(0))
         assert app.chat.turn is live_turn  # the live turn is untouched
-        assert app.query('#m_chatpending')  # its spinner is still pinned
+        assert app.query('.chatpending')  # its spinner is still pinned
         # the live turn finishes on its own and clears cleanly
         for _ in range(100):
             await pilot.pause(0.05)
             if app.chat.turn is None:
                 break
         assert app.chat.turn is None
-        assert not app.query('#m_chatpending')
+        assert not app.query('.chatpending')
+
+
+async def test_second_send_queues_behind_the_in_flight_turn(
+    pair_tree: pathlib.Path,
+) -> None:
+    """A send while a turn is in flight queues and dispatches on that turn's done.
+
+    Two sends on one branch never race a single spinner into a duplicate-id
+    crash: the second parks as a ``you`` line behind the first's turn, then
+    dispatches on its own once the first finishes -- both prompts reach an
+    agent, oldest first.
+    """
+    events = [
+        ChatEvent(kind='session', text='chat-sess'),
+        ChatEvent(kind='text', text='reply'),
+        ChatEvent(kind='meta', text='done · 1 turns · 0.1s · $0.01'),
+    ]
+    app = FractalApp(
+        resolve_node(pair_tree),
+        branch='main.alpha',
+        turn_factory=lambda command, agent: MockTurn(events, pause=0.05),
+    )
+    async with app.run_test(size=(150, 48)) as pilot:
+        app.start_chat('first')
+        first_turn = app.chat.turn
+        assert first_turn is not None
+        # a second send while the first streams parks in the queue, unraced
+        app.start_chat('second')
+        assert app.chat.turn is first_turn
+        # both turns run to completion, second after first
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if app.chat.turn is None and not app.query('.chatpending'):
+                break
+        convo = app.chat.transcript('main.alpha')
+    # both prompts posted, in order; each turn streamed its own reply bubble
+    assert [text for who, text in convo if who == 'you'] == ['first', 'second']
+    assert [text for who, text in convo if who == 'auth'] == ['reply', 'reply']
+    assert app.chat.turn is None
+
+
+async def test_queued_send_dispatches_against_the_branch_it_was_typed_on(
+    pair_tree: pathlib.Path,
+) -> None:
+    """A queued send dispatches against its own branch after a re-scope away.
+
+    The send is stamped with the branch it was typed on, so re-scoping the
+    cockpit before the in-flight turn finishes cannot redirect it -- its reply
+    lands in the branch it was addressed to, and the newly scoped branch stays
+    untouched.
+    """
+    events = [
+        ChatEvent(kind='session', text='chat-sess'),
+        ChatEvent(kind='text', text='reply'),
+        ChatEvent(kind='meta', text='done · 1 turns · 0.1s · $0.01'),
+    ]
+    app = FractalApp(
+        resolve_node(pair_tree),
+        branch='main.alpha',
+        turn_factory=lambda command, agent: MockTurn(events, pause=0.05),
+    )
+    async with app.run_test(size=(150, 48)) as pilot:
+        app.start_chat('first')
+        app.start_chat('second')  # queued against main.alpha
+        # re-scope away while the first turn is still in flight
+        app.scope_to('main')
+        for _ in range(200):
+            await pilot.pause(0.05)
+            if app.chat.turn is None:
+                break
+        alpha = app.chat.transcript('main.alpha')
+        root = app.chat.transcript('main')
+    # both queued sends reached main.alpha; the re-scoped branch got nothing
+    assert [text for who, text in alpha if who == 'you'] == ['first', 'second']
+    assert [text for who, text in alpha if who == 'auth'] == ['reply', 'reply']
+    assert root == []
+
+
+async def test_interrupt_recalls_a_lone_queued_send_to_the_composer(
+    pair_tree: pathlib.Path,
+) -> None:
+    """``ctrl+g`` with one queued send hands it back to the composer.
+
+    Interrupt abandons the streaming turn (a ``cancelled`` line lands); the
+    single send queued behind it was never sent, so its ``you`` line leaves
+    the transcript and its text lands in the body for an edit or a re-send.
+    """
+    events = [
+        ChatEvent(kind='session', text='chat-sess'),
+        ChatEvent(kind='text', text='reply'),
+        ChatEvent(kind='meta', text='done · 1 turns · 0.1s · $0.01'),
+    ]
+    app = FractalApp(
+        resolve_node(pair_tree),
+        branch='main.alpha',
+        turn_factory=lambda command, agent: MockTurn(events, pause=5.0),
+    )
+    async with app.run_test(size=(150, 48)) as pilot:
+        app.start_chat('first')
+        turn = app.chat.turn
+        assert turn is not None
+        app.start_chat('second')  # queued behind the slow first turn
+        await pilot.pause()
+        await pilot.press('ctrl+g')  # interrupt
+        await pilot.pause()
+        assert turn.cancelled  # the streaming subprocess was killed
+        assert app.chat.turn is None
+        assert app.chat.dequeue() is None  # the queue drained into the composer
+        body = app.query_one('#m_body', TextArea)
+        assert body.text == 'second'  # the recalled send, ready to edit
+        convo = app.chat.transcript('main.alpha')
+    # the recalled send left the transcript; the sent prompt and cancel stayed
+    assert [text for who, text in convo if who == 'you'] == ['first']
+    assert any(who == 'meta' and text == 'cancelled' for who, text in convo)
+
+
+async def test_interrupt_dispatches_several_queued_sends_as_one_turn(
+    pair_tree: pathlib.Path,
+) -> None:
+    """``ctrl+g`` with several queued sends fires them at once as one turn.
+
+    Interrupt abandons the streaming turn, then the queued sends -- already
+    reading in order as ``you`` lines -- combine oldest-first into a single
+    prompt and dispatch immediately as the next turn.
+    """
+    events = [
+        ChatEvent(kind='session', text='chat-sess'),
+        ChatEvent(kind='text', text='reply'),
+        ChatEvent(kind='meta', text='done · 1 turns · 0.1s · $0.01'),
+    ]
+    commands: list[Invocation] = []
+
+    def factory(command: Invocation, agent: ClaudeAgent) -> MockTurn:
+        commands.append(command)
+        return MockTurn(events, pause=5.0)
+
+    app = FractalApp(
+        resolve_node(pair_tree),
+        branch='main.alpha',
+        turn_factory=factory,
+    )
+    async with app.run_test(size=(150, 48)) as pilot:
+        app.start_chat('first')
+        first_turn = app.chat.turn
+        assert first_turn is not None
+        app.start_chat('second')
+        app.start_chat('third')
+        await pilot.pause()
+        await pilot.press('ctrl+g')  # interrupt
+        await pilot.pause()
+        assert first_turn.cancelled
+        # the queued sends went out together as the new in-flight turn
+        combined = app.chat.turn
+        assert combined is not None
+        assert combined is not first_turn
+        assert app.chat.dequeue() is None
+        convo = app.chat.transcript('main.alpha')
+        assert [text for who, text in convo if who == 'you'] == [
+            'first',
+            'second',
+            'third',
+        ]
+    # the combined turn's invocation carries both prompts, oldest first
+    assert any('second\n\nthird' in part for part in commands[-1].argv)
 
 
 async def test_broken_deployment_hook_errors_the_turn_not_the_app(

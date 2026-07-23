@@ -127,6 +127,10 @@ class MessagePane:
         self.node = app.scope
         self.session = (list(app.snapshot.sessions) or ['-'])[0]
         self._streaming = False
+        # the live in-flight spinner line; an owned reference, not a DOM id --
+        # widget removal is deferred, so an id lookup can meet a dying spinner
+        # and a same-id re-mount would collide with it
+        self._pending_line: Optional[Static] = None
         # combo state
         self._cfid = ''
         self._cprev = ''
@@ -549,6 +553,8 @@ class MessagePane:
         """Swap the transcript to the scoped branch's buffer."""
         convo = self.app.query_one('#m_convo')
         convo.remove_children()
+        # the sweep took any spinner line with it
+        self._pending_line = None
         for who, text in self.app.chat.transcript(self.app.scope):
             convo.mount(self._msg(who, text))
         self._streaming = False
@@ -598,7 +604,9 @@ class MessagePane:
         # the trailing agent bubble sits just above the spinner, when present;
         # markup stays off (matching _msg's agent bubble) -- a delta boundary
         # can split a tag, so a raw buffer must never parse as markup
-        bubbles = [child for child in convo.children if child.id != 'm_chatpending']
+        bubbles = [
+            child for child in convo.children if 'chatpending' not in child.classes
+        ]
         if self._streaming and bubbles:
             bubbles[-1].update(buffered)
         else:
@@ -610,15 +618,15 @@ class MessagePane:
         self.app.call_after_refresh(convo.scroll_end, animate=False)
 
     def _pending(self: MessagePane) -> Optional[Static]:
-        """Find the in-flight spinner line (the transcript's last child)."""
-        pending = self.app.query('#m_chatpending')
-        return pending.first(Static) if pending else None
+        """Return the live in-flight spinner line (``None`` when idle)."""
+        return self._pending_line
 
     def show_pending(self: MessagePane) -> None:
         """Pin the in-flight spinner line at the transcript tail."""
         self.clear_pending()
         convo = self.app.query_one('#m_convo')
-        convo.mount(Static('', classes='msg', id='m_chatpending'))
+        self._pending_line = Static('', classes='msg chatpending')
+        convo.mount(self._pending_line)
         self.update_pending()
         self.app.call_after_refresh(convo.scroll_end, animate=False)
 
@@ -638,8 +646,21 @@ class MessagePane:
 
     def clear_pending(self: MessagePane) -> None:
         """Drop the spinner line (the turn finished or was cancelled)."""
-        for widget in self.app.query('#m_chatpending'):
-            widget.remove()
+        if self._pending_line is not None:
+            self._pending_line.remove()
+            self._pending_line = None
+
+    def recall_send(self: MessagePane, branch: str, prompt: str) -> None:
+        """Pull an unsent queued send back into the composer for editing.
+
+        Drops the send's pending ``you`` line from the branch transcript and
+        lands the text in the body, above any draft already typed there.
+        """
+        self.app.chat.recall(branch, prompt)
+        if branch == self.app.scope:
+            self.rescope_convo()
+        body = self.app.query_one('#m_body', TextArea)
+        body.text = f'{prompt}\n{body.text}' if body.text else prompt
 
     def send_body(self: MessagePane) -> None:
         """Send the body: a slash command, a chat turn, or a radio message."""

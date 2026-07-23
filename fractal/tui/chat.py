@@ -285,8 +285,9 @@ class ChatController:
 
     Owns everything about "one chat turn at a time": the live ``ChatTurn``,
     its branch, the monotonically incremented turn id (staleness stamp),
-    the last-delta instant (watchdog input), and the spinner counters.
-    The app owns only the worker and the intervals.
+    the last-delta instant (watchdog input), the spinner counters, and the
+    FIFO queue of sends typed while a turn was in flight. The app owns only
+    the worker and the intervals.
     """
 
     def __init__(
@@ -311,6 +312,11 @@ class ChatController:
         self._seen = 0.0
         self._spin_frame = 0
         self._spin_started = 0.0
+        # sends typed while a turn was in flight, oldest first; each entry
+        # is (branch, prompt, explicit session) captured at type time
+        self._queue: collections.deque[tuple[str, str, Optional[str]]] = (
+            collections.deque()
+        )
 
     def transcript(self: ChatController, branch: str) -> list[tuple[str, str]]:
         """Return a branch's transcript (created empty on first access).
@@ -331,6 +337,18 @@ class ChatController:
             transcript[-1] = ('auth', transcript[-1][1] + text)
         else:
             transcript.append(('auth', text))
+
+    def recall(self: ChatController, branch: str, prompt: str) -> None:
+        """Drop the newest ``('you', prompt)`` line from a branch's transcript.
+
+        An interrupt hands a lone queued send back to the composer; the line
+        it posted was never sent, so it leaves the record too.
+        """
+        transcript = self.transcript(branch)
+        for index in range(len(transcript) - 1, -1, -1):
+            if transcript[index] == ('you', prompt):
+                del transcript[index]
+                return
 
     def session(self: ChatController, branch: str) -> Optional[str]:
         """Return the cockpit's own chat session for a branch, if any."""
@@ -395,6 +413,25 @@ class ChatController:
             turn.cancel()
         self._turn = None
         self._turn_branch = ''
+
+    def enqueue(
+        self: ChatController,
+        branch: str,
+        prompt: str,
+        explicit: Optional[str],
+    ) -> None:
+        """Queue a send typed while a turn is in flight (FIFO, branch-stamped)."""
+        self._queue.append((branch, prompt, explicit))
+
+    def dequeue(self: ChatController) -> Optional[tuple[str, str, Optional[str]]]:
+        """Pop the oldest queued send; ``None`` when the queue is empty."""
+        return self._queue.popleft() if self._queue else None
+
+    def clear_queue(self: ChatController) -> list[tuple[str, str, Optional[str]]]:
+        """Drop every queued send, returning the dropped entries."""
+        dropped = list(self._queue)
+        self._queue.clear()
+        return dropped
 
     @property
     def spin_frame(self: ChatController) -> int:

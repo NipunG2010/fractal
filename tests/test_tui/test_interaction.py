@@ -512,13 +512,13 @@ async def test_chat_stream_coalesces_and_survives_rescope(
         # the compose session defaults to the leaf's last loop session, so the
         # turn forks it (an explicit session always wins the transport)
         app.start_chat('hi there')
-        assert app.query('#m_chatpending')  # the in-flight spinner is pinned
+        assert app.query('.chatpending')  # the in-flight spinner is pinned
         app.scope_to('main')  # look away mid-stream
         for _ in range(100):
             await pilot.pause(0.05)
             if app.chat.turn is None:
                 break
-        assert not app.query('#m_chatpending')  # the spinner left with the turn
+        assert not app.query('.chatpending')  # the spinner left with the turn
         convo = app.chat.transcript(leaf)
         assert convo[0] == ('you', 'hi there')
         forked = session_for(leaf, 1, 1)

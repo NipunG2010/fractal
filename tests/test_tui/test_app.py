@@ -198,9 +198,9 @@ async def test_cancelling_an_in_flight_turn_notes_it_and_drops_the_spinner(
 ) -> None:
     """Cancelling a live turn kills it, notes the cancel, and clears the spinner.
 
-    This is the lever a re-send pulls before spawning the next turn: the prior
-    turn's subprocess is killed (worker cancellation alone cannot unblock a
-    readline) and a ``cancelled`` line lands in the transcript.
+    This is the lever an interrupt pulls: the turn's subprocess is killed
+    (worker cancellation alone cannot unblock a readline) and a ``cancelled``
+    line lands in the transcript.
     """
     events = [
         ChatEvent(kind='session', text='chat-sess'),
@@ -217,12 +217,12 @@ async def test_cancelling_an_in_flight_turn_notes_it_and_drops_the_spinner(
         turn = app.chat.turn
         assert turn is not None
         await pilot.pause()
-        assert app.query('#m_chatpending')  # the spinner is pinned
-        app._cancel_turn()  # the lever a re-send pulls
+        assert app.query('.chatpending')  # the spinner is pinned
+        app._cancel_turn()  # the lever an interrupt pulls
         await pilot.pause()
         assert turn.cancelled  # the subprocess was killed
         assert app.chat.turn is None
-        assert not app.query('#m_chatpending')  # the spinner left with the turn
+        assert not app.query('.chatpending')  # the spinner left with the turn
         convo = app.chat.transcript('main.alpha')
         assert any(who == 'meta' and text == 'cancelled' for who, text in convo)
 
