@@ -232,7 +232,12 @@ class GrokAgent(Agent):
         return _rates(model)
 
     @classmethod
-    def _seed(cls: type[GrokAgent], node_dir: pathlib.Path) -> None:
+    def _seed(
+        cls: type[GrokAgent],
+        node_dir: pathlib.Path,
+        *,
+        parent_dir: Optional[pathlib.Path] = None,
+    ) -> None:
         """Link the node's grok auth through to the global home."""
         # grok auth must stay global: GROK_HOME points at this node dir, but
         # the credential is shared via a symlink to the global grok home --
