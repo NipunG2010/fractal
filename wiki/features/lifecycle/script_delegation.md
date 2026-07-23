@@ -26,9 +26,10 @@ uniform and per-deployment customization has a place to land.
 
 Status flips and slot checks happen under the `.worktrees` file lock: per-node
 helpers re-check their guards under that lock so concurrent fan-outs serialize,
-and flips are atomic. The scripts themselves run *outside* the lock — they do
-slow work (git worktrees, tmux, remotes) that must not hold up every other
-lifecycle operation on the tree.
+and flips are atomic. Scripts that perform slow work (git worktrees, remotes)
+run *outside* the lock so they do not hold up lifecycle operations elsewhere in
+the tree. `start.sh` is the bounded exception: start holds the lock through its
+runtime handoff so fresh, continued, tmux and headless launches cannot overlap.
 
 ## What the scripts do
 

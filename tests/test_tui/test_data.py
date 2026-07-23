@@ -30,7 +30,7 @@ __all__ = [
     'test_display_name_of',
     'test_tree_topology_and_flags',
     'test_tree_shows_crashed_active_as_exited',
-    'test_tree_keeps_live_headless_node_active',
+    'test_tree_reconciles_headless_process_identity',
     'test_crash_between_quiet_builds_reconciles_to_exited',
     'test_active_card_streams_live_state',
     'test_settled_card_is_a_time_machine',
@@ -127,22 +127,44 @@ def test_tree_shows_crashed_active_as_exited(
     assert data.status('main.gamma') == 'active'
 
 
-def test_tree_keeps_live_headless_node_active(
+@pytest.mark.parametrize(
+    ('probe', 'recorded', 'expected'),
+    [
+        ('live', True, 'active'),
+        ('permission', False, 'active'),
+        ('recycled', False, 'exited'),
+    ],
+)
+def test_tree_reconciles_headless_process_identity(
     data: TuiData,
     builder: SnapshotBuilder,
     monkeypatch: pytest.MonkeyPatch,
+    probe: str,
+    recorded: bool,
+    expected: str,
 ) -> None:
-    """A live headless process group is authoritative without tmux."""
+    """Headless display liveness is conservative and rejects PID reuse."""
     branch = 'main.gamma'
     node_dir = data.node_dir(branch)
     assert node_dir is not None
     (node_dir / '.headless').write_text('headless\n', encoding='utf-8')
     (node_dir / '.pgid').write_text('4242\n', encoding='utf-8')
     monkeypatch.setattr(data, 'live_sessions', frozenset)
-    monkeypatch.setattr('fractal.tui.data.os.killpg', lambda pgid, signal: None)
+    if probe == 'permission':
+
+        def killpg(pgid: int, signal: int) -> None:
+            raise PermissionError
+
+        monkeypatch.setattr('fractal.tui.data.os.killpg', killpg)
+    else:
+        monkeypatch.setattr('fractal.tui.data.os.killpg', lambda pgid, signal: None)
+    monkeypatch.setattr(
+        'fractal.tui.data._recorded_group',
+        lambda pgid, recorded_at: recorded,
+    )
     snap = builder.build('main')
     statuses = {row['branch']: row['status'] for row in snap.tree}
-    assert statuses[branch] == 'active'
+    assert statuses[branch] == expected
 
 
 def test_crash_between_quiet_builds_reconciles_to_exited(

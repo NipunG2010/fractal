@@ -1513,14 +1513,13 @@ class Node:
                         )
                     self._enforce_rearm_limits()
                     self.status_set('idle')
-                # launch outside the lock -- the idle re-arm above already holds
-                # the slot; roll a failed launch back to the settled status so
-                # --continue stays the retry path (idle reads as never-started)
-                try:
-                    result = self._run_script('start.sh', *args)
-                except Exception:
-                    self.status_set(current_status)
-                    raise
+                    # keep the boot handoff atomic across runtime backends; roll
+                    # a failed launch back so --continue stays the retry path
+                    try:
+                        result = self._run_script('start.sh', *args)
+                    except Exception:
+                        self.status_set(current_status)
+                        raise
             except Exception:
                 # a refused gate or failed launch must not keep the retune --
                 # restore the priors in both stores (config.json, and the

@@ -7,11 +7,13 @@ merge-to-parent semantics.
 
 from __future__ import annotations
 
+import concurrent.futures
 import fcntl
 import os
 import pathlib
 import signal
 import subprocess
+import threading
 import time
 from typing import NoReturn, Optional
 
@@ -38,6 +40,7 @@ __all__ = [
     'test_start_only_from_idle',
     'test_start_continue_from_terminal',
     'test_start_headless_selects_detached_backend',
+    'test_start_serializes_runtime_backends',
     'test_start_continue_re_arms_after_drained_run',
     'test_start_continue_refuses_after_budget_end',
     'test_start_continue_rolls_back_retune_on_refusal_or_failed_launch',
@@ -225,6 +228,45 @@ def test_start_headless_selects_detached_backend(
     run_scripts = _stub_run_script(monkeypatch, node)
     node.start(headless=True)
     assert run_scripts == [('start.sh', f'{node._root}', '--headless')]
+
+
+def test_start_serializes_runtime_backends(
+    node_with_db: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tmux start cannot enter while a headless handoff is in progress."""
+    node = node_with_db
+    node.config.set('max_cost', 1.0)
+    node.status_set('stopped')
+    entered = threading.Event()
+    raced = threading.Event()
+    release = threading.Event()
+
+    def run_script(
+        script: str,
+        *args: str,
+    ) -> subprocess.CompletedProcess[str]:
+        entered.set()
+        assert release.wait(timeout=5)
+        node.status_set('active')
+        return subprocess.CompletedProcess([script, *args], 0, '', '')
+
+    def start_tmux() -> str:
+        raced.set()
+        return node.start()
+
+    monkeypatch.setattr(node, '_run_script', run_script)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        launch = pool.submit(node.start, continue_run=True, headless=True)
+        assert entered.wait(timeout=5)
+        competing = pool.submit(start_tmux)
+        assert raced.wait(timeout=5)
+        with pytest.raises(concurrent.futures.TimeoutError):
+            competing.result(timeout=0.1)
+        release.set()
+        launch.result(timeout=5)
+        with pytest.raises(RuntimeError, match="Cannot start from status: 'active'"):
+            competing.result(timeout=5)
 
 
 def test_headless_liveness_reconciles_a_dead_process_group(
