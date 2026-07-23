@@ -276,7 +276,18 @@ defaults — files or directories to avoid, patterns to follow, tools to use or
 skip, style preferences. If the user has additions, append them to the
 `## Rules` section. If not, move on.
 
-**d) Budget and scope.** Ask about cost limits (`--max-cost` caps each run —
+**d) Decomposition.** Always ask how much the node should be encouraged to
+decompose — how wide and how deep. Wide is `--max-children` and
+`--max-descendants` (how many subtasks can run in parallel); deep is
+`--max-depth` (how many management levels below this node). All three default to
+unlimited, and `0` disables spawning. Map the answer onto those caps, and write
+the encouragement itself into the `## Instructions` section of
+`<node_dir>/NODE.md`: the seed's Delegation rule already tells a node with
+nonzero caps to spawn when a subtask is separable, so record only a deviation
+from that default — decompose more aggressively, or hold back and work solo
+unless a subtask is clearly independent.
+
+**e) Budget and scope.** Ask about cost limits (`--max-cost` caps each run —
 runs are isolated — `--max-iter-cost` caps per-iteration). `--max-cost` is
 optional but strongly recommended: without it the node runs **uncapped** — a
 warning at start, bounded only by `--max-iters`/`--timeout` — so settle on a cap
@@ -313,12 +324,12 @@ config commit: the tip sha plus the baseline figures the comparison will read
 against. Comparisons read against the declared baseline, never against stale
 round figures.
 
-**e) Remote pushing.** Nodes push their branch to `origin` after each commit by
+**f) Remote pushing.** Nodes push their branch to `origin` after each commit by
 default; `--local` keeps commits local. Err on the side of `--local`: pass it
 unless the user has made it clear they want commits pushed to the remote. With
 no remote the push is skipped automatically, so move on.
 
-**f) Iteration steps.** Briefly explain how each iteration works: sync runs
+**g) Iteration steps.** Briefly explain how each iteration works: sync runs
 automatically before each numbered step to handle radio communication (inbox,
 feed, parent directives), then the step itself executes. The default steps are
 prepare, plan, execute, review, and commit — but steps can be added, removed, or
@@ -338,16 +349,16 @@ isolates a single step in its own session within a continuous node, and
 `requires_approval: true` holds the loop after the step completes until the
 operator approves it (`fractal node pending`/`approve`).
 
-**g) Environment setup.** Ask if the project needs environment preparation
+**h) Environment setup.** Ask if the project needs environment preparation
 (virtual environments, dependencies, containers, build steps). If so, edit
 `<node_dir>/scripts/setup.sh`. It runs automatically at the start of every
 iteration and must be idempotent.
 
-**h) Validation and testing.** Mention that `<node_dir>/scripts/lint.sh` runs
+**i) Validation and testing.** Mention that `<node_dir>/scripts/lint.sh` runs
 before each commit, and `<node_dir>/scripts/test.sh` is called by the agent
 during execution. Ask if the user wants to configure either.
 
-**i) Review.** Once all sections are defined, print the final contents of
+**j) Review.** Once all sections are defined, print the final contents of
 `<node_dir>/NODE.md` so the user can review it. Ask if anything needs
 adjustment. Iterate until the user is satisfied.
 
