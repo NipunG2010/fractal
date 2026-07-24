@@ -49,11 +49,13 @@ __all__ = [
     'node_seed',
 ]
 
+# consumers bind list columns by header name, never by position
 _LIST_COLUMNS = [
     'status',
     'node',
     'title',
     'max_cost',
+    'spend',
     'max_depth',
     'max_children',
     'max_descendants',
@@ -800,9 +802,11 @@ def node_list(app: typer.Typer) -> typer.Typer:
         """List a node's descendants with status (blank limit columns mean unlimited).
 
         Lists descendants only -- it never includes the target row; use
-        ``fractal node status`` for the node's own status. ``last`` is
-        the age of each node's newest activity; ``!`` flags an active
-        node quiet past ``max(step_timeout, 5m)``.
+        ``fractal node status`` for the node's own status. ``spend`` is
+        the current run's subtree cost, the scope ``max_cost`` beside it
+        is enforced at, and is blank for a node that has never run.
+        ``last`` is the age of each node's newest activity; ``!`` flags an
+        active node quiet past ``max(step_timeout, 5m)``.
         """
         # validate arguments
         require_non_negative(max_depth=max_depth)

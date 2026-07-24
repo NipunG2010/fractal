@@ -54,6 +54,12 @@ subtree** -- is what `spent` totals and what budget enforcement reads. A deleted
 child's recorded runs still count; history outlives the registry. `--max-depth`
 bounds the walk (`0` is this node alone, `1` adds direct children).
 
+`fractal node list`'s `spend` column is this same reading, one row per
+descendant, so it compares directly against the `max_cost` printed beside it --
+the listing would mislead if the two columns disagreed on scope. It rounds to
+cents and stays blank for a node with no recorded runs, which is not the same
+claim as a spend of `0`.
+
 `fractal node cost breakdown` renders the same lineage as a per-branch table:
 the target's own row leads with its cap, each still-registered descendant
 follows (idle children read `0.00`), and any lineage descendant whose registry

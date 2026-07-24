@@ -60,6 +60,10 @@ logger = logging.getLogger(__name__)
 # earns the '!' suffix on the rendered age
 _STALE_AGE_FLOOR_SECONDS = 300.0
 
+# the listing's spend column is a steering read, not an invoice, so it
+# rounds to cents -- the ledger commands report the full precision
+_SPEND_PRECISION = 2
+
 
 class Node:
     """An autonomous agent node in a git worktree.
@@ -2990,10 +2994,12 @@ class Node:
         :meth:`_reconcile_status`, not just relabeled -- before listing, so
         the fleet's default steering read never echoes a dead loop as
         ``active``. Cap columns render each present child's live config
-        values; a gone worktree keeps the registry caps. The ``last``
-        column renders each row's newest activity instant as a compact
-        age, flagged (``12m!``) when an active node has sat quiet past
-        ``max(step_timeout, 5m)``.
+        values; a gone worktree keeps the registry caps. ``spend`` reads
+        against the ``max_cost`` beside it at the same scope the cap is
+        enforced at -- the current run's subtree spend -- and is blank for
+        a node with no recorded runs. The ``last`` column renders each
+        row's newest activity instant as a compact age, flagged (``12m!``)
+        when an active node has sat quiet past ``max(step_timeout, 5m)``.
 
         Args:
             all_nodes: Include retired nodes in output.
@@ -3115,15 +3121,25 @@ class Node:
                     if age > max(step_timeout or 0.0, _STALE_AGE_FLOOR_SECONDS):
                         last += '!'
             # a gone worktree keeps its registry caps -- the only surviving
-            # source -- so it skips the drift overlay, not the row itself
+            # source -- and yields no spend: the live config and the ledger
+            # are both reached through the node
             drifted = {}
+            spend = None
             if node is not None:
                 caps = ('max_cost', 'max_depth', 'max_children', 'max_descendants')
                 for key in caps:
                     config_value = node.config.get(key)
                     if config_value is not None and config_value != row[key]:
                         drifted[key] = config_value
-            row = {**row, **drifted, 'last': last}
+                # spend reads against the max_cost beside it -- the same scope
+                # the cap is enforced at: the current run's subtree spend
+                # (active run, else the most recent); resolving the run here
+                # rather than inside Cost.spent keeps a never-run node blank
+                # instead of reporting its 0.0 as a real reading
+                *_, run_id = node.record.resolve_context()
+                if run_id is not None:
+                    spend = round(node.cost.spent(run_id=run_id), _SPEND_PRECISION)
+            row = {**row, **drifted, 'spend': spend, 'last': last}
             capped.append(row)
         rows = capped
         # decorate the displayed status with each active descendant's pending
