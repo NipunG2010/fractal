@@ -27,15 +27,21 @@ Commands run from the repository root act as the user node.
 **Status at a glance.** `fractal node list` lists a node's descendants with
 status, spend, and limits (run from the root it shows the whole tree; it never
 includes the target row itself — `fractal node status <node>` gives one node's
-status). `spend` sits next to `max_cost` and reads at the scope that cap is
-enforced at: the current run's spend including descendant runs chained under it
-(see [[features/cost/measurement|measurement]]). It is blank for a node that has
-never run — no reading, as distinct from a spend of $0 — and rounded to cents, a
-steering read rather than an invoice. The `last` column is the age of each
-node's newest activity, and a `!` flags an active node that has been quiet past
-`max(step_timeout, 5m)` — the first sign of a hang. `--live` re-checks reality:
-it relabels a crashed active node (no tmux session) as `exited` and drops nodes
-whose worktree is gone.
+status). `status` is always the bare lifecycle status, and any qualifier rides
+the `detail` column beside it: a pending `pausing`/`stopping`/`finishing`
+signal, an `exited` run's recorded end reason, or `orphaned` for a settled node
+whose worktree was removed out of band. Keeping the two apart is what lets a
+script select on `status` without defending against a suffix — and end reasons
+carry parentheses of their own, so a composed `exited (<reason>)` could not be
+split back apart reliably. `spend` sits next to `max_cost` and reads at the
+scope that cap is enforced at: the current run's spend including descendant runs
+chained under it (see [[features/cost/measurement|measurement]]). It is blank
+for a node that has never run — no reading, as distinct from a spend of $0 — and
+rounded to cents, a steering read rather than an invoice. The `last` column is
+the age of each node's newest activity, and a `!` flags an active node that has
+been quiet past `max(step_timeout, 5m)` — the first sign of a hang. `--live`
+re-checks reality: it relabels a crashed active node (no tmux session) as
+`exited` and drops nodes whose worktree is gone.
 
 **History and spend.** `fractal node activity` shows a node's lifecycle activity
 most recent first, each row with its own-node step cost.

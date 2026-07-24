@@ -52,6 +52,7 @@ __all__ = [
 # consumers bind list columns by header name, never by position
 _LIST_COLUMNS = [
     'status',
+    'detail',
     'node',
     'title',
     'max_cost',
@@ -802,7 +803,9 @@ def node_list(app: typer.Typer) -> typer.Typer:
         """List a node's descendants with status (blank limit columns mean unlimited).
 
         Lists descendants only -- it never includes the target row; use
-        ``fractal node status`` for the node's own status. ``spend`` is
+        ``fractal node status`` for the node's own status. ``status`` is
+        always bare and ``detail`` carries any qualifier (a pending
+        signal, an exited run's end reason, ``orphaned``). ``spend`` is
         the current run's subtree cost, the scope ``max_cost`` beside it
         is enforced at, and is blank for a node that has never run.
         ``last`` is the age of each node's newest activity; ``!`` flags an

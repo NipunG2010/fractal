@@ -385,11 +385,12 @@ def test_list_surfaces_pending_signal_and_filters_on_base(
     repo: dict,
     live_loop: Callable[[pathlib.Path], None],
 ) -> None:
-    """``node list`` shows ``active (stopping)``; ``--status=active`` still matches.
+    """``node list`` reports ``stopping`` in ``detail``; the status stays ``active``.
 
-    The pending-signal suffix is display-only: the status filter compares the
-    bare first chunk, so a winding-down child is still selected by
-    ``--status=active`` and still counted as active by the loop's child count.
+    The pending signal rides its own column, so a machine consumer selecting
+    on ``status`` never has to defend against a qualifier: a winding-down
+    child reads plain ``active``, is still selected by ``--status=active``,
+    and is still counted as active by the loop's child count.
     """
     root = repo['root']
     wt, _ = _arm(root, 'listdec')
@@ -398,9 +399,10 @@ def test_list_surfaces_pending_signal_and_filters_on_base(
     # the parent's listing surfaces the child's pending stop
     listing = _run(root, 'node', 'list')
     assert listing.returncode == 0
-    rows = {r['node']: r['status'] for r in csv.DictReader(io.StringIO(listing.stdout))}
-    assert rows['main.listdec'] == 'active (stopping)'
-    # the bare-first-chunk filter still selects the winding-down child
+    rows = {r['node']: r for r in csv.DictReader(io.StringIO(listing.stdout))}
+    assert rows['main.listdec']['status'] == 'active'
+    assert rows['main.listdec']['detail'] == 'stopping'
+    # the status filter still selects the winding-down child
     filtered = _run(root, 'node', 'list', '--status', 'active')
     selected = [r['node'] for r in csv.DictReader(io.StringIO(filtered.stdout))]
     assert 'main.listdec' in selected

@@ -3,7 +3,8 @@
 Covers default vs ``--all`` filtering, the live view (trusting real
 state and relabeling crashed-active rows), config-cap overlays over
 stale registry rows, orphan flagging, and the ``last`` activity-age
-column with its staleness flag, plus the spend reading.
+column with its staleness flag, plus the spend reading and the split of
+the status qualifier into its own column.
 """
 
 from __future__ import annotations
@@ -232,12 +233,13 @@ def test_list_decorates_exited_with_run_reason(
     git_repo: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A decorated listing carries an exited child's recorded end reason.
+    """A decorated listing carries an exited child's end reason in ``detail``.
 
-    ``node list`` inherits the ``status_display`` terminal decoration: an
-    ``exited`` row whose latest run recorded why it ended reads
-    ``exited (<reason>)``. Display-only -- the bare listing stays cheap,
-    and status filters still match on the bare first chunk.
+    The reason rides its own column, never a suffix on ``status``: end
+    reasons contain parentheses of their own (a budget landing quotes the
+    figures), so a consumer splitting a composed ``exited (<reason>)`` back
+    apart cannot do it reliably. ``status`` stays bare either way, and the
+    undecorated listing stays cheap by leaving ``detail`` empty.
     """
     parent, child = _spawn_parent_child(git_repo, monkeypatch)
     # land the child's run on its budget with the boundary's reason recorded
@@ -245,12 +247,14 @@ def test_list_decorates_exited_with_run_reason(
     run_id = _active_run(child)
     child.record.run_end(run_id=run_id, status='exited', exit_code=0, metadata=reason)
     child.status_set('exited')
-    # the decorated listing carries the reason; the bare one stays bare
-    decorated = {row['node']: row['status'] for row in parent.list(decorated=True)}
-    assert decorated[child.branch] == f'exited ({reason})'
-    plain = {row['node']: row['status'] for row in parent.list()}
-    assert plain[child.branch] == 'exited'
-    # filters match the bare first chunk, decoration notwithstanding
+    # the decorated listing carries the reason whole, beside a bare status
+    decorated = {row['node']: row for row in parent.list(decorated=True)}
+    assert decorated[child.branch]['status'] == 'exited'
+    assert decorated[child.branch]['detail'] == reason
+    plain = {row['node']: row for row in parent.list()}
+    assert plain[child.branch]['status'] == 'exited'
+    assert not plain[child.branch]['detail']
+    # the filter selects on the status column itself
     filtered = parent.list(status='exited', decorated=True)
     assert [row['node'] for row in filtered] == [child.branch]
 

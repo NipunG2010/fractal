@@ -1038,9 +1038,9 @@ def test_rm_rf_worktree_lists_orphan_then_force_deletes(repo: dict) -> None:
 def test_list_shows_stored_status_for_orphaned_terminal_node(repo: dict) -> None:
     """Out-of-band git cleanup keeps a terminal node's stored status listable.
 
-    Plain ``list`` must render ``completed (orphaned)`` -- the stored
-    terminal status stays visible, with the bare ``orphan`` alarm reserved
-    for live-ish rows (active/idle) whose artifacts vanished. Creates and
+    Plain ``list`` must keep the stored terminal status visible and flag the
+    orphaning in ``detail``, with the bare ``orphan`` status reserved for
+    live-ish rows (active/idle) whose artifacts vanished. Creates and
     removes its own node, so the shared fixture is left as found.
     """
     root = repo['root']
@@ -1053,8 +1053,13 @@ def test_list_shows_stored_status_for_orphaned_terminal_node(repo: dict) -> None
 
     # the stored terminal status survives in the listing, orphaning marked
     listing = _run(root, 'node', 'list', '--csv').stdout
-    row = next(line for line in listing.splitlines() if 'main.done' in line)
-    assert 'completed (orphaned)' in row
+    row = next(
+        entry
+        for entry in csv.DictReader(io.StringIO(listing))
+        if entry['node'] == 'main.done'
+    )
+    assert row['status'] == 'completed'
+    assert row['detail'] == 'orphaned'
 
     # cleanup: deregister the orphan row (branch pruning is best-effort)
     deleted = _run(root, 'node', 'delete', 'main.done', '--force')
