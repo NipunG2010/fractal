@@ -99,6 +99,10 @@ else
     # instead: require the squash marker, fully staged resolutions, and
     # provenance from this branch; continuing a stranger's squash would strip
     # the wrong seed and advance the wrong merge-base
+    # the pre-merge base, captured before the squash lands: it is what the
+    # node's own offering is measured against below, and the merge-base advance
+    # would otherwise move it to the target's HEAD
+    PRE_MERGE_BASE=$(git -C "$PARENT_WORKTREE_DIR" merge-base HEAD "$BRANCH" 2>/dev/null || true)
     SQUASH_MSG_FILE=$(git -C "$PARENT_WORKTREE_DIR" rev-parse --git-path SQUASH_MSG)
     [[ "$SQUASH_MSG_FILE" = /* ]] || SQUASH_MSG_FILE="$PARENT_WORKTREE_DIR/$SQUASH_MSG_FILE"
     if [[ ! -f "$SQUASH_MSG_FILE" ]]; then
@@ -177,6 +181,47 @@ advance_merge_base() {
         # below stays the single user-facing line
         git -C "$WORKTREE_DIR" merge -q -s ours --no-edit "$PARENT_BRANCH"
     fi
+}
+
+# name the paths a --continue's resolution settled against the node: ones it
+# offered that the target now holds differently; the squash records no per-hunk
+# ancestry, so the node keeps its own version and the next merge re-stages it
+# cleanly -- an explicit rejection silently undone unless the operator pushes
+# the resolution down to the node
+warn_resolved_against_node() {
+    # scope to the paths the node itself changed since the pre-merge base, the
+    # way delete.sh scopes its unmerged check -- a symmetric tree diff would
+    # also name everything the target owns and the node never had; exclude the
+    # seed (the merge strips it) and the generated wiki indexes plus the
+    # tool-owned .wiki/ dir (the merge regenerates them on the target, so the
+    # node's copies always differ)
+    [[ -n "$PRE_MERGE_BASE" ]] || return 0
+    if [[ "$PROJECT_PATH" == "." ]]; then
+        WIKI_PREFIX="wiki"
+    else
+        WIKI_PREFIX="$PROJECT_PATH/wiki"
+    fi
+    # read NUL-delimited so a path with spaces stays one entry and a non-ASCII
+    # name is never C-quoted by core.quotePath into a pathspec matching nothing
+    OFFERED_PATHS=()
+    while IFS= read -r -d '' OFFERED_PATH; do
+        OFFERED_PATHS+=("$OFFERED_PATH")
+    done < <(git -C "$PARENT_WORKTREE_DIR" diff --name-only -z \
+        "$PRE_MERGE_BASE" "$BRANCH" -- ":!$SEED_PREFIX" \
+        ":(exclude,glob)$WIKI_PREFIX/**/_index.md" ":!$WIKI_PREFIX/.wiki" \
+        2>/dev/null || true)
+    [[ ${#OFFERED_PATHS[@]} -gt 0 ]] || return 0
+    RESOLVED_PATHS=()
+    while IFS= read -r -d '' RESOLVED_PATH; do
+        RESOLVED_PATHS+=("$RESOLVED_PATH")
+    done < <(git -C "$PARENT_WORKTREE_DIR" diff --name-only -z HEAD "$BRANCH" \
+        -- "${OFFERED_PATHS[@]}" 2>/dev/null || true)
+    [[ ${#RESOLVED_PATHS[@]} -gt 0 ]] || return 0
+    RESOLVED_LIST=$(printf '%s, ' "${RESOLVED_PATHS[@]}")
+    echo "Warning: $PARENT_BRANCH keeps its own content over $BRANCH's in" \
+        "${#RESOLVED_PATHS[@]} file(s) (${RESOLVED_LIST%, }); $BRANCH still" \
+        "carries its version, so a later re-merge re-stages it -- land the" \
+        "resolution on $BRANCH (or retire it) to make the decision stick" >&2
 }
 
 if [[ "$CONTINUE" -eq 0 ]]; then
@@ -279,6 +324,7 @@ if git -C "$PARENT_WORKTREE_DIR" diff --cached --quiet; then
         rm -f "$MARKER"
     done
     advance_merge_base
+    warn_resolved_against_node
     end_merge_event completed
     echo "Nothing to commit for $PARENT_BRANCH: the resolution kept its own" \
         "content for every change $BRANCH offered"
@@ -329,6 +375,12 @@ fi
 trap - INT TERM
 
 advance_merge_base
+
+# only a hand-resolved squash can settle a hunk against the node: a clean merge
+# takes the node's content wholesale, so its trees already agree
+if [[ "$CONTINUE" -eq 1 ]]; then
+    warn_resolved_against_node
+fi
 
 end_merge_event completed
 echo "Squash-merged $BRANCH into $PARENT_BRANCH"

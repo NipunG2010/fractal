@@ -454,15 +454,18 @@ Once the node is running, briefly explain how to interact with it:
   and stage the conflicts, then finish with
   `fractal node merge <branch> --continue` rather than committing yourself — the
   continue runs the rest of the merge (seed strip, wiki index refresh, commit,
-  merge-base advance) that a hand-rolled finish would miss. Deleting afterward
-  with `fractal node delete <branch>` is optional hygiene, never automatic — a
-  merged branch keeps audit value (delete must run from outside the worktree).
-  **Delete is destructive:** it is recursive — removing the node's whole subtree
-  — and force-removes each worktree and **force-deletes the branch(es)
-  regardless of merge state**, so any committed-but-unmerged work is lost.
-  Always confirm the `merge` succeeded first (check its output). To keep a
-  node's branch while hiding it, retire it instead. Delete prompts for
-  confirmation `[y/N]`; pass `--force`/`-f` to skip the prompt.
+  merge-base advance) that a hand-rolled finish would miss, and names every file
+  where the resolution kept the target's content over the node's — the node
+  still carries its own version there, so land the resolution on the node (or
+  retire it) or a later re-merge silently re-stages it. Deleting afterward with
+  `fractal node delete <branch>` is optional hygiene, never automatic — a merged
+  branch keeps audit value (delete must run from outside the worktree). **Delete
+  is destructive:** it is recursive — removing the node's whole subtree — and
+  force-removes each worktree and **force-deletes the branch(es) regardless of
+  merge state**, so any committed-but-unmerged work is lost. Always confirm the
+  `merge` succeeded first (check its output). To keep a node's branch while
+  hiding it, retire it instead. Delete prompts for confirmation `[y/N]`; pass
+  `--force`/`-f` to skip the prompt.
 - **Reset:** `fractal reset` (from anywhere in the repo) tears down every node
   worktree, branch, and registration in one sweep; the project, wiki, and all
   history in the central database survive, so fresh nodes spawn immediately

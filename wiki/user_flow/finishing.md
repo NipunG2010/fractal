@@ -86,6 +86,15 @@ should know:
   resolution never hand-rolls those steps or strands seed files in the target
   working tree. Its failure paths leave the staged resolution in place (never
   `reset --hard`); fix and re-run.
+- **A resolution against the node does not reach it.** The squash records no
+  per-hunk ancestry, so a hunk you resolve in the target's favor stays resolved
+  only on the target — the node still carries its own version, and because the
+  merge-base advanced, the next merge re-stages it cleanly and silently, undoing
+  your decision without a conflict to warn you. A `--continue` therefore ends by
+  naming every file where the target kept its content over the node's. Land that
+  resolution on the node (or retire/delete it) for the decision to stick. The
+  notice is scoped to what the node offered, so hunks you resolved the node's
+  way, and content the target owns that the node never had, are not named.
 - **Nothing to merge is a clean outcome.** A node whose changes are already on
   the target reports so and exits without committing. A `--continue` whose
   resolution kept the target's own content for every change the node offered

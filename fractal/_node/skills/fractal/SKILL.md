@@ -328,14 +328,17 @@ seed; once done, merge it and launch the target.
   by hand (`git merge --squash <branch>`), resolve and stage the conflicts, then
   finish with `fractal node merge <branch> --continue` rather than committing
   yourself -- the continue runs the rest of the merge (seed strip, wiki index
-  refresh, commit, merge-base advance) that a hand-rolled finish would miss, and
-  its own failures leave your staged resolution in place to fix and re-run.
-  Deleting after the merge (`fractal node delete <branch>`) is OPTIONAL hygiene,
-  never automatic -- a merged node's branch and records keep audit value, so
-  keep them unless clutter demands otherwise. Delete is destructive -- it
-  force-removes the worktree and force-deletes the branch (and the whole
-  subtree) regardless of merge state, discarding any unmerged work, so confirm
-  the merge succeeded first.
+  refresh, commit, merge-base advance) that a hand-rolled finish would miss. It
+  names every file where your resolution kept your content over the child's --
+  the child still carries its own version there, so land the resolution on the
+  child (or retire it) or a later re-merge silently re-stages it. The continue's
+  own failures leave your staged resolution in place to fix and re-run. Deleting
+  after the merge (`fractal node delete <branch>`) is OPTIONAL hygiene, never
+  automatic -- a merged node's branch and records keep audit value, so keep them
+  unless clutter demands otherwise. Delete is destructive -- it force-removes
+  the worktree and force-deletes the branch (and the whole subtree) regardless
+  of merge state, discarding any unmerged work, so confirm the merge succeeded
+  first.
 
 ## Continue mode
 

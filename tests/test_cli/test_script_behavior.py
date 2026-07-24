@@ -22,7 +22,10 @@ real CLI, pinning edges the end-to-end lifecycle tests don't reach:
   merge-base advance -- and refuses when no squash is in progress. A resolution
   that keeps the target's content for everything the node offered stages
   nothing, and still finishes that tail minus the commit, so the target is left
-  neither mid-squash nor primed to replay the resolved conflict.
+  neither mid-squash nor primed to replay the resolved conflict. It also names
+  the files it settled against the node -- a squash carries no per-hunk
+  ancestry, so the node keeps its version and a re-merge would silently undo
+  the decision.
 - **``delete.sh`` unmerged warning** surfaces commits the parent never absorbed
   on the automation path (the interactive prompt warns only the user) -- for
   non-ASCII file names too, which ``core.quotePath`` would otherwise C-quote
@@ -54,6 +57,7 @@ __all__ = [
     'test_failed_merge_restore_removes_the_staged_child_additions',
     'test_merge_continue_finishes_a_hand_resolved_squash',
     'test_merge_continue_finishes_a_target_only_resolution',
+    'test_merge_continue_names_files_resolved_against_the_node',
     'test_delete_warns_on_unmerged_commits',
     'test_delete_does_not_warn_after_squash_merge',
     'test_delete_does_not_warn_after_squash_merge_then_target_advances',
@@ -568,6 +572,75 @@ def test_merge_continue_finishes_a_target_only_resolution(
         env=_cli_env(),
     )
     assert again.returncode == 0, (again.stdout, again.stderr)
+    # every offered change was settled against the node, so the notice names it
+    assert 'tracked.txt' in result.stderr
+
+
+def test_merge_continue_names_files_resolved_against_the_node(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A ``--continue`` names the files it settled against the node, and only those.
+
+    A squash records no per-hunk ancestry, so a hunk resolved in the target's
+    favor does not reach the node: it keeps its own version and the next merge
+    re-stages it cleanly, silently undoing an explicit decision. The continue
+    warns with the files this happened to, scoped to what the node offered --
+    a notice that also fired for hunks resolved the node's way, or for content
+    the target owns and the node never had, would be noise and get ignored.
+    """
+    repo = _init_tree(tmp_path / 'resolvedrepo')
+    init = _run(repo, 'node', 'init', 'task', '--agent', 'claude', '--local')
+    assert init.returncode == 0, init.stderr
+    worktree = repo / '.worktrees' / 'main.task'
+    merge_sh = _scripts_dir() / 'merge.sh'
+
+    # both files conflict; the resolution below goes one way on each
+    for name, text in (
+        ('kept.txt', 'parent kept\n'),
+        ('dropped.txt', 'parent dropped\n'),
+    ):
+        (repo / name).write_text(text, encoding='utf-8')
+    _git(repo, 'add', '-A')
+    _git(repo, 'commit', '-m', 'parent adds both')
+    for name, text in (('kept.txt', 'node kept\n'), ('dropped.txt', 'node dropped\n')):
+        (worktree / name).write_text(text, encoding='utf-8')
+    _git(worktree, 'add', '-A')
+    _git(worktree, 'commit', '-m', 'node adds both')
+    conflicted = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert conflicted.returncode != 0, conflicted.stdout
+
+    # the operator keeps the node's content for one file, the target's for the
+    # other, so only the latter is a decision the node never learns about
+    subprocess.run(
+        ['git', 'merge', '--squash', 'main.task'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+    )
+    _git(repo, 'checkout', '--theirs', '--', 'kept.txt')
+    _git(repo, 'checkout', '--ours', '--', 'dropped.txt')
+    _git(repo, 'add', 'kept.txt', 'dropped.txt')
+
+    result = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}', '--continue'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert (repo / 'kept.txt').read_text(encoding='utf-8') == 'node kept\n'
+    assert (repo / 'dropped.txt').read_text(encoding='utf-8') == 'parent dropped\n'
+    # only the file the node still disagrees on is named
+    assert 'dropped.txt' in result.stderr
+    assert 'kept.txt' not in result.stderr
 
 
 # ------ delete.sh: unmerged-commit warning
