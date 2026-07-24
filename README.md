@@ -20,6 +20,17 @@ with live in a terminal UI.
 
 ![fractal TUI dashboard](https://raw.githubusercontent.com/plasma-ai/fractal/main/docs/_static/tui.png)
 
+> [!WARNING]
+> **Nodes run their agent without permission prompts by default.** Unattended
+> loops cannot stop to ask, so every seeded agent config disables the approval
+> gate — Claude `bypassPermissions`, Codex `danger-full-access`, Grok
+> `--always-approve`, opencode `--auto`, omp `--yolo`. A node can therefore run
+> any command its agent decides to run, with your credentials and your machine's
+> reach. The per-node `git worktree` isolates the *branch* it commits to, not
+> the filesystem, the network, or anything else outside it. Only launch nodes
+> whose task you would trust to run unsupervised, and prefer a sandboxed or
+> otherwise disposable host for anything else.
+
 ______________________________________________________________________
 
 **Source**:
