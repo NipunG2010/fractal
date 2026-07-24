@@ -2214,7 +2214,7 @@ class Node:
             return self.config.get('root')
         return None
 
-    def merge(self: Node) -> tuple[str, str]:
+    def merge(self: Node, *, continue_merge: bool = False) -> tuple[str, str]:
         """Squash-merge the node's branch into its merge target.
 
         ``merge.sh`` resolves the target -- the node's configured ``base`` if
@@ -2225,6 +2225,13 @@ class Node:
 
         The full commit history is preserved on the node's
         branch; only a single squash commit lands on the target.
+
+        ``continue_merge`` finishes a hand-resolved squash after a conflicted
+        merge: the operator redoes ``git merge --squash`` in the target
+        worktree, resolves and stages the conflicts, and the continue then
+        runs the merge's own tail -- seed strip, index refresh, commit,
+        merge-base advance -- so a manual resolution never has to hand-roll
+        those steps (a hand-rolled seed strip leaves working-tree residue).
 
         Refuses while the target is active or paused -- the squash, index
         refresh, and recovery ``reset --hard`` all mutate the target
@@ -2277,7 +2284,10 @@ class Node:
                     )
         # run merge script -- merge.sh resolves the target and logs the
         # merge event on it (it's the single source of truth for the target)
-        result = self._run_script('merge.sh', f'{self._root}')
+        args = [f'{self._root}']
+        if continue_merge:
+            args.append('--continue')
+        result = self._run_script('merge.sh', *args)
         # success-path warnings ride stderr (e.g. a skipped merge-base
         # advance predicting spurious re-merge diffs) and would vanish with
         # the CompletedProcess -- return them beside the output

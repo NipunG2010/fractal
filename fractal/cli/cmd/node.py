@@ -535,6 +535,12 @@ def node_merge(app: typer.Typer) -> typer.Typer:
     # node argument
     node_help = 'Target node branch (default: this node).'
     node = typer.Argument(None, help=node_help)
+    # continue flag
+    continue_help = (
+        'Finish a hand-resolved squash after a conflicted merge: strip the'
+        ' seed, refresh indexes, commit, and advance the merge-base.'
+    )
+    continue_ = typer.Option(False, '--continue', help=continue_help)
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
@@ -542,11 +548,12 @@ def node_merge(app: typer.Typer) -> typer.Typer:
     @command(app, 'merge')
     def _merge(
         node: Optional[str] = node,
+        continue_: bool = continue_,
         path: str = path,
     ) -> None:
         """Squash-merge a node's branch into its parent."""
         node = resolve_target(path, node)
-        output, notices = node.merge()
+        output, notices = node.merge(continue_merge=continue_)
         if output:
             typer.echo(output)
         # success-path warnings ride stderr so piped stdout stays parseable

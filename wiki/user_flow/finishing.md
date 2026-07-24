@@ -77,9 +77,21 @@ should know:
   under it — except by the target's own loop, which merges its settled children
   as part of its normal iteration), and while the target worktree has
   uncommitted changes. On conflict the target worktree is restored exactly as it
-  was, and the merge is yours to redo by hand.
+  was.
+- **Conflicts finish with `--continue`.** After a conflicted merge, redo the
+  squash by hand in the target worktree (`git merge --squash <branch>`), resolve
+  and stage the conflicts, then run `fractal node merge <node> --continue`: it
+  validates the staged squash came from the node's branch, then runs the merge's
+  own tail — seed strip, index refresh, commit, merge-base advance — so a manual
+  resolution never hand-rolls those steps or strands seed files in the target
+  working tree. Its failure paths leave the staged resolution in place (never
+  `reset --hard`); fix and re-run.
 - **Nothing to merge is a clean outcome.** A node whose changes are already on
-  the target reports so and exits without committing.
+  the target reports so and exits without committing. A `--continue` whose
+  resolution kept the target's own content for every change the node offered
+  reports that instead, and still finishes the tail — the squash state is
+  cleared and the merge-base advances, so the resolved conflict is not replayed
+  on the next merge.
 
 ## Reaching the base branch and review
 

@@ -448,7 +448,13 @@ Once the node is running, briefly explain how to interact with it:
   explicit `--max-cost`) on a stopped/exited node.
 - **Worktree:** The node runs in a git worktree at
   `<repo>/.worktrees/<branch>/`. The user's repo is untouched. When done, from
-  the repo root, merge with `fractal node merge <branch>`. Deleting afterward
+  the repo root, merge with `fractal node merge <branch>`. A conflicted merge
+  restores the target worktree exactly as it was and leaves the resolution to
+  you: redo the squash there by hand (`git merge --squash <branch>`), resolve
+  and stage the conflicts, then finish with
+  `fractal node merge <branch> --continue` rather than committing yourself — the
+  continue runs the rest of the merge (seed strip, wiki index refresh, commit,
+  merge-base advance) that a hand-rolled finish would miss. Deleting afterward
   with `fractal node delete <branch>` is optional hygiene, never automatic — a
   merged branch keeps audit value (delete must run from outside the worktree).
   **Delete is destructive:** it is recursive — removing the node's whole subtree
