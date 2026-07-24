@@ -47,6 +47,7 @@ __all__ = [
     'test_start_revalidates_hand_edited_config',
     'test_continue_refuses_to_discard_dirty_project_files',
     'test_continue_refusal_does_not_persist_the_max_cost_retune',
+    'test_continue_names_the_iter_cap_floor_a_retune_sits_under',
     'test_continue_clean_discards_and_proceeds',
     'test_continue_allows_node_dir_only_dirt',
     'test_continue_from_killed_prints_the_countermand',
@@ -238,6 +239,34 @@ def test_continue_refusal_does_not_persist_the_max_cost_retune(repo: dict) -> No
     # the refusal fired before the retune -- the child's cap is untouched
     after = _run(worktree, 'config', '_get', 'max_cost').stdout.strip()
     assert after == before
+
+
+def test_continue_names_the_iter_cap_floor_a_retune_sits_under(repo: dict) -> None:
+    """A ``--max-cost`` under the node's per-iteration cap names the floor.
+
+    The generic ordering rule is right in general but wrong here as an
+    explanation: at the retune site the operator asked for a run cap and
+    would get an error about ``max_iter_cost``, a config field they never
+    passed and whose value the message never states -- leaving them to
+    discover both the floor and the way past it. The continue's own refusal
+    names the floor and both remedies, and persists nothing.
+    """
+    worktree = _settled_node(repo, 'capfloor')
+    node = Node(worktree)
+    node.config.set('max_cost', 50.0)
+    node.config.set('max_iter_cost', 40.0)
+
+    result = _start_continue(repo, worktree, '--max-cost=30')
+
+    assert result.returncode != 0, result.stdout
+    # the floor, the field it comes from, and both ways past it
+    assert '$40.00' in result.stderr, result.stderr
+    assert 'max_iter_cost' in result.stderr, result.stderr
+    assert '--max-cost >= $40.00' in result.stderr, result.stderr
+    assert 'Started' not in result.stdout
+    # refused before the retune -- the node keeps its cap and stays settled
+    assert _run(worktree, 'config', '_get', 'max_cost').stdout.strip() == '50.0'
+    assert _run(worktree, 'node', 'status').stdout.strip() == 'exited'
 
 
 def test_continue_clean_discards_and_proceeds(repo: dict) -> None:

@@ -1258,7 +1258,10 @@ class Node:
         ``exited``/0 landing) never re-arms silently: a bare continue
         refuses, naming the spent and armed figures, and an explicit
         ``max_cost`` is applied through the parent's retune
-        (:meth:`child_retune`) before the launch.
+        (:meth:`child_retune`) before the launch. A retune below the node's
+        own ``max_iter_cost`` refuses in the continue's own terms, naming
+        that floor and both remedies -- the general ordering rule would
+        otherwise cite a config field the operator never passed.
 
         Every successful launch logs a completed ``start`` event (metadata
         ``continue`` on a continue), so the event log carries the node's
@@ -1404,6 +1407,20 @@ class Node:
                         'Commit them first, or pass --clean to discard them.'
                     )
             if max_cost is not None:
+                # a retune landing under the node's own per-iteration cap
+                # fails the config ordering rule; at the retune site the
+                # operator asked for a run cap, so name the floor and both
+                # ways past it rather than let the generic ordering error
+                # cite a field they never passed
+                max_iter_cost = self.config.get('max_iter_cost')
+                if max_iter_cost is not None and max_cost < float(max_iter_cost):
+                    floor = float(max_iter_cost)
+                    raise RuntimeError(
+                        f'--max-cost ${max_cost:.2f} sits below {self.branch}'
+                        f"'s per-iteration cap (${floor:.2f} max_iter_cost);"
+                        f' pass --max-cost >= ${floor:.2f}, or lower the'
+                        " node's max_iter_cost first."
+                    )
                 # echo the retune old -> new like `node update` -- a silent
                 # launch-time retune is indistinguishable from a dropped one
                 *_, name = self.branch.rsplit('.', 1)
