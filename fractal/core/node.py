@@ -3114,15 +3114,17 @@ class Node:
                         )
                     if age > max(step_timeout or 0.0, _STALE_AGE_FLOOR_SECONDS):
                         last += '!'
-            if node is None:
-                capped.append({**row, 'last': last})
-                continue
+            # a gone worktree keeps its registry caps -- the only surviving
+            # source -- so it skips the drift overlay, not the row itself
             drifted = {}
-            for key in ('max_cost', 'max_depth', 'max_children', 'max_descendants'):
-                config_value = node.config.get(key)
-                if config_value is not None and config_value != row[key]:
-                    drifted[key] = config_value
-            capped.append({**row, **drifted, 'last': last})
+            if node is not None:
+                caps = ('max_cost', 'max_depth', 'max_children', 'max_descendants')
+                for key in caps:
+                    config_value = node.config.get(key)
+                    if config_value is not None and config_value != row[key]:
+                        drifted[key] = config_value
+            row = {**row, **drifted, 'last': last}
+            capped.append(row)
         rows = capped
         # decorate the displayed status with each active descendant's pending
         # stop/finish signal (display-only); the filters below match on the bare
