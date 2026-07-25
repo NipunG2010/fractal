@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import time
 import tomllib
@@ -274,7 +275,7 @@ class CodexAgent(Agent):
                 raise RuntimeError(
                     f'codex preflight failed for model {model!r}\n'
                     f'(exit {process.returncode}):{detail}\n'
-                    "Check codex's output for the cause -- common ones:"
+                    "Check codex's output for the cause — common ones:"
                     ' an invalid or expired OPENROUTER_API_KEY (check the'
                     ' OpenRouter dashboard), account data-policy settings'
                     ' excluding the model, or a slug OpenRouter does not'
@@ -283,7 +284,7 @@ class CodexAgent(Agent):
             raise RuntimeError(
                 f'codex preflight failed for model {model!r}\n'
                 f'(exit {process.returncode}):{detail}\n'
-                "Check codex's output for the cause -- common ones:"
+                "Check codex's output for the cause — common ones:"
                 ' expired/invalid auth (re-run codex login), network or'
                 ' rate-limit errors (retry), or a model unavailable to this'
                 ' account (some ChatGPT-plan accounts lack access to some'
@@ -291,8 +292,29 @@ class CodexAgent(Agent):
             )
 
     @classmethod
-    def _seed(cls: type[CodexAgent], node_dir: pathlib.Path) -> None:
-        """Link the node's codex auth through to the global home."""
+    def _seed(
+        cls: type[CodexAgent],
+        node_dir: pathlib.Path,
+        *,
+        parent_dir: Optional[pathlib.Path] = None,
+    ) -> None:
+        """Carry the parent's instructions file and link auth globally."""
+        # carry the model instructions the inherited config names: codex
+        # resolves a relative model_instructions_file against CODEX_HOME and
+        # fails the run when the file is missing, so the file must travel
+        # with the parent's copied config; an absolute path resolves the
+        # same from every node and travels inside the config alone
+        if parent_dir is not None:
+            parent_config_dir = parent_dir / f'.{cls.name}'
+            instructions = _config_instructions(parent_config_dir / cls.config_file)
+            if instructions is not None and not instructions.is_absolute():
+                source = parent_config_dir / instructions
+                target = node_dir / f'.{cls.name}' / instructions
+                # a missing source seeds nothing (the parent's own codex
+                # fails the same way); an existing file is never overwritten
+                if source.is_file() and not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(source, target)
         # codex auth must stay global: CODEX_HOME points at this node dir, but
         # the credential is shared via a symlink to the global codex home --
         # codex writes auth.json in-place through the link (token refresh
@@ -363,3 +385,24 @@ def _compute_cost(
         + cached_tokens * cached_rate
         + output_tokens * output_rate
     )
+
+
+def _config_instructions(config: pathlib.Path) -> Optional[pathlib.Path]:
+    """Resolve the instructions file a codex config names.
+
+    Codex reads ``model_instructions_file`` from its ``CODEX_HOME``
+    ``config.toml``, resolving a relative value against ``CODEX_HOME``;
+    ``None`` when it names none.
+    """
+    if not config.is_file():
+        return None
+    # an unreadable or malformed config names no instructions file
+    try:
+        with open(config, 'rb') as file:
+            data = tomllib.load(file)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    instructions = data.get('model_instructions_file')
+    if isinstance(instructions, str) and instructions:
+        return pathlib.Path(instructions)
+    return None

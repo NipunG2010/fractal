@@ -62,6 +62,10 @@ logger = logging.getLogger(__name__)
 # earns the '!' suffix on the rendered age
 _STALE_AGE_FLOOR_SECONDS = 300.0
 
+# the listing's spend column is a steering read, not an invoice, so it
+# rounds to cents -- the ledger commands report the full precision
+_SPEND_PRECISION = 2
+
 
 class Node:
     """An autonomous agent node in a git worktree.
@@ -1096,7 +1100,7 @@ class Node:
         if '/' in branch:
             raise ValueError(
                 f'Cannot initialize a user node on branch {branch!r}:'
-                " branch names containing '/' are not supported -- switch"
+                " branch names containing '/' are not supported — switch"
                 ' to a slash-free branch and re-run init.'
             )
         # default the path to self._root relative to the repo root; coerce to a
@@ -1120,7 +1124,7 @@ class Node:
             if existing != path:
                 raise ValueError(
                     f'A fractal already exists on branch {branch!r} for project'
-                    f' {existing!r}; one branch maps to a single project --'
+                    f' {existing!r}; one branch maps to a single project —'
                     ' use a separate branch.'
                 )
         # derive the project name from the repo dir (dashes -> _, validated as an
@@ -1181,7 +1185,7 @@ class Node:
                     f'Another active fractal already uses the tmux name'
                     f' {repo_name!r} (session {clash!r}). Two fractals sharing a'
                     f' repository basename collide on node sessions and'
-                    f' `node kill` -- rename this repository directory or stop'
+                    f' `node kill` — rename this repository directory or stop'
                     f' that fractal first.'
                 )
         # write the project cache first so node_dir resolves under <project>/
@@ -1290,7 +1294,10 @@ class Node:
         ``exited``/0 landing) never re-arms silently: a bare continue
         refuses, naming the spent and armed figures, and an explicit
         ``max_cost`` is applied through the parent's retune
-        (:meth:`child_retune`) before the launch.
+        (:meth:`child_retune`) before the launch. A retune below the node's
+        own ``max_iter_cost`` refuses in the continue's own terms, naming
+        that floor and both remedies -- the general ordering rule would
+        otherwise cite a config field the operator never passed.
 
         Every successful launch logs a completed ``start`` event (metadata
         ``continue`` on a continue), so the event log carries the node's
@@ -1422,6 +1429,20 @@ class Node:
                         'Commit them first, or pass --clean to discard them.'
                     )
             if max_cost is not None:
+                # a retune landing under the node's own per-iteration cap
+                # fails the config ordering rule; at the retune site the
+                # operator asked for a run cap, so name the floor and both
+                # ways past it rather than let the generic ordering error
+                # cite a field they never passed
+                max_iter_cost = self.config.get('max_iter_cost')
+                if max_iter_cost is not None and max_cost < float(max_iter_cost):
+                    floor = float(max_iter_cost)
+                    raise RuntimeError(
+                        f'--max-cost ${max_cost:.2f} sits below {self.branch}'
+                        f"'s per-iteration cap (${floor:.2f} max_iter_cost);"
+                        f' pass --max-cost >= ${floor:.2f}, or lower the'
+                        " node's max_iter_cost first."
+                    )
                 # echo the retune old -> new like `node update` -- a silent
                 # launch-time retune is indistinguishable from a dropped one
                 *_, name = self.branch.rsplit('.', 1)
@@ -2263,7 +2284,7 @@ class Node:
             return self.config.get('root')
         return None
 
-    def merge(self: Node) -> tuple[str, str]:
+    def merge(self: Node, *, continue_merge: bool = False) -> tuple[str, str]:
         """Squash-merge the node's branch into its merge target.
 
         ``merge.sh`` resolves the target -- the node's configured ``base`` if
@@ -2274,6 +2295,13 @@ class Node:
 
         The full commit history is preserved on the node's
         branch; only a single squash commit lands on the target.
+
+        ``continue_merge`` finishes a hand-resolved squash after a conflicted
+        merge: the operator redoes ``git merge --squash`` in the target
+        worktree, resolves and stages the conflicts, and the continue then
+        runs the merge's own tail -- seed strip, index refresh, commit,
+        merge-base advance -- so a manual resolution never has to hand-roll
+        those steps (a hand-rolled seed strip leaves working-tree residue).
 
         Refuses while the target is active or paused -- the squash, index
         refresh, and recovery ``reset --hard`` all mutate the target
@@ -2326,7 +2354,10 @@ class Node:
                     )
         # run merge script -- merge.sh resolves the target and logs the
         # merge event on it (it's the single source of truth for the target)
-        result = self._run_script('merge.sh', f'{self._root}')
+        args = [f'{self._root}']
+        if continue_merge:
+            args.append('--continue')
+        result = self._run_script('merge.sh', *args)
         # success-path warnings ride stderr (e.g. a skipped merge-base
         # advance predicting spurious re-merge diffs) and would vanish with
         # the CompletedProcess -- return them beside the output
@@ -2940,43 +2971,60 @@ class Node:
             return status_file.read_text(encoding='utf-8').strip()
         return 'idle'
 
-    def status_display(self: Node) -> str:
-        """Return the status decorated with a pending signal or end reason.
+    def status_detail(self: Node) -> str:
+        """Return the qualifier that refines the node's status, if any.
 
-        ``active (pausing)`` / ``active (stopping)`` / ``active (finishing)``
-        when a pause/stop/finish signal is pending on an active node;
-        ``exited (<reason>)`` when the latest run row recorded why the run
-        ended (the run row is the single source -- a reconcile-healed crash
-        records no reason and stays bare); else the bare status. The suffix
-        is display-only -- the stored status (and the value status filters
-        match on, via the first space-delimited chunk) stays bare -- but a
-        crashed-but-active node is reconciled (persisted) first: reads are
-        where staleness is observed, and the probe is a no-op unless the
-        stored status is ``active``.
+        ``pausing`` / ``stopping`` / ``finishing`` when a pause/stop/finish
+        signal is pending on an active node; the recorded end reason when
+        the latest run row says why an ``exited`` run ended (the run row is
+        the single source -- a reconcile-healed crash records no reason);
+        else empty. The qualifier never enters the stored status, which
+        stays bare -- but a crashed-but-active node is reconciled
+        (persisted) first: reads are where staleness is observed, and the
+        probe is a no-op unless the stored status is ``active``.
 
         Returns:
-            Status string, possibly with a pending-signal or end-reason
-            suffix.
+            The qualifier, or an empty string when the status stands alone.
 
         """
         self._reconcile_status()
         status = self.status()
         if status == 'active':
             if self.record.signal_get('pause') is not None:
-                return 'active (pausing)'
+                return 'pausing'
             if self.record.signal_get('stop') is not None:
-                return 'active (stopping)'
+                return 'stopping'
             if self.record.signal_get('finish') is not None:
-                return 'active (finishing)'
+                return 'finishing'
         if status == 'exited':
             # the latest run row records why the loop ended (budget landing,
             # timeout, setup abort); a crash healed by reconcile closes its
             # rows reason-less and keeps the bare status
             rows = self.record.runs(limit=1)
             if rows and rows[0]['status'] == 'exited' and rows[0]['metadata']:
-                reason = rows[0]['metadata']
-                return f'exited ({reason})'
-        return status
+                return rows[0]['metadata']
+        return ''
+
+    def status_display(self: Node) -> str:
+        """Return the status decorated with a pending signal or end reason.
+
+        ``active (pausing)`` / ``active (stopping)`` / ``active (finishing)``
+        / ``exited (<reason>)`` -- :meth:`status_detail`'s qualifier in
+        parentheses -- else the bare status. The composed form is for
+        single-node human surfaces; the tabular listing carries the two as
+        separate ``status`` and ``detail`` columns so machine consumers
+        never parse the parentheses back apart.
+
+        Returns:
+            Status string, possibly with a pending-signal or end-reason
+            suffix.
+
+        """
+        # status_detail reconciles first, so the status read here is the
+        # healed one the qualifier was derived from
+        detail = self.status_detail()
+        status = self.status()
+        return f'{status} ({detail})' if detail else status
 
     def status_set(self: Node, status: str) -> None:
         """Set the node's status.
@@ -3034,10 +3082,14 @@ class Node:
         :meth:`_reconcile_status`, not just relabeled -- before listing, so
         the fleet's default steering read never echoes a dead loop as
         ``active``. Cap columns render each present child's live config
-        values; a gone worktree keeps the registry caps. The ``last``
-        column renders each row's newest activity instant as a compact
-        age, flagged (``12m!``) when an active node has sat quiet past
-        ``max(step_timeout, 5m)``.
+        values; a gone worktree keeps the registry caps. ``spend`` reads
+        against the ``max_cost`` beside it at the same scope the cap is
+        enforced at -- the current run's subtree spend -- and is blank for
+        a node with no recorded runs. ``status`` is always bare, with any
+        qualifier (a pending signal, an ``exited`` run's end reason, an
+        ``orphaned`` flag) in ``detail``. The ``last`` column renders each
+        row's newest activity instant as a compact age, flagged (``12m!``)
+        when an active node has sat quiet past ``max(step_timeout, 5m)``.
 
         Args:
             all_nodes: Include retired nodes in output.
@@ -3051,11 +3103,10 @@ class Node:
                 to ``exited``, and a booting ``idle`` node (live runtime,
                 the loop not yet stamped) to ``active`` (the authoritative
                 view). Read-only -- it does not persist the relabel.
-            decorated: Append each active descendant's pending stop/finish
-                signal (``active (stopping)``) and each exited one's
-                recorded end reason (``exited (<reason>)``) to its
-                displayed status; display-only, gated off for hot paths
-                such as ``--count``.
+            decorated: Record each active descendant's pending stop/finish
+                signal (``stopping``) and each exited one's recorded end
+                reason in its ``detail``; display-only, gated off for hot
+                paths such as ``--count``.
 
         Returns:
             List of child node records.
@@ -3113,16 +3164,16 @@ class Node:
             rows = [row for row, _ in self._heal_crashed(pairs)]
             # flag a registry row whose worktree is gone (removed out of band)
             # rather than reporting a vanished node as healthy: a settled/kept
-            # status keeps an '(orphaned)' suffix (filters match on the bare
-            # first chunk), while a live-ish row turns 'orphan' outright --
-            # artifacts vanishing mid-life is an anomaly, not cleanup
+            # status stays itself and takes an 'orphaned' detail, while a
+            # live-ish row turns 'orphan' outright -- artifacts vanishing
+            # mid-life is an anomaly, not cleanup
             settled = ('completed', 'stopped', 'exited', 'killed', 'retired')
             flagged = []
             for row in rows:
                 if row['node'] not in worktrees:
                     stored = _base_status(row.get('status'))
                     if stored in settled:
-                        row = {**row, 'status': f'{stored} (orphaned)'}
+                        row = {**row, 'status': stored, 'detail': 'orphaned'}
                     else:
                         row = {**row, 'status': 'orphan'}
                 flagged.append(row)
@@ -3164,22 +3215,36 @@ class Node:
                         )
                     if age > max(step_timeout or 0.0, _STALE_AGE_FLOOR_SECONDS):
                         last += '!'
-            if node is None:
-                capped.append({**row, 'last': last})
-                continue
+            # a gone worktree keeps its registry caps -- the only surviving
+            # source -- and yields no spend: the live config and the ledger
+            # are both reached through the node
             drifted = {}
-            for key in ('max_cost', 'max_depth', 'max_children', 'max_descendants'):
-                config_value = node.config.get(key)
-                if config_value is not None and config_value != row[key]:
-                    drifted[key] = config_value
-            capped.append({**row, **drifted, 'last': last})
+            spend = None
+            if node is not None:
+                caps = ('max_cost', 'max_depth', 'max_children', 'max_descendants')
+                for key in caps:
+                    config_value = node.config.get(key)
+                    if config_value is not None and config_value != row[key]:
+                        drifted[key] = config_value
+                # spend reads against the max_cost beside it -- the same scope
+                # the cap is enforced at: the current run's subtree spend
+                # (active run, else the most recent); resolving the run here
+                # rather than inside Cost.spent keeps a never-run node blank
+                # instead of reporting its 0.0 as a real reading
+                *_, run_id = node.record.resolve_context()
+                if run_id is not None:
+                    spend = round(node.cost.spent(run_id=run_id), _SPEND_PRECISION)
+            # 'detail' leads the merge so an orphan flag set above wins it,
+            # and every row carries the key either way
+            row = {'detail': None, **row, **drifted, 'spend': spend, 'last': last}
+            capped.append(row)
         rows = capped
-        # decorate the displayed status with each active descendant's pending
-        # stop/finish signal (display-only); the filters below match on the bare
-        # first chunk, so e.g. status='active' still selects 'active (stopping)'
+        # record each active descendant's pending stop/finish signal (and each
+        # exited one's end reason) in 'detail'; 'status' stays bare, so the
+        # filters below select on the column itself
         if decorated:
             worktrees = fractal.util.git.worktree_map(self.repo_dir)
-            rows = [self._decorate_status(row, worktrees) for row in rows]
+            rows = [self._detail_status(row, worktrees) for row in rows]
         # filter by an explicit status (one or comma-several), else apply
         # the retired/all default
         if status is not None:
@@ -3191,25 +3256,27 @@ class Node:
             rows = [row for row in rows if _base_status(row.get('status')) != 'retired']
         return rows
 
-    def _decorate_status(
+    def _detail_status(
         self: Node,
         row: dict,
         worktrees: dict[str, pathlib.Path],
     ) -> dict:
-        """Append a descendant's pending graceful signal or end reason.
+        """Fill a descendant's ``detail`` with its pending signal or end reason.
 
         Display helper for ``list``: for a descendant whose own stored
-        status still matches the row's (``active`` or ``exited``), replaces
-        the row's status with its :meth:`status_display`
-        (``active (pausing)`` / ``active (stopping)`` /
-        ``active (finishing)`` / ``exited (<reason>)``). Decoration only --
-        a diverged row (a stale registry value, or ``--live``'s
-        display-only relabel of a crashed ``active`` node) keeps its value
-        without consulting ``status_display``, whose reconcile would
-        otherwise persist a heal from a read-only listing. ``worktrees`` is
-        a branch->path map (one ``git worktree list``) so the listing
-        resolves worktrees without a subprocess per row. Best-effort -- a
-        row whose worktree is gone keeps its cached status.
+        status still matches the row's (``active`` or ``exited``), records
+        its :meth:`status_detail` (``pausing`` / ``stopping`` /
+        ``finishing`` / the run's end reason) in the row's ``detail``. The
+        row's ``status`` stays bare. A diverged row (a stale registry
+        value, or ``--live``'s display-only relabel of a crashed ``active``
+        node) is left alone without consulting ``status_detail``, whose
+        reconcile would otherwise persist a heal from a read-only listing;
+        the status is re-read after that reconcile, since a heal that moved
+        the node off the row's status makes the qualifier stale.
+        ``worktrees`` is a branch->path map (one ``git worktree list``) so
+        the listing resolves worktrees without a subprocess per row.
+        Best-effort -- a row whose worktree is gone keeps its cached status
+        and an empty detail.
         """
         stored = _base_status(row.get('status'))
         if stored not in ('active', 'exited'):
@@ -3218,9 +3285,9 @@ class Node:
         if worktree_dir:
             node = self.__class__(worktree_dir)
             if node.exists() and node.status() == stored:
-                display = node.status_display()
-                if _base_status(display) == stored:
-                    return {**row, 'status': display}
+                detail = node.status_detail()
+                if detail and node.status() == stored:
+                    return {**row, 'detail': detail}
         return row
 
     def _heal_crashed(

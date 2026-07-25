@@ -447,7 +447,7 @@ if [[ -f "$WORKTREES_DIR/.project/$BRANCH" ]]; then
     EXISTING_PROJECT=$(cat "$WORKTREES_DIR/.project/$BRANCH")
     if [[ "$EXISTING_PROJECT" != "$PROJECT_PATH" ]]; then
         echo "Error: branch '$BRANCH' already maps to project '$EXISTING_PROJECT';" \
-            "one branch maps to a single project -- use a separate branch" >&2
+            "one branch maps to a single project — use a separate branch" >&2
         exit 1
     fi
 fi

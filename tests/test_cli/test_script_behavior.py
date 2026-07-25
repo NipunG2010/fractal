@@ -17,6 +17,15 @@ real CLI, pinning edges the end-to-end lifecycle tests don't reach:
   immediately before the destructive squash, so an edit that lands in the
   target *during* the merge is refused -- never absorbed into the squash commit
   nor discarded by the recovery ``reset --hard``.
+- **``merge.sh --continue``** finishes an operator's hand-resolved squash after
+  a conflicted merge with the merge's own tail -- seed strip, commit,
+  merge-base advance -- and refuses when no squash is in progress. A resolution
+  that keeps the target's content for everything the node offered stages
+  nothing, and still finishes that tail minus the commit, so the target is left
+  neither mid-squash nor primed to replay the resolved conflict. It also names
+  the files it settled against the node -- a squash carries no per-hunk
+  ancestry, so the node keeps its version and a re-merge would silently undo
+  the decision.
 - **``delete.sh`` unmerged warning** surfaces commits the parent never absorbed
   on the automation path (the interactive prompt warns only the user) -- for
   non-ASCII file names too, which ``core.quotePath`` would otherwise C-quote
@@ -46,6 +55,9 @@ __all__ = [
     'test_merge_preserves_a_target_edit_that_lands_during_the_merge',
     'test_merge_re_merges_an_iterating_child_without_conflict',
     'test_failed_merge_restore_removes_the_staged_child_additions',
+    'test_merge_continue_finishes_a_hand_resolved_squash',
+    'test_merge_continue_finishes_a_target_only_resolution',
+    'test_merge_continue_names_files_resolved_against_the_node',
     'test_delete_warns_on_unmerged_commits',
     'test_delete_does_not_warn_after_squash_merge',
     'test_delete_does_not_warn_after_squash_merge_then_target_advances',
@@ -357,6 +369,278 @@ def test_failed_merge_restore_removes_the_staged_child_additions(
     )
     assert (repo / 'keep.txt').read_text(encoding='utf-8') == 'operator scratch\n'
     assert _git(repo, 'log', '-1', '--format=%s').stdout.strip() != 'merge main.task'
+
+
+# ------ merge.sh: finishing a hand-resolved squash with --continue
+
+
+def test_merge_continue_finishes_a_hand_resolved_squash(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``--continue`` finishes a hand-resolved squash exactly like a clean merge.
+
+    A conflicted merge restores the target and leaves the resolution to the
+    operator, whose hand-rolled finish must otherwise reproduce the merge's
+    own tail -- seed strip, commit, merge-base advance -- and a hand-rolled
+    seed strip (``reset`` then ``rm``) leaves seed residue in the target
+    working tree whenever the ``rm`` misses a path the squash materialized.
+    ``--continue`` picks up the staged, hand-resolved squash and runs that
+    tail itself: the seed lands neither in the commit nor on disk, the
+    resolution is committed like a clean merge, and the child's merge-base
+    advances so the next merge diffs only new work. Without a squash in
+    progress the continue refuses instead of committing whatever happens to
+    be staged.
+    """
+    repo = _init_tree(tmp_path / 'continuerepo')
+    init = _run(repo, 'node', 'init', 'task', '--agent', 'claude', '--local')
+    assert init.returncode == 0, init.stderr
+    worktree = repo / '.worktrees' / 'main.task'
+    merge_sh = _scripts_dir() / 'merge.sh'
+
+    # without a squash in progress the continue refuses
+    premature = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}', '--continue'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert premature.returncode != 0, premature.stdout
+    assert 'no squash merge is in progress' in premature.stderr
+
+    # parent and child edit the same line so the merge conflicts
+    (repo / 'tracked.txt').write_text('parent line\n', encoding='utf-8')
+    _git(repo, 'add', 'tracked.txt')
+    _git(repo, 'commit', '-m', 'parent edits tracked')
+    (worktree / 'tracked.txt').write_text('child line\n', encoding='utf-8')
+    _git(worktree, 'add', '-A')
+    _git(worktree, 'commit', '-m', 'child edits tracked')
+    conflicted = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert conflicted.returncode != 0, conflicted.stdout
+    assert '--continue' in conflicted.stderr
+
+    # the operator redoes the squash by hand (it conflicts and stages the
+    # child's seed into the target working tree), resolves, and stages
+    redo = subprocess.run(
+        ['git', 'merge', '--squash', 'main.task'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+    )
+    assert redo.returncode != 0, redo.stdout
+    assert (repo / '.fractal' / 'main.task').is_dir()
+    (repo / 'tracked.txt').write_text('resolved line\n', encoding='utf-8')
+    _git(repo, 'add', 'tracked.txt')
+
+    result = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}', '--continue'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+
+    # the continue commits the resolution like a clean merge, with the seed
+    # stripped from the commit and the working tree both
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert _git(repo, 'log', '-1', '--format=%s').stdout.strip() == 'merge main.task'
+    assert (repo / 'tracked.txt').read_text(encoding='utf-8') == 'resolved line\n'
+    committed = _git(repo, 'show', '--stat', '--format=', 'HEAD').stdout
+    assert '.fractal/' not in committed
+    assert not (repo / '.fractal' / 'main.task').exists()
+    # the child's merge-base advanced: the parent's merge commit is now an
+    # ancestor of the child, so the next merge diffs only new work
+    main_head = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
+    ancestor = subprocess.run(
+        ['git', 'merge-base', '--is-ancestor', main_head, 'HEAD'],
+        cwd=f'{worktree}',
+        capture_output=True,
+        text=True,
+    )
+    assert ancestor.returncode == 0, ancestor.stderr
+
+
+def test_merge_continue_finishes_a_target_only_resolution(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``--continue`` finishes the tail even when the resolution stages nothing.
+
+    Resolving every conflicting hunk in favor of the target leaves an empty
+    staged diff once the seed is stripped, which is *not* the clean merge's
+    "no changes" outcome -- the node had changes and the operator adjudicated
+    them away. Exiting there as a clean merge does would leave the target
+    mid-squash (``SQUASH_MSG`` intact, so a bare ``git commit`` prefills the
+    squash message) and skip the merge-base advance, replaying the identical
+    conflict on the next merge forever. The continue clears the squash state
+    and advances the merge-base instead, skipping only the commit.
+    """
+    repo = _init_tree(tmp_path / 'ourssrepo')
+    # settle the wiki so the merge's index refresh stages nothing of its own:
+    # the resolution's empty staged diff is what this test turns on
+    settle = subprocess.run(
+        ['wiki', 'update', '--path', f'{repo}/wiki'],
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert settle.returncode == 0, settle.stderr
+    _git(repo, 'add', '-A')
+    _git(repo, 'commit', '-m', 'settle wiki')
+    init = _run(repo, 'node', 'init', 'task', '--agent', 'claude', '--local')
+    assert init.returncode == 0, init.stderr
+    worktree = repo / '.worktrees' / 'main.task'
+    merge_sh = _scripts_dir() / 'merge.sh'
+
+    # a first clean merge lands the node's inherited scaffolding on the target
+    # (and leaves its worktree clean), so the conflicting file below is the
+    # node's whole contribution from there on
+    _git(worktree, 'add', '-A')
+    _git(worktree, 'commit', '-m', 'settle node scaffolding')
+    settled = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert settled.returncode == 0, (settled.stdout, settled.stderr)
+
+    # resolving that one file to the target's content leaves nothing to commit
+    (repo / 'tracked.txt').write_text('parent line\n', encoding='utf-8')
+    _git(repo, 'add', 'tracked.txt')
+    _git(repo, 'commit', '-m', 'parent edits tracked')
+    (worktree / 'tracked.txt').write_text('child line\n', encoding='utf-8')
+    _git(worktree, 'add', 'tracked.txt')
+    _git(worktree, 'commit', '-m', 'child edits tracked')
+    conflicted = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert conflicted.returncode != 0, conflicted.stdout
+
+    # the operator redoes the squash and keeps the target's own content
+    subprocess.run(
+        ['git', 'merge', '--squash', 'main.task'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+    )
+    _git(repo, 'checkout', '--ours', '--', 'tracked.txt')
+    _git(repo, 'add', 'tracked.txt')
+
+    result = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}', '--continue'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+
+    # the resolution stands: no merge commit, the target's content intact
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert 'Nothing to commit' in result.stdout
+    assert _git(repo, 'log', '-1', '--format=%s').stdout.strip() != 'merge main.task'
+    assert (repo / 'tracked.txt').read_text(encoding='utf-8') == 'parent line\n'
+    # the squash state is cleared, so the target no longer looks mid-squash
+    # and a bare git commit prefills nothing from the abandoned squash
+    assert not (repo / '.git' / 'SQUASH_MSG').exists()
+    assert not (repo / '.git' / 'MERGE_MSG').exists()
+    assert not (repo / '.git' / 'AUTO_MERGE').exists()
+    # and the merge-base advanced, so the resolved conflict is not replayed
+    main_head = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
+    ancestor = subprocess.run(
+        ['git', 'merge-base', '--is-ancestor', main_head, 'HEAD'],
+        cwd=f'{worktree}',
+        capture_output=True,
+        text=True,
+    )
+    assert ancestor.returncode == 0, ancestor.stderr
+    again = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert again.returncode == 0, (again.stdout, again.stderr)
+    # every offered change was settled against the node, so the notice names it
+    assert 'tracked.txt' in result.stderr
+
+
+def test_merge_continue_names_files_resolved_against_the_node(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A ``--continue`` names the files it settled against the node, and only those.
+
+    A squash records no per-hunk ancestry, so a hunk resolved in the target's
+    favor does not reach the node: it keeps its own version and the next merge
+    re-stages it cleanly, silently undoing an explicit decision. The continue
+    warns with the files this happened to, scoped to what the node offered --
+    a notice that also fired for hunks resolved the node's way, or for content
+    the target owns and the node never had, would be noise and get ignored.
+    """
+    repo = _init_tree(tmp_path / 'resolvedrepo')
+    init = _run(repo, 'node', 'init', 'task', '--agent', 'claude', '--local')
+    assert init.returncode == 0, init.stderr
+    worktree = repo / '.worktrees' / 'main.task'
+    merge_sh = _scripts_dir() / 'merge.sh'
+
+    # both files conflict; the resolution below goes one way on each
+    for name, text in (
+        ('kept.txt', 'parent kept\n'),
+        ('dropped.txt', 'parent dropped\n'),
+    ):
+        (repo / name).write_text(text, encoding='utf-8')
+    _git(repo, 'add', '-A')
+    _git(repo, 'commit', '-m', 'parent adds both')
+    for name, text in (('kept.txt', 'node kept\n'), ('dropped.txt', 'node dropped\n')):
+        (worktree / name).write_text(text, encoding='utf-8')
+    _git(worktree, 'add', '-A')
+    _git(worktree, 'commit', '-m', 'node adds both')
+    conflicted = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+    assert conflicted.returncode != 0, conflicted.stdout
+
+    # the operator keeps the node's content for one file, the target's for the
+    # other, so only the latter is a decision the node never learns about
+    subprocess.run(
+        ['git', 'merge', '--squash', 'main.task'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+    )
+    _git(repo, 'checkout', '--theirs', '--', 'kept.txt')
+    _git(repo, 'checkout', '--ours', '--', 'dropped.txt')
+    _git(repo, 'add', 'kept.txt', 'dropped.txt')
+
+    result = subprocess.run(
+        ['bash', f'{merge_sh}', f'{worktree}', '--continue'],
+        cwd=f'{repo}',
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert (repo / 'kept.txt').read_text(encoding='utf-8') == 'node kept\n'
+    assert (repo / 'dropped.txt').read_text(encoding='utf-8') == 'parent dropped\n'
+    # only the file the node still disagrees on is named
+    assert 'dropped.txt' in result.stderr
+    assert 'kept.txt' not in result.stderr
 
 
 # ------ delete.sh: unmerged-commit warning

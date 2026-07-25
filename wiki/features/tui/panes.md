@@ -36,7 +36,10 @@ so moving focus never triggers reads.
 - **Node pane** -- the focused node's card: status, the run/iter/step line,
   agent/model/session, measures, and config chips; below it a run -> iteration
   -> step explorer and a unified activity timeline. The card, the explorer, and
-  the event log are three sub-zones sharing the pane.
+  the event log are three sub-zones sharing the pane. A toggle scopes the
+  timeline to the node's own events or all descendants merged: a first visit
+  defaults the user (root) node to descendants and every other node to its own
+  activity, and a toggled choice sticks per node for the session.
 - **Radio pane** -- three sources over the scoped node's radio: its own
   messages, the cross-subtree feed (every descendant's public/outbox posts), and
   the archive of saved messages. A zone ladder (source tabs, filters, rows)
@@ -47,4 +50,10 @@ so moving focus never triggers reads.
   [[features/chat/_index|chat]] surface), while `radio` sends real messages -- a
   fresh send or a threaded reply -- through the action layer. Fields navigate as
   a grid, combo fields drop a filtered picker, and `/node`-style slash commands
-  set fields straight from the body.
+  set fields straight from the body. Chat runs one turn at a time: a send typed
+  while a turn is streaming queues (FIFO) behind it as a pending `you` line and
+  dispatches when that turn finishes, against the branch it was typed on even if
+  the cockpit has since re-scoped away. `ctrl+g` interrupts the in-flight turn
+  from anywhere, the composer included (`ctrl+i` cannot serve, as terminals
+  encode it as Tab): a lone queued send goes back into the composer for editing,
+  several dispatch at once as one combined turn.

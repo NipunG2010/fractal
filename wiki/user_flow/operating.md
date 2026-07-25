@@ -27,10 +27,21 @@ Commands run from the repository root act as the user node.
 **Status at a glance.** `fractal node list` lists a node's descendants with
 status, spend, and limits (run from the root it shows the whole tree; it never
 includes the target row itself — `fractal node status <node>` gives one node's
-status). The `last` column is the age of each node's newest activity, and a `!`
-flags an active node that has been quiet past `max(step_timeout, 5m)` — the
-first sign of a hang. `--live` re-checks reality: it relabels a crashed active
-node (no tmux session) as `exited` and drops nodes whose worktree is gone.
+status). `status` is always the bare lifecycle status, and any qualifier rides
+the `detail` column beside it: a pending `pausing`/`stopping`/`finishing`
+signal, an `exited` run's recorded end reason, or `orphaned` for a settled node
+whose worktree was removed out of band. Keeping the two apart is what lets a
+script select on `status` without defending against a suffix — and end reasons
+carry parentheses of their own, so a composed `exited (<reason>)` could not be
+split back apart reliably. `spend` sits next to `max_cost` and reads at the
+scope that cap is enforced at: the current run's spend including descendant runs
+chained under it (see [[features/cost/measurement|measurement]]). It is blank
+for a node that has never run — no reading, as distinct from a spend of $0 — and
+rounded to cents, a steering read rather than an invoice. The `last` column is
+the age of each node's newest activity, and a `!` flags an active node that has
+been quiet past `max(step_timeout, 5m)` — the first sign of a hang. `--live`
+re-checks reality: it relabels a crashed active node (no tmux session) as
+`exited` and drops nodes whose worktree is gone.
 
 **History and spend.** `fractal node activity` shows a node's lifecycle activity
 most recent first, each row with its own-node step cost.
@@ -54,8 +65,11 @@ decisions, blockers (the full surface:
 [[features/radio/_index|features/radio/]]). `fractal radio feed` lists what your
 subscriptions (your children, by default) have posted;
 `fractal radio read --feed --unread` prints the new bodies;
-`fractal radio thread <uuid>` reconstructs a conversation. A silent node is a
-suspect node: check its outbox first, then its tmux session.
+`fractal radio thread <uuid>` reconstructs a conversation. What needs your
+attention — replies to your messages, questions, decisions you own, finish
+sign-offs — lands in your inbox instead: `fractal radio messages` lists it,
+`fractal radio read --channel=inbox --unread` prints the new bodies. A silent
+node is a suspect node: check its outbox first, then its tmux session.
 
 ## Steering
 
@@ -97,8 +111,8 @@ Steering tools, ordered by weight:
 ## The operator's cadence
 
 A healthy rhythm: scan `fractal node list` (or keep the TUI open), read the
-radio feed, answer anything addressed to you, and intervene only on signal — a
-`!` in the list, a silent outbox, a spend outlier, a directive gone
-unacknowledged. Nodes are briefed to surface blockers and questions on radio and
-to keep working rather than wait; the operator who answers promptly and steers
-with small directives gets the most out of a tree.
+radio feed and your inbox, answer anything addressed to you, and intervene only
+on signal — a `!` in the list, a silent outbox, a spend outlier, a directive
+gone unacknowledged. Nodes are briefed to surface blockers and questions on
+radio and to keep working rather than wait; the operator who answers promptly
+and steers with small directives gets the most out of a tree.

@@ -43,7 +43,8 @@ via `--inherit`.
   link), recreated at every init and gitignored. The parent's live copy always
   wins over the package seed, so agent-level settings flow down the tree
   unconditionally -- this is the one file surface that inherits without opting
-  in.
+  in. For codex, a relative `model_instructions_file` the config names is copied
+  alongside it, so the inherited config never points at a missing file.
 
 ## Opt-in: the inherit surfaces
 

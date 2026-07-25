@@ -266,7 +266,7 @@ def test_events_render_through_the_production_renderer_grok(
     captured = capsys.readouterr()
     assert 'Done.' in captured.out
     # the final close prints the terminal frame's turns and priced spend
-    assert '-- 2 turns, ' in captured.out
+    assert '— 2 turns, ' in captured.out
     assert f', ${_USAGE_COST:.4f}' in captured.out
     assert 'agent error: rate limited' in captured.err
 

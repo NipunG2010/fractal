@@ -404,7 +404,7 @@ def ensure_project_wiki(
     if foreign and any(wiki_dir.iterdir()):
         relative = wiki_dir.relative_to(worktree)
         raise RuntimeError(
-            f'{relative}/ already exists and is not a project wiki --'
+            f'{relative}/ already exists and is not a project wiki —'
             ' adopting it would rewrite its files in place. Move the'
             ' directory aside and re-run init, or adopt it deliberately'
             f' first: wiki init --path={relative}'
@@ -423,7 +423,7 @@ def ensure_project_wiki(
         executable = fractal.util.system.console_script('wiki')
     except RuntimeError as e:
         raise RuntimeError(
-            "No 'wiki' executable found -- install fractal's plasma-wiki"
+            "No 'wiki' executable found — install fractal's plasma-wiki"
             ' dependency into its environment and re-run init.'
         ) from e
     cmd = [executable, 'init', name, f'--path={wiki_dir}', f'--settings={settings}']
@@ -431,7 +431,7 @@ def ensure_project_wiki(
     if result.returncode != 0:
         error = result.stderr.strip()
         raise RuntimeError(
-            f'wiki init failed (exit {result.returncode}): {error!r} --'
+            f'wiki init failed (exit {result.returncode}): {error!r} —'
             ' fix the cause and re-run init (a partial init is repaired'
             ' in place)'
         )
@@ -462,13 +462,13 @@ def verify_hook_formatters(repo_dir: pathlib.Path) -> None:
     if 'mdformat-wiki' in config or FRACTAL_FOLDER in config:
         return
     logger.warning(
-        'Note: this repo runs pre-commit hooks -- structure-preserving'
+        'Note: this repo runs pre-commit hooks — structure-preserving'
         ' reformats of wiki pages are auto-retried, structure-breaking ones'
         ' fail loud with the pages restored, and any hook rewrite of other'
         ' node-data pages (.fractal/ seeds) is refused outright. Give'
         ' mdformat the wikilink-aware plugin (additional_dependencies:'
         ' [mdformat-wiki] on its hook, dropping mdformat-frontmatter if'
-        ' present -- both register a frontmatter renderer and whichever is'
+        ' present — both register a frontmatter renderer and whichever is'
         ' discovered first wins), or keep formatters off the wiki paths.'
     )
 

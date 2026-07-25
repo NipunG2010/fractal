@@ -122,9 +122,11 @@ class NodePane:
         self.ex_sel = 0
         self.ex_expanded: set[tuple] = set()
         self.ev_sel = 0
-        # include descendants in the event log; the user (root) node defaults
-        # to the descendants view, every other node to its own activity
-        self.sub_log = app.scope == app.data.root_branch
+        # toggled choices stick per branch for the session; a branch never
+        # toggled falls back to log_scope's default rule
+        self.sub_log_by_branch: dict[str, bool] = {}
+        # include descendants in the event log
+        self.sub_log = self.log_scope(app.scope)
         self.log_hover = False
 
     def compose(self: NodePane) -> ComposeResult:
@@ -841,9 +843,19 @@ class NodePane:
         self.log_hover = hover
         self.paint_log_scope()
 
+    def log_scope(self: NodePane, branch: str) -> bool:
+        """Return a branch's log scope (toggled choice, else the default rule).
+
+        The user (root) node defaults to the descendants view, every other
+        node to its own activity.
+        """
+        default = branch == self.app.data.root_branch
+        return self.sub_log_by_branch.get(branch, default)
+
     def toggle_log_scope(self: NodePane) -> None:
         """Flip the activity log between the node and its descendants."""
         self.sub_log = not self.sub_log
+        self.sub_log_by_branch[self.app.scope] = self.sub_log
         self.ev_sel = 0
         self.app.refresh_log()
 

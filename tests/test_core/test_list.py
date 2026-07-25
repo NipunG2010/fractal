@@ -3,7 +3,8 @@
 Covers default vs ``--all`` filtering, the live view (trusting real
 state and relabeling crashed-active rows), config-cap overlays over
 stale registry rows, orphan flagging, and the ``last`` activity-age
-column with its staleness flag.
+column with its staleness flag, plus the spend reading and the split of
+the status qualifier into its own column.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from fractal.constants import SOCKET_FILE
 from fractal.core.node import Node
 from tests._helpers import _past_timestamp
 
-from .conftest import _active_run, _spawn_parent_child
+from .conftest import _active_run, _record_step_cost, _spawn_parent_child
 
 __all__ = [
     'test_list_returns_nodes',
@@ -29,6 +30,7 @@ __all__ = [
     'test_list_live_confirms_relabels_on_recorded_socket',
     'test_list_renders_config_caps_over_stale_registry',
     'test_list_decorates_exited_with_run_reason',
+    'test_list_reports_run_scoped_subtree_spend',
     'test_list_flags_orphan_rows',
     'test_list_renders_last_activity_age',
     'test_list_flags_stale_active_rows',
@@ -231,12 +233,13 @@ def test_list_decorates_exited_with_run_reason(
     git_repo: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A decorated listing carries an exited child's recorded end reason.
+    """A decorated listing carries an exited child's end reason in ``detail``.
 
-    ``node list`` inherits the ``status_display`` terminal decoration: an
-    ``exited`` row whose latest run recorded why it ended reads
-    ``exited (<reason>)``. Display-only -- the bare listing stays cheap,
-    and status filters still match on the bare first chunk.
+    The reason rides its own column, never a suffix on ``status``: end
+    reasons contain parentheses of their own (a budget landing quotes the
+    figures), so a consumer splitting a composed ``exited (<reason>)`` back
+    apart cannot do it reliably. ``status`` stays bare either way, and the
+    undecorated listing stays cheap by leaving ``detail`` empty.
     """
     parent, child = _spawn_parent_child(git_repo, monkeypatch)
     # land the child's run on its budget with the boundary's reason recorded
@@ -244,14 +247,47 @@ def test_list_decorates_exited_with_run_reason(
     run_id = _active_run(child)
     child.record.run_end(run_id=run_id, status='exited', exit_code=0, metadata=reason)
     child.status_set('exited')
-    # the decorated listing carries the reason; the bare one stays bare
-    decorated = {row['node']: row['status'] for row in parent.list(decorated=True)}
-    assert decorated[child.branch] == f'exited ({reason})'
-    plain = {row['node']: row['status'] for row in parent.list()}
-    assert plain[child.branch] == 'exited'
-    # filters match the bare first chunk, decoration notwithstanding
+    # the decorated listing carries the reason whole, beside a bare status
+    decorated = {row['node']: row for row in parent.list(decorated=True)}
+    assert decorated[child.branch]['status'] == 'exited'
+    assert decorated[child.branch]['detail'] == reason
+    plain = {row['node']: row for row in parent.list()}
+    assert plain[child.branch]['status'] == 'exited'
+    assert not plain[child.branch]['detail']
+    # the filter selects on the status column itself
     filtered = parent.list(status='exited', decorated=True)
     assert [row['node'] for row in filtered] == [child.branch]
+
+
+def test_list_reports_run_scoped_subtree_spend(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``spend`` reads at the scope its ``max_cost`` neighbour is enforced at.
+
+    The cap is a per-**run** ceiling over the run's whole subtree, so the
+    column beside it must be the same reading -- the current run's spend
+    including descendant runs chained under it -- or an operator comparing
+    the two columns misjudges the headroom. A node that has never run has
+    no reading to give and stays blank rather than claiming a spend of $0.
+    """
+    parent, child = _spawn_parent_child(git_repo, monkeypatch)
+    _record_step_cost(parent, run_id=_active_run(parent), cost=2.5)
+    _record_step_cost(child, run_id=_active_run(child), cost=1.25)
+
+    # from the root: the parent's row carries its own spend plus the child
+    # run chained under it, the child's row carries its own
+    rows = {row['node']: row for row in Node(git_repo).list()}
+    assert rows[parent.branch]['spend'] == pytest.approx(3.75)
+    assert rows[child.branch]['spend'] == pytest.approx(1.25)
+
+    # a spawned-but-never-started sibling has no run to read
+    node_dir = parent.node_dir
+    monkeypatch.setenv('_NODE', f'{node_dir}')
+    Node(git_repo).init(name='fresh')
+    monkeypatch.delenv('_NODE')
+    rows = {row['node']: row for row in Node(git_repo).list()}
+    assert rows[f'{parent.branch}.fresh']['spend'] is None
 
 
 def test_list_flags_orphan_rows(node_with_db: Node) -> None:

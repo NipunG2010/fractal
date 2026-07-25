@@ -83,7 +83,7 @@ def command_base(command: str) -> str:
     if any(char in command for char in '\'"\\'):
         raise ValueError(
             f'Unsupported agent command: {command!r} (commands split on'
-            ' whitespace only -- quotes and backslashes are not supported).'
+            ' whitespace only — quotes and backslashes are not supported).'
         )
     base_word, *_ = command.split()
     return base_word
@@ -1055,17 +1055,25 @@ class Agent:
         skills = config_dir / 'skills'
         if not skills.exists():
             skills.symlink_to('../skills')
-        # delegate provider extras (auth links)
-        return cls._seed(node_dir)
+        # delegate provider extras (auth links, inherited file copies)
+        return cls._seed(node_dir, parent_dir=parent_dir)
 
     @classmethod
-    def _seed(cls: type[Agent], node_dir: pathlib.Path) -> None:
+    def _seed(
+        cls: type[Agent],
+        node_dir: pathlib.Path,
+        *,
+        parent_dir: Optional[pathlib.Path] = None,
+    ) -> None:
         """Hook for provider-specific seeding (auth links). Default no-op.
+
+        ``parent_dir`` is the parent node's data directory, so a backend
+        can carry files the inherited config references.
 
         Override in a backend to link shared credentials::
 
             @classmethod
-            def _seed(cls, node_dir):
+            def _seed(cls, node_dir, *, parent_dir=None):
                 link = node_dir / f'.{cls.name}' / 'auth.json'
                 if not link.is_symlink():
                     link.symlink_to(pathlib.Path.home() / '.provider' / 'auth.json')

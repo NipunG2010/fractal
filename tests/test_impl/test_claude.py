@@ -394,13 +394,13 @@ def test_events_render_through_the_production_renderer_claude(
     assert 'Read' in out
     assert 'file contents' in out
     # the authoritative result closes on turns, duration, and cost
-    assert '-- 3 turns, 5.0s, $0.1234' in out
+    assert '— 3 turns, 5.0s, $0.1234' in out
 
 
 def test_renderer_closes_a_truncated_stream_on_a_fresh_line(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A stream killed mid-delta ends on a newline and a ``-- $?`` summary.
+    """A stream killed mid-delta ends on a newline and a ``— $?`` summary.
 
     A truncated stream (no result frame) leaves the text run open;
     ``close()`` -- called by the driving command after the drain -- ends it
@@ -427,7 +427,7 @@ def test_renderer_closes_a_truncated_stream_on_a_fresh_line(
     render.close()
     out = capsys.readouterr().out
     assert out.startswith('partial reply\n')
-    assert out.count('-- $?') == 1
+    assert out.count('— $?') == 1
     assert out.endswith('\n')
 
 

@@ -42,7 +42,10 @@ delegates to its private hook, which the subclass implements:
   the seam the project-files surface fronts (see
   [[features/files/transcripts]]);
 - the preflight hook probes provider readiness before a run commits;
-- the seeding hook materializes the provider's config directory in a new node.
+- the seeding hook materializes the provider's config directory in a new node,
+  receiving the parent node's data directory so files an inherited config
+  references — codex's relative model instructions file — travel with the config
+  copy.
 
 Capability declarations — session forking, who mints session ids, cost scope,
 pricing needs, budget enforcement, result-frame cadence, and the provider route

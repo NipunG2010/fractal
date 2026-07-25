@@ -716,7 +716,7 @@ class Loop:
                 adopt = None
         if adopt is None:
             print(
-                'Error: no open run to adopt -- was the node paused?',
+                'Error: no open run to adopt — was the node paused?',
                 file=sys.stderr,
             )
             # no paused run to preserve here, so record the honest exited row
@@ -2670,7 +2670,7 @@ class Loop:
             config_value, registry_value = values
             print(
                 f'WARNING: config {key}={config_value} != registry'
-                f' {registry_value} -- registry updated to match config'
+                f' {registry_value} — registry updated to match config'
                 f" (retune with 'fractal node update')"
             )
 
@@ -2911,7 +2911,7 @@ class Loop:
         print(
             f'WARNING: cost caps are set but {self._agent.name} does not'
             ' enforce a per-step budget and no timeout is configured; one'
-            ' runaway step can overshoot the caps unbounded -- set'
+            ' runaway step can overshoot the caps unbounded — set'
             ' --step-timeout to bound it.'
         )
 
@@ -3157,7 +3157,7 @@ class Loop:
                     print(
                         f'=== Cost budget exceeded in finish wind-down'
                         f' (${spent:.4f} of ${self._max_cost_label} spent);'
-                        f' deliberate finish -- completing ==='
+                        f' deliberate finish — completing ==='
                     )
                     self._cap_overshoot = (
                         f'cost budget exceeded in finish wind-down'

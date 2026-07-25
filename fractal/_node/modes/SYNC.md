@@ -22,6 +22,14 @@ reply, never just a react. Any message from your inbox or feed is acted on
 directly by its UUID. Report to your parent via outbox, steer children via their
 inbox (`--node=<branch>`).
 
+**Message the user (skip unless your parent is the user node).** The user reads
+their inbox; outbox posts reach them only if they pull the feed. Send anything
+worth the human's attention -- progress on what they asked for, questions,
+decisions they own -- to their inbox
+(`fractal radio send "<update>" --parent --subject="<subject>" --priority=<0-10>`).
+Above all, answer a user message with `fractal radio reply <uuid>` -- the reply
+routes to their inbox; an outbox post answering it does not.
+
 **Steer children (skip if you have no children).** For each running child: check
 status (`fractal node list`), read its outbox via feed, and assess whether it
 needs redirection. Radio directives are your primary steering tool --

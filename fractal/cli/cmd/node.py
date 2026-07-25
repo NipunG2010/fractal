@@ -51,11 +51,14 @@ __all__ = [
     'node_seed',
 ]
 
+# consumers bind list columns by header name, never by position
 _LIST_COLUMNS = [
     'status',
+    'detail',
     'node',
     'title',
     'max_cost',
+    'spend',
     'max_depth',
     'max_children',
     'max_descendants',
@@ -174,7 +177,7 @@ def node_init(app: typer.Typer) -> typer.Typer:
     wait = typer.Option(None, '--wait', help=wait_help)
     # max cost option
     max_cost_help = (
-        'Maximum cost in USD per run -- runs are isolated, so each launch'
+        'Maximum cost in USD per run — runs are isolated, so each launch'
         ' arms the cap anew; after a budget-ended run, `node start'
         ' --continue` refuses without an explicit --max-cost.'
     )
@@ -331,7 +334,7 @@ def node_init(app: typer.Typer) -> typer.Typer:
                     tracked = True
             if tracked:
                 typer.echo(
-                    'Warning: no --max-cost/--max-iters -- this node can run'
+                    'Warning: no --max-cost/--max-iters — this node can run'
                     ' and spend without bound.',
                     err=True,
                 )
@@ -347,8 +350,8 @@ def node_start(app: typer.Typer) -> typer.Typer:
     # continue flag
     continue_help = (
         'Continue a stopped/exited node (further iterations): the launch'
-        ' restores the worktree -- uncommitted project files refuse without'
-        ' --clean -- and a budget-ended run refuses without an explicit'
+        ' restores the worktree — uncommitted project files refuse without'
+        ' --clean — and a budget-ended run refuses without an explicit'
         ' --max-cost.'
     )
     continue_ = typer.Option(False, '--continue', help=continue_help)
@@ -554,6 +557,12 @@ def node_merge(app: typer.Typer) -> typer.Typer:
     # node argument
     node_help = 'Target node branch (default: this node).'
     node = typer.Argument(None, help=node_help)
+    # continue flag
+    continue_help = (
+        'Finish a hand-resolved squash after a conflicted merge: strip the'
+        ' seed, refresh indexes, commit, and advance the merge-base.'
+    )
+    continue_ = typer.Option(False, '--continue', help=continue_help)
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
@@ -561,11 +570,12 @@ def node_merge(app: typer.Typer) -> typer.Typer:
     @command(app, 'merge')
     def _merge(
         node: Optional[str] = node,
+        continue_: bool = continue_,
         path: str = path,
     ) -> None:
         """Squash-merge a node's branch into its parent."""
         node = resolve_target(path, node)
-        output, notices = node.merge()
+        output, notices = node.merge(continue_merge=continue_)
         if output:
             typer.echo(output)
         # success-path warnings ride stderr so piped stdout stays parseable
@@ -812,9 +822,13 @@ def node_list(app: typer.Typer) -> typer.Typer:
         """List a node's descendants with status (blank limit columns mean unlimited).
 
         Lists descendants only -- it never includes the target row; use
-        ``fractal node status`` for the node's own status. ``last`` is
-        the age of each node's newest activity; ``!`` flags an active
-        node quiet past ``max(step_timeout, 5m)``.
+        ``fractal node status`` for the node's own status. ``status`` is
+        always bare and ``detail`` carries any qualifier (a pending
+        signal, an exited run's end reason, ``orphaned``). ``spend`` is
+        the current run's subtree cost, the scope ``max_cost`` beside it
+        is enforced at, and is blank for a node that has never run.
+        ``last`` is the age of each node's newest activity; ``!`` flags an
+        active node quiet past ``max(step_timeout, 5m)``.
         """
         # validate arguments
         require_non_negative(max_depth=max_depth)
@@ -1050,7 +1064,7 @@ def node_update(app: typer.Typer) -> typer.Typer:
     title = typer.Option(None, '--title', help=title_help)
     # max cost option
     max_cost_help = (
-        'Child maximum cost in USD per run -- runs are isolated, so each'
+        'Child maximum cost in USD per run — runs are isolated, so each'
         ' launch arms the cap anew; after a budget-ended run, `node start'
         ' --continue` refuses without an explicit --max-cost.'
     )

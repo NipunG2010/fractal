@@ -109,7 +109,7 @@ def commit(
         if prefixed or re.match(r'iteration\b', lowered):
             raise RuntimeError(
                 f'Commit message {message!r} starts with the branch name or'
-                f" an 'iteration' label -- the tool wraps the message as"
+                f" an 'iteration' label — the tool wraps the message as"
                 f" '{node.branch}: iteration <run>.<iter> (<message>)'."
                 f' Re-commit with a bare lowercase summary.'
             )
@@ -753,10 +753,10 @@ def _hook_retry(
             details.append(
                 f'wiki pages with broken structure: {", ".join(broken)}'
                 ' (hook rewrites of wiki pages must preserve wikilinks,'
-                ' frontmatter, and *** separators -- give mdformat the'
+                ' frontmatter, and *** separators — give mdformat the'
                 ' wikilink-aware plugin (additional_dependencies:'
                 ' [mdformat-wiki] on its hook, dropping mdformat-frontmatter'
-                ' if present -- both register a frontmatter renderer and'
+                ' if present — both register a frontmatter renderer and'
                 ' whichever is discovered first wins), or keep formatters'
                 ' off the wiki paths)'
             )
@@ -764,7 +764,7 @@ def _hook_retry(
             details.append(
                 f'byte-guarded pages: {", ".join(byte_gated)}'
                 ' (seed and machine pages must never be rewritten by hooks'
-                ' -- keep formatters off the .fractal/ paths)'
+                ' — keep formatters off the .fractal/ paths)'
             )
         detail = '; '.join(details)
         raise RuntimeError(

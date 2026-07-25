@@ -33,7 +33,7 @@ __all__ = [
     'test_explorer_selection_time_machines_the_card',
     'test_event_log_row_opens_the_explorer',
     'test_event_log_subtree_toggle',
-    'test_log_scope_defaults_per_node',
+    'test_log_scope_defaults_and_persists_per_node',
     'test_scope_zone_sits_between_runs_and_log',
     'test_attach_without_a_live_session_notifies',
     'test_attach_headless_node_reports_log',
@@ -254,10 +254,15 @@ async def test_event_log_subtree_toggle(
         }
 
 
-async def test_log_scope_defaults_per_node(
+async def test_log_scope_defaults_and_persists_per_node(
     cockpit_app: Callable[..., FractalApp],
 ) -> None:
-    """The user node opens on the descendants log; a rescope resets to node."""
+    """First visits get the default log scope; a toggled choice sticks.
+
+    The user (root) node opens on the merged descendants view, every other
+    node on its own activity; once toggled, a branch keeps its choice across
+    rescopes for the session while untouched branches keep the defaults.
+    """
     app = cockpit_app()
     async with app.run_test(size=(150, 48)) as pilot:
         await pilot.pause()
@@ -266,12 +271,29 @@ async def test_log_scope_defaults_per_node(
         assert pane.sub_log
         branches = {row['branch'] for row in app.snapshot.log}
         assert 'main.alpha' in branches
-        # scoping to a child resets the default to its own activity
+        # a child's first visit defaults to its own activity
         await pilot.press('enter', 'down', 'enter')  # tree: select main.alpha
         await pilot.pause()
         assert app.scope == 'main.alpha'
         assert not pane.sub_log
         assert {row['branch'] for row in app.snapshot.log} == {'main.alpha'}
+        # toggle to descendants, look away, come back: the choice survived
+        await pilot.click('#nodelogscope')
+        await pilot.pause()
+        assert pane.sub_log
+        app.scope_to('main')
+        await pilot.pause()
+        assert pane.sub_log  # the untoggled root keeps its own default
+        app.scope_to('main.alpha')
+        await pilot.pause()
+        assert pane.sub_log
+        assert {'main.alpha.deep', 'main.alpha.stopper'} <= {
+            row['branch'] for row in app.snapshot.log
+        }
+        # an untoggled sibling's first visit still defaults to its own activity
+        app.scope_to('main.beta')
+        await pilot.pause()
+        assert not pane.sub_log
 
 
 async def test_scope_zone_sits_between_runs_and_log(
@@ -512,13 +534,13 @@ async def test_chat_stream_coalesces_and_survives_rescope(
         # the compose session defaults to the leaf's last loop session, so the
         # turn forks it (an explicit session always wins the transport)
         app.start_chat('hi there')
-        assert app.query('#m_chatpending')  # the in-flight spinner is pinned
+        assert app.query('.chatpending')  # the in-flight spinner is pinned
         app.scope_to('main')  # look away mid-stream
         for _ in range(100):
             await pilot.pause(0.05)
             if app.chat.turn is None:
                 break
-        assert not app.query('#m_chatpending')  # the spinner left with the turn
+        assert not app.query('.chatpending')  # the spinner left with the turn
         convo = app.chat.transcript(leaf)
         assert convo[0] == ('you', 'hi there')
         forked = session_for(leaf, 1, 1)

@@ -126,12 +126,14 @@ steps).
   (hundreds of KB) fail OS-dependently -- put bulk content in files or the
   project wiki and send a pointer.
 - **Reach the user (root node).** The user is a passive mailbox with no loop, so
-  a sleeping operator sees messages only on wake. If the user is your parent,
-  post to your outbox (they are subscribed); otherwise send to their inbox
-  (`--node=<root-branch>`). The COMMIT step's finish sign-off
-  (`radio send --parent`) is the exception: it replaces a final outbox post --
-  one report, not both. Post and continue -- never block on a reply; if you
-  truly need an answer to proceed, make a reversible call and note it.
+  a sleeping operator sees messages only on wake. Routine narrative goes to your
+  outbox when the user is your parent (they are subscribed); anything that needs
+  their attention -- a reply to their message, a question, a decision they own
+  -- goes to their inbox (`--parent`, or `--node=<root-branch>` from deeper in
+  the tree). The COMMIT step's finish sign-off (`radio send --parent`) is the
+  exception: it replaces a final outbox post -- one report, not both. Post and
+  continue -- never block on a reply; if you truly need an answer to proceed,
+  make a reversible call and note it.
 - **Radio reaches one hop.** Your feed spans only your parent and your direct
   children -- never grandchildren or deeper, and there is no tree-wide view.
   Information crosses more than one level by relaying hop-by-hop: each tier

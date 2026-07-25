@@ -4,8 +4,9 @@ The codex dialect end to end: the ``exec --json`` protocol parsed into
 normalized events, the ``exec`` argv builder, thread-cumulative pricing
 over the OpenAI cached-subset usage shape, the ``config.toml`` model
 default, the dated-rollout transcript layout, the account model
-preflight, and the auth write-through seeding. Stream-level cases drive
-the base ``Agent.stream`` driver against a real node ledger.
+preflight, and the auth write-through and instructions-carry seeding.
+Stream-level cases drive the base ``Agent.stream`` driver against a real
+node ledger.
 """
 
 from __future__ import annotations
@@ -56,6 +57,8 @@ __all__ = [
     'test_config_model_reads_the_toml_top_level',
     'test_seed_config_disables_fast_mode_codex',
     'test_seed_links_auth_write_through_codex',
+    'test_seed_carries_the_parent_instructions_file_codex',
+    'test_seed_skips_uncarriable_instructions_codex',
     'test_transcript_globs_the_dated_rollouts',
     'test_preflight_probes_model_acceptance',
 ]
@@ -199,7 +202,7 @@ def test_parser_flushes_cost_per_turn(monkeypatch: pytest.MonkeyPatch) -> None:
         pytest.approx(_USAGE_SECOND_COST),
     ]
     # each turn's result carries the recorded turn cost (the renderer's
-    # '-- $X.XXXX' close reads it off the event)
+    # '— $X.XXXX' close reads it off the event)
     assert [event.cost for event in events if event.kind == 'result'] == costs
 
 
@@ -295,14 +298,14 @@ def test_events_render_through_the_production_renderer_codex(
     assert 'Done.' in captured.out
     # the turn closes on the recorded turn cost alone -- '$?' when there is
     # no cost fact, never $0 and never the wall time
-    assert '-- $?' in captured.out
+    assert '— $?' in captured.out
     assert 'agent error: rate limited' in captured.err
 
 
 def test_renderer_closes_a_truncated_stream_with_the_placeholder_summary(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A stream killed before ``turn.completed`` still closes on ``-- $?``.
+    """A stream killed before ``turn.completed`` still closes on ``— $?``.
 
     A truncated stream carries no result frame, so nothing prints the
     closing summary; ``close()`` -- called by the driving command after the
@@ -322,7 +325,7 @@ def test_renderer_closes_a_truncated_stream_with_the_placeholder_summary(
             render(event)
     render.close()
     out = capsys.readouterr().out
-    assert '-- $?' in out
+    assert '— $?' in out
 
 
 def test_compute_cost_prices_the_cached_subset(
@@ -702,6 +705,74 @@ def test_seed_links_auth_write_through_codex(
     CodexAgent.seed(fresh_dir)
     target = (real_home / 'auth.json').resolve()
     assert (fresh_dir / '.codex' / 'auth.json').readlink() == target
+
+
+def test_seed_carries_the_parent_instructions_file_codex(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relative instructions file travels with the inherited config.
+
+    Codex resolves a relative ``model_instructions_file`` against
+    ``CODEX_HOME`` and fails the run when the file is missing, so the
+    child's seed copies the file the parent's config names -- nested
+    directories included -- and reseeding never clobbers the child's
+    copy.
+    """
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'global-home'))
+    parent_dir = tmp_path / 'parent'
+    (parent_dir / '.codex' / 'prompts').mkdir(parents=True)
+    (parent_dir / '.codex' / 'config.toml').write_text(
+        'model_instructions_file = "prompts/math.md"\n', encoding='utf-8'
+    )
+    (parent_dir / '.codex' / 'prompts' / 'math.md').write_text(
+        'Solve carefully.\n', encoding='utf-8'
+    )
+    node_dir = tmp_path / 'node'
+    (node_dir / 'skills').mkdir(parents=True)
+    CodexAgent.seed(node_dir, parent_dir=parent_dir)
+    copied = node_dir / '.codex' / 'prompts' / 'math.md'
+    assert copied.read_text(encoding='utf-8') == 'Solve carefully.\n'
+    # an existing file is never overwritten
+    (parent_dir / '.codex' / 'prompts' / 'math.md').write_text(
+        'Updated upstream.\n', encoding='utf-8'
+    )
+    CodexAgent.seed(node_dir, parent_dir=parent_dir)
+    assert copied.read_text(encoding='utf-8') == 'Solve carefully.\n'
+
+
+@pytest.mark.parametrize('case', ['absolute-path', 'missing-source', 'no-key'])
+def test_seed_skips_uncarriable_instructions_codex(
+    case: str,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a relative, present instructions file travels to the child.
+
+    An absolute path resolves the same from every node, so nothing is
+    copied; a relative path whose source is missing at the parent seeds
+    nothing (the parent's own codex fails the same way); a config naming
+    no instructions file seeds nothing new.
+    """
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'global-home'))
+    parent_dir = tmp_path / 'parent'
+    (parent_dir / '.codex').mkdir(parents=True)
+    # build the parent config for the case
+    if case == 'absolute-path':
+        shared = tmp_path / 'shared-instructions.md'
+        shared.write_text('Shared instructions.\n', encoding='utf-8')
+        config = f'model_instructions_file = "{shared}"\n'
+    elif case == 'missing-source':
+        config = 'model_instructions_file = "math_prompt.md"\n'
+    else:
+        config = 'model = "gpt-5-codex"\n'
+    (parent_dir / '.codex' / 'config.toml').write_text(config, encoding='utf-8')
+    node_dir = tmp_path / 'node'
+    (node_dir / 'skills').mkdir(parents=True)
+    CodexAgent.seed(node_dir, parent_dir=parent_dir)
+    # the child's codex dir carries only the config, skills link, and auth
+    seeded = {path.name for path in (node_dir / '.codex').iterdir()}
+    assert seeded == {'config.toml', 'skills', 'auth.json'}
 
 
 def test_transcript_globs_the_dated_rollouts(node_with_db: Node) -> None:
