@@ -53,6 +53,7 @@ EVENTS = (
     'merge',
     'delete',
     'orphan',
+    'model_drop',
     'start',
     'finish',
     'finish_cancel',

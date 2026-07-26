@@ -74,6 +74,12 @@ _BUDGET_REASON_STEMS = (
 # still a deliberate finish
 _BUDGET_REASON_HEADS = tuple(f'{stem} (spent $' for stem in _BUDGET_REASON_STEMS)
 
+# the dash-segment widths a dated model snapshot stamps: one YYYYMMDD run,
+# or a dashed YYYY-MM-DD (a dotted date normalizes to the same three) -- the
+# whole tail must be the stamp, so a version bump ahead of a date
+# (<pin>-1-20250805) reads as the different model it is
+_SNAPSHOT_WIDTHS = ((8,), (4, 2, 2))
+
 
 class Step:
     """One discovered step file.
@@ -355,6 +361,10 @@ class Loop:
         self._step_effort = ''
         self._step_detached = False
         self._step_launched = False
+        # every distinct model this launch's stream named (drop detection
+        # must see a substitution the stream recovered from; empty for an
+        # agent whose stream names none)
+        self._step_served: tuple[str, ...] = ()
         self._step_limit_seconds = 0
         self._step_timeout_effective = self._step_timeout_seconds
         self._step_budget_value: Optional[float] = None
@@ -1427,8 +1437,13 @@ class Loop:
 
             # attempt loop: only a failed launch retries -- timed out, paused,
             # and skipped are deliberate outcomes -- and every attempt books
-            # its own step row, so cost and duration attribute honestly
-            for attempt in range(self._step_retries + 1):
+            # its own step row, so cost and duration attribute honestly; a
+            # model drop (a completed launch served off its pinned model)
+            # re-dispatches once, outside the failure-retry allowance
+            attempt = 0
+            drop_retried = False
+            drop_completed = False
+            while True:
                 print()
                 print(f'--- Step {step_num}/{step_count} ({step_name}) ---')
 
@@ -1442,10 +1457,11 @@ class Loop:
                 except Exception:
                     self._step_id = None
 
-                # every attempt's row arms its own approval gate -- a retry
-                # only follows a failed attempt, whose wait never ran, so no
-                # granted approval is ever re-demanded; the fresh pend voids
-                # the failed row's stale gate
+                # every attempt's row arms its own approval gate -- a failure
+                # retry follows a failed attempt, whose wait never ran, and a
+                # drop re-dispatch produces new work, so its fresh demand is
+                # deliberate (an approval never transfers between attempts);
+                # the fresh pend voids the prior row's stale gate
                 if step.requires_approval and self._step_id is not None:
                     try:
                         node.record.step_pending(step_id=self._step_id)
@@ -1568,6 +1584,10 @@ class Loop:
                 # recompute duration (includes approval wait)
                 duration = int(time.monotonic() - step_start)
 
+                # tool-native pin enforcement: a completed launch whose
+                # recorded (stream-reported) model dropped the pinned one
+                served = self._model_drop() if step_status == 'completed' else None
+
                 if self._step_id is not None:
                     # a one-line fractal-owned reason for failure visibility in
                     # `node activity` (the full stderr/traceback blob lives in
@@ -1591,6 +1611,14 @@ class Loop:
                             step_reason = 'awaiting approval'
                     elif step_status == 'failed':
                         step_reason = result.reason or 'agent error'
+                    elif step_status == 'completed':
+                        # a drop marks its own attempt's row -- the durable
+                        # fact `node list` composes into its detail column
+                        # while the step's newest completed attempt carries
+                        # it (a clean re-dispatch supersedes the mark; an
+                        # abandoned or failed one leaves it standing)
+                        if served is not None:
+                            step_reason = f'model drop (served {served})'
                     # a retry attempt's row is marked so the row-per-attempt
                     # shape reads in `node activity`; the failed first
                     # attempt keeps its plain reason
@@ -1632,6 +1660,39 @@ class Loop:
                 if self._paused:
                     return True
 
+                # every drop lands an event; the first re-dispatches the step
+                # once (infrastructure weather can silently serve a different
+                # model than pinned), the second is recorded and the loop
+                # proceeds -- consumer-side gates and the operator own the
+                # response, never a crash or a kill
+                if served is not None:
+                    self._record_model_drop(step_name, served=served)
+                    drop_completed = True
+                    # a spent deadline abandons the re-dispatch outright: the
+                    # launch's own pre-check would only convert the completed
+                    # work into a timed-out failure
+                    deadline = self._soonest_deadline()
+                    expired = deadline > 0 and time.time() >= deadline
+                    if not drop_retried and not expired:
+                        drop_retried = True
+                        print(
+                            f'--- Step {step_num}/{step_count} ({step_name}):'
+                            f' retrying after model drop in'
+                            f' {self._step_retry_backoff} ---'
+                        )
+                        if self._retry_backoff():
+                            # the backoff can outlive the deadline too --
+                            # re-read it before buying the launch
+                            deadline = self._soonest_deadline()
+                            if deadline <= 0 or time.time() < deadline:
+                                continue
+                        # a pause landing during the backoff parks; stop, the
+                        # spent subtree ceiling, and a deadline crossing
+                        # abandon the re-dispatch, leaving the drop evented
+                        # (and its row marked) for the operator
+                        if self._paused:
+                            return True
+
                 # only a failed launch buys a retry, and only
                 # while attempts remain
                 if result.status != 'failed' or attempt >= self._step_retries:
@@ -1647,6 +1708,23 @@ class Loop:
                     if self._paused:
                         return True
                     break
+                attempt += 1
+
+            # a re-dispatch (or the failure retries its failure bought) that
+            # cannot complete must not downgrade the step: the dropped
+            # attempt's work is complete -- and, when gated, was approved
+            # before the drop check ran -- so the loop proceeds on it, the
+            # drop evented and its row marked; an interrupted approval keeps
+            # the failure path (unapproved work never ships)
+            if failed and drop_completed and not approval_interrupted:
+                failed = False
+                self._timed_out = False
+                self._fail_reason = None
+                print(
+                    f'--- Step {step_num}/{step_count} ({step_name}):'
+                    f' re-dispatch did not complete; proceeding on the'
+                    f' dropped attempt ---'
+                )
 
             if failed:
                 # book the never-run tail as real rows (start + immediate
@@ -1996,8 +2074,10 @@ class Loop:
         # re-records the group, pause.sh the marker
         (node_dir / STEP_PGID_FILE).unlink(missing_ok=True)
         (node_dir / PAUSE_ABORT_FILE).unlink(missing_ok=True)
-        # a stale launch reason must never label this invocation's outcome
+        # a stale launch reason must never label this invocation's outcome,
+        # and a stale served-model record must never flag it
         self._fail_reason = None
+        self._step_served = ()
 
         # resolve this agent's session (empty unless a
         # continuous session exists)
@@ -2160,6 +2240,10 @@ class Loop:
 
         session_out = result.session if result is not None else None
         cost_out = result.cost if result is not None else None
+        # keep the stream's full served-model record for the drop check --
+        # the row keeps only the last stamp, which a recovered mid-stream
+        # substitution would read as clean
+        self._step_served = result.models if result is not None else ()
 
         # a failed/timed-out launch keeps its stderr durably: <agent>.err is
         # the per-invocation live capture the next launch truncates, so the
@@ -2314,6 +2398,69 @@ class Loop:
             return True
         return False
 
+    def _model_drop(self: Loop) -> Optional[str]:
+        """Return the served model when it dropped this launch's pinned one.
+
+        The launch's own served-model record is the read: every distinct
+        model the agent's stream named (attached and detached launches
+        stream in-process alike), so a substitution the stream recovered
+        from before ending still flags. A launch whose stream named none
+        falls back to the step row -- the pre-spawn stamp records the pin
+        itself there, so an agent that never names the served model stays
+        clean rather than conflated with a verified match (and the
+        session-capture re-stamp keeps an init-frame mismatch visible).
+        Matching is :func:`_models_match`, not bare equality: an alias pin
+        (``opus``) must not flag the full id it resolves to, a gateway
+        slug (``anthropic/<id>``) must not flag its bare form, and a dated
+        snapshot is its pin -- while a truncation or variant suffix is a
+        genuinely different model. Guarded: a contended read proves
+        nothing.
+        """
+        pinned = self._step_model
+        if not pinned or self._step_id is None:
+            return None
+        served = self._step_served
+        if not served:
+            try:
+                rows = self.node.db.read(
+                    'steps',
+                    where={'step_id': self._step_id},
+                    limit=1,
+                )
+            except Exception:
+                return None
+            model = rows[0]['model'] if rows else None
+            served = (model,) if model else ()
+        for model in served:
+            if not _models_match(pinned, model):
+                return model
+        return None
+
+    def _record_model_drop(self: Loop, step_name: str, *, served: str) -> None:
+        """Scream a model drop and record its event with the step's lineage.
+
+        The warning is the pane's durable trace; the event is the ledger's.
+        The event write is guarded like every ledger write on the step path
+        -- a contended DB must never turn the drop policy into a loop death.
+        """
+        print(
+            f'WARNING: model drop on {step_name} — pinned {self._step_model}'
+            f' but {served} served the step',
+            file=sys.stderr,
+        )
+        try:
+            event_id = self.node.record.event_start(
+                'model_drop',
+                metadata=f'served {served}, pinned {self._step_model}',
+                run_id=self._run_id,
+                iter_id=self._iter_id,
+                step_id=self._step_id,
+            )
+            if event_id is not None:
+                self.node.record.event_end(event_id=event_id, status='completed')
+        except Exception:
+            pass
+
     def _sync(
         self: Loop,
         step_num: int,
@@ -2358,6 +2505,13 @@ class Loop:
         # close would then stamp 0.0 over its real flushed cost, so restore
         # the caller's flag after the sync's own zero-stamp check
         saved_launched = self._step_launched
+        # the sync's launch also resolves its own pin and served-model
+        # record over the caller's -- the drop check runs after the
+        # approval wait, so the awaited step's must be restored or the
+        # sync's would falsify it (both directions: a step pin compared
+        # against the node default, or erased with it)
+        saved_model = self._step_model
+        saved_served = self._step_served
         print()
         print(f'--- SYNC ({label}) ---')
         self._step_label = f'SYNC ({label})'
@@ -2431,6 +2585,8 @@ class Loop:
         self._step_label = saved_label
         self._step_id = saved_step_id
         self._step_launched = saved_launched
+        self._step_model = saved_model
+        self._step_served = saved_served
         return result, duration, sync_step_id
 
     def _wait_for_children(self: Loop, context: str) -> bool:
@@ -3606,6 +3762,56 @@ def _is_cascaded_budget_reason(reason: str, /) -> bool:
     match is the loop-authored budget shape plus the fan-out attribution.
     """
     return '(via finish of ' in reason and _is_budget_reason(reason)
+
+
+def _model_id(model: str, /) -> str:
+    """Return a model id with its gateway prefix stripped and dots dashed.
+
+    The comparable form of an id: a gateway slug (``anthropic/<id>``) and
+    its bare form name one model, as do the slug and API spellings of one
+    version (``sonnet-4.6``, ``sonnet-4-6``).
+    """
+    _, _, name = model.rpartition('/')
+    return name.replace('.', '-')
+
+
+def _models_match(pinned: str, served: str) -> bool:
+    """Return whether a served model id carries the pinned one.
+
+    Bare equality is too strict -- a gateway slug pin (``anthropic/<id>``)
+    must match its bare form, an alias pin (``opus``) must match the full
+    id it resolves to, and a dated snapshot (``<pin>-20260115``) is the
+    pin it stamps -- while raw containment is too loose: a truncation or
+    variant suffix of the pin (``gpt-5.6`` for ``gpt-5.6-sol``, a
+    ``-mini``) is a genuinely different model and must flag. So both ids
+    are compared as :func:`_model_id` forms.
+
+    A bare word pin is an alias naming a family, not a version, so it
+    matches any served id carrying it dash-bounded and trailed by the
+    family's own version run -- but a named variant riding a version
+    (``-5-mini``) is a different model, while a lone word tail is the
+    version itself (``-latest``). Anything else matches exactly, or
+    extended by a date stamp alone (:data:`_SNAPSHOT_WIDTHS`), so a
+    version bump (``-1``) never passes as a snapshot.
+    """
+    pinned = _model_id(pinned)
+    served = _model_id(served)
+    if pinned == served:
+        return True
+    segments = served.split('-')
+    # an alias pin (opus, fable) matches the full id it resolves to -- as
+    # a dash-bounded word, so a variant sharing the substring never passes
+    if '-' not in pinned and not any(char.isdigit() for char in pinned):
+        if pinned not in segments:
+            return False
+        tail = segments[segments.index(pinned) + 1 :]
+        return len(tail) <= 1 or all(segment.isdigit() for segment in tail)
+    # a dated snapshot extends its pin with the date stamp and nothing else
+    if served.startswith(f'{pinned}-'):
+        tail = served[len(pinned) + 1 :].split('-')
+        widths = tuple(len(segment) for segment in tail)
+        return all(segment.isdigit() for segment in tail) and widths in _SNAPSHOT_WIDTHS
+    return False
 
 
 def _boot_env(node: Node, *, detached: bool, meta: str) -> dict[str, str]:

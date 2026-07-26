@@ -23,7 +23,7 @@ import pytest
 from fractal.constants import SOCKET_FILE
 from fractal.core import pricing
 from fractal.core.event import Event
-from fractal.core.loop import Loop, Step, StepResult
+from fractal.core.loop import Loop, Step, StepResult, _models_match
 from fractal.core.node import Node
 from fractal.exceptions import _Abort
 from fractal.impl.claude import ClaudeAgent
@@ -72,6 +72,11 @@ __all__ = [
     'test_step_retries_zero_disables_the_retry',
     'test_pause_during_retry_backoff_parks',
     'test_ceiling_trip_during_retry_backoff_abandons_the_retry',
+    'test_models_match_admits_pin_forms_and_flags_variants',
+    'test_slow_approval_sync_never_falsifies_a_clean_pin',
+    'test_slow_approval_sync_never_hides_a_real_drop',
+    'test_failed_drop_redispatch_proceeds_on_the_dropped_attempt',
+    'test_spent_deadline_abandons_the_drop_redispatch',
     'test_err_snapshots_keep_every_attempts_diagnosis',
     'test_run_end_drain_outlives_the_closed_iterations_deadline',
     'test_before_last_step_drain_uses_the_run_wall_not_the_iter_deadline',
@@ -1586,6 +1591,266 @@ def test_ceiling_trip_during_retry_backoff_abandons_the_retry(
     assert len(failed_rows) == 1
 
 
+# ------ model-drop policy
+
+
+class ServingLoop(MockLoop):
+    """Mock loop whose work launches stamp a scripted served model.
+
+    Each non-SYNC launch pops the next entry of ``serves`` and -- unless
+    it is ``None`` -- lands it exactly as the stream driver does: stamped
+    on the live step row and stowed as the launch's served-model record
+    (which every launch, SYNC included, first resets).
+    """
+
+    def __init__(
+        self: ServingLoop,
+        node: Node,
+        results: Optional[list[StepResult]] = None,
+        serves: Optional[list[Optional[str]]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize ``ServingLoop``."""
+        super().__init__(node, results=results, **kwargs)
+        self.serves = list(serves or [])
+
+    def _launch(self: ServingLoop, step: Step, *args: Any, **kwargs: Any) -> StepResult:
+        """Stamp the scripted served model beside the popped outcome."""
+        result = super()._launch(step, *args, **kwargs)
+        self._step_served = ()
+        if step.name != 'SYNC' and self.serves and self._step_id is not None:
+            served = self.serves.pop(0)
+            if served is not None:
+                self.node.record.step_session(
+                    'claude',
+                    step_id=self._step_id,
+                    model=served,
+                    session='sess',
+                )
+                self._step_served = (served,)
+        return result
+
+
+class ApprovingServingLoop(ServingLoop):
+    """Serving loop double whose approval lands only after a sync cycle ran."""
+
+    def _sync(self: ApprovingServingLoop, *args: Any, **kwargs: Any) -> Any:
+        """Grant the awaited step's gate once the sync restored its id."""
+        out = super()._sync(*args, **kwargs)
+        # the sync restored the awaited step's id -- grant its gate
+        if self._step_id is not None:
+            self.node.record.step_approve(step_id=self._step_id)
+        return out
+
+
+@pytest.mark.parametrize(
+    argnames=('pinned', 'served', 'match'),
+    argvalues=[
+        # exact ids, and the forms a pin legitimately resolves to
+        ('pinned-model', 'pinned-model', True),
+        ('claude-opus-5', 'claude-opus-5-20260115', True),
+        ('opus', 'claude-opus-5-20260115', True),
+        ('anthropic/claude-opus-5', 'claude-opus-5', True),
+        ('claude-opus-5', 'anthropic/claude-opus-5', True),
+        ('anthropic/claude-sonnet-4.6', 'claude-sonnet-4-6-20260101', True),
+        ('gpt-4o', 'gpt-4o-2024-08-06', True),
+        # an alias names a family, so its own version run and date match
+        ('opus', 'claude-opus-4-1-20250805', True),
+        ('opus', 'claude-opus-latest', True),
+        # genuinely different models, containment notwithstanding
+        ('pinned-model', 'dropped-model', False),
+        ('gpt-5.6-sol', 'gpt-5.6', False),
+        ('gpt-5.6', 'gpt-5.6-sol', False),
+        ('claude-fable-5', 'claude-fable-5-mini', False),
+        ('claude-opus-4', 'claude-opus-4-1', False),
+        ('claude-opus-4-1', 'claude-opus-4', False),
+        ('opus', 'propus-x', False),
+        # a variant riding a version is a different model, alias pin or not
+        ('opus', 'claude-opus-5-mini', False),
+        # a version bump ahead of a date is a bump, not a snapshot stamp
+        ('claude-opus-4', 'claude-opus-4-1-20250805', False),
+        ('gpt-5', 'gpt-5-1-20260101', False),
+    ],
+)
+def test_models_match_admits_pin_forms_and_flags_variants(
+    pinned: str,
+    served: str,
+    match: bool,
+) -> None:
+    """Pin matching admits alias/slug/date forms and flags real swaps.
+
+    A gateway slug on either side and a dated snapshot are the pin they
+    stand for, and an alias pin is its whole family -- version run and
+    date alike. A truncation, a variant suffix, or a version bump is a
+    genuinely different model, even when one id contains the other as a
+    bare substring, and even when the bump hides behind a date stamp.
+    """
+    assert _models_match(pinned, served) is match
+
+
+def test_slow_approval_sync_never_falsifies_a_clean_pin(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An approval-wait SYNC must not clobber the pin the drop check reads.
+
+    A gated step pinned by frontmatter, served exactly its pin, approved
+    only after a sync cycle ran (a human-latency approval): the sync's own
+    launch resolves the node default over the step pin, and an unrestored
+    pin would falsify a drop -- a spurious event, a wasted re-dispatch,
+    and a second approval demand on a fully clean step.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    (loop_node.node_dir / 'steps' / '01-PLAN.md').write_text(
+        '---\nmodel: pinned-model\nrequires_approval: true\n---\n# PLAN\n\nWork.\n',
+        encoding='utf-8',
+    )
+    _configure(loop_node, model='node-default', sync=True, wait='1s')
+    loop = ApprovingServingLoop(loop_node, serves=['pinned-model'])
+    assert loop.run() == 0
+    # the pin was served: nothing evented, nothing re-dispatched, one
+    # approval consumed, and no marker reaches the listing
+    assert loop_node.db.read('events', where={'event': 'model_drop'}) == []
+    work = [label for label in loop.launched if label.startswith('step ')]
+    assert len(work) == 1
+    row = loop_node.db.read('steps', where={'step_name': 'PLAN'})[0]
+    assert (row['model'], row['metadata']) == ('pinned-model', '')
+    assert row['approved']
+    assert loop_node.status_detail() == ''
+
+
+def test_slow_approval_sync_never_hides_a_real_drop(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frontmatter-only pin still catches a drop across an approval sync.
+
+    With no node-level model the sync's launch resolves an empty pin, and
+    an unrestored one would disable detection on exactly the gated steps
+    it should guard: a genuinely dropped serve must still event, mark the
+    attempt's row, and buy the single re-dispatch.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    (loop_node.node_dir / 'steps' / '01-PLAN.md').write_text(
+        '---\nmodel: pinned-model\nrequires_approval: true\n---\n# PLAN\n\nWork.\n',
+        encoding='utf-8',
+    )
+    _configure(loop_node, sync=True, wait='1s', step_retry_backoff='1s')
+    loop = ApprovingServingLoop(loop_node, serves=['dropped-model', 'pinned-model'])
+    assert loop.run() == 0
+    # the drop evented and bought the re-dispatch; the dropped attempt's
+    # row carries the mark and the clean retry supersedes it
+    assert len(loop_node.db.read('events', where={'event': 'model_drop'})) == 1
+    work = [label for label in loop.launched if label.startswith('step ')]
+    assert len(work) == 2
+    redispatched, dropped = loop_node.db.read('steps', where={'step_name': 'PLAN'})
+    assert (dropped['model'], dropped['metadata']) == (
+        'dropped-model',
+        'model drop (served dropped-model)',
+    )
+    assert (redispatched['model'], redispatched['metadata']) == ('pinned-model', '')
+    assert loop_node.status_detail() == ''
+
+
+def test_failed_drop_redispatch_proceeds_on_the_dropped_attempt(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A re-dispatch that cannot complete never downgrades the dropped step.
+
+    The dropped attempt's work is complete; when the re-dispatch and the
+    failure retries its failure bought all fail, the loop proceeds on that
+    work -- the iteration completes, the tail steps run, and the drop
+    stays evented, marked on its own row, and surfaced in the listing.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md', '02-EXECUTE.md'])
+    for name in ('01-PLAN.md', '02-EXECUTE.md'):
+        (loop_node.node_dir / 'steps' / name).write_text(
+            f'---\nmodel: pinned-model\n---\n# {name}\n\nWork.\n',
+            encoding='utf-8',
+        )
+    _configure(loop_node, step_retry_backoff='1s')
+    failure = StepResult(status='failed', exit_code=2, reason='agent error (exit 2)')
+    results = [
+        StepResult(status='completed'),  # PLAN, served off the pin
+        failure,  # the drop re-dispatch
+        failure,  # the failure retry its failure bought
+        StepResult(status='completed'),  # EXECUTE, served the pin
+    ]
+    serves = ['dropped-model', None, None, 'pinned-model']
+    loop = ServingLoop(loop_node, results=results, serves=serves)
+    assert loop.run() == 0
+    assert 'proceeding on the dropped attempt' in capsys.readouterr().out
+    # the failed re-dispatch chain spent its rows, then the tail step ran
+    assert loop.launched == [
+        'step 1 of 2 (PLAN)',
+        'step 1 of 2 (PLAN)',
+        'step 1 of 2 (PLAN)',
+        'step 2 of 2 (EXECUTE)',
+    ]
+    # newest-first: EXECUTE, the failed retry, the failed re-dispatch, and
+    # the dropped attempt whose mark no completed attempt superseded
+    rows = loop_node.db.read('steps', where={'node': loop_node.branch})
+    assert [(row['step'], row['status'], row['metadata']) for row in rows] == [
+        (2, 'completed', ''),
+        (1, 'failed', 'agent error (exit 2); retry'),
+        (1, 'failed', 'agent error (exit 2)'),
+        (1, 'completed', 'model drop (served dropped-model)'),
+    ]
+    assert len(loop_node.db.read('events', where={'event': 'model_drop'})) == 1
+    # the iteration completed on the dropped attempt's work, and the
+    # unresolved drop reaches the listing
+    assert loop_node.status() == 'completed'
+    assert loop_node.status_detail() == 'model drop'
+
+
+def test_spent_deadline_abandons_the_drop_redispatch(
+    loop_node: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drop past the iteration deadline proceeds instead of re-dispatching.
+
+    The re-dispatch's own launch pre-check would only convert the
+    completed work into a timed-out failure, so a spent deadline abandons
+    it: one launch, the drop evented and marked, the iteration completed
+    -- never a timed-out run off work that finished.
+    """
+    monkeypatch.setenv('_NODE', '')
+    _seed_steps(loop_node, ['01-PLAN.md'])
+    (loop_node.node_dir / 'steps' / '01-PLAN.md').write_text(
+        '---\nmodel: pinned-model\n---\n# PLAN\n\nWork.\n',
+        encoding='utf-8',
+    )
+    _configure(loop_node, iter_timeout='1s')
+
+    class OverrunningLoop(ServingLoop):
+        """Mock loop whose launch completes past the iteration deadline."""
+
+        def _launch(self: OverrunningLoop, *args: Any, **kwargs: Any) -> StepResult:
+            time.sleep(1.2)
+            return super()._launch(*args, **kwargs)
+
+    loop = OverrunningLoop(loop_node, serves=['dropped-model'])
+    assert loop.run() == 0
+    # the spent deadline bought no re-dispatch; the completed work stands
+    assert loop.launched == ['step 1 of 1 (PLAN)']
+    row = loop_node.db.read('steps', where={'step_name': 'PLAN'})[0]
+    assert (row['status'], row['metadata']) == (
+        'completed',
+        'model drop (served dropped-model)',
+    )
+    assert len(loop_node.db.read('events', where={'event': 'model_drop'})) == 1
+    # the iteration and run close clean -- not timed out
+    iter_row = loop_node.db.read('iters', where={'node': loop_node.branch})[0]
+    assert (iter_row['status'], iter_row['metadata']) == ('completed', '')
+    assert loop_node.record.runs(limit=1)[0]['metadata'] == 'Reached max iterations (1)'
+    assert loop_node.status_detail() == 'model drop'
+
+
 # ------ launch diagnostics
 
 
@@ -1620,6 +1885,7 @@ def test_err_snapshots_keep_every_attempts_diagnosis(loop_node: Node) -> None:
         session = None
         cost = None
         budget_stopped = False
+        models = ()
 
     class MockAgent:
         """Agent double writing a canned diagnosis per spawn, then failing."""
