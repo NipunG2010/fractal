@@ -15,6 +15,7 @@ from .test_lifecycle import *
 from .test_lifecycle_shells import *
 from .test_loop_contract import *
 from .test_main import *
+from .test_model_drop import *
 from .test_node_cli import *
 from .test_plan_cli import *
 from .test_radio_cli import *

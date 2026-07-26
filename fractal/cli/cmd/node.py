@@ -805,11 +805,11 @@ def node_list(app: typer.Typer) -> typer.Typer:
         Lists descendants only -- it never includes the target row; use
         ``fractal node status`` for the node's own status. ``status`` is
         always bare and ``detail`` carries any qualifier (a pending
-        signal, an exited run's end reason, ``orphaned``). ``spend`` is
-        the current run's subtree cost, the scope ``max_cost`` beside it
-        is enforced at, and is blank for a node that has never run.
-        ``last`` is the age of each node's newest activity; ``!`` flags an
-        active node quiet past ``max(step_timeout, 5m)``.
+        signal, an exited run's end reason, ``orphaned``, an unresolved
+        ``model drop``). ``spend`` is the current run's subtree cost, the
+        scope ``max_cost`` beside it is enforced at, and is blank for a node
+        that has never run. ``last`` is the age of each node's newest activity;
+        ``!`` flags an active node quiet past ``max(step_timeout, 5m)``.
         """
         # validate arguments
         require_non_negative(max_depth=max_depth)

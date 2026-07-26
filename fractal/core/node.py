@@ -2924,10 +2924,13 @@ class Node:
         signal is pending on an active node; the recorded end reason when
         the latest run row says why an ``exited`` run ended (the run row is
         the single source -- a reconcile-healed crash records no reason);
-        else empty. The qualifier never enters the stored status, which
-        stays bare -- but a crashed-but-active node is reconciled
-        (persisted) first: reads are where staleness is observed, and the
-        probe is a no-op unless the stored status is ``active``.
+        else empty. An unresolved model drop on the newest iteration
+        composes a ``model drop`` marker onto whichever qualifier stands
+        (any status -- served-model honesty outlives the run). The
+        qualifier never enters the stored status, which stays bare -- but
+        a crashed-but-active node is reconciled (persisted) first: reads
+        are where staleness is observed, and the probe is a no-op unless
+        the stored status is ``active``.
 
         Returns:
             The qualifier, or an empty string when the status stands alone.
@@ -2935,21 +2938,50 @@ class Node:
         """
         self._reconcile_status()
         status = self.status()
+        detail = ''
         if status == 'active':
             if self.record.signal_get('pause') is not None:
-                return 'pausing'
-            if self.record.signal_get('stop') is not None:
-                return 'stopping'
-            if self.record.signal_get('finish') is not None:
-                return 'finishing'
+                detail = 'pausing'
+            elif self.record.signal_get('stop') is not None:
+                detail = 'stopping'
+            elif self.record.signal_get('finish') is not None:
+                detail = 'finishing'
         if status == 'exited':
             # the latest run row records why the loop ended (budget landing,
             # timeout, setup abort); a crash healed by reconcile closes its
             # rows reason-less and keeps the bare status
             rows = self.record.runs(limit=1)
             if rows and rows[0]['status'] == 'exited' and rows[0]['metadata']:
-                return rows[0]['metadata']
-        return ''
+                detail = rows[0]['metadata']
+        # an unresolved model drop composes onto the qualifier (the metadata
+        # append shape), so neither fact hides the other
+        if self._model_dropped():
+            detail = f'{detail}; model drop' if detail else 'model drop'
+        return detail
+
+    def _model_dropped(self: Node) -> bool:
+        """Return whether the newest iteration carries an unresolved model drop.
+
+        The loop marks every completed attempt served off its pin on that
+        attempt's own row, so a drop stands unresolved exactly while a
+        step's *newest completed* attempt carries the marker: a clean
+        re-dispatch supersedes it, while one that failed, timed out, or
+        was abandoned (stop, ceiling, a parked backoff resume never
+        re-entered) leaves it standing. The read is the newest iteration
+        alone, so a later iteration supersedes the marker.
+        """
+        iters = self.record.iters(limit=1)
+        if not iters:
+            return False
+        steps = self.record.steps(iter_id=iters[0]['iter_id'])
+        # newest completed attempt per step, rows newest-first (SYNC rows
+        # carry the awaited step's number, so the name joins the key)
+        newest: dict[tuple, dict] = {}
+        for row in steps:
+            key = (row['step'], row['step_name'])
+            if row['status'] == 'completed' and key not in newest:
+                newest[key] = row
+        return any('model drop' in row['metadata'] for row in newest.values())
 
     def status_display(self: Node) -> str:
         """Return the status decorated with a pending signal or end reason.
@@ -3033,7 +3065,8 @@ class Node:
         enforced at -- the current run's subtree spend -- and is blank for
         a node with no recorded runs. ``status`` is always bare, with any
         qualifier (a pending signal, an ``exited`` run's end reason, an
-        ``orphaned`` flag) in ``detail``. The ``last`` column renders each
+        ``orphaned`` flag, a ``model drop`` marker) in ``detail``. The
+        ``last`` column renders each
         row's newest activity instant as a compact age, flagged (``12m!``)
         when an active node has sat quiet past ``max(step_timeout, 5m)``.
 
@@ -3049,9 +3082,9 @@ class Node:
                 to ``exited``, and a booting ``idle`` node (live session,
                 the loop not yet stamped) to ``active`` (the authoritative
                 view). Read-only -- it does not persist the relabel.
-            decorated: Record each active descendant's pending stop/finish
-                signal (``stopping``) and each exited one's recorded end
-                reason in its ``detail``; display-only, gated off for hot
+            decorated: Record each descendant's status qualifier (a
+                pending signal, an exited run's end reason, a model-drop
+                marker) in its ``detail``; display-only, gated off for hot
                 paths such as ``--count``.
 
         Returns:
@@ -3201,13 +3234,14 @@ class Node:
         row: dict,
         worktrees: dict[str, pathlib.Path],
     ) -> dict:
-        """Fill a descendant's ``detail`` with its pending signal or end reason.
+        """Fill a descendant's ``detail`` with its status qualifier.
 
         Display helper for ``list``: for a descendant whose own stored
-        status still matches the row's (``active`` or ``exited``), records
-        its :meth:`status_detail` (``pausing`` / ``stopping`` /
-        ``finishing`` / the run's end reason) in the row's ``detail``. The
-        row's ``status`` stays bare. A diverged row (a stale registry
+        status still matches the row's, records its :meth:`status_detail`
+        (``pausing`` / ``stopping`` / ``finishing`` / the run's end reason
+        / the ``model drop`` marker -- which any status can carry, so no
+        stored-status gate scopes the consult) in the row's ``detail``.
+        The row's ``status`` stays bare. A diverged row (a stale registry
         value, or ``--live``'s display-only relabel of a crashed ``active``
         node) is left alone without consulting ``status_detail``, whose
         reconcile would otherwise persist a heal from a read-only listing;
@@ -3219,8 +3253,6 @@ class Node:
         and an empty detail.
         """
         stored = _base_status(row.get('status'))
-        if stored not in ('active', 'exited'):
-            return row
         worktree_dir = worktrees.get(row['node'])
         if worktree_dir:
             node = self.__class__(worktree_dir)
