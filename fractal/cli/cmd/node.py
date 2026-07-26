@@ -118,6 +118,12 @@ def node_init(app: typer.Typer) -> typer.Typer:
         ' or all.'
     )
     inherit = typer.Option(None, '--inherit', help=inherit_help)
+    # steps option
+    steps_help = (
+        'Directory of NN- prefixed step files (*.md) to seed steps/ from'
+        ' instead of the package seed; mutually exclusive with --inherit=steps.'
+    )
+    steps = typer.Option(None, '--steps', help=steps_help)
     # agent option
     agent_help = 'Agent command (default: inherited from the nearest ancestor).'
     agent = typer.Option(None, '--agent', help=agent_help)
@@ -216,6 +222,7 @@ def node_init(app: typer.Typer) -> typer.Typer:
         base: Optional[str] = base,
         meta: Optional[str] = meta,
         inherit: Optional[list[str]] = inherit,
+        steps: Optional[str] = steps,
         agent: Optional[str] = agent,
         provider: Optional[str] = provider,
         model: Optional[str] = model,
@@ -282,6 +289,7 @@ def node_init(app: typer.Typer) -> typer.Typer:
             base=base,
             meta=meta,
             inherit=inherit,
+            steps=steps,
             agent=agent,
             provider=provider,
             model=model,

@@ -54,7 +54,8 @@ expands to the full set. Inheriting a surface the parent does not carry is an
 error.
 
 - **`steps`** -- copy the parent's step list, including its trims, added steps,
-  and frontmatter overrides (see [[configuration/steps]]).
+  and frontmatter overrides (see [[configuration/steps]]); mutually exclusive
+  with an explicit `--steps` directory (see [[configuration/node_init]]).
 - **`scripts`** -- copy the parent's setup, test, and lint scripts with their
   project-specific extensions (see [[configuration/scripts]]).
 - **`skills`** -- copy the parent's skill set.

@@ -52,6 +52,7 @@ __all__ = [
     'test_child_inherits_agent_config_from_parent',
     'test_init_stores_unset_booleans_as_null',
     'test_child_inherits_steps_and_scripts_from_parent',
+    'test_init_seeds_steps_from_directory',
     'test_child_inherits_skills_only_on_request',
     'test_child_inherits_config_preferences_not_caps',
     'test_init_requires_resolvable_agent',
@@ -679,6 +680,75 @@ def test_child_inherits_steps_and_scripts_from_parent(
     # a flagless sibling still seeds the full profile from the package
     Node(git_repo).init(name='stock')
     stock_steps = node_dir('main.task.stock') / 'steps'
+    assert (stock_steps / '00-PREPARE.md').is_file()
+
+
+def test_init_seeds_steps_from_directory(
+    git_repo: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """``--steps`` seeds the node's steps from an explicit directory.
+
+    The directory's step files reach the node byte-for-byte in filename
+    order instead of the package seed, even from a directory whose name
+    carries glob metacharacters; a sibling spawned without the flag still
+    seeds the stock set. A missing directory, a directory with no
+    step files, a profile the loop could not discover (a missing ``NN-``
+    prefix, mixed prefix widths), and combining with ``--inherit=steps``
+    -- named or reached through ``all``, two rival step sources -- all
+    refuse before any worktree is created.
+    """
+
+    def node_dir(branch: str) -> pathlib.Path:
+        return git_repo / '.worktrees' / branch / '.fractal' / branch
+
+    Node(git_repo).init(agent='claude', user=True)
+    # author a custom step profile -- the glob metacharacters in the dir
+    # name must reach init.sh's existence check literally, not
+    # pattern-expanded
+    profile = tmp_path / 'pro[file]'
+    profile.mkdir()
+    (profile / '00-SCOUT.md').write_bytes(b'# scout the terrain\n')
+    (profile / '01-STRIKE.md').write_bytes(b'# strike the target\n')
+    # a missing dir and a dir with no step files refuse up front
+    with pytest.raises(ValueError, match='does not exist'):
+        Node(git_repo).init(name='task', steps=tmp_path / 'absent')
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    with pytest.raises(ValueError, match='no step files'):
+        Node(git_repo).init(name='task', steps=empty)
+    # a profile the loop could not discover refuses here, not at the
+    # node's first iteration
+    unprefixed = tmp_path / 'unprefixed'
+    unprefixed.mkdir()
+    (unprefixed / 'scout.md').write_text('# scout the terrain\n')
+    with pytest.raises(ValueError, match='without an NN- prefix'):
+        Node(git_repo).init(name='task', steps=unprefixed)
+    mixed = tmp_path / 'mixed'
+    mixed.mkdir()
+    (mixed / '0-SCOUT.md').write_text('# scout the terrain\n')
+    (mixed / '01-STRIKE.md').write_text('# strike the target\n')
+    with pytest.raises(ValueError, match='mixes digit prefix widths'):
+        Node(git_repo).init(name='task', steps=mixed)
+    # --steps and --inherit=steps are rival step sources, whether the
+    # surface is named or reached through the 'all' alias
+    with pytest.raises(ValueError, match='inherit=steps'):
+        Node(git_repo).init(name='task', steps=profile, inherit=['steps'])
+    with pytest.raises(ValueError, match='inherit=steps'):
+        Node(git_repo).init(name='task', steps=profile, inherit=['all'])
+    assert not (git_repo / '.worktrees' / 'main.task').exists()
+    # the profile replaces the stock set, byte-for-byte in filename order
+    Node(git_repo).init(name='task', steps=profile)
+    seeded = node_dir('main.task') / 'steps'
+    assert sorted(f.name for f in seeded.glob('*.md')) == [
+        '00-SCOUT.md',
+        '01-STRIKE.md',
+    ]
+    for src in profile.glob('*.md'):
+        assert (seeded / src.name).read_bytes() == src.read_bytes()
+    # a flagless sibling still seeds the stock set from the package
+    Node(git_repo).init(name='stock')
+    stock_steps = node_dir('main.stock') / 'steps'
     assert (stock_steps / '00-PREPARE.md').is_file()
 
 

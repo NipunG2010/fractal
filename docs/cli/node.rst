@@ -109,6 +109,12 @@ node at ``--path``.
        (comma-separated; repeatable): ``steps``, ``scripts``, ``skills``,
        ``config``, or ``all``. ``config`` copies preference keys only —
        budget-class caps never inherit.
+   * - ``--steps <dir>``
+     - package seed
+     - Directory of step files (``*.md``) seeding the node's ``steps/``
+       instead of the package seed; must hold at least one, each carrying
+       the loop's ``NN-`` digit prefix at one width.
+       Mutually exclusive with ``--inherit=steps``.
    * - ``--agent <command>``
      - nearest ancestor's
      - Agent command, validated against the agent registry (a typo refuses).

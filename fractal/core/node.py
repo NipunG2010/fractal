@@ -500,6 +500,7 @@ class Node:
         base: Optional[str] = None,
         meta: Optional[str] = None,
         inherit: Optional[list[str]] = None,
+        steps: Optional[PathLike] = None,
         agent: Optional[str] = None,
         provider: Optional[str] = None,
         model: Optional[str] = None,
@@ -549,6 +550,10 @@ class Node:
                 package seed (``steps``, ``scripts``, ``skills``,
                 ``config``, or ``all``). ``config`` copies the parent's
                 preference keys only -- budget-class caps never inherit.
+            steps: Directory of step files (``*.md``, each carrying the
+                loop's ``NN-`` digit prefix at one width) to seed the
+                node's ``steps/`` from instead of the package seed;
+                mutually exclusive with inheriting ``steps``.
             agent: Agent type.
             provider: Provider route for the agent (e.g. ``openrouter``;
                 default: the vendor-native endpoint, inherited from the
@@ -587,6 +592,7 @@ class Node:
 
         """
         from .agent import command_base, resolve
+        from .loop import _STEP_PREFIX
 
         # coerce path to a str -- downstream '.' comparisons and persisted
         # caches expect the string form
@@ -642,6 +648,43 @@ class Node:
                     )
             if 'all' in inherit:
                 inherit = ['steps', 'scripts', 'skills', 'config']
+        # an explicit steps dir is a rival step source to inheriting the
+        # parent's -- refuse the combination rather than pick one silently --
+        # and it must satisfy the loop's discovery contract, checked here so a
+        # bad profile refuses before any worktree is created rather than
+        # failing the node's first iteration; resolved so the arg handed to
+        # init.sh never depends on the script's inherited cwd
+        if steps is not None:
+            if inherit and 'steps' in inherit:
+                raise ValueError('--steps cannot be combined with --inherit=steps.')
+            steps = pathlib.Path(steps).resolve()
+            if not steps.exists():
+                raise ValueError(f'--steps directory does not exist: {steps}')
+            if not steps.is_dir():
+                raise ValueError(f'--steps is not a directory: {steps}')
+            # only regular files seed -- init.sh copies the same set
+            step_files = sorted(
+                entry for entry in steps.glob('*.md') if entry.is_file()
+            )
+            if not step_files:
+                raise ValueError(
+                    f'--steps directory contains no step files (*.md): {steps}'
+                )
+            # the loop discovers steps by their NN- prefix and fails an
+            # iteration on a missing prefix or mixed digit widths
+            widths = set()
+            for step_file in step_files:
+                match = _STEP_PREFIX.match(step_file.name)
+                if match is None:
+                    raise ValueError(
+                        f'--steps directory has a step file without an'
+                        f' NN- prefix: {step_file.name}'
+                    )
+                widths.add(len(match.group(1)))
+            if len(widths) > 1:
+                raise ValueError(
+                    f'--steps directory mixes digit prefix widths: {steps}'
+                )
         # expand --meta into --base + --scope
         if meta:
             # handle mutually exclusive flags
@@ -833,6 +876,8 @@ class Node:
         if inherit:
             joined = ','.join(inherit)
             args.append(f'--inherit={joined}')
+        if steps is not None:
+            args.append(f'--steps={steps}')
         if agent:
             args.append(f'--agent={agent}')
         if provider:

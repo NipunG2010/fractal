@@ -16,6 +16,7 @@ SCOPE=""
 BASE=""
 META=""
 INHERIT=""
+STEPS=""
 AGENT=""
 PROVIDER=""
 MODEL=""
@@ -61,6 +62,8 @@ Options:
     --inherit=<surfaces>               Seed surfaces from the parent node instead of the
                                        package seed (comma-separated; repeatable): steps,
                                        scripts, skills, config, all
+    --steps=<dir>                      Seed steps/ from the NN- prefixed step files
+                                       (*.md) in <dir> instead of the package seed
     --agent=<agent>                    Agent type
                                        (currently claude, codex, grok, opencode, or omp)
     --provider=<provider>              Provider route for the agent (e.g. openrouter)
@@ -230,6 +233,7 @@ for arg in "$@"; do
             ;;
         --meta=*) META="${arg#*=}" ;;
         --inherit=*) INHERIT="${INHERIT:+$INHERIT,}${arg#*=}" ;;
+        --steps=*) STEPS="${arg#*=}" ;;
         --sync) SYNC=true ;;
         --no-sync) SYNC=false ;;
         --detached) DETACHED=true ;;
@@ -402,6 +406,17 @@ if [[ "$INHERIT_SKILLS" == true && ! -d "$PARENT_NODE_DIR/skills" ]]; then
     echo "Error: --inherit=skills: parent has no skills dir at $PARENT_NODE_DIR/skills/" >&2
     exit 1
 fi
+# an explicit steps dir must carry step files -- fail loudly (before any
+# worktree is created) rather than seeding an empty steps/; globbed with the
+# dir quoted so a metacharacter in its name stays literal (compgen -G would
+# pattern-expand it)
+if [[ -n "$STEPS" ]]; then
+    STEPS_MATCH=("$STEPS/"*.md)
+    if [[ ! -e "${STEPS_MATCH[0]}" ]]; then
+        echo "Error: --steps: no step files at $STEPS/" >&2
+        exit 1
+    fi
+fi
 
 # branch = <parent>.<name>
 BRANCH="$PARENT_BRANCH.$NAME"
@@ -521,14 +536,18 @@ fi
 if [[ "$RESET" == true ]]; then
     rm -rf "$NODE_DIR/steps"
 fi
-# inherit the parent's live steps when requested, else the package seed
-if [[ "$INHERIT_STEPS" == true ]]; then
+# seed from an explicit --steps dir when given, else the parent's live steps
+# when requested, else the package seed
+if [[ -n "$STEPS" ]]; then
+    STEPS_SRC="$STEPS"
+elif [[ "$INHERIT_STEPS" == true ]]; then
     STEPS_SRC="$PARENT_NODE_DIR/steps"
 else
     STEPS_SRC="$NODE_SEED_DIR/steps"
 fi
 mkdir -p "$NODE_DIR/steps"
 for FILE in "$STEPS_SRC/"*.md; do
+    [[ -f "$FILE" ]] || continue
     BASENAME=$(basename "$FILE")
     if [[ ! -f "$NODE_DIR/steps/$BASENAME" ]]; then
         cp "$FILE" "$NODE_DIR/steps/$BASENAME"
