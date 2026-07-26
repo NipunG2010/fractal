@@ -42,6 +42,8 @@ class SampleParser(StreamParser):
             self.session = event.session
         if event.model is not None:
             self.model = event.model
+            if event.model not in self.models:
+                self.models.append(event.model)
         if event.cost is not None:
             self.cost = event.cost
         if event.final:

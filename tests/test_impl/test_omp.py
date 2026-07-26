@@ -113,8 +113,9 @@ def test_parser_maps_the_stream_protocol_omp() -> None:
     assert result.cost == pytest.approx(0.01)
     assert result.duration is not None
     assert result.duration >= 0.0
-    # the served model rides the turn frame
+    # the served model rides the turn frame, and joins the served record
     assert parser.model == 'openai/gpt-5.5'
+    assert parser.models == ['openai/gpt-5.5']
 
 
 def test_parser_captures_the_session_from_the_header_once() -> None:

@@ -256,6 +256,10 @@ class StreamResult:
     model: Optional[str]
     cost: Optional[float]
     budget_stopped: bool = False
+    # NOTE: every distinct model the stream's own rows named, in order -- the
+    #   step row keeps only the last, so a mid-stream substitution that
+    #   recovers before the stream ends is visible here alone
+    models: tuple[str, ...] = ()
 
 
 class StreamParser:
@@ -272,6 +276,7 @@ class StreamParser:
         """Initialize ``StreamParser``."""
         self.session: Optional[str] = None
         self.model = model  # stream-reported model overwrites
+        self.models: list[str] = []  # every distinct stream-named served model
         self.cost: Optional[float] = None  # running figure (None = no fact yet)
         self.final: bool = False  # a result frame settled the cost
         self.budget_stopped: bool = False
@@ -687,6 +692,9 @@ class Agent:
             model=parser.model,
             cost=parser.cost,
             budget_stopped=parser.budget_stopped,
+            # parser state is raw wire text -- sanitize here like session
+            # and model above, or a lone-surrogate model name reaches SQLite
+            models=tuple(_sanitize(model) for model in parser.models),
         )
 
     def record_session(

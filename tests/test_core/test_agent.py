@@ -381,6 +381,7 @@ def test_stream_records_sessions_and_costs(node_with_db: Node) -> None:
         model='opus-4.8',
         cost=0.42,
         budget_stopped=False,
+        models=('opus-4.8',),
     )
     # hooks fire in the documented order, one cost flush per figure
     names = [type(event).__name__ for event in backend.calls]
@@ -420,10 +421,14 @@ def test_stream_neutralizes_lone_surrogates(node_with_db: Node) -> None:
     ]
     rendered: list[StreamEvent] = []
     # no UnicodeEncodeError despite the lone surrogates in the bound fields
-    backend.stream(_lines(frames), step_id=step_id, render=rendered.append)
+    result = backend.stream(_lines(frames), step_id=step_id, render=rendered.append)
     row = node.db.read('steps', where={'step_id': step_id})[0]
     assert '\udc80' not in row['session']
     assert '\udc80' not in row['model']
+    # the drained served-model record is sanitized too -- it feeds the drop
+    # path's SQLite writes (row marks, model_drop events)
+    assert result.models
+    assert not any('\udc80' in model for model in result.models)
     text = next(event.text for event in rendered if event.kind == 'text')
     assert '\udc80' not in text
 

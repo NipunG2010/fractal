@@ -119,16 +119,33 @@ class ClaudeParser(StreamParser):
                                 message=result,
                             )
                         )
-        # assistant messages -- accumulate best-effort cost: claude's result
-        # frame is the authoritative record, but a killed or timed-out agent
-        # never emits one, so each message's usage is priced as it arrives and
-        # the running total emitted per event (the stream reader can die by
-        # signal); the eventual result overwrites the estimate; Claude repeats
-        # one frame per content block with identical message-level usage, so a
-        # message id is priced once -- pricing every block would inflate the
-        # estimate toward Nx for an N-block message
+        # price cost per message as it arrives: the authoritative result
+        # frame never comes from a killed agent (when it does come, it
+        # overwrites the estimate); usage is message-level and repeats on
+        # every content block, so a message id is priced once
         elif message_type == 'assistant':
             inner = message.get('message') or {}
+            # init names the model claude resolved, not the one served
+            # (infrastructure substitutes silently): re-stamp from each real
+            # top-level assistant row -- the row keeps the last served model,
+            # `models` keeps every distinct one so a mid-stream recovery
+            # stays visible; sidechain rows run their own model and synthetic
+            # rows name none -- neither feeds the record
+            if message.get('parent_tool_use_id') is None:
+                model = inner.get('model')
+                real = isinstance(model, str) and model and model != '<synthetic>'
+                if real and self.session is not None:
+                    if model not in self.models:
+                        self.models.append(model)
+                    if model != self.model:
+                        self.model = model
+                        events.append(
+                            StreamEvent(
+                                kind='session',
+                                session=self.session,
+                                model=model,
+                            )
+                        )
             usage = inner.get('usage')
             # a frame with no id cannot be deduped, so it prices as it arrives
             message_id = inner.get('id')
