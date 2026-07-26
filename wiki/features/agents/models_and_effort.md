@@ -2,8 +2,9 @@
 name: features/agents/models_and_effort
 desc: |
   Where a spawn's model and reasoning-effort overrides come from, how each
-  provider backend spells them on its command line, and how a backend
-  resolves the model its own configuration defaults to.
+  provider backend spells them on its command line, how a backend resolves
+  the model its own configuration defaults to, and how the served model is
+  recorded off the stream.
 created: 2026-07-21T05:04:16Z
 updated: 2026-07-21T05:04:16Z
 ---
@@ -40,20 +41,38 @@ Each backend translates the same two overrides into its own CLI dialect:
 | `opencode` | `-m`       | `--variant` (a model variant)       |
 | `omp`      | `--model`  | `--thinking` (a thinking level)     |
 
-For claude the effort flag outranks the settings-file effort level; node
-settings (permissions, model, environment) ride a CLI flag rather than a file
-merge. On the openrouter route a model-less claude invocation pins an explicit
-model slug, because the process environment beats the settings file and the
-route must not trust latest-model aliases.
+For claude the effort flag outranks the settings-file effort level, and it is
+the only effort channel fractal uses -- the `CLAUDE_CODE_EFFORT_LEVEL` env knob
+is deliberately not set, since a spawn-env knob leaks into the session's own
+subprocesses and would override any nested claude run; node settings
+(permissions, model, environment) ride a CLI flag rather than a file merge. On
+the openrouter route a model-less claude invocation pins an explicit model slug,
+because the process environment beats the settings file and the route must not
+trust latest-model aliases.
 
-## The configured-model fallback
+## The served-model record
 
-When a spawn names no model, the model that actually served is still
-recoverable: each stream parser starts from the backend's *configured model* and
-prefers the model the stream itself reports, so the session record stamps the
-real served model even for defaulted spawns. Each backend resolves its
-configured model from its own vendor config, best-effort — an unreadable or
-malformed file simply names no model:
+The step row records the model that *actually served*, not merely the one asked
+for: each stream parser starts from the backend's *configured model* and prefers
+the model the stream itself reports, re-stamping the session whenever the stream
+names a different one (record_session is idempotent), so the row ends up
+carrying the last served model even for defaulted spawns. For claude the init
+frame names only the model the CLI resolved — infrastructure can silently
+substitute — so the served model is read off each *real top-level* assistant row
+(`.message.model`), skipping sidechain rows (a subagent's, flagged by
+`parent_tool_use_id`, legitimately running its own model), synthetic rows (the
+CLI's injected error stand-ins), and non-string wire noise; omp reads it off
+each `turn_end` frame, and grok off its terminal frame's sole `modelUsage` key —
+its only model report, and a multi-entry usage is ambiguous (an auxiliary model
+beside the serving one), so it names no served model. Beside the row's last-wins
+stamp, every distinct model the stream names rides the launch's served-model
+record (`StreamResult.models`), which is what the loop's model-drop enforcement
+compares against a step's pin (see [[features/loop/steps|steps]]) — the row
+alone would read a substitution the stream recovered from as clean. Backends
+whose stream never names a served model (codex, opencode) leave the record
+empty, which the drop check reads as unknown rather than as a match. Each
+backend resolves its configured model from its own vendor config, best-effort —
+an unreadable or malformed file simply names no model:
 
 - claude walks its settings chain (the node agent dir's local settings over its
   `settings.json`, then the user's `~/.claude/settings.json`); the first file

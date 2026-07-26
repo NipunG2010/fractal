@@ -46,9 +46,11 @@ abnormal one (timeout, a failed final iteration, an unexpected death). A run
 that ends for a reason carries it in the row's metadata, which is what
 `fractal node activity` shows. Events are point-in-time entries with optional
 step/iteration/run lineage: commits, pauses, resumes, and their kin each land as
-one event, and pause/resume event instants credit the paused span back to run
-and iteration deadlines, so a paused node is not billed wall-clock time against
-its budgets (the credit walk's exact semantics live in
+one event, a model drop (a step served off its pinned model, see
+[[features/loop/steps|steps]]) events against the dropped attempt's row, and
+pause/resume event instants credit the paused span back to run and iteration
+deadlines, so a paused node is not billed wall-clock time against its budgets
+(the credit walk's exact semantics live in
 [[features/cost/time_budgets|time_budgets]]). The commit pipeline logs each work
 commit as an event keyed on the new sha, tying git history back to the row that
 produced it (see [[features/loop/commit_pipeline|commit_pipeline]]).
