@@ -25,14 +25,15 @@ if typing.TYPE_CHECKING:
 __all__ = []
 
 # pathspec excludes appended to every stage -- fractal's runtime artifacts
-# (the central DB and its sidecars, the status and pause markers) and
-# virtualenvs must never ride a work commit
+# (the central DB and its sidecars, the status and pause markers, the config
+# write lock) and virtualenvs must never ride a work commit
 _STAGE_EXCLUDES = (
     ':!**/.venv',
     ':!**/.db',
     ':!**/.db-*',
     ':!**/.status',
     ':!**/.paused',
+    ':!**/config.json.lock',
     # write_atomic's crash-stranded temp (.{name}-{rand}.tmp) -- a crash
     # between mkstemp and os.replace can leave one beside a committable target
     ':!**/.*-*.tmp',
@@ -405,7 +406,7 @@ def commit_user_init(node: Node, message: str) -> str:
     """Commit a user node's baseline: the project wiki (and node data when tracked).
 
     The ``--init`` baseline is the only commit a user node takes. By default
-    the node's own ``.fractal/`` data is git-excluded on the top-level
+    the node's own ``.fractal/`` data is self-ignored on the top-level
     branch, so this stages only the project wiki (under ``<project>/`` for a
     sub-project) and the ``.gitattributes`` merge attribute ``wiki init``
     wrote; on a tree opted in via ``fractal track`` the node's seed dir
@@ -427,11 +428,11 @@ def commit_user_init(node: Node, message: str) -> str:
         seed, wiki = FRACTAL_FOLDER, 'wiki'
     else:
         seed, wiki = f'{project}/{FRACTAL_FOLDER}', f'{project}/wiki'
-    # stage fractal's node data only when tracked (it is git-excluded on the
+    # stage fractal's node data only when tracked (it is self-ignored on the
     # top-level branch by default); the shared project wiki always rides along
     # so the base ref has a committed wiki
     paths = []
-    if worktree.exclude_tracks(node.repo_dir, f'{seed}/{node.branch}'):
+    if worktree.seed_tracked(node.node_dir):
         paths.append(f'{seed}/{node.branch}')
     if (node.worktree / wiki).is_dir():
         paths.append(wiki)
@@ -447,8 +448,15 @@ def commit_user_init(node: Node, message: str) -> str:
     if not paths:
         return f'User node baseline already committed on {node.branch}.'
     # literal pathspec magic: a glob char in the project prefix must not
-    # widen or empty the match
+    # widen or empty the match; the stage excludes ride every pathspec --
+    # a tracked seed dir stages everything not otherwise ignored, so the
+    # runtime artifacts inside it must be barred here too
     specs = [f':(literal){path}' for path in paths]
+    specs += _STAGE_EXCLUDES
+    # refresh the shared exclude block before staging: its basename patterns
+    # are the first layer keeping runtime files out of a tracked seed, and a
+    # fresh clone starts with no info/exclude at all
+    worktree.exclude_update(node.repo_dir)
 
     # stage the pathspec; closure so the hook-rewrite recovery can re-use it
     def _stage_paths() -> None:

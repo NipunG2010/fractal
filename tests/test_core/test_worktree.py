@@ -25,7 +25,7 @@ __all__ = [
     'test_exclude_update_preserves_content_and_collapses_blocks',
     'test_exclude_update_orphan_begin_preserves_tail',
     'test_exclude_update_concurrent_writers_preserve_custom',
-    'test_exclude_update_without_seed_dir_preserves_tracking_choice',
+    'test_seed_ignore_toggle_hides_and_exposes_the_dir',
 ]
 
 
@@ -332,27 +332,43 @@ def test_exclude_update_concurrent_writers_preserve_custom(
     assert blocks == 1
 
 
-def test_exclude_update_without_seed_dir_preserves_tracking_choice(
+def test_seed_ignore_toggle_hides_and_exposes_the_dir(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A rewrite without a resolved user node keeps the block's tracking state.
+    """The seed dir's self-ignore hides it from status; removal exposes it.
 
-    ``exclude_tracks`` reads tracking truth from the block's own seed-dir
-    line, so a rewrite that cannot resolve the user node (e.g. the repo-root
-    worktree switched off the root branch) must carry the line forward --
-    dropping it would silently flip the tree to tracked without
-    ``fractal track``.
+    The self-ignore silences the whole dir -- the ignore file included -- so
+    an untracked tree never surfaces in ``git status``, and no shared-block
+    rewrite can flip the choice. ``seed_ignore_remove`` (``fractal track``)
+    makes the dir stageable again.
     """
     repo = _git_repo(tmp_path)
-    seed_dir = '.fractal/main'
-    # an untracked tree keeps its seed-dir ignore across a seed-less rewrite
-    fractal.core.worktree.exclude_update(repo, track=False, seed_dir=seed_dir)
+    node_dir = repo / '.fractal' / 'main'
+    node_dir.mkdir(parents=True)
+    (node_dir / 'config.json').write_text('{}\n', encoding='utf-8')
+    fractal.core.worktree.seed_ignore_write(node_dir)
+    assert fractal.core.worktree.seed_tracked(node_dir) is False
+    # the whole dir is silent in status, and a block rewrite changes nothing
     fractal.core.worktree.exclude_update(repo)
-    assert fractal.core.worktree.exclude_tracks(repo, seed_dir) is False
-    # a tracked tree stays tracked across a seed-less rewrite
-    fractal.core.worktree.exclude_update(repo, track=True, seed_dir=seed_dir)
-    fractal.core.worktree.exclude_update(repo)
-    assert fractal.core.worktree.exclude_tracks(repo, seed_dir) is True
+    status = subprocess.run(
+        ['git', 'status', '--porcelain'],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert '.fractal' not in status
+    # lifting the self-ignore exposes the dir to git again
+    fractal.core.worktree.seed_ignore_remove(node_dir)
+    assert fractal.core.worktree.seed_tracked(node_dir) is True
+    status = subprocess.run(
+        ['git', 'status', '--porcelain'],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert '.fractal/' in status
 
 
 # ------ helpers

@@ -13,6 +13,8 @@ CONFIG_FILE = 'config.json'
 DB_FILE = '.db'
 #: lock filename, standalone or as a suffix, serializing concurrent access
 LOCK_FILE = '.lock'
+#: self-ignore file in the user node's data directory (fractal track removes it)
+SEED_IGNORE_FILE = '.gitignore'
 
 # NOTE: the loop marker filenames below are git-ignored via the
 #   _assets/git/exclude template -- retire or add markers in both

@@ -174,17 +174,13 @@ def track(app: typer.Typer) -> typer.Typer:
     ) -> None:
         """Track the user node's ``.fractal/`` data on the top-level branch.
 
-        Rewrites the repo-local git exclude so the user node's seed dir is
-        no longer ignored, then prints the git command that stages it -- the
-        index is never touched. Repo-wide, idempotent, and usable on any
-        initialized tree; ``fractal untrack`` is the inverse.
+        Removes the seed dir's self-ignore file so it is no longer hidden,
+        then prints the git command that stages it -- the index is never
+        touched. Repo-wide, idempotent, and usable on any initialized tree;
+        ``fractal untrack`` is the inverse.
         """
         user, seed_dir = _resolve_user_seed(path)
-        fractal.core.worktree.exclude_update(
-            repo_dir=user.repo_dir,
-            track=True,
-            seed_dir=seed_dir,
-        )
+        fractal.core.worktree.seed_ignore_remove(user.node_dir)
         typer.echo(
             f'Tracking {seed_dir}/ on the top-level branch.'
             f'\nNext: stage it with: git add -- {seed_dir}'
@@ -205,18 +201,14 @@ def untrack(app: typer.Typer) -> typer.Typer:
     ) -> None:
         """Git-ignore the user node's ``.fractal/`` data (the default state).
 
-        Rewrites the repo-local git exclude so the user node's seed dir is
-        ignored on the top-level branch, then prints the git command that
-        unstages an already-committed seed -- the index is never touched.
-        Repo-wide, idempotent, and usable on any initialized tree;
-        ``fractal track`` is the inverse.
+        Restores the seed dir's self-ignore file so it is hidden on the
+        top-level branch, then prints the git command that unstages an
+        already-committed seed -- the index is never touched. Repo-wide,
+        idempotent, and usable on any initialized tree; ``fractal track``
+        is the inverse.
         """
         user, seed_dir = _resolve_user_seed(path)
-        fractal.core.worktree.exclude_update(
-            repo_dir=user.repo_dir,
-            track=False,
-            seed_dir=seed_dir,
-        )
+        fractal.core.worktree.seed_ignore_write(user.node_dir)
         typer.echo(
             f'Ignoring {seed_dir}/ on the top-level branch.'
             f'\nNext: unstage a committed seed with: git rm -r --cached -- {seed_dir}'
@@ -494,8 +486,8 @@ def _resolve_user_seed(path: str) -> tuple[Node, str]:
     """Resolve the user node and its seed dir (shared by track/untrack).
 
     Tracking is repo-wide, so the toggle anchors on the user node that owns
-    the exclude block by config, not the current branch (mirrors pause) --
-    the verbs stay usable on any checkout inside the repo.
+    the seed dir by config, not the current branch (mirrors pause) -- the
+    verbs stay usable on any checkout inside the repo.
     """
     user = resolve_user_node(path)
     # the seed dir nests under <project>/ for a sub-project user node

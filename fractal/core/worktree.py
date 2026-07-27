@@ -17,6 +17,7 @@ from fractal.constants import (
     FRACTAL_FOLDER,
     LOCK_FILE,
     PROJECT_FOLDER,
+    SEED_IGNORE_FILE,
     WORKTREES_FOLDER,
 )
 from fractal.typing import PathLike
@@ -247,12 +248,7 @@ def set_project_path(repo_dir: pathlib.Path, branch: str, project: str) -> None:
     (project_dir / branch).write_text(f'{project}\n', encoding='utf-8')
 
 
-def exclude_update(
-    repo_dir: pathlib.Path,
-    *,
-    track: bool = False,
-    seed_dir: Optional[str] = None,
-) -> None:
+def exclude_update(repo_dir: pathlib.Path) -> None:
     """Write fractal's ignore patterns into the repo-local ``info/exclude``.
 
     Fractal's runtime artifacts -- worktrees, databases, status files,
@@ -262,24 +258,21 @@ def exclude_update(
     every prior fractal block is replaced (so new patterns propagate on
     re-init) and all other ``info/exclude`` content is preserved.
 
+    The block is static -- the shipped template verbatim, identical for
+    every tree -- so no rewrite can carry per-tree state, and a second
+    tree's init can never expose the first's. Each user node's own seed
+    dir ignores itself via :func:`seed_ignore_write` instead.
+
     Idempotent and concurrency-safe: the common-dir ``info/exclude`` is
     shared by every worktree, so sibling ``init``/``start`` fan-out races on
-    it. The rewrite computes the new content from a clean read and commits it
-    with an atomic unique-temp ``os.replace`` -- a racing writer can never
-    observe a truncated file and drop the user's lines, and a crash mid-write
-    cannot orphan a half-block.
+    it. Every writer produces identical block bytes, and the rewrite computes
+    the new content from a clean read and commits it with an atomic
+    unique-temp ``os.replace`` -- a racing writer can never observe a
+    truncated file and drop the user's lines, and a crash mid-write cannot
+    orphan a half-block.
 
     Args:
         repo_dir: Main git repo root.
-        track: The tree tracks ``.fractal/`` on the top-level branch, so
-            the seed dir is not ignored.
-        seed_dir: The user node's own seed dir (``<project>/.fractal/<branch>``),
-            prepended so the top-level branch ignores it; child seeds
-            (``.fractal/<branch>.<child>``) stay tracked so meta and merge-up
-            keep working -- ``fractal track`` opts the top-level branch back in.
-            ``None`` carries the existing block's seed-dir line forward, so a
-            rewrite that cannot resolve the user node never flips the
-            tracking choice.
 
     """
     # build the managed block from the shipped template
@@ -289,14 +282,6 @@ def exclude_update(
     exclude = _exclude_file(repo_dir)
     current = exclude.read_text(encoding='utf-8') if exclude.exists() else ''
     lines = current.splitlines()
-    # a rewrite without a resolved user node (e.g. the repo-root worktree
-    # switched off the root branch) carries the existing block's seed-dir
-    # line forward -- dropping it would make the next exclude_tracks probe
-    # read the tree as tracked, silently latching without `fractal track`
-    if seed_dir is None:
-        seed_dir = _exclude_seed_dir(lines)
-    if seed_dir is not None and not track:
-        patterns = f'# User node\n{seed_dir}/\n\n{patterns}'
     block = f'{_EXCLUDE_BEGIN}\n{patterns}{_EXCLUDE_END}\n'
     # strip every prior fractal block, preserving all other content
     kept = _strip_exclude_blocks(lines)
@@ -307,40 +292,54 @@ def exclude_update(
     fractal.util.filesystem.write_atomic(exclude, prefix + block)
 
 
-def exclude_tracks(repo_dir: pathlib.Path, seed_dir: str) -> bool:
+def seed_tracked(node_dir: pathlib.Path) -> bool:
     """Return whether the tree tracks the user seed dir on the top-level branch.
 
-    Tracking truth lives in the fractal block's own seed-dir ignore line --
-    the exclude state ``fractal track``/``untrack`` toggles -- so every
-    block rewrite preserves the current choice. The probe is scoped to the
-    block itself, never ``git check-ignore``: check-ignore also matches a
-    user ``.gitignore`` entry, which would make ``fractal track`` silently
-    non-stick. With no block yet (first-ever init) the tree is untracked
-    by definition.
+    Tracking truth is the seed dir's own self-ignore file -- the state
+    ``fractal track``/``untrack`` toggles -- so shared-block rewrites can
+    never flip the choice. The probe is file presence, never
+    ``git check-ignore``: check-ignore also matches a user ``.gitignore``
+    entry, which would make ``fractal track`` silently non-stick.
 
     Args:
-        repo_dir: Main git repo root.
-        seed_dir: The user node's own seed dir
-            (``<project>/.fractal/<branch>``).
+        node_dir: The user node's data directory.
 
     Returns:
-        ``True`` when a fractal block exists without the seed-dir ignore
-        line; ``False`` when the line is present or no block exists.
+        ``True`` when the seed dir carries no self-ignore file.
 
     """
-    exclude = _exclude_file(repo_dir)
-    if not exclude.exists():
-        return False
-    lines = [line.strip() for line in exclude.read_text(encoding='utf-8').splitlines()]
-    if _EXCLUDE_BEGIN not in lines:
-        return False
-    # tracked iff the block carries no seed-dir ignore line
-    begin = lines.index(_EXCLUDE_BEGIN)
-    try:
-        end = lines.index(_EXCLUDE_END, begin)
-    except ValueError:
-        end = len(lines)
-    return f'{seed_dir}/' not in lines[begin:end]
+    return not (node_dir / SEED_IGNORE_FILE).exists()
+
+
+def seed_ignore_write(node_dir: pathlib.Path) -> None:
+    """Self-ignore the user seed dir on the top-level branch (the default).
+
+    Writes a ``.gitignore`` of ``*`` into the node dir: git ignores the
+    whole dir, the ignore file included, with no per-tree line in any
+    shared surface. Child seeds (``.fractal/<branch>.<child>``) carry no
+    such file and stay tracked so meta and merge-up keep working --
+    ``fractal track`` opts the top-level branch back in.
+
+    Args:
+        node_dir: The user node's data directory.
+
+    """
+    ignore = node_dir / SEED_IGNORE_FILE
+    content = '# fractal runtime state (`fractal track` removes this file)\n*\n'
+    # atomic like the shared block: `fractal untrack` re-asserts the default
+    # under a concurrent reader (seed_tracked, a baseline commit) or a second
+    # untrack -- init's own write lands in a directory it just created
+    fractal.util.filesystem.write_atomic(ignore, content)
+
+
+def seed_ignore_remove(node_dir: pathlib.Path) -> None:
+    """Lift the user seed dir's self-ignore (``fractal track``).
+
+    Args:
+        node_dir: The user node's data directory.
+
+    """
+    (node_dir / SEED_IGNORE_FILE).unlink(missing_ok=True)
 
 
 def exclude_strip(repo_dir: pathlib.Path) -> None:
@@ -569,28 +568,6 @@ def _exclude_file(repo_dir: pathlib.Path) -> pathlib.Path:
     """Resolve the common-dir ``info/exclude`` (shared across all worktrees)."""
     common_dir = fractal.util.git.run(['rev-parse', '--git-common-dir'], cwd=repo_dir)
     return (repo_dir / common_dir).resolve() / 'info' / 'exclude'
-
-
-def _exclude_seed_dir(lines: list[str]) -> Optional[str]:
-    """Return the current fractal block's seed dir (``None`` when absent).
-
-    Reads the ``# User node`` stanza :func:`exclude_update` writes, so a
-    rewrite without a resolved user node can preserve the tracking choice.
-    """
-    stripped = [line.strip() for line in lines]
-    if _EXCLUDE_BEGIN not in stripped:
-        return None
-    begin = stripped.index(_EXCLUDE_BEGIN)
-    try:
-        end = stripped.index(_EXCLUDE_END, begin)
-    except ValueError:
-        end = len(stripped)
-    block = stripped[begin:end]
-    if '# User node' in block:
-        index = block.index('# User node') + 1
-        if index < len(block) and block[index].endswith('/'):
-            return block[index].removesuffix('/')
-    return None
 
 
 def _strip_exclude_blocks(lines: list[str]) -> list[str]:

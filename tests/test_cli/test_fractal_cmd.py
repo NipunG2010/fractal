@@ -283,47 +283,48 @@ def test_destroy_off_branch_removes_the_user_data(tmp_path: pathlib.Path) -> Non
 def test_track_untrack_round_trip_prints_git_follow_ups(
     tmp_path: pathlib.Path,
 ) -> None:
-    """``track``/``untrack`` toggle the seed-dir ignore and print git follow-ups.
+    """``track``/``untrack`` toggle the seed dir's self-ignore and print follow-ups.
 
-    The verbs rewrite only the repo-local exclude block -- the index is never
-    touched, so each prints the git command that finishes the move. Both are
-    idempotent: repeating one is a no-op that prints the same follow-up.
+    The verbs toggle only the seed dir's own ignore file -- the index is
+    never touched, so each prints the git command that finishes the move.
+    Both are idempotent: repeating one is a no-op printing the same follow-up.
     """
     repo = _seed_repo(tmp_path / 'toggled')
     # neutralize any global excludes file so the ignore state below is
-    # attributable to fractal's exclude block alone
+    # attributable to fractal's own surfaces alone
     _git(repo, 'config', 'core.excludesFile', os.devnull)
     seed_dir = '.fractal/main'
-    # a fresh tree is untracked: the seed dir is git-ignored
-    assert _ignored(repo, seed_dir)
+    probe = f'{seed_dir}/config.json'
+    # a fresh tree is untracked: the seed dir hides itself
+    assert _ignored(repo, probe)
     # track lifts the ignore and prints the staging follow-up without staging
     result = _run(repo, 'track')
     assert result.returncode == 0, result.stderr
     assert f'git add -- {seed_dir}' in result.stdout
-    assert not _ignored(repo, seed_dir)
+    assert not _ignored(repo, probe)
     assert _git(repo, 'ls-files', seed_dir).stdout == ''
     # idempotent: a second track is a no-op printing the same follow-up
     result = _run(repo, 'track')
     assert result.returncode == 0, result.stderr
     assert f'git add -- {seed_dir}' in result.stdout
-    assert not _ignored(repo, seed_dir)
+    assert not _ignored(repo, probe)
     # untrack restores the ignore and prints the unstage follow-up
     result = _run(repo, 'untrack')
     assert result.returncode == 0, result.stderr
     assert f'git rm -r --cached -- {seed_dir}' in result.stdout
-    assert _ignored(repo, seed_dir)
+    assert _ignored(repo, probe)
     # idempotent the same way in reverse
     result = _run(repo, 'untrack')
     assert result.returncode == 0, result.stderr
     assert f'git rm -r --cached -- {seed_dir}' in result.stdout
-    assert _ignored(repo, seed_dir)
+    assert _ignored(repo, probe)
     # the verbs anchor on the user node by config, not the checkout, so they
     # stay usable when the repo root sits on a non-init branch
     _git(repo, 'checkout', '-b', 'sidework')
     result = _run(repo, 'track')
     assert result.returncode == 0, result.stderr
     assert f'git add -- {seed_dir}' in result.stdout
-    assert not _ignored(repo, seed_dir)
+    assert not _ignored(repo, probe)
 
 
 # ------ open

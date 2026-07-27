@@ -217,12 +217,12 @@ to `.gitignore`. The root node's own `.fractal/` is **git-ignored on the
 top-level branch** by default, keeping it out of your main history; run
 `fractal track` to commit it there too and `fractal untrack` to revert — both
 toggle only the ignore and print the follow-up git command, never touching the
-index. Fractal manages this — its runtime artifacts (worktrees, the central
-database, status, agent logs) plus the top-level `.fractal/` — via the
-repo-local `.git/info/exclude`, which it writes automatically; it never touches
-the committed `.gitignore`. Keep your own ignore patterns anchored
-(`/artifacts/`, not `artifacts/`), or they also match — and silently hide —
-same-named subtrees at any depth, such as a node's committable
+index. Fractal manages this automatically: its runtime artifacts (worktrees, the
+central database, status, agent logs) ride the repo-local `.git/info/exclude`,
+and the top-level `.fractal/<branch>/` hides itself with its own ignore file —
+the committed `.gitignore` is never touched. Keep your own ignore patterns
+anchored (`/artifacts/`, not `artifacts/`), or they also match — and silently
+hide — same-named subtrees at any depth, such as a node's committable
 `.fractal/<node>/artifacts/`.
 
 `fractal init` also wires the wiki merge driver: the committed `.gitattributes`

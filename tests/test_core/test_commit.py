@@ -86,6 +86,12 @@ def test_user_node_commit_init_commits_baseline(
     # the baseline commits without error and always tracks the project wiki; the
     # node's own seed is committed only on a tracked tree
     before = _head()
+    # a stranded config write lock sits beside the config at commit time
+    (git_repo / '.fractal' / 'main' / 'config.json.lock').touch()
+    # a fresh clone carries no info/exclude at all, so the baseline cannot
+    # lean on a block written at init -- the runtime artifacts beside the
+    # seed must stay out of the commit on their own
+    (git_repo / '.git' / 'info' / 'exclude').unlink()
     node.commit('configure', init=True)
     # a tracked tree makes a real commit (the seed is new); untracked, the wiki
     # is already committed by the fixture, so the baseline is legitimately a no-op
@@ -101,6 +107,9 @@ def test_user_node_commit_init_commits_baseline(
     tracked = result.stdout
     assert 'wiki/_index.md' in tracked
     assert ('.fractal/main/config.json' in tracked) == track
+    # runtime artifacts never ride the baseline, tracked or not
+    assert '.db' not in tracked
+    assert 'config.json.lock' not in tracked
 
 
 def test_commit_pushes_unless_local(tmp_path: pathlib.Path) -> None:

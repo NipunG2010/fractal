@@ -1203,6 +1203,9 @@ class Node:
         # create node directory (under <repo_dir>/<project>/.fractal/<branch>)
         node_dir = self.node_dir
         node_dir.mkdir(parents=True, exist_ok=True)
+        # self-ignore the seed dir before any state lands in it -- a fresh
+        # tree is untracked by definition; `fractal track` is the only opt-in
+        worktree.seed_ignore_write(node_dir)
         # write config (the 'user' flag marks node identity, not lifecycle;
         # 'root' anchors the central database for the whole tree)
         config = {
@@ -1222,10 +1225,9 @@ class Node:
             seed, wiki = FRACTAL_FOLDER, 'wiki'
         else:
             seed, wiki = f'{path}/{FRACTAL_FOLDER}', f'{path}/wiki'
-        # ensure git excludes -- a fresh tree is untracked by definition (there
-        # is no exclude block to probe yet), so the seed-dir ignore is written
-        # outright; `fractal track` is the only opt-in
-        worktree.exclude_update(self.repo_dir, track=False, seed_dir=f'{seed}/{branch}')
+        # ensure git excludes -- the static block covers the runtime artifacts
+        # init creates outside the node dir (.worktrees/ above all)
+        worktree.exclude_update(self.repo_dir)
         # initialize database and radio
         self.db.init()
         self.radio.init()
@@ -1253,33 +1255,11 @@ class Node:
     def _git_exclude(self: Node) -> None:
         """Write fractal's ignore patterns into the repo-local ``info/exclude``.
 
-        Resolves the user node's seed-dir prepend, then delegates the
-        marker-delimited block rewrite to :func:`worktree.exclude_update`.
+        A pure template refresh: the block is static, identical for every
+        tree -- per-tree ignore state lives in each user seed dir's own
+        self-ignore file, which no block rewrite can touch.
         """
-        # prepend the user node's own seed dir so the top-level branch ignores it;
-        # child seeds (.fractal/<branch>.<child>) stay tracked so meta and merge-up
-        # keep working -- `fractal track` opts the top-level branch back in; skip
-        # when the repo has no commit yet (no branch to resolve a node from)
-        branch = fractal.util.git.branch(self._root, check=False)
-        user = None
-        if branch:
-            for ancestor in self._self_and_ancestors():
-                if ancestor.is_user:
-                    user = ancestor
-                    break
-        track = False
-        seed_dir = None
-        if user is not None:
-            project = user.config.get('project', '.')
-            if project == '.':
-                seed = FRACTAL_FOLDER
-            else:
-                seed = f'{project}/{FRACTAL_FOLDER}'
-            seed_dir = f'{seed}/{user.branch}'
-            # tracking truth lives in the exclude block itself, so the rewrite
-            # preserves the current `fractal track`/`untrack` choice
-            track = worktree.exclude_tracks(self.repo_dir, seed_dir)
-        worktree.exclude_update(self.repo_dir, track=track, seed_dir=seed_dir)
+        worktree.exclude_update(self.repo_dir)
 
     def start(
         self: Node,
