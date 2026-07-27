@@ -51,6 +51,26 @@ its last committed tip). Re-initializing over an existing branch re-adds the
 worktree at that branch's tip and preserves its committed history; a failed init
 rolls the worktree and cache entry back so a retry starts clean.
 
+## Warming the build cache
+
+A fork takes only committed history, so a new worktree starts with none of the
+git-ignored build state its siblings have already paid for. The user node's
+`clone_dirs` key ([[configuration/config_json]]) names the directories worth
+carrying over — a Lean `.lake`, say — and each spawn copy-on-write clones them
+from the main checkout into the child (`cp -c`, APFS clonefile): near-instant,
+costing no disk until a file diverges, and the child owns its logical copy, so
+concurrent builds never share a mutable file.
+
+The clone runs after the spawn lock releases — a multi-gigabyte tree must never
+serialize sibling spawns — and is best-effort throughout. A missing source, an
+already-populated target, a filesystem without clonefile, or any filesystem
+error skips that directory and leaves the node to re-derive the cache exactly as
+it would have without the clone; nothing here can fail a spawn, whose node is
+registered by the time the clone starts. Each directory clones to a dot-prefixed
+temporary sibling and is renamed into place, so a partial tree never poisons the
+build it was meant to warm, and a crash-stranded temp matches the commit
+pipeline's ignore family rather than riding a commit.
+
 ## Scopes
 
 A node may be initialized with a `scope` — one or more subdirectories of the

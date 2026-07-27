@@ -331,7 +331,15 @@ def node_init(app: typer.Typer) -> typer.Typer:
                 parent = node
             effective_agent = agent or parent.agent_effective()
             tracked = True
-            if effective_agent:
+            # the probe needs an initialized node to anchor the agent
+            # registry's database: the resolve_init target falls back to the
+            # repo root, which carries no config (and so no tree root to
+            # resolve the database through) whenever the checkout sits off
+            # the tree's root branch -- the operator's own branch, while
+            # nodes run; an unprobed agent reads as tracked, exactly like the
+            # unregistered backend below: unknown spend earns the warning,
+            # and this advisory must never fail a spawn that already succeeded
+            if effective_agent and parent.exists():
                 # an unregistered backend reads as tracked -- unknown
                 # spend earns the warning, never a block
                 try:

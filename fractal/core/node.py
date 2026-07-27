@@ -1106,6 +1106,23 @@ class Node:
                         created_branch=created_branch,
                     )
                 raise
+        # warm the child's configured cache dirs (copy-on-write clones from
+        # the main checkout, see worktree.clone_cache_dirs) after the lock
+        # releases -- a multi-gigabyte clone must never serialize sibling
+        # spawns -- reading the dir list from the tree's user config
+        # ('clone_dirs', absent by default); resolve the user by config off
+        # the tree's root branch, not by walking ancestor worktrees: the root
+        # branch has no worktree to find whenever the main checkout sits on
+        # another branch (the operator's own, while nodes run), and this key
+        # lives only on the user node, so the lookup must reach it every time
+        if child_worktree_dir is not None:
+            user = Node.resolve_user(self.repo_dir, name=root)
+            if user is not None:
+                worktree.clone_cache_dirs(
+                    repo_dir=self.repo_dir,
+                    worktree_dir=child_worktree_dir,
+                    dirs=user.config.get('clone_dirs') or [],
+                )
         # surface the summary + any notices, but drop the per-artifact
         # "Created ..." progress lines that flood logs under wide fan-out
         # (errors don't come back through stdout here -- a failed init raises);

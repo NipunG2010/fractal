@@ -51,6 +51,7 @@ _CONFIG_ORDER = (
     'user',
     'project',
     'scope',
+    'clone_dirs',
     'base',
     'meta',
     'agent',

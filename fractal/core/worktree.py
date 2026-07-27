@@ -8,6 +8,7 @@ import json
 import logging
 import pathlib
 import re
+import shutil
 import subprocess
 from collections.abc import Iterator
 from typing import Optional
@@ -340,6 +341,75 @@ def seed_ignore_remove(node_dir: pathlib.Path) -> None:
 
     """
     (node_dir / SEED_IGNORE_FILE).unlink(missing_ok=True)
+
+
+def clone_cache_dirs(
+    repo_dir: pathlib.Path,
+    worktree_dir: pathlib.Path,
+    dirs: list[str],
+) -> None:
+    """Clone heavy git-ignored cache dirs from the main checkout into a worktree.
+
+    Copy-on-write clones (``cp -c``, APFS clonefile): near-instant, no new
+    disk until a file diverges, and the worktree owns its logical copy --
+    concurrent builds never share a mutable file. Build state a fresh
+    worktree would otherwise re-derive from scratch (a Lean ``.lake``)
+    arrives warm. Best-effort by design -- an escaping entry, a missing
+    source, an existing target, a filesystem without clonefile, or any
+    filesystem error skips the dir, and the worktree then re-derives the
+    cache exactly as it would have without the clone. Nothing here may
+    raise: the caller clones only after the child node is registered, so a
+    propagated error would fail a spawn whose node already exists and whose
+    retry refuses as a duplicate. A failed clone never leaves a partial
+    target (temp then rename; the dot-prefixed temp matches the
+    ``.*-*.tmp`` ignore family, so a crash-stranded one never rides a
+    commit).
+
+    Args:
+        repo_dir: Main git repo root (the clone source checkout).
+        worktree_dir: The freshly created worktree (the clone target).
+        dirs: Repo-relative cache directories to clone.
+
+    """
+    for rel in dirs:
+        # only a real subdirectory clones: an absolute or '..' entry lands
+        # outside the worktree this warms, and one naming no subdirectory
+        # ('', '.') would clone the whole checkout over the worktree root.
+        # The config validator rejects all three, so only a hand-edited
+        # config reaches here -- and a skip beats cloning an unrelated tree
+        path = pathlib.PurePosixPath(rel)
+        if path.is_absolute() or '..' in path.parts or not path.parts:
+            logger.info('Cache clone skipped for %s: not a repo-relative dir', rel)
+            continue
+        source = repo_dir / rel
+        target = worktree_dir / rel
+        if not source.is_dir() or target.exists():
+            continue
+        # clone beside the target, then rename: cp dies mid-tree on any
+        # error (cross-volume, non-APFS), and a partial cache would poison
+        # the build it was meant to warm; no cross-worktree collision --
+        # the temp lives inside the target's own worktree
+        temp = target.parent / f'.{target.name}-clone.tmp'
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(temp, ignore_errors=True)
+            result = subprocess.run(
+                ['cp', '-c', '-R', str(source), str(temp)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                shutil.rmtree(temp, ignore_errors=True)
+                logger.info(
+                    'Cache clone skipped for %s: %s', rel, result.stderr.strip()
+                )
+                continue
+            temp.rename(target)
+        except OSError as error:
+            shutil.rmtree(temp, ignore_errors=True)
+            logger.info('Cache clone skipped for %s: %s', rel, error)
+            continue
+        logger.info('Cloned cache dir %s into %s', rel, worktree_dir)
 
 
 def exclude_strip(repo_dir: pathlib.Path) -> None:

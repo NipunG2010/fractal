@@ -31,6 +31,7 @@ __all__ = [
     'test_force_commit_body_describes_the_sweep',
     'test_commit_ignore_scope_bypasses_scope_but_not_lint',
     'test_multi_scope_commit_boundary',
+    'test_dot_scope_root_bounds_the_whole_project',
     'test_scoped_commit_handles_non_ascii_and_whitespace_paths',
     'test_scoped_child_baseline_commits_init_gitattributes',
     'test_commit_check_detects_untracked_work',
@@ -721,6 +722,56 @@ def test_multi_scope_commit_boundary(tmp_path: pathlib.Path) -> None:
         node.commit('touch outside')
     assert 'inscope_a' in str(excinfo.value)
     assert 'inscope_b' in str(excinfo.value)
+
+
+def test_dot_scope_root_bounds_the_whole_project(tmp_path: pathlib.Path) -> None:
+    """A ``.`` scope root names the project itself, so nothing is out of scope.
+
+    ``.`` is the one legal scope root that is not a subdirectory. It collapses
+    to the project boundary instead of joining into a literal ``./`` prefix --
+    which matches no git path, so it would put every changed file out of scope
+    and refuse every commit the node ever makes.
+    """
+    repo = _make_git_repo(tmp_path / 'repo')
+    Node(repo).init(agent='claude', user=True)
+    output = Node(repo).init(
+        name='task',
+        agent='claude',
+        local=True,
+        scope=['.'],
+    )
+    project_dir = _parse_project_dir(output)
+    # configure git identity in the worktree
+    for key, val in (('user.email', 'test@test.com'), ('user.name', 'Test')):
+        subprocess.run(
+            ['git', 'config', key, val],
+            cwd=project_dir,
+            capture_output=True,
+            check=True,
+        )
+    node = Node(project_dir)
+    # '.' is its own canonical form, so the setter's normalization keeps it
+    assert node.config.get('scope') == ['.']
+    # baseline cleans the tree (sweeping init's root .gitattributes); stub the
+    # lint gate (not under test) so the boundary check alone decides
+    node.commit('baseline', init=True)
+    branch = _resolve_branch(project_dir)
+    lint = project_dir / '.fractal' / branch / 'scripts' / 'lint.sh'
+    lint.write_text('#!/usr/bin/env bash\nexit 0\n', encoding='utf-8')
+    # work anywhere in the project commits: a nested dir and the project root
+    (project_dir / 'nested').mkdir()
+    (project_dir / 'nested' / 'work.txt').write_text('nested work\n', encoding='utf-8')
+    (project_dir / 'root.txt').write_text('root work\n', encoding='utf-8')
+    node.commit('touch the whole project')
+    result = subprocess.run(
+        ['git', '-C', f'{project_dir}', 'ls-files'],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    tracked = result.stdout
+    assert 'nested/work.txt' in tracked
+    assert 'root.txt' in tracked
 
 
 def test_scoped_commit_handles_non_ascii_and_whitespace_paths(

@@ -24,6 +24,7 @@ KEYS = (
     'project',
     'root',
     'scope',
+    'clone_dirs',
     'base',
     'meta',
     'agent',
@@ -50,6 +51,15 @@ KEYS = (
     'detached',
     'local',
     'blind',
+)
+
+# keys whose value is a JSON list of repo-relative subdirectories (the CLI
+# accepts a comma- or space-separated string and stores each entry in
+# canonical path form, and the read path splits a space-joined one, so both
+# forms round-trip)
+LIST_KEYS = (
+    'scope',
+    'clone_dirs',
 )
 
 # keys whose value must be a plain bool (true/false/null)
@@ -168,9 +178,9 @@ class Config:
         if self.path.exists():
             config = self.load()
             value = config.get(key, default)
-            # scope is stored as a JSON list; tolerate a string value
-            # holding the roots space-joined
-            if key == 'scope' and isinstance(value, str):
+            # list keys are stored as a JSON list; tolerate a string value
+            # holding the entries space-joined
+            if key in LIST_KEYS and isinstance(value, str):
                 value = value.split()
             return value
         return default
@@ -235,9 +245,15 @@ class Config:
         ``max_iters`` reads as unlimited in the loop), a non-bool mode flag
         (the loop's ``bool()`` coercion reads a hand-edited ``"false"``
         string as ``True``), a bare-number or zero-truncating duration
-        (which bricks the loop at launch or at its mid-run re-reads), and
-        an absolute or ``..`` scope root (which never matches the commit
-        pipeline's relative prefix check, bricking every scoped commit).
+        (which bricks the loop at launch or at its mid-run re-reads), an
+        absolute or ``..`` list-key entry (a scope root that never matches
+        the commit pipeline's relative prefix check bricks every scoped
+        commit; a ``clone_dirs`` entry would reach outside the worktree it
+        warms), a non-canonical list-key spelling (``./src``, ``src/`` --
+        the setters store canonical form, so only a hand-edit lands one,
+        and the literal prefix match would refuse every scoped commit),
+        and a ``.`` cache dir (which would clone the whole checkout
+        -- as a scope root it is legal, naming the project itself).
 
         Args:
             config: The config mapping to validate; the stored
@@ -370,25 +386,47 @@ class Config:
                     f'iter_timeout ({iter_timeout_value}) exceeds'
                     f' interval ({interval_value}).'
                 )
-        # scope roots must be repo-relative subdirectories, exactly as init
-        # enforces -- an absolute or '..' root (any JSON type can land here
-        # via a hand-edit, as above) never matches the commit pipeline's
-        # relative prefix check, bricking every scoped commit
-        scope = config.get('scope')
-        if scope is not None:
+        # list-key entries must be repo-relative, exactly as init enforces --
+        # an absolute or '..' entry (any JSON type can land here via a
+        # hand-edit, as above) points outside the tree: a scope root never
+        # matches the commit pipeline's relative prefix check, bricking every
+        # scoped commit, and a clone_dirs entry would clone over a path
+        # outside the worktree it was meant to warm
+        for key in LIST_KEYS:
+            entries = config.get(key)
+            if entries is None:
+                continue
             # tolerate the space-joined string form the read path splits
-            if isinstance(scope, str):
-                scope = scope.split()
-            scope_is_list = isinstance(scope, list)
-            if not scope_is_list or not all(isinstance(root, str) for root in scope):
-                raise ValueError('scope must be a list of strings.')
-            for root in scope:
-                rel = pathlib.PurePosixPath(root)
-                if rel.is_absolute() or '..' in rel.parts:
-                    raise ValueError(
-                        f'scope must be a repo-relative subdirectory, not'
-                        f' {root!r} (no absolute or ".." paths).'
-                    )
+            if isinstance(entries, str):
+                entries = entries.split()
+            entries_are_list = isinstance(entries, list)
+            if entries_are_list and all(isinstance(entry, str) for entry in entries):
+                for entry in entries:
+                    rel = pathlib.PurePosixPath(entry)
+                    if rel.is_absolute() or '..' in rel.parts:
+                        raise ValueError(
+                            f'{key} must be a repo-relative subdirectory, not'
+                            f' {entry!r} (no absolute or ".." paths).'
+                        )
+                    # '.' names the project root: a legal scope (the commit
+                    # boundary collapses to the project) but never a cache
+                    # dir, where it would clone the entire checkout over the
+                    # worktree root
+                    if key == 'clone_dirs' and not rel.parts:
+                        raise ValueError(
+                            f'clone_dirs must name a subdirectory, not {entry!r}.'
+                        )
+                    # the setters store canonical form, so only a hand-edit
+                    # lands a './src', 'src/', or 'a//b' here -- spellings
+                    # the commit pipeline's literal prefix match reads as
+                    # out of scope for every change, refusing every commit
+                    if entry != rel.as_posix():
+                        raise ValueError(
+                            f'{key} entries must be canonical, not {entry!r}'
+                            f' (write it as {rel.as_posix()!r}).'
+                        )
+            else:
+                raise ValueError(f'{key} must be a list of strings.')
 
     def reconcile(self: Config) -> dict[str, tuple[Any, Any]]:
         """Reconcile the registry cap row to this node's config file.

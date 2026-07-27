@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import subprocess
+import sys
 import threading
 
 import pytest
@@ -26,6 +27,7 @@ __all__ = [
     'test_exclude_update_orphan_begin_preserves_tail',
     'test_exclude_update_concurrent_writers_preserve_custom',
     'test_seed_ignore_toggle_hides_and_exposes_the_dir',
+    'test_clone_cache_dirs_clones_missing_and_skips_unusable',
 ]
 
 
@@ -385,3 +387,44 @@ def _git_repo(tmp_path: pathlib.Path) -> pathlib.Path:
         check=True,
     )
     return repo
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='clonefile is APFS-only')
+def test_clone_cache_dirs_clones_missing_and_skips_unusable(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Configured cache dirs clone in; every unusable entry skips silently.
+
+    The clone runs after the child node is registered, so a raise would fail
+    a spawn whose node already exists -- an absent source, an existing target
+    (a warm cache the node has since diverged), and an entry escaping the
+    worktree must each degrade to a skip, leaving the worktree to re-derive
+    the cache exactly as it would have without the clone.
+    """
+    repo = tmp_path / 'repo'
+    (repo / 'lean' / '.lake').mkdir(parents=True)
+    (repo / 'lean' / '.lake' / 'artifact.olean').write_text('built', encoding='utf-8')
+    (tmp_path / 'outside').mkdir()
+    worktree_dir = tmp_path / 'child'
+    worktree_dir.mkdir()
+    fractal.core.worktree.clone_cache_dirs(
+        repo_dir=repo,
+        worktree_dir=worktree_dir,
+        dirs=['lean/.lake', 'missing/.cache', '../outside', '/etc'],
+    )
+    # the configured dir arrived with its content; every other entry skipped
+    clone = worktree_dir / 'lean' / '.lake' / 'artifact.olean'
+    assert clone.read_text(encoding='utf-8') == 'built'
+    assert not (worktree_dir / 'missing').exists()
+    assert not (worktree_dir / 'outside').exists()
+    # no temp residue anywhere under the worktree (asserted by shape, so a
+    # change to the temp naming cannot quietly void the check)
+    assert not list(worktree_dir.rglob('*.tmp'))
+    # an existing target is never overwritten
+    clone.write_text('diverged', encoding='utf-8')
+    fractal.core.worktree.clone_cache_dirs(
+        repo_dir=repo,
+        worktree_dir=worktree_dir,
+        dirs=['lean/.lake'],
+    )
+    assert clone.read_text(encoding='utf-8') == 'diverged'

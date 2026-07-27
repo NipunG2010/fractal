@@ -127,6 +127,13 @@ def commit(
     # nested under the project prefix for a sub-project node
     project = node.project_path
     scope = node.config.get('scope') or []
+    # a '.' root names the project itself, and subsumes any sibling root --
+    # collapse the whole scope so the boundary becomes the project dir (or
+    # unbounded at the repo root); kept out of the joins below: a literal
+    # './' (or '<project>/./') prefix matches no git path, so leaving it in
+    # place would put every changed file out of scope and refuse every commit
+    if any(not pathlib.PurePosixPath(root).parts for root in scope):
+        scope = []
     if scope:
         if project == '.':
             commit_scopes = list(scope)
