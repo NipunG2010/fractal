@@ -164,22 +164,26 @@ def init(app: typer.Typer) -> typer.Typer:
 
 def track(app: typer.Typer) -> typer.Typer:
     """Register the ``track`` command."""
-    # path argument
+    # name argument
+    name_help = 'Tree root branch (default: the tree this checkout belongs to).'
+    name = typer.Argument(None, help=name_help)
+    # path option
     path_help = 'Repository path.'
-    path = typer.Argument('.', help=path_help)
+    path = typer.Option('.', '--path', help=path_help)
 
     @command(app, 'track')
     def _track(
+        name: Optional[str] = name,
         path: str = path,
     ) -> None:
         """Track the user node's ``.fractal/`` data on the top-level branch.
 
         Removes the seed dir's self-ignore file so it is no longer hidden,
         then prints the git command that stages it -- the index is never
-        touched. Repo-wide, idempotent, and usable on any initialized tree;
+        touched. Idempotent and usable from any checkout in the repo;
         ``fractal untrack`` is the inverse.
         """
-        user, seed_dir = _resolve_user_seed(path)
+        user, seed_dir = _resolve_user_seed(path, name)
         fractal.core.worktree.seed_ignore_remove(user.node_dir)
         typer.echo(
             f'Tracking {seed_dir}/ on the top-level branch.'
@@ -191,23 +195,27 @@ def track(app: typer.Typer) -> typer.Typer:
 
 def untrack(app: typer.Typer) -> typer.Typer:
     """Register the ``untrack`` command."""
-    # path argument
+    # name argument
+    name_help = 'Tree root branch (default: the tree this checkout belongs to).'
+    name = typer.Argument(None, help=name_help)
+    # path option
     path_help = 'Repository path.'
-    path = typer.Argument('.', help=path_help)
+    path = typer.Option('.', '--path', help=path_help)
 
     @command(app, 'untrack')
     def _untrack(
+        name: Optional[str] = name,
         path: str = path,
     ) -> None:
         """Git-ignore the user node's ``.fractal/`` data (the default state).
 
         Restores the seed dir's self-ignore file so it is hidden on the
         top-level branch, then prints the git command that unstages an
-        already-committed seed -- the index is never touched. Repo-wide,
-        idempotent, and usable on any initialized tree; ``fractal track``
-        is the inverse.
+        already-committed seed -- the index is never touched. Idempotent and
+        usable from any checkout in the repo; ``fractal track`` is the
+        inverse.
         """
-        user, seed_dir = _resolve_user_seed(path)
+        user, seed_dir = _resolve_user_seed(path, name)
         fractal.core.worktree.seed_ignore_write(user.node_dir)
         typer.echo(
             f'Ignoring {seed_dir}/ on the top-level branch.'
@@ -279,11 +287,14 @@ def commit(app: typer.Typer) -> typer.Typer:
 
 def open(app: typer.Typer) -> typer.Typer:
     """Register the ``open`` command."""
-    # node argument
-    node_help = 'Node branch to focus (default: this node).'
-    node = typer.Argument(None, help=node_help)
+    # name argument
+    name_help = (
+        'Tree root branch, or a node branch to focus'
+        " (default: the caller's own tree, at its root)."
+    )
+    name = typer.Argument(None, help=name_help)
     # path option
-    path_help = 'Worktree directory.'
+    path_help = 'Repository path.'
     path = typer.Option('.', '--path', help=path_help)
     # light flag
     light_help = 'Open with the light palette.'
@@ -294,12 +305,12 @@ def open(app: typer.Typer) -> typer.Typer:
 
     @command(app, 'open')
     def _open(
-        node: Optional[str] = node,
+        name: Optional[str] = name,
         path: str = path,
         light: bool = light,
         dark: bool = dark,
     ) -> None:
-        """Open the fractal TUI (the cockpit)."""
+        """Open a tree's fractal TUI (the cockpit), focused on a node or its root."""
         if light and dark:
             raise typer.BadParameter('--light and --dark are mutually exclusive.')
         # NOTE: import textual lazily: the TUI must stay off cold start
@@ -308,36 +319,49 @@ def open(app: typer.Typer) -> typer.Typer:
         # the palette applies before the app constructs (the theme module's
         # tokens are read at render time, so one select re-skins everything)
         theme.select('light' if light else 'dark')
-        node = resolve_target(path, node)
-        # anchor the cockpit on the user node by config, not the checkout
-        # (mirrors pause): a branch-keyed resolution on a non-init checkout
-        # refuses to open even with the node to focus named explicitly
-        root = resolve_user_node(node.repo_dir)
-        FractalApp(root, branch=node.branch).run()
+        # one slot takes either name (mirrors `node list`): a tree root opens
+        # the cockpit at the root, a node branch opens the tree owning it,
+        # focused there. A root owns no worktree, so it resolves by config --
+        # never the worktree map, which would need its branch checked out
+        user = Node.resolve_user(path, name=name) if name else None
+        branch = None
+        if user is None and name:
+            node = resolve_target(path, name)
+            # the node names its own tree, whatever the caller's checkout
+            user, branch = resolve_user_node(node.worktree), node.branch
+        # the cockpit is the tree's, so anchor on the user node by config, not
+        # the checkout (mirrors pause): a branch-keyed resolution would refuse
+        # to open on a non-init checkout, when the operator most wants to look
+        root = user if user is not None else resolve_user_node(path)
+        FractalApp(root, branch=branch).run()
 
     return app
 
 
 def pause(app: typer.Typer) -> typer.Typer:
     """Register the ``pause`` command."""
-    # path argument
-    path_help = 'Repository path.'
-    path = typer.Argument('.', help=path_help)
+    # name argument
+    name_help = 'Tree root branch (default: the tree this checkout belongs to).'
+    name = typer.Argument(None, help=name_help)
     # reason option
     reason_help = 'Optional reason for pausing.'
     reason = typer.Option(None, '--reason', help=reason_help)
+    # path option
+    path_help = 'Repository path.'
+    path = typer.Option('.', '--path', help=path_help)
 
     @command(app, 'pause')
     def _pause(
-        path: str = path,
+        name: Optional[str] = name,
         reason: Optional[str] = reason,
+        path: str = path,
     ) -> None:
         """Pause the whole tree: abort in-flight agents, park every loop."""
         # a tree-wide brake -- anchor on the user node by config, never the
         # current branch: on a non-init checkout resolve_node would mis-scope
         # to a lone child (or die on two), silently narrowing the exact
         # emergency brake it exists for
-        node = resolve_user_node(path)
+        node = resolve_user_node(path, name)
         result = node.pause(reason)
         typer.echo(result)
 
@@ -346,18 +370,22 @@ def pause(app: typer.Typer) -> typer.Typer:
 
 def resume(app: typer.Typer) -> typer.Typer:
     """Register the ``resume`` command."""
-    # path argument
+    # name argument
+    name_help = 'Tree root branch (default: the tree this checkout belongs to).'
+    name = typer.Argument(None, help=name_help)
+    # path option
     path_help = 'Repository path.'
-    path = typer.Argument('.', help=path_help)
+    path = typer.Option('.', '--path', help=path_help)
 
     @command(app, 'resume')
     def _resume(
+        name: Optional[str] = name,
         path: str = path,
     ) -> None:
         """Resume the paused tree where it left off (leaf-first)."""
         # anchored on the user node like pause (by config, not branch), so the
         # release matches the brake from any checkout
-        node = resolve_user_node(path)
+        node = resolve_user_node(path, name)
         result = node.resume()
         typer.echo(result)
 
@@ -366,38 +394,43 @@ def resume(app: typer.Typer) -> typer.Typer:
 
 def reset(app: typer.Typer) -> typer.Typer:
     """Register the ``reset`` command."""
-    # path argument
-    path_help = 'Repository path.'
-    path = typer.Argument('.', help=path_help)
+    # name argument
+    name_help = 'Tree root branch (default: the tree this checkout belongs to).'
+    name = typer.Argument(None, help=name_help)
     # force flag
     force_help = 'Skip confirmation prompt (paused nodes are killed without asking).'
     force = typer.Option(False, '--force', '-f', help=force_help)
+    # path option
+    path_help = 'Repository path.'
+    path = typer.Option('.', '--path', help=path_help)
 
     @command(app, 'reset')
     def _reset(
-        path: str = path,
+        name: Optional[str] = name,
         force: bool = force,
+        path: str = path,
     ) -> None:
-        """Reset the fractal: remove every node worktree, keep the history."""
-        # reset is a repo-wide teardown -- resolve to the repo root from any
-        # cwd inside it (the agent's NODE_DIR, a worktree, or the repo root)
+        """Reset a tree: remove its node worktrees, keep the history."""
+        # the confirmation names the repo, resolved from any cwd inside it
+        # (the agent's NODE_DIR, a worktree, or the repo root)
         repo_dir = Node(path).repo_dir
+        # anchor on the user node by config, not the checkout (mirrors pause):
+        # a bare Node(path) on a non-init branch counts 0 nodes and hides the
+        # paused-node kill warning below; the resolution is strict with or
+        # without --force, so a missing tree is refused before any confirmation
+        user = resolve_user_node(path, name)
         if not force:
-            # anchor on the user node by config, not the checkout (mirrors
-            # pause): a bare Node(repo_dir) on a non-init branch counts 0
-            # nodes and hides the paused-node kill warning below
-            user = Node.resolve_user(repo_dir)
-            count = len(user.child_list()) if user else 0
+            count = len(user.child_list())
             s = 's' if count != 1 else ''
             typer.echo(
-                'Warning: This permanently removes every node worktree,'
-                ' branch, and registration. The user node, project wiki,'
-                ' and all history are left in place.',
+                "Warning: This permanently removes every one of the tree's"
+                ' node worktrees, branches, and registrations. The user node,'
+                ' project wiki, and all history are left in place.',
                 err=True,
             )
             # the confirmation is the authorization to kill paused nodes, so
             # it must name them (the teardown settles their frozen work)
-            paused = len(user.list(status='paused', live=True)) if user else 0
+            paused = len(user.list(status='paused', live=True))
             if paused:
                 p = 's' if paused != 1 else ''
                 hold = 'hold' if paused != 1 else 'holds'
@@ -406,9 +439,9 @@ def reset(app: typer.Typer) -> typer.Typer:
                     ' work and will be killed.',
                     err=True,
                 )
-            prompt = f'Reset the fractal at {repo_dir} ({count} node{s})?'
+            prompt = f'Reset the tree {user.branch!r} at {repo_dir} ({count} node{s})?'
             typer.confirm(prompt, abort=True)
-        output = Node.reset(repo_dir)
+        output = Node.reset(path, name=name)
         if output:
             typer.echo(output)
 
@@ -417,38 +450,59 @@ def reset(app: typer.Typer) -> typer.Typer:
 
 def destroy(app: typer.Typer) -> typer.Typer:
     """Register the ``destroy`` command."""
-    # path argument
-    path_help = 'Repository path.'
-    path = typer.Argument('.', help=path_help)
+    # name argument
+    name_help = 'Tree root branch to destroy (mutex with --all; one is required).'
+    name = typer.Argument(None, help=name_help)
+    # all flag
+    all_help = 'Destroy every tree and remove .worktrees/ (the full inverse of init).'
+    all_ = typer.Option(False, '--all', help=all_help)
     # force flag
     force_help = 'Skip confirmation prompt (paused nodes are killed without asking).'
     force = typer.Option(False, '--force', '-f', help=force_help)
+    # path option
+    path_help = 'Repository path.'
+    path = typer.Option('.', '--path', help=path_help)
 
     @command(app, 'destroy')
     def _destroy(
-        path: str = path,
+        name: Optional[str] = name,
+        all_: bool = all_,
         force: bool = force,
+        path: str = path,
     ) -> None:
-        """Destroy the fractal: every node, branch, and the user node's data."""
-        # destroy is a repo-wide teardown -- resolve to the repo root from any
-        # cwd inside it (the agent's NODE_DIR, a worktree, or the repo root)
+        """Destroy a fractal tree, or the whole fractal with ``--all``."""
+        # exactly one scope: a bare destroy is ambiguous between "this tree"
+        # and "everything", so the caller must name one
+        if (name is not None) == all_:
+            raise typer.BadParameter('Name a tree or pass --all (exactly one).')
+        # the confirmation names the repo, resolved from any cwd inside it
+        # (the agent's NODE_DIR, a worktree, or the repo root)
         repo_dir = Node(path).repo_dir
+        # the trees in scope: the named one, resolved strictly with or without
+        # --force so an unknown name is refused the same way either way; or
+        # every tree, since the counts below must sum the whole teardown
+        trees = [resolve_user_node(path, name)] if name else Node.user_nodes(path)
         if not force:
-            # anchor on the user node by config, not the checkout (mirrors
-            # pause): a bare Node(repo_dir) on a non-init branch counts 0
-            # nodes and hides the paused-node kill warning below
-            user = Node.resolve_user(repo_dir)
-            count = len(user.child_list()) if user else 0
+            if all_:
+                typer.echo(
+                    'Warning: This permanently removes every node worktree and'
+                    ' branch plus all fractal data, including every user node.'
+                    ' The project wiki and commit history are left in place.',
+                    err=True,
+                )
+            else:
+                typer.echo(
+                    "Warning: This permanently removes the tree's node"
+                    ' worktrees and branches plus its fractal data, including'
+                    ' its user node. Sibling trees, the project wiki, and'
+                    ' commit history are left in place.',
+                    err=True,
+                )
+            count = sum(len(tree.child_list()) for tree in trees)
             s = 's' if count != 1 else ''
-            typer.echo(
-                'Warning: This permanently removes every node worktree and'
-                ' branch plus all fractal data, including the user node.'
-                ' The project wiki and commit history are left in place.',
-                err=True,
-            )
             # the confirmation is the authorization to kill paused nodes, so
             # it must name them (the teardown settles their frozen work)
-            paused = len(user.list(status='paused', live=True)) if user else 0
+            paused = sum(len(tree.list(status='paused', live=True)) for tree in trees)
             if paused:
                 p = 's' if paused != 1 else ''
                 hold = 'hold' if paused != 1 else 'holds'
@@ -457,9 +511,12 @@ def destroy(app: typer.Typer) -> typer.Typer:
                     ' work and will be killed.',
                     err=True,
                 )
-            prompt = f'Destroy the fractal at {repo_dir} ({count} node{s})?'
+            if all_:
+                prompt = f'Destroy the fractal at {repo_dir} ({count} node{s})?'
+            else:
+                prompt = f'Destroy the tree {name!r} at {repo_dir} ({count} node{s})?'
             typer.confirm(prompt, abort=True)
-        output = Node.destroy(repo_dir)
+        output = Node.destroy(path, name=name)
         if output:
             typer.echo(output)
 
@@ -482,14 +539,14 @@ def _bundled_skills() -> list[Traversable]:
     return sorted(skills, key=lambda path: path.name)
 
 
-def _resolve_user_seed(path: str) -> tuple[Node, str]:
-    """Resolve the user node and its seed dir (shared by track/untrack).
+def _resolve_user_seed(path: str, name: Optional[str] = None) -> tuple[Node, str]:
+    """Resolve a tree's user node and its seed dir (shared by track/untrack).
 
-    Tracking is repo-wide, so the toggle anchors on the user node that owns
+    Tracking is per tree, so the toggle anchors on the user node that owns
     the seed dir by config, not the current branch (mirrors pause) -- the
     verbs stay usable on any checkout inside the repo.
     """
-    user = resolve_user_node(path)
+    user = resolve_user_node(path, name)
     # the seed dir nests under <project>/ for a sub-project user node
     project = user.config.get('project', '.')
     if project == '.':

@@ -305,6 +305,12 @@ corresponding wiki branch for context.
 - **Use the CLI.** Run `wiki search <pattern>` to find content. Run `wiki map`
   for the navigation tree. Run `wiki update` to refresh frontmatter and links.
   Run `wiki lint` to catch what `wiki update` cannot repair.
+- **Links inside tables need an escaped pipe.** `wiki update` rewrites a bare
+  folder link into the aliased `[[branch/_index|branch]]` form, whose `|` a
+  markdown table reads as a column break — the row silently loses every target
+  after it, and `wiki lint` sees plain text, not a broken link. Write table
+  links as `[[branch/_index\|branch]]` from the start; the escaped form
+  round-trips `wiki update` and `mdformat` unchanged.
 - **Description style.** Frontmatter `desc` fields and link descriptions are
   human-readable prose — complete sentences ending in a period, with
   class/method names rephrased into plain language (backticks only if code must
@@ -389,13 +395,26 @@ See `pyproject.toml` for formatter/linter config.
   is always the message author. Deleting a node removes only its registry rows
   and subscriptions; all history rows persist. Read the schema in `core/` before
   adding or changing tables.
+- **Tree scoping:** one repo can carry several trees, one per branch `init` ran
+  on, each with its own user node, data dir, and central DB. Every tree-scoped
+  verb (`pause`, `resume`, `reset`, `track`, `untrack`, `open`) takes the root
+  branch as an optional first argument and otherwise infers it from the caller's
+  own branch (`Node.resolve_user`); a lone tree answers any checkout, but
+  several trees plus a branch belonging to none of them is a refusal, never a
+  guess. `destroy` takes the same name but never infers it (see below). `path`
+  is `--path` on these verbs, since the positional names the tree.
+  `destroy --all` is the only repo-wide verb. `open` and `node list` take either
+  name in that one slot: a root scopes to the whole tree, a node branch to that
+  node (a root owns no worktree, so it resolves by config first).
 - **Teardown tiers:** `node delete` removes one subtree; `fractal reset` removes
-  every worktree, branch, and registration while the user node's data (config,
-  memory, the central DB with all history) survives; `fractal destroy` is the
-  full inverse of `fractal init`, the database included. All three refuse over
-  running nodes; `reset`/`destroy` kill paused nodes as part of the confirmed
-  teardown (the confirmation or `--force` authorizes discarding their frozen
-  work), while `delete` — agent-reachable — refuses over them.
+  the tree's worktrees, branches, and registrations while the user node's data
+  (config, memory, the central DB with all history) survives;
+  `fractal destroy <name>` removes one tree outright, database included, and
+  `fractal destroy --all` is the full inverse of `fractal init` (exactly one
+  scope must be named — a bare `destroy` is ambiguous and refused). All three
+  refuse over running nodes; `reset`/`destroy` kill paused nodes as part of the
+  confirmed teardown (the confirmation or `--force` authorizes discarding their
+  frozen work), while `delete` — agent-reachable — refuses over them.
 - **Project-files surface:** `node.files` (the `Files` facade in
   `core/files.py`) exposes a node's work product to consumers: git-tracked files
   including `wiki/` and `.fractal/` (consumers filter or collapse machinery;

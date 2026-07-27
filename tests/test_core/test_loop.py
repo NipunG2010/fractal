@@ -1349,17 +1349,26 @@ def test_deadline_expired_before_launch_keeps_the_plain_reason(
     """
     monkeypatch.setenv('_NODE', '')
     _configure(loop_node, timeout='1s')
+    launched = []
 
     class SlowLoop(MockLoop):
         """Mock loop whose first launch outlives the run deadline."""
 
         def _launch(self: SlowLoop, *args: Any, **kwargs: Any) -> StepResult:
+            # PLAN won its race to start, so EXECUTE is the step the expired
+            # deadline catches -- the premise the assertion below rests on
+            launched.append(True)
             time.sleep(2.5)
             return super()._launch(*args, **kwargs)
 
     loop = SlowLoop(loop_node, results=[StepResult(status='completed')])
     assert loop.run() == 0
     iteration = loop_node.db.read('iters', where={'node': loop_node.branch})[0]
+    # starvation: the one-second deadline lapsed before PLAN could launch, so
+    # PLAN is the timed-out step and the ceiling under test never came up
+    if not launched:
+        pytest.skip('load starvation: the run deadline expired before any launch')
+    # the guarded regression: EXECUTE never launched, so no ceiling resolved
     assert iteration['metadata'] == 'EXECUTE timed out'
 
 

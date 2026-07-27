@@ -498,30 +498,43 @@ def resolve_node(path: PathLike, *, check: bool = True) -> Node:
     return node
 
 
-def resolve_user_node(path: PathLike) -> Node:
-    """Resolve the tree's user (root) node from any checkout, by config not branch.
+def resolve_user_node(path: PathLike, name: Optional[str] = None) -> Node:
+    """Resolve a tree's user (root) node from any checkout, by config not branch.
 
-    The tree-wide brake (``pause``/``resume``) must always anchor on the user
-    node, but :func:`resolve_node` keys on the repo's *current* branch -- so on
-    a non-init checkout (the user on their own branch while nodes run) it
-    silently mis-scopes to a lone child or dies on two.
-    :meth:`Node.resolve_user` finds the ``config.json`` marked ``user: true``
+    The tree-wide verbs (``pause``/``resume``/``track``/...) must always
+    anchor on the user node, but :func:`resolve_node` keys on the repo's
+    *current* branch -- so on a non-init checkout (the user on their own
+    branch while nodes run) it silently mis-scopes to a lone child or dies on
+    two. :meth:`Node.resolve_user` finds the ``config.json`` marked
+    ``user: true`` for the named tree (or the one owning the caller's branch)
     and pins a ``Node`` to that branch, independent of the git checkout; this
-    wrapper turns its no-fractal ``None`` into the CLI refusal.
+    wrapper turns its no-such-tree ``None`` into the CLI refusal.
 
     Args:
         path: Any path inside the repo.
+        name: Root branch of the tree to act on; ``None`` infers it from the
+            caller's branch.
 
     Returns:
-        The user (root) node, branch-pinned.
+        The tree's user (root) node, branch-pinned.
 
     Raises:
-        typer.BadParameter: If the repo has no user node (no fractal).
+        typer.BadParameter: If the repo has no such tree, or several trees
+            leave the caller's checkout ambiguous.
 
     """
-    user = Node.resolve_user(path)
+    # an ambiguous checkout is a usage mistake, not a runtime failure -- its
+    # remedy is naming the tree, so it refuses like the unknown name below
+    try:
+        user = Node.resolve_user(path, name=name)
+    except RuntimeError as error:
+        raise typer.BadParameter(str(error)) from None
     if user is None:
         repo = Node(path).repo_dir
+        if name is not None:
+            trees = ', '.join(tree.branch for tree in Node.user_nodes(path))
+            found = f' Trees here: {trees}.' if trees else ''
+            raise typer.BadParameter(f'No fractal tree {name!r} under {repo}.{found}')
         raise typer.BadParameter(
             f'No user node found under {repo}. Run `fractal init` at the repo root.'
         )

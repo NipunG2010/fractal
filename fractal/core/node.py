@@ -427,29 +427,28 @@ class Node:
         return None
 
     @classmethod
-    def resolve_user(cls: type[Node], path: PathLike) -> Optional[Node]:
-        """Resolve the repo's user (root) node by config, not the checkout.
+    def user_nodes(cls: type[Node], path: PathLike) -> list[Node]:
+        """Return every tree's user (root) node in the repo, branch-sorted.
 
-        A bare ``Node`` keys on the repo's *current* branch, so on a non-init
-        checkout (the user on their own branch while nodes run) the user node
-        reads as uninitialized even though the fractal exists. Scan the repo's
-        fractal data dirs (top-level and each sub-project) for the
-        ``config.json`` marked ``user: true`` and pin a ``Node`` to that
-        branch, independent of the git checkout.
+        One repository can carry several fractal trees, each rooted on its
+        own branch with its own data directory and central database. Scan
+        the repo's fractal data dirs (top-level and each sub-project) for
+        the ``config.json`` marked ``user: true`` and pin a ``Node`` to each
+        root branch, independent of the git checkout.
 
         Args:
             path: Any path inside the repo.
 
         Returns:
-            The user (root) node, branch-pinned, or ``None`` when there is
-            no user node to find (no fractal, or no git repo at all).
+            The repo's user (root) nodes, branch-pinned and sorted by
+            branch; empty when there is no fractal, or no git repo at all.
 
         """
         # mirror exists(): a repo-less path has no user node, not an error
         try:
             repo = cls(path).repo_dir
         except RuntimeError:
-            return None
+            return []
         # the user config lives at <repo>/[<project>/].fractal/<branch>/config.json;
         # check the top level first, then each sub-project dir
         fractal_dirs = [repo / FRACTAL_FOLDER]
@@ -467,6 +466,9 @@ class Node:
                 project = worktree.project_path(repo, project_file.name)
                 if project != '.':
                     fractal_dirs.append(repo / project / FRACTAL_FOLDER)
+        # keyed by branch: init enforces one fractal per branch, and the dirs
+        # above can name the same sub-project twice (iterdir plus the cache)
+        users: dict[str, Node] = {}
         for fractal_dir in fractal_dirs:
             if not fractal_dir.is_dir():
                 continue
@@ -480,8 +482,63 @@ class Node:
                     # <project>/ prefix from the .worktrees/.project cache, so a
                     # sub-project anchor would double the prefix (mirrors
                     # resolve_init_target); the branch is the config dir's name
-                    return cls(repo, branch=config_path.parent.name)
-        return None
+                    branch = config_path.parent.name
+                    users.setdefault(branch, cls(repo, branch=branch))
+        return [users[branch] for branch in sorted(users)]
+
+    @classmethod
+    def resolve_user(
+        cls: type[Node],
+        path: PathLike,
+        *,
+        name: Optional[str] = None,
+    ) -> Optional[Node]:
+        """Resolve one tree's user (root) node by config, not the checkout.
+
+        A bare ``Node`` keys on the repo's *current* branch, so on a non-init
+        checkout (the user on their own branch while nodes run) the user node
+        reads as uninitialized even though the fractal exists. ``name`` picks
+        a tree by its root branch outright; otherwise the caller's own branch
+        selects the tree that owns it -- a node worktree sits on
+        ``<root>.<...>``, the repo root on the root branch itself -- and a
+        lone tree answers for any checkout.
+
+        Args:
+            path: Any path inside the repo.
+            name: Root branch of the tree to resolve; ``None`` infers it from
+                the caller's branch.
+
+        Returns:
+            The tree's user (root) node, branch-pinned, or ``None`` when
+            there is no such tree (no fractal, no git repo, or no tree
+            under ``name``).
+
+        Raises:
+            RuntimeError: If the repo carries several trees and the caller's
+                branch belongs to none of them -- guessing would act on a
+                healthy sibling.
+
+        """
+        users = cls.user_nodes(path)
+        if name is not None:
+            return next((user for user in users if user.branch == name), None)
+        if len(users) <= 1:
+            return users[0] if users else None
+        # several trees: the caller's branch names its owner; check=False so a
+        # detached checkout ('HEAD') or an unborn one (no branch at all, hence
+        # the None guard below) falls through to the refusal instead of dying
+        branch = fractal.util.git.branch(cls(path).worktree, check=False)
+        if branch is not None:
+            for user in users:
+                if branch == user.branch or branch.startswith(f'{user.branch}.'):
+                    return user
+        trees = ', '.join(user.branch for user in users)
+        # an unborn checkout has no branch to name in the refusal
+        owner = f'branch {branch!r}' if branch is not None else 'this checkout'
+        raise RuntimeError(
+            f'This repository carries several fractal trees ({trees}) and'
+            f' {owner} belongs to none of them — name the tree to act on.'
+        )
 
     def exists(self: Node) -> bool:
         """Return whether this node has been initialized."""
@@ -1113,6 +1170,26 @@ class Node:
                 " branch names containing '/' are not supported — switch"
                 ' to a slash-free branch and re-run init.'
             )
+        # a dotted root branch is fine on its own -- the root's branch is the
+        # user's ('v1.0', 'stable-2.1'), not fractal's to name -- but two roots
+        # may not dot-nest: '.' is the node hierarchy separator, so a tree
+        # rooted at 'v1.0' reads as a node inside one rooted at 'v1', and every
+        # <root>.* scope (destroy, reset, the ancestor walk) would cross between
+        # them -- a re-init sees its own tree here, so skip it
+        for other in Node.user_nodes(self.repo_dir):
+            if other.branch == branch:
+                continue
+            nested = branch.startswith(f'{other.branch}.')
+            nests_other = other.branch.startswith(f'{branch}.')
+            if nested or nests_other:
+                raise ValueError(
+                    f'Cannot initialize a user node on branch {branch!r}: it'
+                    f' collides with the tree rooted at {other.branch!r} —'
+                    " '.' is the node hierarchy separator, so one reads as a"
+                    ' node inside the other and every subtree scope would cross'
+                    ' between them. Switch to a branch that is not dot-nested'
+                    ' with an existing tree root and re-run init.'
+                )
         # default the path to self._root relative to the repo root; coerce to a
         # str so it serializes cleanly into config.json and the .project cache
         if path is None:
@@ -1183,13 +1260,19 @@ class Node:
         # tmux namespace: node sessions and `node kill` resolve by the global
         # name '<repo-basename> (<branch>)', so two fractals under one basename
         # collide and a kill can cross-fire onto the other tree -- tmux names
-        # carry no repo path, but this fractal does not exist yet, so any live
-        # session under our basename is necessarily a different repo's
+        # carry no repo path, so a session counts as ours only when its name
+        # derives from a branch this repo has checked out: a sibling tree's
+        # running node is our own namespace, not a stranger's
         repo_name = self.repo_dir.name.replace('.', '-').replace(':', '-')
         sessions = fractal.util.tmux.probe()
         if sessions is not None:
             prefix = f'{repo_name} ('
-            clash = next((name for name in sessions if name.startswith(prefix)), None)
+            ours = {
+                tmux_session_name(self.repo_dir, checkout)
+                for checkout in fractal.util.git.worktree_map(self.repo_dir)
+            }
+            foreign = sessions - ours
+            clash = next((name for name in foreign if name.startswith(prefix)), None)
             if clash is not None:
                 raise RuntimeError(
                     f'Another active fractal already uses the tmux name'
@@ -2688,40 +2771,62 @@ class Node:
         return 'Node unretired'
 
     @staticmethod
-    def destroy(path: pathlib.Path) -> str:
-        """Destroy the repo's fractal -- the full inverse of ``fractal init``.
+    def destroy(path: PathLike, *, name: Optional[str] = None) -> str:
+        """Destroy one fractal tree, or the whole fractal when ``name`` is ``None``.
 
-        Tears down every node worktree and local branch, removes
-        ``.worktrees/``, deletes the user node's data directory, and strips
-        fractal's block from the repo's ``info/exclude``. Committed artifacts
-        (the project wiki, baseline commits) and remote branches are left in
-        place. Refuses while any node's tmux session is alive; paused nodes
-        are killed as part of the teardown -- the caller's confirmation
+        Whole-fractal mode is the full inverse of ``fractal init``: tears
+        down every node worktree and local branch, removes ``.worktrees/``,
+        deletes every user node's data directory, and strips fractal's block
+        from the repo's ``info/exclude``. Tree mode is the same teardown
+        scoped to one tree -- only its node worktrees, branches, and data
+        directory go, while sibling trees and the shared ``.worktrees/``
+        plumbing survive; the block is stripped only when no tree remains.
+        Committed artifacts (the project wiki, baseline commits), remote
+        branches, and the tree's own root branch are left in place. Refuses
+        while any in-scope node's tmux session is alive; paused nodes are
+        killed as part of the teardown -- the caller's confirmation
         authorized discarding the frozen mid-step work their parked
         worktrees hold.
 
         Args:
-            path: Git repository root.
+            path: Any path inside the repo.
+            name: Root branch of the tree to destroy (``None`` destroys the
+                whole fractal).
 
         Returns:
             Script output.
 
         """
-        # anchor on the user node by config, not the checkout: on a non-init
-        # branch a bare Node(path) reads uninitialized, skipping the pre-flight
-        # and paused settle, and the script would key the data dir off the
-        # wrong branch, leaving the config and central DB behind
-        node = Node.resolve_user(path) or Node(path)
+        if name is None:
+            # every tree is in scope, so every tree anchors the teardown: a
+            # single anchor would pre-flight, settle, and prune one tree's
+            # nodes while the script tore down all of them
+            trees = Node.user_nodes(path)
+            # a repo with no fractal still runs the script (its no-op report)
+            node = trees[0] if trees else Node(path)
+        else:
+            # anchor the named tree explicitly, never by inference -- a scoped
+            # teardown keyed to the wrong tree's DB would guard and prune a
+            # healthy sibling
+            node = Node.resolve_user(path, name=name)
+            if node is None:
+                raise RuntimeError(f'No tree found on branch {name!r}.')
+            trees = [node]
+        repo_dir = node.repo_dir
         # snapshot the registry before the teardown: the script removes the
-        # central DB with the user node's data dir, so the phantom prune
+        # central DB with each user node's data dir, so the phantom prune
         # below must read the branch list while it still exists
-        registry = node.db.read('nodes') if node.exists() else []
-        # refuse if the caller stands inside a node worktree -- git cannot
-        # remove a worktree the caller occupies
+        registry = [
+            row for tree in trees if tree.exists() for row in tree.db.read('nodes')
+        ]
+        # refuse if the caller stands inside an in-scope node worktree -- git
+        # cannot remove a worktree the caller occupies
         cwd = pathlib.Path.cwd().resolve()
-        for _, worktree_path in fractal.util.git.worktree_map(node.repo_dir).items():
+        for branch, worktree_path in fractal.util.git.worktree_map(repo_dir).items():
             worktree_dir = worktree_path.resolve()
-            if worktree_dir == node.repo_dir.resolve():
+            if worktree_dir == repo_dir.resolve():
+                continue
+            if name is not None and not branch.startswith(f'{name}.'):
                 continue
             if cwd == worktree_dir or worktree_dir in cwd.parents:
                 raise RuntimeError(
@@ -2731,42 +2836,51 @@ class Node:
         # reconcile crashed nodes so their orphaned process groups reap while
         # the .pgid records still exist (the script removes them with the
         # worktrees; a headless agent would otherwise keep spending unseen)
-        if node.exists():
-            for _, descendant in node._live_descendants(status='active'):
+        for tree in trees:
+            if not tree.exists():
+                continue
+            for _, descendant in tree._live_descendants(status='active'):
                 descendant._reconcile_status()
-        result = Node._guarded_teardown(
-            node,
-            'destroy.sh',
-            path,
-            f'--branch={node.branch}',
-        )
+        args = [f'--branch={node.branch}']
+        if name is None:
+            args.append('--all')
+            # the sweep clears every tree's data dir, so name them here -- the
+            # 'user' marker identifying a root lives in each node's config
+            args += [
+                f'--node-dir={tree.node_dir.relative_to(repo_dir)}' for tree in trees
+            ]
+        result = Node._guarded_teardown(node, trees, 'destroy.sh', repo_dir, *args)
         # prune every snapshot branch: a no-op for the worktrees the script
         # tore down, and the cleanup destroy.sh cannot do for a phantom (its
         # worktree rm -rf'd out of band) -- a stale branch would resurrect
         # old history under a later re-init of the name
         for branch in sorted({row['node'] for row in registry}):
-            worktree.prune_branch(node.repo_dir, branch)
+            worktree.prune_branch(repo_dir, branch)
         # strip fractal's block from the shared info/exclude (the inverse of
-        # exclude_update: same whole-line markers, all other content preserved)
-        worktree.exclude_strip(path)
+        # exclude_update: same whole-line markers, all other content
+        # preserved) -- kept while any sibling tree survives
+        if not Node.user_nodes(repo_dir):
+            worktree.exclude_strip(repo_dir)
         return result.stdout.strip()
 
     @staticmethod
-    def reset(path: pathlib.Path) -> str:
-        """Remove every node worktree, keeping the project and its history.
+    def reset(path: PathLike, *, name: Optional[str] = None) -> str:
+        """Remove one tree's node worktrees, keeping the project and its history.
 
         The middle rung between ``delete`` (one subtree) and ``destroy`` (the
-        full inverse of init): tears down all node worktrees and local
-        branches and clears the node registry, while the user node's data --
-        config, memory, and the central database with every history row --
-        plus the wiki and baseline commits survive, so fresh nodes spawn
-        immediately after. Refuses while any node's tmux session is alive;
-        paused nodes are killed as part of the teardown -- the caller's
-        confirmation authorized discarding the frozen mid-step work their
-        parked worktrees hold.
+        tree, or the whole fractal): tears down the tree's node worktrees and
+        local branches and clears its node registry, while the user node's
+        data -- config, memory, and the central database with every history
+        row -- plus the wiki and baseline commits survive, so fresh nodes
+        spawn immediately after. Sibling trees are untouched. Refuses while
+        any of the tree's tmux sessions is alive; paused nodes are killed as
+        part of the teardown -- the caller's confirmation authorized
+        discarding the frozen mid-step work their parked worktrees hold.
 
         Args:
-            path: Git repository root.
+            path: Any path inside the repo.
+            name: Root branch of the tree to reset; ``None`` infers it from
+                the caller's branch.
 
         Returns:
             Script output.
@@ -2775,18 +2889,24 @@ class Node:
         # anchor on the user node by config, not the checkout: on a non-init
         # branch a bare Node(path) reads uninitialized, skipping the registry
         # snapshot (orphaning its rows), the reconcile, and the latch cleanup
-        node = Node.resolve_user(path) or Node(path)
+        node = Node.resolve_user(path, name=name)
+        if node is None:
+            if name is not None:
+                raise RuntimeError(f'No tree found on branch {name!r}.')
+            node = Node(path)
         repo_dir = node.repo_dir
         # snapshot the registry before the teardown: the deregistration below
         # must sweep exactly the rows that predate the script, never a node a
         # concurrent init registers afterward
         registry = node.db.read('nodes') if node.exists() else []
-        # refuse if the caller stands inside a node worktree -- git cannot
-        # remove a worktree the caller occupies
+        # refuse if the caller stands inside one of the tree's node worktrees
+        # -- git cannot remove a worktree the caller occupies
         cwd = pathlib.Path.cwd().resolve()
-        for _, worktree_path in fractal.util.git.worktree_map(repo_dir).items():
+        for branch, worktree_path in fractal.util.git.worktree_map(repo_dir).items():
             worktree_dir = worktree_path.resolve()
             if worktree_dir == repo_dir.resolve():
+                continue
+            if not branch.startswith(f'{node.branch}.'):
                 continue
             if cwd == worktree_dir or worktree_dir in cwd.parents:
                 raise RuntimeError(
@@ -2798,7 +2918,13 @@ class Node:
         if node.exists():
             for _, descendant in node._live_descendants(status='active'):
                 descendant._reconcile_status()
-        result = Node._guarded_teardown(node, 'reset.sh', path)
+        result = Node._guarded_teardown(
+            node,
+            [node],
+            'reset.sh',
+            repo_dir,
+            f'--branch={node.branch}',
+        )
         # prune every snapshot branch: a no-op for the worktrees the script
         # tore down, and the cleanup delete.sh cannot do for a phantom (its
         # worktree rm -rf'd out of band) -- a stale branch or .project entry
@@ -2834,6 +2960,7 @@ class Node:
     @staticmethod
     def _guarded_teardown(
         node: Node,
+        trees: list[Node],
         script: str,
         path: pathlib.Path,
         *args: str,
@@ -2842,7 +2969,7 @@ class Node:
 
         The shared ``destroy``/``reset`` shape. Pre-flights the script's
         own refusals first -- a live tmux session or a locked worktree
-        anywhere in the tree -- because the paused settle below is
+        anywhere in the trees in scope -- because the paused settle below is
         irreversible (the kills close the parked runs), so a teardown the
         script would refuse must abort here with nothing touched. Then
         settles frozen work: a paused node has no session for the
@@ -2860,7 +2987,11 @@ class Node:
         lands after the pre-flight.
 
         Args:
-            node: The repo-root node handle.
+            node: The repo-root node handle -- runs the script and owns the
+                flock.
+            trees: The user nodes whose subtrees the teardown covers; each is
+                pre-flighted and settled before the script runs, so a
+                repo-wide sweep never guards one tree and tears down another.
             script: The teardown script (``destroy.sh``/``reset.sh``); its
                 stem names the verb in the kill attribution.
             path: Git repository root, passed through to the script.
@@ -2871,11 +3002,13 @@ class Node:
 
         """
         verb, *_ = script.split('.')
-        if node.exists():
+        for tree in trees:
+            if not tree.exists():
+                continue
             # pre-flight the script's refusals before the irreversible settle
             # (the user node runs no loop, so only descendants can hold a
             # session): one pass per guard, mirroring the script's ordering
-            descendants = node._live_descendants()
+            descendants = tree._live_descendants()
             # probe each node's recorded socket, never the ambient one alone:
             # a session alive on the socket the loop recorded at boot is
             # invisible to a shell resolving a different server (see
@@ -2905,18 +3038,21 @@ class Node:
                 if git_dir and (pathlib.Path(git_dir) / 'locked').is_file():
                     raise RuntimeError(
                         f'Cannot {verb}: worktree is locked: {descendant._root}'
-                        f' (unlock with: git -C "{node.repo_dir}"'
+                        f' (unlock with: git -C "{tree.repo_dir}"'
                         f' worktree unlock "{descendant._root}").'
                     )
-            # settle frozen work: kill each parked node so its open rows
-            # close -- before the lock (each kill takes the same flock);
-            # best-effort per node (mirrors kill's sweep), the script's
-            # paused re-check backstops
-            for _, descendant in node._live_descendants(status='paused'):
+        # settle frozen work once every tree passed its pre-flight: kill each
+        # parked node so its open rows close -- before the lock (each kill
+        # takes the same flock); best-effort per node (mirrors kill's sweep),
+        # the script's paused re-check backstops
+        for tree in trees:
+            if not tree.exists():
+                continue
+            for _, descendant in tree._live_descendants(status='paused'):
                 try:
                     descendant._kill(f'{verb} teardown', fan_out=True)
                 except Exception:
-                    node.log(
+                    tree.log(
                         message=f'Warning: failed to kill {descendant._root}',
                         level=logging.WARNING,
                     )

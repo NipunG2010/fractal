@@ -99,6 +99,7 @@ its subtree) clears only the registry rows and subscriptions; all history rows �
 runs, iterations, steps, events, messages — persist in the central database.
 Merge events are logged on the merge *target*, so even the record of a child's
 integration outlives the child. A tree-level `fractal reset` keeps the user
-node's data directory, database included; only `fractal destroy` — the full
-inverse of `fractal init` — removes the database itself. The durability
-reasoning behind these tiers lives in the [[design/_index|design]] branch.
+node's data directory, database included; only `fractal destroy` removes the
+database itself — the named tree's with `destroy <tree>`, every tree's with
+`destroy --all`, the full inverse of `fractal init`. The durability reasoning
+behind these tiers lives in the [[design/_index|design]] branch.

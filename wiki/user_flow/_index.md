@@ -5,7 +5,7 @@ desc: |
   launching nodes, monitoring and steering, finishing and merging, pausing
   and resuming, and tearing down.
 created: 2026-07-21T04:35:35Z
-updated: 2026-07-21T04:47:43Z
+updated: 2026-07-27T02:49:50Z
 ---
 
 # user_flow
@@ -32,8 +32,9 @@ through directives, NODE.md edits, chat, and retunes; and how the passive root
 node participates.
 
 [[user_flow/teardown|teardown]]: The three teardown tiers and their guards: node
-delete removes one subtree, fractal reset clears every worktree while history
-survives, and fractal destroy is the full inverse of init.
+delete removes one subtree, fractal reset clears a tree's worktrees while its
+history survives, and fractal destroy removes one tree by name or, with the all
+flag, the whole fractal as the full inverse of init.
 
 ***
 

@@ -348,7 +348,7 @@ def test_measures_tolerate_a_numeric_config_duration(pair_tree: pathlib.Path) ->
     config.json is agent-editable, so a self-tuning node may write
     ``timeout: 3600`` (an int) instead of ``'1h'``. ``_measures`` must coerce
     before parsing -- a raw int would hit ``.strip()`` and crash the whole
-    cockpit build, killing scope-to and ``fractal open <node>`` at boot.
+    cockpit build, killing scope-to and ``fractal open`` at boot.
     """
     alpha = Node(pair_tree / '.worktrees' / 'main.alpha')
     config_path = alpha.node_dir / 'config.json'

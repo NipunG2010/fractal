@@ -2,8 +2,8 @@
 name: architecture/node_tree
 desc: |
   The node tree model: dotted branch naming, the parent/child relationship
-  derived from branch names, the passive root (user) node, and the central
-  node registry.
+  derived from branch names, the passive root (user) node, several
+  independent trees in one repository, and the central node registry.
 created: 2026-07-21T04:47:26Z
 updated: 2026-07-21T04:47:26Z
 ---
@@ -35,7 +35,9 @@ Because position is encoded in the name, no parent pointer is stored anywhere:
 the parent is always the branch minus its last dotted segment, and a branch with
 no dot is the tree root. Slash-style branch names (`feat/x`) are rejected at
 user-node init, since every per-branch artifact keys on the branch as a single
-path component.
+path component. A *dotted* root branch is fine — the root's branch is the user's
+own (`v1.0`, `stable-2.1`), and parenthood derives only below the tree root, so
+it never reads as the child of a phantom node.
 
 ## Parent and child
 
@@ -69,6 +71,51 @@ latches a marker file beside that database so even top-level spawns and starts
 refuse until the tree-wide resume. Agent nodes, by contrast, carry the full
 lifecycle status set (`active`, `paused`, `completed`, `exited`, and the rest)
 in their `.status` file and registry row.
+
+## Several trees in one repository
+
+A repository can carry more than one tree. Each `fractal init` on a different
+root branch creates a separate tree: its own user node, its own data directory,
+its own central database and history. Trees share only the repository and the
+`.worktrees/` plumbing beneath it; nothing crosses between them.
+
+Two roots may not *dot-nest*, though — a tree rooted at `v1.0` would read as a
+node inside one rooted at `v1`, and every `<root>.*` scope would cross between
+them. Init refuses the second of such a pair, whichever came first. (A dotted
+root alone stays legal; only the collision is refused.)
+
+Because the trees are independent, every tree-scoped verb — `pause`, `resume`,
+`reset`, `track`, `untrack`, and the cockpit — has to know which tree it means,
+and it must never guess. Each takes the tree's root branch as an optional first
+argument and otherwise infers it from **the caller's own branch**: a node
+worktree sits on `<root>.<...>` and names its tree that way, the repository root
+names it by its checkout. A lone tree answers from any checkout, including the
+operator's own side branch. But when several trees exist and the caller's branch
+belongs to none of them, the verb refuses and names the trees to choose from —
+guessing would brake, toggle, or tear down a healthy sibling.
+
+The read-only listing is the exception that proves the rule: `fractal node list`
+spans every tree when the caller's branch owns none, and takes a tree's root
+branch to scope to one. Showing more than was asked for is no guess, and each
+row's branch names the tree it sits in.
+
+`node list` and the cockpit take either kind of name in that one slot — a root
+branch scopes to the whole tree, a node branch to that node. A node branch is
+never ambiguous: it names its own tree, so `fractal open <node>` works from a
+checkout that belongs to no tree at all.
+
+A name and a path answer different questions, which is why the verbs carry both.
+A path names a tree only through whatever branch is checked out there, and that
+mapping is mutable, partial, and sometimes empty: the repository root sits on
+one root branch at a time, and a user node has no worktree of its own, so a tree
+whose nodes have all finished is reachable by name alone. `--path` says which
+repository; the positional says which tree inside it.
+
+`destroy` is the one exception to the inference: a bare `fractal destroy` is
+ambiguous between "this tree" and "everything", so it takes the name or `--all`
+and refuses without exactly one of them. `fractal destroy --all` is the one
+deliberately repo-wide verb, and it pre-flights every tree before touching any
+of them.
 
 ## The node registry
 

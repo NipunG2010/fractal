@@ -5,7 +5,7 @@ desc: |
   worktree-per-node design, the agent-provider seam, the central per-tree
   database, and the package layout.
 created: 2026-07-21T04:35:35Z
-updated: 2026-07-21T11:34:02Z
+updated: 2026-07-27T02:49:26Z
 ---
 
 # architecture
@@ -22,7 +22,8 @@ survives node deletion, and the main table families.
 
 [[architecture/node_tree|node_tree]]: The node tree model: dotted branch naming,
 the parent/child relationship derived from branch names, the passive root (user)
-node, and the central node registry.
+node, several independent trees in one repository, and the central node
+registry.
 
 [[architecture/packages|packages]]: How the packages fit together: the cli,
 core, tui, impl, and util packages, the node-machinery seeds, and the shim

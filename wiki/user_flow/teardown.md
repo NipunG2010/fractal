@@ -2,8 +2,9 @@
 name: user_flow/teardown
 desc: |
   The three teardown tiers and their guards: node delete removes one
-  subtree, fractal reset clears every worktree while history survives, and
-  fractal destroy is the full inverse of init.
+  subtree, fractal reset clears a tree's worktrees while its history
+  survives, and fractal destroy removes one tree by name or, with the all
+  flag, the whole fractal as the full inverse of init.
 created: 2026-07-21T04:47:43Z
 updated: 2026-07-21T04:47:43Z
 ---
@@ -49,41 +50,52 @@ you might revisit; delete what you won't. And if a worktree or branch was
 cleaned up with plain git instead of `delete`, `fractal node reconcile` audits
 the registry afterward, recording each orphan in the events log.
 
-## Tier 2: `fractal reset` — every node, history kept
+## Tier 2: `fractal reset` — a whole tree, history kept
 
 `fractal reset` is the middle rung: it removes **every** node worktree and local
-branch and clears the node registry, while the user node's data — its config,
-memory, and the central database with every history row — plus the project wiki
-and all baseline commits survive. The tree is empty but the fractal is still
-initialized: fresh nodes spawn immediately after, and past runs remain
-queryable.
+branch in the tree and clears its node registry, while the user node's data —
+its config, memory, and the central database with every history row — plus the
+project wiki and all baseline commits survive. The tree is empty but the fractal
+is still initialized: fresh nodes spawn immediately after, and past runs remain
+queryable. Sibling trees are untouched.
 
 Reach for it when the tree's current shape is spent — an experiment concluded, a
 plan superseded — but the project continues under the same fractal.
 
-## Tier 3: `fractal destroy` — the full inverse of init
+## Tier 3: `fractal destroy` — one tree, or the whole fractal
 
-`fractal destroy` removes everything `fractal init` and its nodes created: every
-worktree and local branch, the `.worktrees/` directory, the user node's data
-directory — central database and all history included — and fractal's block in
-the repository's git-exclude file. What survives is exactly what was committed
-to the repository: the project wiki (committed project memory, never deleted —
-the command says so as it finishes), baseline commits, and any branches on the
-remote.
+`fractal destroy <name>` removes one tree by its root branch: the tree's node
+worktrees and local branches, its project-cache entries, and its user node's
+data directory — central database and all history included. Sibling trees and
+the shared `.worktrees/` plumbing survive; fractal's block in the repository's
+git-exclude file is stripped only when the last tree goes, and the plumbing goes
+with it. The tree's own root branch is the user's branch and is never deleted.
 
-After destroy, the repository is as if fractal had never been initialized; a new
-`fractal init` starts from zero.
+`fractal destroy --all` is the full inverse of init: every tree's worktrees,
+branches, and data directories, plus the `.worktrees/` directory and the
+git-exclude block. Exactly one of the two scopes must be named — a bare
+`fractal destroy` is refused as ambiguous.
+
+What survives either scope is exactly what was committed to the repository: the
+project wiki (committed project memory, never deleted — the command says so as
+it finishes), baseline commits, and any branches on the remote.
+
+After `destroy --all`, the repository is as if fractal had never been
+initialized; a new `fractal init` starts from zero.
 
 ## The guards, across tiers
 
 All three tiers refuse over a **running** node — any live tmux session stops the
 teardown before it touches anything, with the kill command named in the error.
-Paused nodes split the tiers: `delete` refuses over them (resume or kill first),
-while `reset` and `destroy` **kill paused nodes as part of the confirmed
-teardown** — the confirmation prompt (or `--force`) is what authorizes
-discarding the frozen mid-step work their parked worktrees hold. Both also
-refuse from inside a node worktree and pre-flight every worktree for locks
-before removing any, keeping the non-atomic teardown all-or-nothing in practice.
+The guards travel with the scope: `reset` and `destroy <name>` pre-flight only
+that tree's nodes, so an ended tree can be torn down while a sibling tree runs,
+and `destroy --all` pre-flights every tree before touching any of them. Paused
+nodes split the tiers: `delete` refuses over them (resume or kill first), while
+`reset` and `destroy` **kill paused nodes as part of the confirmed teardown** —
+the confirmation prompt (or `--force`) is what authorizes discarding the frozen
+mid-step work their parked worktrees hold. Both also refuse from inside a node
+worktree and pre-flight every worktree for locks before removing any, keeping
+the non-atomic teardown all-or-nothing in practice.
 
 Remote branches are the deliberate survivor at tiers 2 and 3: reset and destroy
 report which branches remain on origin rather than deleting them (only tier 1's

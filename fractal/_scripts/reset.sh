@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reset the repo's fractal: every worktree and branch; keep the user node
-# -----------------------------------------------------------------------
+# Reset one fractal tree: its worktrees and branches; keep the user node
+# ----------------------------------------------------------------------
 
 usage() {
     cat <<USAGE
-Usage: reset.sh <repo>
+Usage: reset.sh <repo> [options]
 
-Reset the repo's fractal: every worktree and branch; keep the user node.
+Reset one fractal tree: its worktrees and branches; keep the user node.
 
 Options:
-    --help|-h    Show this help message
+    --branch=<branch>    Tree root branch (default: the current checkout)
+    --help|-h            Show this help message
 USAGE
     exit 0
 }
 
 REPO=""
+BRANCH=""
 
 for arg in "$@"; do
     case "$arg" in
         --help | -h) usage ;;
+        --branch=*) BRANCH="${arg#*=}" ;;
         *)
             if [[ -z "$REPO" ]]; then
                 REPO="$arg"
@@ -48,16 +51,26 @@ fi
 REPO_NAME=${REPO##*/}
 WORKTREES_DIR="$REPO/.worktrees"
 
+# the caller names the tree root (the checkout may sit on another branch);
+# a standalone run falls back to the current branch
+if [[ -z "$BRANCH" ]]; then
+    BRANCH=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
+fi
+
 # nothing to tear down -- a clean no-op
 if [[ ! -d "$WORKTREES_DIR" ]]; then
     echo "No worktrees found. Nothing to reset."
     exit 0
 fi
 
-# find active worktrees
+# find active worktrees -- worktree dirs are named by branch, so the
+# <branch>.* scope matches only the tree's own nodes and leaves sibling
+# trees standing
 WORKTREES=()
 for SUBDIR in "$WORKTREES_DIR"/*/; do
     [[ ! -d "$SUBDIR" ]] && continue
+    NAME=$(basename "$SUBDIR")
+    [[ "$NAME" == "$BRANCH".* ]] || continue
     if [[ -f "$SUBDIR/.git" ]]; then
         WORKTREES+=("$(cd "$SUBDIR" && pwd)")
     fi
@@ -69,11 +82,11 @@ done
 # targets by prefix/fnmatch, so a short name false-matches longer session names
 if [[ ${#WORKTREES[@]} -gt 0 ]]; then
     for WORKTREE in "${WORKTREES[@]}"; do
-        BRANCH=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-        TMUX_SESSION_NAME="${REPO_NAME//[.:]/-} (${BRANCH//./-})"
+        WT_BRANCH=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+        TMUX_SESSION_NAME="${REPO_NAME//[.:]/-} (${WT_BRANCH//./-})"
         if tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$TMUX_SESSION_NAME"; then
             echo "Error: node is still running in tmux ($TMUX_SESSION_NAME)" >&2
-            echo "Kill it first with: fractal node kill $BRANCH" >&2
+            echo "Kill it first with: fractal node kill $WT_BRANCH" >&2
             exit 1
         fi
     done
@@ -86,23 +99,23 @@ fi
 # pause landing after the sweep, mid-reset, would slip through
 if [[ ${#WORKTREES[@]} -gt 0 ]]; then
     for WORKTREE in "${WORKTREES[@]}"; do
-        BRANCH=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+        WT_BRANCH=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
         # the node dir nests under the .worktrees/.project/<branch> project
         # prefix (mirrors Node.node_dir)
         PROJECT="."
-        PROJECT_FILE="$WORKTREES_DIR/.project/$BRANCH"
+        PROJECT_FILE="$WORKTREES_DIR/.project/$WT_BRANCH"
         if [[ -f "$PROJECT_FILE" ]]; then
             PROJECT=$(cat "$PROJECT_FILE")
         fi
         if [[ "$PROJECT" == "." ]]; then
-            STATUS_FILE="$WORKTREE/.fractal/$BRANCH/.status"
+            STATUS_FILE="$WORKTREE/.fractal/$WT_BRANCH/.status"
         else
-            STATUS_FILE="$WORKTREE/$PROJECT/.fractal/$BRANCH/.status"
+            STATUS_FILE="$WORKTREE/$PROJECT/.fractal/$WT_BRANCH/.status"
         fi
         if [[ -f "$STATUS_FILE" && "$(cat "$STATUS_FILE")" == "paused" ]]; then
-            echo "Error: node is paused ($BRANCH)" >&2
-            echo "Resume it first with: fractal node resume $BRANCH" >&2
-            echo "  (or kill it with: fractal node kill $BRANCH)" >&2
+            echo "Error: node is paused ($WT_BRANCH)" >&2
+            echo "Resume it first with: fractal node resume $WT_BRANCH" >&2
+            echo "  (or kill it with: fractal node kill $WT_BRANCH)" >&2
             exit 1
         fi
     done
@@ -126,15 +139,15 @@ fi
 REMOTE_BRANCHES=()
 if [[ ${#WORKTREES[@]} -gt 0 ]]; then
     for WORKTREE in "${WORKTREES[@]}"; do
-        BRANCH=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+        WT_BRANCH=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
         # note non-local branches actually present on origin (fail closed: an
         # unreadable config counts as local, an unreachable origin reports
         # nothing -- the note must never claim a branch that was never pushed)
         LOCAL=$(fractal config _get local --path="$WORKTREE" 2>/dev/null || echo true)
         if [[ "$LOCAL" != true ]]; then
-            if git -C "$REPO" ls-remote --exit-code --heads origin "$BRANCH" \
+            if git -C "$REPO" ls-remote --exit-code --heads origin "$WT_BRANCH" \
                 >/dev/null 2>&1; then
-                REMOTE_BRANCHES+=("$BRANCH")
+                REMOTE_BRANCHES+=("$WT_BRANCH")
             fi
         fi
 
@@ -146,9 +159,9 @@ if [[ ${#WORKTREES[@]} -gt 0 ]]; then
         fi
         # >/dev/null: drop git's own "Deleted branch ... (was <sha>)"
         # so only the script's message below shows (no duplicate line)
-        git -C "$REPO" branch -D "$BRANCH" >/dev/null 2>&1 || true
-        rm -f "$WORKTREES_DIR/.project/$BRANCH"
-        echo "Deleted $WORKTREE ($BRANCH)"
+        git -C "$REPO" branch -D "$WT_BRANCH" >/dev/null 2>&1 || true
+        rm -f "$WORKTREES_DIR/.project/$WT_BRANCH"
+        echo "Deleted $WORKTREE ($WT_BRANCH)"
     done
 fi
 
@@ -160,4 +173,4 @@ git -C "$REPO" worktree prune
 if [[ ${#REMOTE_BRANCHES[@]} -gt 0 ]]; then
     echo "Remote branches left on origin: ${REMOTE_BRANCHES[*]}"
 fi
-echo "Reset fractal: $REPO"
+echo "Reset tree: $BRANCH"

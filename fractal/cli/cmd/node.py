@@ -766,7 +766,9 @@ def node_status(app: typer.Typer) -> typer.Typer:
 def node_list(app: typer.Typer) -> typer.Typer:
     """Register the ``list`` command."""
     # node argument
-    node_help = "Target node branch (default: this node's descendants)."
+    node_help = (
+        "Tree root branch, or a target node branch (default: this node's descendants)."
+    )
     node = typer.Argument(None, help=node_help)
     # all nodes flag
     all_nodes_help = 'Include retired nodes.'
@@ -811,7 +813,9 @@ def node_list(app: typer.Typer) -> typer.Typer:
         """List a node's descendants with status (blank limit columns mean unlimited).
 
         Lists descendants only -- it never includes the target row; use
-        ``fractal node status`` for the node's own status. ``status`` is
+        ``fractal node status`` for the node's own status. A tree root
+        lists its whole tree; with several trees and a checkout belonging
+        to none of them, a bare ``list`` spans them all. ``status`` is
         always bare and ``detail`` carries any qualifier (a pending
         signal, an exited run's end reason, ``orphaned``, an unresolved
         ``model drop``). ``spend`` is the current run's subtree cost, the
@@ -841,29 +845,43 @@ def node_list(app: typer.Typer) -> typer.Typer:
         # list (exit 0) on the uninitialized case rather than hard-failing
         if node is None:
             try:
-                node = resolve_target(path, node)
+                targets = [resolve_target(path, node)]
             except typer.BadParameter:
                 # a non-init checkout (the user on their own branch while
                 # nodes run) is a live tree, not "no nodes" -- anchor on the
                 # user node by config, not the checkout (mirrors pause)
-                node = Node.resolve_user(path)
-                if node is None:
+                try:
+                    user = Node.resolve_user(path)
+                    targets = [user] if user is not None else []
+                except RuntimeError:
+                    # several trees, and the checkout owns none of them: a
+                    # read-only listing spans them all instead of taking the
+                    # mutating verbs' refusal -- showing every node is no
+                    # guess, and each row's branch names the tree it sits in
+                    targets = Node.user_nodes(path)
+                if not targets:
                     if count:
                         typer.echo(0)
                     else:
                         print_rows([], csv=csv, columns=_LIST_COLUMNS)
                     return
         else:
-            node = resolve_target(path, node)
+            # a tree root owns no worktree of its own, so it resolves by
+            # config like the tree-scoped verbs -- keyed to the worktree map
+            # a whole-tree listing would need its root branch checked out
+            user = Node.resolve_user(path, name=node)
+            targets = [user] if user is not None else [resolve_target(path, node)]
         # list nodes
-        rows = node.list(
-            all_nodes=all_nodes,
-            retired_only=retired,
-            max_depth=max_depth,
-            status=status,
-            live=live,
-            decorated=not count,
-        )
+        rows = []
+        for target in targets:
+            rows += target.list(
+                all_nodes=all_nodes,
+                retired_only=retired,
+                max_depth=max_depth,
+                status=status,
+                live=live,
+                decorated=not count,
+            )
         # count short-circuits formatting -- emit just the number
         if count:
             typer.echo(len(rows))

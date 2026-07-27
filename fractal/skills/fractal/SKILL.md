@@ -422,8 +422,9 @@ Once the node is running, briefly explain how to interact with it:
   included), while `activity`'s `cost` column sums only the node's own steps —
   and both are per-run, with no lifetime rollup.
 - **TUI:** For a live view of the whole tree — nodes, runs, costs, and output —
-  suggest the user open the dashboard with `fractal open` (run from the repo
-  root).
+  suggest the user open the dashboard with `fractal open` (from anywhere in the
+  repo; add a node branch to open focused on it, or a tree's root branch to open
+  at the root).
 - **Stopping:** From the worktree, three escalation levels:
   - `fractal node finish` — stop after current iteration
   - `fractal node stop` — stop after current step
@@ -467,10 +468,22 @@ Once the node is running, briefly explain how to interact with it:
   hiding it, retire it instead. Delete prompts for confirmation `[y/N]`; pass
   `--force`/`-f` to skip the prompt.
 - **Reset:** `fractal reset` (from anywhere in the repo) tears down every node
-  worktree, branch, and registration in one sweep; the project, wiki, and all
-  history in the central database survive, so fresh nodes spawn immediately
-  after. It refuses while any node is running or paused, and prompts `[y/N]`
-  (`--force`/`-f` skips).
+  worktree, branch, and registration in the tree in one sweep; the project,
+  wiki, and all history in the central database survive, so fresh nodes spawn
+  immediately after. It refuses while any node is running; a paused node is
+  killed as part of the teardown, which the confirmation `[y/N]` authorizes
+  (`--force`/`-f` skips it).
+- **Tree scope:** one repository can carry several trees — one per branch you
+  ran `fractal init` on, each with its own user node, database, and history. The
+  tree-scoped verbs (`pause`, `resume`, `reset`, `track`, `untrack`, `open`)
+  take the tree's root branch as an optional first argument and otherwise infer
+  it from your own branch: a node worktree names its tree, the repo root names
+  its checkout. With several trees and a checkout belonging to none of them,
+  they refuse rather than guess — name the tree. `open` and `node list` also
+  accept a node branch in that slot, scoping to that node instead of the whole
+  tree. `destroy` takes the same name but never infers it: a bare
+  `fractal destroy` is ambiguous between this tree and everything, so name a
+  tree or pass `--all`, the one repo-wide verb.
 - **Radio:** nodes communicate via `fractal radio` commands. `radio send` writes
   any channel permissions allow, given at least one routing dimension
   (`--node`/`--parent` or `--channel`) — a fully bare send refuses; `radio post`

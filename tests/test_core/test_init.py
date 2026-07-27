@@ -40,11 +40,13 @@ __all__ = [
     'test_init_materializes_title_in_registry',
     'test_init_on_existing_node_refuses_loudly',
     'test_init_refuses_when_an_active_fractal_shares_the_repo_name',
+    'test_init_allows_a_second_tree_while_a_sibling_node_runs',
     'test_start_refuses_a_foreign_session_name_collision',
     'test_reset_refuses_a_running_or_frozen_node',
     'test_init_refuses_case_variant_of_existing_sibling',
     'test_root_anchors_central_db',
     'test_user_init_on_a_dotted_branch',
+    'test_user_init_rejects_a_dot_nested_second_root',
     'test_user_init_rejects_detached_head',
     'test_user_init_stores_and_updates_agent',
     'test_child_inherits_agent_from_ancestor',
@@ -335,15 +337,42 @@ def test_init_refuses_when_an_active_fractal_shares_the_repo_name(
     Two repositories with the same directory basename produce the same tmux
     session namespace (``<basename> (<branch>)``), so their node sessions --
     and ``node kill``, which resolves by that global name -- would collide.
-    tmux names carry no repo path, but this fractal does not exist yet, so a
-    live session under our basename can only be a different repo's; refuse
-    the init rather than create a fractal that cannot be operated safely.
+    tmux names carry no repo path, so a session counts as ours only when its
+    name derives from a branch this repo has checked out; one that no
+    checkout accounts for is a different repo's, and the init is refused
+    rather than creating a fractal that cannot be operated safely.
     """
     repo_name = git_repo.name.replace('.', '-').replace(':', '-')
     sessions = frozenset({f'{repo_name} (main.other)'})
     monkeypatch.setattr('fractal.util.tmux.probe', lambda *, socket=None: sessions)
     with pytest.raises(RuntimeError, match='Another active fractal'):
         Node(git_repo).init(agent='claude', user=True)
+
+
+def test_init_allows_a_second_tree_while_a_sibling_node_runs(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running sibling tree never reads as a foreign fractal at init.
+
+    One repository carries several trees, so the namespace guard must place
+    a live session before refusing: a name derived from a branch this repo
+    has checked out is our own tree's node, not a stranger sharing the
+    basename, and initializing the second tree beside it has to work.
+    """
+    Node(git_repo).init(agent='claude', user=True)
+    Node(git_repo).init(name='task', local=True)
+    task = Node(git_repo / '.worktrees' / 'main.task')
+    sessions = frozenset({task.tmux_session})
+    monkeypatch.setattr('fractal.util.tmux.probe', lambda *, socket=None: sessions)
+    subprocess.run(
+        ['git', 'checkout', '-b', 'second'],
+        cwd=git_repo,
+        capture_output=True,
+        check=True,
+    )
+    assert Node(git_repo).init(agent='claude', user=True)
+    assert [user.branch for user in Node.user_nodes(git_repo)] == ['main', 'second']
 
 
 def test_start_refuses_a_foreign_session_name_collision(
@@ -477,6 +506,45 @@ def test_user_init_on_a_dotted_branch(tmp_path: pathlib.Path) -> None:
     # a phantom 'v1'
     with pytest.raises(ValueError, match='No parent node'):
         node.radio.send(parent=True, subject='s', data='d', priority=3)
+
+
+@pytest.mark.parametrize(
+    argnames=('first', 'second'),
+    argvalues=[
+        ('v1', 'v1.0'),
+        ('v1.0', 'v1'),
+    ],
+    ids=['plain_first', 'dotted_first'],
+)
+def test_user_init_rejects_a_dot_nested_second_root(
+    tmp_path: pathlib.Path,
+    first: str,
+    second: str,
+) -> None:
+    """A second tree may not dot-nest under an existing one, in either order.
+
+    A dotted root is fine alone, but ``.`` is the node hierarchy separator:
+    a tree rooted at ``v1.0`` reads as a node inside one rooted at ``v1``, so
+    every ``<root>.*`` scope (destroy, reset, the ancestor walk) would cross
+    between them. The second init is refused whichever root came first, and
+    the existing tree is left intact.
+    """
+    # the repo dir name feeds the wiki project name, so keep it dot-free
+    repo = _make_git_repo(tmp_path / 'repo')
+    for branch in (first, second):
+        subprocess.run(
+            ['git', 'checkout', '-b', branch],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+        if branch == first:
+            assert Node(repo).init(agent='claude', user=True)
+    with pytest.raises(ValueError, match='collides with the tree rooted at'):
+        Node(repo).init(agent='claude', user=True)
+    # the established tree is untouched and still the only one
+    roots = [user.branch for user in Node.user_nodes(repo)]
+    assert roots == [first]
 
 
 def test_user_init_rejects_detached_head(tmp_path: pathlib.Path) -> None:
