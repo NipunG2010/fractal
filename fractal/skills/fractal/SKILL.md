@@ -460,13 +460,16 @@ Once the node is running, briefly explain how to interact with it:
   still carries its own version there, so land the resolution on the node (or
   retire it) or a later re-merge silently re-stages it. Deleting afterward with
   `fractal node delete <branch>` is optional hygiene, never automatic — a merged
-  branch keeps audit value (delete must run from outside the worktree). **Delete
-  is destructive:** it is recursive — removing the node's whole subtree — and
-  force-removes each worktree and **force-deletes the branch(es) regardless of
-  merge state**, so any committed-but-unmerged work is lost. Always confirm the
-  `merge` succeeded first (check its output). To keep a node's branch while
-  hiding it, retire it instead. Delete prompts for confirmation `[y/N]`; pass
-  `--force`/`-f` to skip the prompt.
+  branch keeps audit value (delete must run from outside the worktree). Pass
+  `--delete` to `merge` to chain the two in one command: every delete refusal
+  and the confirmation `[y/N]` pre-flight the squash, so a chain that cannot
+  finish never starts. **Delete is destructive:** it is recursive — removing the
+  node's whole subtree — and force-removes each worktree and **force-deletes the
+  branch(es) regardless of merge state**, so any committed-but-unmerged work is
+  lost. Always confirm the `merge` succeeded first (check its output). To keep a
+  node's branch while hiding it, retire it instead. Delete prompts for
+  confirmation `[y/N]`, chained or standalone; pass `--force`/`-f` to skip the
+  prompt.
 - **Reset:** `fractal reset` (from anywhere in the repo) tears down every node
   worktree, branch, and registration in the tree in one sweep; the project,
   wiki, and all history in the central database survive, so fresh nodes spawn

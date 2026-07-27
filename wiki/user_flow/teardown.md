@@ -29,6 +29,15 @@ the central database. **History survives**: the subtree's runs, steps, events,
 and messages persist in the database — deletion removes the machinery, not the
 record.
 
+The lifecycle's happy path can chain this tier itself:
+`fractal node merge --delete` runs the delete after a successful merge, so a
+settled child leaves no worktree or branch behind. Each removal echoes the
+worktree's disk size, so `.worktrees/` growth stays visible. Every one of the
+delete's guards below rides the pre-flight — the refusals and the confirmation
+prompt alike land before the merge, so a chain the teardown would refuse (or the
+operator declines) never starts: the squash it would otherwise leave behind is
+irreversible.
+
 Its guards:
 
 - A confirmation prompt (`--force` skips it).

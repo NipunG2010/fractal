@@ -2422,19 +2422,24 @@ class Node:
         # the CompletedProcess -- return them beside the output
         return result.stdout.strip(), result.stderr.strip()
 
-    def delete(self: Node) -> tuple[str, str]:
-        """Recursively remove the node and its whole subtree.
+    def guard_delete(self: Node) -> None:
+        """Guard a subtree teardown: pre-flight its refusals, settle what it can.
 
-        Tears down every descendant too (deepest first), then the node itself:
-        each live worktree via ``delete.sh`` (worktree + branch + remote), and
-        the subtree's registry rows and subscriptions are cleared from the
-        central database -- its history rows (runs, steps, messages, ...)
-        persist. Refuses if the node or any descendant is active or paused --
-        stop, resume, or kill the subtree first.
+        The refusal slice of :meth:`delete`: node validity, settled statuses
+        across the subtree, no locked worktree, and the cwd sitting outside
+        every worktree git would remove. Standalone so a chained teardown
+        (``merge --delete``) can run it first, landing any refusal before work
+        that cannot be undone -- the same pre-flight-then-settle shape
+        :meth:`_guarded_teardown` gives the tree-wide tiers.
 
-        Returns:
-            Tuple of per-node script output (deletion order) and collected
-            stderr notices (e.g. unmerged-work warnings).
+        Not a dry run: a crashed-but-active node is reconciled before its
+        status is tested, because otherwise the guard would refuse a node
+        :meth:`delete` removes happily. So a pass reaps orphaned process
+        groups and closes their open rows even when it goes on to refuse.
+
+        Raises:
+            RuntimeError: If the node, a descendant, a lock, or the cwd
+                refuses the teardown.
 
         """
         # validate node
@@ -2446,20 +2451,15 @@ class Node:
         # reject user nodes
         if self.is_user:
             raise RuntimeError('Cannot delete a user node.')
-        # reconcile a crashed-but-active node so it can be deleted
+        # reconcile a crashed-but-active node so it can be torn down
         self._reconcile_status()
         # validate status -- the node itself must not be running
         if self.status() == 'active':
             raise RuntimeError('Cannot delete an active node. Stop or kill it first.')
         if self.status() == 'paused':
             raise RuntimeError('Cannot delete a paused node. Resume or kill it first.')
-        # collect the subtree: self + every descendant (flat registry);
-        # capture branch + repo dir + central db up front -- they resolve
-        # through self._root, which is torn down below, so they must be
-        # read before any teardown
-        branch = self.branch
         repo_dir = self.repo_dir
-        db = self.db
+        branch = self.branch
         descendant_branches = [row['node'] for row in self.child_list()]
         subtree_branches = [branch, *descendant_branches]
         # refuse if the caller stands inside any worktree in the subtree -- git
@@ -2469,17 +2469,14 @@ class Node:
             if subtree_branch == branch:
                 worktree_dir = self._root.resolve()
             else:
-                worktree_dir = fractal.util.git.find_worktree(repo_dir, subtree_branch)
-                if worktree_dir:
-                    worktree_dir = worktree_dir.resolve()
-                else:
-                    worktree_dir = None
+                found = fractal.util.git.find_worktree(repo_dir, subtree_branch)
+                worktree_dir = found.resolve() if found else None
             if worktree_dir and (cwd == worktree_dir or worktree_dir in cwd.parents):
                 raise RuntimeError(
                     'Cannot delete the current worktree from inside it.'
                     ' Run from the repo root or another worktree.'
                 )
-        # reconcile crashed descendants so a dead child doesn't wedge the delete
+        # reconcile crashed descendants so a dead child doesn't wedge the teardown
         for _, descendant in self._live_descendants(status='active'):
             descendant._reconcile_status()
         # refuse if any descendant is still active or paused -- recursive
@@ -2514,6 +2511,33 @@ class Node:
                     f' (unlock with: git -C "{repo_dir}"'
                     f' worktree unlock "{worktree_dir}").'
                 )
+
+    def delete(self: Node) -> tuple[str, str]:
+        """Recursively remove the node and its whole subtree.
+
+        Tears down every descendant too (deepest first), then the node itself:
+        each live worktree via ``delete.sh`` (worktree + branch + remote), and
+        the subtree's registry rows and subscriptions are cleared from the
+        central database -- its history rows (runs, steps, messages, ...)
+        persist. Refuses if the node or any descendant is active or paused --
+        stop, resume, or kill the subtree first.
+
+        Returns:
+            Tuple of per-node script output (deletion order) and collected
+            stderr notices (e.g. unmerged-work warnings).
+
+        """
+        # every refusal pre-flights before anything is touched (the same
+        # gauntlet the chained merge --delete runs before its squash)
+        self.guard_delete()
+        # collect the subtree: self + every descendant (flat registry);
+        # capture branch + repo dir + central db up front -- they resolve
+        # through self._root, which is torn down below, so they must be
+        # read before any teardown
+        branch = self.branch
+        repo_dir = self.repo_dir
+        db = self.db
+        descendant_branches = [row['node'] for row in self.child_list()]
         # tear down descendants deepest first (each live worktree via delete.sh;
         # worktree-less registry rows are deregistered below), then the node
         ordered_branches = sorted(

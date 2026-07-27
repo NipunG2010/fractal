@@ -552,6 +552,14 @@ def node_merge(app: typer.Typer) -> typer.Typer:
         ' seed, refresh indexes, commit, and advance the merge-base.'
     )
     continue_ = typer.Option(False, '--continue', help=continue_help)
+    # delete flag
+    delete_help = (
+        'Delete the node (worktree, branch, and subtree) after a successful merge.'
+    )
+    delete = typer.Option(False, '--delete', help=delete_help)
+    # force flag
+    force_help = 'With --delete, skip its confirmation prompt.'
+    force = typer.Option(False, '--force', '-f', help=force_help)
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
@@ -560,16 +568,56 @@ def node_merge(app: typer.Typer) -> typer.Typer:
     def _merge(
         node: Optional[str] = node,
         continue_: bool = continue_,
+        delete: bool = delete,
+        force: bool = force,
         path: str = path,
     ) -> None:
         """Squash-merge a node's branch into its parent."""
         node = resolve_target(path, node)
+        # --delete tears down the subtree; pre-flight every one of the
+        # teardown's refusals (the cwd inside a doomed worktree, a live or
+        # locked descendant) here, so a refusal lands before the squash
+        # rather than after a merge that already committed
+        if delete:
+            node.guard_delete()
+            # the chained teardown is as destructive as `node delete`, so it
+            # takes the same confirmation gate -- landed before the squash
+            # for the same reason as the refusals above
+            if not force:
+                descendants = len(node.child_list())
+                if descendants:
+                    s = 's' if descendants != 1 else ''
+                    prompt = (
+                        f'Merge node {node.branch}, then delete it and its'
+                        f' {descendants} descendant{s}?'
+                    )
+                else:
+                    prompt = f'Merge node {node.branch}, then delete it?'
+                # the node and each descendant hold one worktree and one branch
+                s = 's' if descendants else ''
+                es = 'es' if descendants else ''
+                typer.echo(
+                    f'Warning: This permanently removes the worktree{s} and'
+                    f' deletes the branch{es} after the merge.\nConsider'
+                    f' retiring the node to hide it while preserving its'
+                    f' branch{es}.',
+                    err=True,
+                )
+                typer.confirm(prompt, abort=True)
         output, notices = node.merge(continue_merge=continue_)
         if output:
             typer.echo(output)
         # success-path warnings ride stderr so piped stdout stays parseable
         if notices:
             typer.echo(notices, err=True)
+        # chain the teardown only after a merge that landed (a failed merge
+        # raised above); its gate already passed with the pre-flight
+        if delete:
+            output, notices = node.delete()
+            if output:
+                typer.echo(output)
+            if notices:
+                typer.echo(notices, err=True)
 
     return app
 
