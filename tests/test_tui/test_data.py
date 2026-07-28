@@ -42,6 +42,7 @@ __all__ = [
     'test_build_tolerates_an_undecodable_status',
     'test_sync_folds_into_its_step',
     'test_drain_sync_lists_standalone',
+    'test_a_user_step_named_sync_lists_numbered',
     'test_open_spans_tick_through_a_sync_window',
     'test_user_root_degrades',
     'test_codex_carries_no_cost_or_sessions',
@@ -549,6 +550,89 @@ def test_drain_sync_lists_standalone(pair_tree: pathlib.Path) -> None:
     assert [row['duration'] for row in steps] == [60.0, 30.0, 20.0, 40.0]
     # the running spend still reads "through this row, syncs included"
     assert steps[-1]['iter_spend'] == pytest.approx(0.20)
+
+
+@pytest.mark.parametrize(
+    argnames=('sync_config', 'labels', 'context', 'log_flags'),
+    argvalues=[
+        (
+            True,
+            ['step 1: PREPARE', 'step 2: SYNC', 'sync'],
+            (2, 'SYNC', 2),
+            {('start', False), ('end', False), ('start', True)},
+        ),
+        (
+            False,
+            ['step 1: PREPARE', 'step 2: SYNC', 'step 3: SYNC'],
+            (3, 'SYNC', 3),
+            {('start', False), ('end', False)},
+        ),
+    ],
+    ids=('sync_on', 'sync_off'),
+)
+def test_a_user_step_named_sync_lists_numbered(
+    pair_tree: pathlib.Path,
+    sync_config: bool,
+    labels: list[str],
+    context: tuple,
+    log_flags: set[tuple],
+) -> None:
+    """A step named SYNC is a numbered step, not sync chrome.
+
+    'SYNC' also names the built-in pass, so SYNC rows classify
+    structurally: a settled row alone on its number -- a user step file
+    named SYNC -- lists under its own number, counts toward the pipeline
+    denominator, and its log rows drop the sync muting, whatever the sync
+    mode. A still-open SYNC row splits on the mode: under sync mode it
+    keeps the standalone ``sync`` shape (a live built-in pass precedes its
+    step's row), while with sync off no pass can exist, so it reads as the
+    running step itself -- numbered, displayed, and counted immediately.
+    """
+    alpha = Node(pair_tree / '.worktrees' / 'main.alpha')
+    config_path = alpha.node_dir / 'config.json'
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    config['sync'] = sync_config
+    config_path.write_text(json.dumps(config), encoding='utf-8')
+    with deterministic_core() as clock:
+        clock.at(600.0)
+        run_id = alpha.record.run_start()
+        clock.at(590.0)
+        iter_id = alpha.record.iter_start(run_id=run_id, iter=1)
+        seeded = (
+            (1, 'PREPARE', 580.0, 540.0, 0.04),
+            (2, 'SYNC', 530.0, 500.0, 0.02),
+        )
+        for step, name, started, ended, cost in seeded:
+            clock.at(started)
+            step_id = alpha.record.step_start(
+                iter_id=iter_id,
+                run_id=run_id,
+                step=step,
+                step_name=name,
+            )
+            alpha.record.step_cost(step_id=step_id, cost=cost)
+            clock.at(ended)
+            alpha.record.step_end(step_id=step_id, status='completed', exit_code=0)
+        # a still-open SYNC row: a live pass under sync mode, the node's own
+        # running step without it
+        clock.at(490.0)
+        alpha.record.step_start(
+            iter_id=iter_id,
+            run_id=run_id,
+            step=3,
+            step_name='SYNC',
+        )
+    data = TuiData(resolve_node(pair_tree))
+    builder = SnapshotBuilder(data, NodePoller(data.db_dir), now=lambda: NOW_EPOCH)
+    snap = builder.build('main.alpha')
+    steps = snap.history[0]['iters'][0]['steps']
+    assert [row['label'] for row in steps] == labels
+    # the card's displayed step and the step N/N denominator follow suit
+    m = snap.measures
+    assert (m['step'], m['step_name'], m['step_total']) == context
+    # the log mutes sync passes only, never the node's own SYNC steps
+    named = [row for row in snap.log if row['kind'] == 'step' and row['name'] == 'SYNC']
+    assert {(row['event'], row['sync']) for row in named} == log_flags
 
 
 def test_open_spans_tick_through_a_sync_window(pair_tree: pathlib.Path) -> None:

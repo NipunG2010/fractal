@@ -55,7 +55,7 @@ _DARK = {
     'CHROME': '#7c776f',  # warm muted: header / footer / labels
     'TITLE': '#9a938a',  # pane border-title
     'SEL': '#322d27',  # selected row / focused input
-    'ZONE': '#262320',  # focused-zone tint / scrollbar trough
+    'ZONE': '#262320',  # focused-zone tint
     'LIT': '#4a3a2a',  # active edit / option highlight
     'LIT_ACTIVE': '#5a4836',  # active toggle segment
     'TRACK': '#37332e',  # empty gauge track
@@ -65,6 +65,7 @@ _DARK = {
     'SCROLL': '#463f37',  # scrollbar handle
     'SCROLL_HOVER': '#5a534a',  # scrollbar handle (hover)
     'SCROLL_ACTIVE': '#6e675d',  # scrollbar handle (active)
+    'SCROLL_BG': '#141210',  # scrollbar trough: darker than every pick, reads as air
     # the cool muted is the Rich `dim` attribute, not a hex (see module docstring)
     'DIM': 'dim',
 }
@@ -99,6 +100,7 @@ _LIGHT = {
     'SCROLL': '#aab2b6',
     'SCROLL_HOVER': '#959ea3',
     'SCROLL_ACTIVE': '#808a8e',
+    'SCROLL_BG': '#f4f6f7',
     # `dim` washes toward a light background; a picked mid grey reads instead
     'DIM': '#667075',
 }
@@ -113,6 +115,7 @@ PANE_PAD = 2  # tree/radio/node pane horizontal padding
 GAP = 2  # the grid unit (row gap, .cell margin)
 BORDER_W = 1  # round-border thickness per side
 SCROLLBAR_W = 1  # scrollbar gutter width
+PANE_CHROME = 2 * BORDER_W + 2 * PANE_PAD  # any pane's border + padding columns
 # node-pane chrome: borders + padding + scrollbar + one breathing column
 NODE_CHROME = 2 * BORDER_W + 2 * PANE_PAD + SCROLLBAR_W + 1
 # tree-pane chrome: borders + padding + a few-space right buffer past the row
@@ -129,7 +132,7 @@ IDENT_W = 13  # node card: ident label column (agent/model/session)
 MEAS_W, BAR_W = 4, 12  # measures matrix: scope label, gauge width
 EL_FIG_W, CO_FIG_W = 8, 20  # measures matrix: elapsed / cost figures
 GAUGE_GAP = 3  # measures matrix: figure-to-gauge gap
-SENDER_W, CHANNEL_W = 14, 8  # radio list columns (buffers use the GAP unit)
+SENDER_W, CHANNEL_W, PRIORITY_W = 14, 8, 8  # radio list columns (buffers use GAP)
 RD_LABEL_W = 11  # radio detail: label column
 # compose-field box widths (TCSS via $m-*-w; m_session also caps the shown
 # value; node/channel size to their content at runtime)
@@ -214,6 +217,7 @@ def _build_theme(name: str, palette: dict[str, str]) -> Theme:
             'scroll': palette['SCROLL'],
             'scroll-hover': palette['SCROLL_HOVER'],
             'scroll-active': palette['SCROLL_ACTIVE'],
+            'scroll-bg': palette['SCROLL_BG'],
         },
     )
 

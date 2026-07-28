@@ -154,8 +154,8 @@ class RadioPane:
         """Build a one-row grid: flexing left side, right-snapped timestamp.
 
         Subject flexes + truncates short of the timestamp; the seam gets one
-        extra column so it reads even with the padded sender/channel gaps; a
-        one-column gap keeps the scrollbar off the time.
+        extra column so it reads even with the padded sender/channel/priority
+        gaps; a one-column gap keeps the scrollbar off the time.
         """
         grid = Table.grid(expand=True)
         grid.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
@@ -170,7 +170,11 @@ class RadioPane:
         gap = ' ' * fractal.tui.theme.GAP
         sender = fractal.tui.fmt.col('sender', fractal.tui.theme.SENDER_W)
         channel = fractal.tui.fmt.col('channel', fractal.tui.theme.CHANNEL_W)
-        left = f'  [{fractal.tui.theme.DIM}]{sender}{gap}{channel}{gap}subject[/]'
+        priority = fractal.tui.fmt.col('priority', fractal.tui.theme.PRIORITY_W)
+        left = (
+            f'  [{fractal.tui.theme.DIM}]{sender}{gap}{channel}{gap}{priority}'
+            f'{gap}subject[/]'
+        )
         return self._grid(left, f'[{fractal.tui.theme.DIM}]timestamp[/]')
 
     def _foot(self: RadioPane) -> str:
@@ -193,7 +197,7 @@ class RadioPane:
         )
 
     def _row_render(self: RadioPane, row: dict) -> Table:
-        """Render one message row (unread dot, sender, channel, subject)."""
+        """Render one message row (unread dot, sender, channel, priority, subject)."""
         read = self._is_read(row)
         dot = ' ' if read else fractal.tui.theme.DOT_ON
         gap = ' ' * fractal.tui.theme.GAP
@@ -207,8 +211,11 @@ class RadioPane:
         channel = fractal.tui.fmt.esc(
             fractal.tui.fmt.col(row['channel'], fractal.tui.theme.CHANNEL_W)
         )
+        priority = fractal.tui.fmt.col(
+            str(row['priority']), fractal.tui.theme.PRIORITY_W
+        )
         subject = fractal.tui.fmt.esc(row['subject'])
-        left = f'{dot} {sender}{gap}{channel}{gap}{subject}'
+        left = f'{dot} {sender}{gap}{channel}{gap}{priority}{gap}{subject}'
         stamp = fractal.tui.fmt.timestamp(row['created_at'], self.app.tz)
         return self._grid(left, f'[{fractal.tui.theme.DIM}]{stamp}[/]')
 

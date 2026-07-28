@@ -57,6 +57,13 @@ customizable per node; disable it wholesale with `--no-sync` (see
 [[configuration/node_init]]). Run-time semantics -- failure handling, timeouts,
 and the checkpoints around each pass -- live in [[features/loop/steps]].
 
+The name is shared with ordinary step files: a step named `SYNC` records like
+any other step, and the cockpit tells the two apart structurally -- a pass
+carries step 0 (the drain wait) or the number of the differently-named step it
+precedes, and a still-open SYNC row reads as a pass only under sync mode (with
+sync off no pass can exist, so a running SYNC step is numbered immediately) --
+so a step named SYNC lists under its own number, never as muted `sync` chrome.
+
 ## Frontmatter overrides
 
 The frontmatter grammar is strictly flat: the block opens with `---` on the

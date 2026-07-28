@@ -11,7 +11,10 @@ Screen { background: $background; color: $foreground; layers: base overlay; }
 .pane.ringsel { border: round $foreground; border-title-color: $foreground; }
 .pane.entered { border: round $primary; border-title-color: $primary; }
 #fractal, #radio, #node, #message { border-title-align: center; }
-#fractal { width: auto; padding: 0 $pane-pad; }
+/* max-width pins the tree inside its column: the geometry path and the edge
+   drag both set absolute widths, which otherwise paint under the neighbors
+   whenever the node pane leaves less room than the tree's natural width */
+#fractal { width: auto; max-width: 100%; padding: 0 $pane-pad; }
 #radio { width: 1fr; padding: 0 $pane-pad; }
 #node { width: auto; height: 100%; padding: 0 $pane-pad; }
 #message { height: 21; }
@@ -35,7 +38,11 @@ Input:focus { background: $sel; }
 #rreact { layer: overlay; background: $overlay; border: round $primary; padding: 0 1; }
 .zonefocus { background: $zone; }
 .litdiv { color: $primary; }
-VerticalScroll, OptionList, TextArea { scrollbar-size: 1 1; scrollbar-background: $zone; scrollbar-color: $scroll; scrollbar-color-hover: $scroll-hover; scrollbar-color-active: $scroll-active; }
+/* minimal scrollbars: a one-column vertical handle (no horizontal bar) on a
+   near-black trough picked darker than every UI tone -- the panes keep the
+   terminal's own ansi-default background, and a handle floating on it with no
+   rail reads as a stray fragment, so the quietest possible rail anchors it */
+VerticalScroll, OptionList, TextArea { scrollbar-size: 0 1; scrollbar-background: $scroll-bg; scrollbar-background-hover: $scroll-bg; scrollbar-background-active: $scroll-bg; scrollbar-color: $scroll; scrollbar-color-hover: $scroll-hover; scrollbar-color-active: $scroll-active; }
 OptionList > .option-list--option-highlighted, OptionList:focus > .option-list--option-highlighted { background: $lit; color: $ink-bright; }
 #m_kind { width: auto; height: 1; margin: 0 $gap 0 0; }
 #m_session { width: $m-session-w; }
