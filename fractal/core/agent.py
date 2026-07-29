@@ -58,6 +58,17 @@ _LOADED: dict[pathlib.Path, Optional[Exception]] = {}
 # boundary (underscore cannot escape a path, so opencode's ses_ ids pass)
 _SESSION_CHARS = re.compile(r'[A-Za-z0-9_-]+')
 
+# ambient effort vars the invocation verb unsets on compose: claude reads
+# CLAUDE_CODE_EFFORT_LEVEL over its own effort flag (an operator shell
+# carrying it would silently override every step's pinned effort), and
+# CLAUDE_EFFORT is claude's own export to hook/Bash subprocesses (a stale
+# ancestor session's value would masquerade as the child's); effort reaches
+# a session only through the step pin's flag (flag-only by design), never env
+_EFFORT_KEYS = (
+    'CLAUDE_EFFORT',
+    'CLAUDE_CODE_EFFORT_LEVEL',
+)
+
 
 def command_base(command: str) -> str:
     """Return an agent command's base word, refusing shell quoting.
@@ -450,8 +461,9 @@ class Agent:
             env: Caller env overlay, merged here in the public verb --
                 base ``os.environ``, then the overlay, then
                 ``_invocation``'s provider-specific keys, with any key
-                whose merged value is ``None`` popped; ``spawn`` kwargs
-                stay supervision-only.
+                whose merged value is ``None`` popped and the ambient
+                effort vars (``_EFFORT_KEYS``) always unset; ``spawn``
+                kwargs stay supervision-only.
 
         Returns:
             The spawnable invocation.
@@ -505,8 +517,19 @@ class Agent:
         # win on collision (codex's CODEX_HOME must survive). _invocation
         # returns only its reserved keys, so the ambient snapshot never
         # re-clobbers the overlay; the composed dict is the full Popen env
-        if env is not None or result.env is not None:
-            merged = {**os.environ, **(env or {}), **(result.env or {})}
+        # an ambient effort var forces composition, so the scrub lands
+        # even for a backend that reserves no env keys of its own
+        ambient_effort = any(key in os.environ for key in _EFFORT_KEYS)
+        if env is not None or result.env is not None or ambient_effort:
+            # pin the ambient effort vars to None over every layer -- the pop
+            # below unsets them, so the only effort signal reaching the
+            # session is the step pin's own flag (see _EFFORT_KEYS)
+            merged = {
+                **os.environ,
+                **(env or {}),
+                **(result.env or {}),
+                **dict.fromkeys(_EFFORT_KEYS),
+            }
             # a merged value of None means unset: pop the key, so a backend
             # can scrub routing keys the ambient environment inherited from
             # an ancestor's provider route

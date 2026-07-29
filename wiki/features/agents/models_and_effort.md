@@ -44,11 +44,15 @@ Each backend translates the same two overrides into its own CLI dialect:
 For claude the effort flag outranks the settings-file effort level, and it is
 the only effort channel fractal uses -- the `CLAUDE_CODE_EFFORT_LEVEL` env knob
 is deliberately not set, since a spawn-env knob leaks into the session's own
-subprocesses and would override any nested claude run; node settings
-(permissions, model, environment) ride a CLI flag rather than a file merge. On
-the openrouter route a model-less claude invocation pins an explicit model slug,
-because the process environment beats the settings file and the route must not
-trust latest-model aliases.
+subprocesses and would override any nested claude run; ambient copies of the
+effort knobs are actively *unset* at invocation compose -- an operator shell's
+`CLAUDE_CODE_EFFORT_LEVEL` would override the step pin inside the session, and a
+stale `CLAUDE_EFFORT` (claude's own export to hook/Bash subprocesses) would
+masquerade as the child session's; node settings (permissions, model,
+environment) ride a CLI flag rather than a file merge. On the openrouter route a
+model-less claude invocation pins an explicit model slug, because the process
+environment beats the settings file and the route must not trust latest-model
+aliases.
 
 ## The served-model record
 
