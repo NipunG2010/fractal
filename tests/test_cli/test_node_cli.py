@@ -52,6 +52,7 @@ __all__ = [
     'test_node_init_path_records_subproject',
     'test_init_prints_node_md_next_steps',
     'test_init_scaffolds_ignored_tmp_scratch_dir',
+    'test_engine_system_skills_ignored',
     'test_init_uncapped_priced_agent_warns',
     'test_init_uncapped_unpriced_agent_stays_quiet',
     'test_init_uncapped_warning_reads_the_spawning_parents_agent',
@@ -684,6 +685,30 @@ def test_init_scaffolds_ignored_tmp_scratch_dir(repo: dict) -> None:
     # the exclude machinery ignores scratch content inside the node worktree
     probe = subprocess.run(
         ['git', '-C', f'{task}', 'check-ignore', '-q', '.fractal/main.task/tmp/x'],
+        capture_output=True,
+    )
+    assert probe.returncode == 0
+
+
+def test_engine_system_skills_ignored(repo: dict) -> None:
+    """Engine-materialized system skills under ``skills/.system/`` stay untracked.
+
+    Codex materializes its bundled system skills into ``$CODEX_HOME/skills/``
+    at launch, and the agent seed symlinks that path at the node's tracked
+    ``skills/`` dir -- so without the exclude, every node branch would sweep
+    ~1,100 engine files into its next work commit.
+    """
+    task = repo['task']
+    # the managed info/exclude block keeps the engine tree out of git
+    probe = subprocess.run(
+        [
+            'git',
+            '-C',
+            f'{task}',
+            'check-ignore',
+            '-q',
+            '.fractal/main.task/skills/.system/imagegen/SKILL.md',
+        ],
         capture_output=True,
     )
     assert probe.returncode == 0

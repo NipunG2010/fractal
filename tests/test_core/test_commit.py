@@ -89,6 +89,10 @@ def test_user_node_commit_init_commits_baseline(
     before = _head()
     # a stranded config write lock sits beside the config at commit time
     (git_repo / '.fractal' / 'main' / 'config.json.lock').touch()
+    # engine-materialized system skills sit under the tracked skills dir
+    system = git_repo / '.fractal' / 'main' / 'skills' / '.system' / 'imagegen'
+    system.mkdir(parents=True)
+    (system / 'SKILL.md').write_text('engine-materialized\n', encoding='utf-8')
     # a fresh clone carries no info/exclude at all, so the baseline cannot
     # lean on a block written at init -- the runtime artifacts beside the
     # seed must stay out of the commit on their own
@@ -111,6 +115,7 @@ def test_user_node_commit_init_commits_baseline(
     # runtime artifacts never ride the baseline, tracked or not
     assert '.db' not in tracked
     assert 'config.json.lock' not in tracked
+    assert 'skills/.system' not in tracked
 
 
 def test_commit_pushes_unless_local(tmp_path: pathlib.Path) -> None:
@@ -895,7 +900,9 @@ def test_commit_check_detects_untracked_work(tmp_path: pathlib.Path) -> None:
     query ``git diff --name-only HEAD`` never lists untracked files, so a step
     that leaves only new untracked work would be reported clean -- the
     force-commit skipped, and a later ``--continue`` (``git clean -fd``) would
-    discard the work. ``--check`` must use a query that sees untracked files.
+    discard the work. ``--check`` must use a query that sees untracked files,
+    and it sees only dirt the stage could commit: runtime artifacts barred by
+    the stage excludes stay invisible even when info/exclude is stale.
     """
     repo = _make_git_repo(tmp_path / 'repo')
     Node(repo).init(agent='claude', user=True)
@@ -913,6 +920,20 @@ def test_commit_check_detects_untracked_work(tmp_path: pathlib.Path) -> None:
     # baseline commit -- everything committed, tree clean
     node.commit('baseline', init=True)
     # a clean tree passes --check (no raise)
+    node.commit(check=True)
+    # runtime artifacts the stage may never commit stay invisible to the
+    # check, even in a worktree whose info/exclude predates their entry --
+    # strip the line to simulate the stale block
+    system = project_dir / '.fractal' / 'main.task' / 'skills' / '.system' / 'x'
+    system.mkdir(parents=True)
+    (system / 'SKILL.md').write_text('engine-materialized\n', encoding='utf-8')
+    exclude = repo / '.git' / 'info' / 'exclude'
+    stale = [
+        line
+        for line in exclude.read_text(encoding='utf-8').splitlines()
+        if line != '**/skills/.system/'
+    ]
+    exclude.write_text('\n'.join(stale) + '\n', encoding='utf-8')
     node.commit(check=True)
     # a step leaves only an untracked file (no tracked changes)
     (project_dir / 'leftover.txt').write_text('uncommitted work\n', encoding='utf-8')

@@ -24,19 +24,24 @@ if typing.TYPE_CHECKING:
 
 __all__ = []
 
-# pathspec excludes appended to every stage -- fractal's runtime artifacts
-# (the central DB and its sidecars, the status and pause markers, the config
-# write lock) and virtualenvs must never ride a work commit
+# pathspec excludes appended to every stage -- fractal's
+# runtime artifacts must never ride a work commit
 _STAGE_EXCLUDES = (
+    # virtualenvs -- the dir entry and, for per-file listings, its contents
     ':!**/.venv',
+    ':!**/.venv/**',
+    # the central DB and its sidecars
     ':!**/.db',
     ':!**/.db-*',
+    # the status and pause markers
     ':!**/.status',
     ':!**/.paused',
+    # the config write lock
     ':!**/config.json.lock',
-    # write_atomic's crash-stranded temp (.{name}-{rand}.tmp) -- a crash
-    # between mkstemp and os.replace can leave one beside a committable target
+    # write_atomic's crash-stranded temps
     ':!**/.*-*.tmp',
+    # engine-materialized system skills
+    ':!**/skills/.system/*',
 )
 
 # advisory threshold for the staged-file size guard
@@ -511,13 +516,18 @@ def _check_clean(node: Node) -> None:
         node: The node whose worktree to check.
 
     Raises:
-        RuntimeError: When any tracked or untracked change remains.
+        RuntimeError: When any tracked or untracked change the stage could
+            commit remains.
 
     """
     # porcelain, not "diff HEAD": diff lists only tracked changes, so a step
     # that left only untracked files reads as clean -- the force-commit safety
     # net skips it and a later --continue (git clean -fd) then discards the work
-    cmd = ['status', '--porcelain']
+    # the stage's own excludes ride along: dirt the stage may never commit
+    # (runtime artifacts in a worktree whose info/exclude has not refreshed)
+    # would otherwise read as permanently dirty and fire the net every
+    # iteration for nothing
+    cmd = ['status', '--porcelain', '--', *_STAGE_EXCLUDES]
     if fractal.util.git.run(cmd, cwd=node.worktree, check=False):
         raise RuntimeError('Uncommitted changes remain (agent should have committed).')
 

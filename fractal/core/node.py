@@ -2305,6 +2305,10 @@ class Node:
         (:meth:`Record.signal_clear` at adoption), so a bare ``--resume``
         launch -- e.g. after a filesystem transplant -- self-clears too.
         """
+        # ensure git excludes: the relaunch path skips start's refresh, so a
+        # worktree whose info/exclude predates the current block heals here
+        # and the adopted run's cleanup and commits see fresh ignores
+        self._git_exclude()
         # the resume event lands before the relaunch so the booting loop's
         # deadline credit sees the pause..resume span closed
         event_id = self.record.event_start('resume')

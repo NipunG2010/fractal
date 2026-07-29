@@ -766,17 +766,51 @@ class Loop:
         node = self.node
         worktree = node.worktree
         node_dir = node.node_dir
-        # preserve operator edits: the documented steering flow edits node-dir
-        # files between runs without committing, and the checkout/clean below
-        # would revert them -- commit them first; --no-verify like every
-        # backstop save (a host hook must not veto it); unguarded: failing
-        # loud beats destroying the edits
-        cmd = ['status', '--porcelain', '--', f'{node_dir}']
-        if fractal.util.git.run(cmd, cwd=worktree, check=False):
+        # commit operator steering edits before the checkout/clean below
+        # reverts them (--no-verify, unguarded: failing loud beats destroying
+        # them); the excludes-scoped -uall probe keeps runtime artifacts from
+        # triggering or riding the commit, and the add takes its listed paths
+        # -- an exclude-riding add silently stages nothing over an untracked tree
+        cmd = [
+            'status',
+            '--porcelain',
+            '-z',
+            '-uall',
+            '--',
+            f'{node_dir}',
+            *commit._STAGE_EXCLUDES,
+        ]
+        raw = fractal.util.git.run_bytes(cmd, cwd=worktree) or b''
+        # "XY <path>" entries; a rename or copy in either column (an
+        # operator's git mv, a worktree-detected move) trails its origin
+        # path as a bare extra token
+        entries = []
+        tokens = iter(os.fsdecode(raw).split('\0'))
+        for token in tokens:
+            if not token:
+                continue
+            entries.append(token[3:])
+            if 'R' in token[:2] or 'C' in token[:2]:
+                entries.append(next(tokens))
+        # stage only paths the add can express: an entry gone from both the
+        # index and the worktree (a staged rename's origin, a staged
+        # deletion) is already fully staged, and naming it is fatal
+        cmd = ['ls-files', '-z', '--', f'{node_dir}']
+        tracked = fractal.util.git.run_bytes(cmd, cwd=worktree) or b''
+        index = set(os.fsdecode(tracked).split('\0'))
+        paths = [
+            path
+            for path in entries
+            if path in index or (worktree / path).exists(follow_symlinks=False)
+        ]
+        if paths:
             print(
                 f'Continuing: committing operator edits under .fractal/{node.branch}...'
             )
-            fractal.util.git.run(['add', '-A', '--', f'{node_dir}'], cwd=worktree)
+            # literal pathspec magic: a glob char in an on-disk path must
+            # not widen or empty the match
+            specs = [f':(literal){path}' for path in paths]
+            fractal.util.git.run(['add', '--', *specs], cwd=worktree)
             cmd = [
                 'commit',
                 '--no-verify',

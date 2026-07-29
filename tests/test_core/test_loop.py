@@ -41,6 +41,7 @@ __all__ = [
     'test_agent_env_publishes_node_branch',
     'test_boot_records_the_tmux_socket_for_the_reconcile_probe',
     'test_continue_restore_lands_config_all_or_nothing',
+    'test_continue_cleanup_excludes_runtime_dirt',
     'test_stream_fault_attributes_to_the_stream_side',
     'test_agent_stderr_tolerates_non_utf8_output',
     'test_agent_launch_failure_books_a_failed_step',
@@ -494,6 +495,70 @@ def test_continue_restore_lands_config_all_or_nothing(
     monkeypatch.setattr(pathlib.Path, 'write_bytes', tear)
     loop._clean_worktree()
     assert json.loads(config_path.read_text(encoding='utf-8')) == expected
+
+
+def test_continue_cleanup_excludes_runtime_dirt(node_with_db: Node) -> None:
+    """The continue cleanup's operator-edit commit skips stage-excluded dirt.
+
+    The cleanup runs in a worktree that may carry no info/exclude at all (a
+    fresh clone, a block predating an exclude's entry), so the stage
+    excludes must ride its probe: runtime artifacts -- the engine skill
+    tree, virtualenv contents, the DB -- never ride the operator-edit
+    commit, and alone they never trigger one. Operator git surgery (a
+    staged rename, a staged deletion) commits cleanly rather than crashing
+    the launch.
+    """
+    node = node_with_db
+    repo = node.worktree
+
+    def _git(*args: str) -> str:
+        """Run git in the repo and return stdout."""
+        result = subprocess.run(
+            ['git', '-C', f'{repo}', *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+
+    # engine-materialized system skills and a virtualenv beside the node
+    # seed, in a repo carrying no info/exclude block at all
+    system = node.node_dir / 'skills' / '.system' / 'imagegen'
+    system.mkdir(parents=True)
+    (system / 'SKILL.md').write_text('engine-materialized\n', encoding='utf-8')
+    venv = node.node_dir / '.venv' / 'bin'
+    venv.mkdir(parents=True)
+    (venv / 'python').write_text('#!interpreter\n', encoding='utf-8')
+    (node.node_dir / 'note.md').write_text('steer left\n', encoding='utf-8')
+    loop = MockLoop(node)
+    loop._clean_worktree()
+    # the operator-edit commit (the seed's untracked files) never sweeps
+    # the engine tree, the venv, or the DB
+    tracked = _git('ls-files')
+    assert 'config.json' in tracked
+    assert 'note.md' in tracked
+    assert 'skills/.system' not in tracked
+    assert '.venv' not in tracked
+    assert '.db' not in tracked
+    # engine dirt alone never triggers the commit: re-materialize what the
+    # clean removed and rerun -- HEAD stays put
+    head = _git('rev-parse', 'HEAD')
+    system.mkdir(parents=True)
+    (system / 'SKILL.md').write_text('engine-materialized\n', encoding='utf-8')
+    loop._clean_worktree()
+    assert _git('rev-parse', 'HEAD') == head
+    # operator git surgery commits cleanly: a staged rename and a staged
+    # deletion are already fully staged, so the cleanup must not re-name
+    # their gone paths to the add
+    _git('mv', f'{node.node_dir / "note.md"}', f'{node.node_dir / "moved.md"}')
+    _git('rm', '-q', f'{node.node_dir / "config.json"}')
+    loop._clean_worktree()
+    tracked = _git('ls-files')
+    assert 'moved.md' in tracked
+    assert 'note.md' not in tracked
+    # the staged deletion committed: config.json's row is gone from the
+    # index (nothing on disk to back up, so the config restore skips too)
+    assert 'config.json' not in tracked
 
 
 def test_stream_fault_attributes_to_the_stream_side(

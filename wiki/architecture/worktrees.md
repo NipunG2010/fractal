@@ -30,14 +30,14 @@ project sub-path inside the worktree (`.` for a repo-root project), written once
 at init and read everywhere else.
 
 Fractal's runtime artifacts — the worktrees themselves, databases, status files,
-agent logs — are ignored through a static marker-delimited block in the
-repo-local `info/exclude` (shared across all worktrees, template shipped in
-`_assets/git/exclude`), never through the user's committed `.gitignore`. The
-block carries no per-tree state: the user node's own seed directory hides itself
-with its own ignore file instead, so a second tree's init can never expose the
-first's. `fractal track` removes that file to opt the seed into tracking, and
-child seeds carry no such file — they stay tracked so merge-up and
-meta-configuration keep working.
+agent logs, engine-materialized system skills — are ignored through a static
+marker-delimited block in the repo-local `info/exclude` (shared across all
+worktrees, template shipped in `_assets/git/exclude`), never through the user's
+committed `.gitignore`. The block carries no per-tree state: the user node's own
+seed directory hides itself with its own ignore file instead, so a second tree's
+init can never expose the first's. `fractal track` removes that file to opt the
+seed into tracking, and child seeds carry no such file — they stay tracked so
+merge-up and meta-configuration keep working.
 
 ## Forking a child
 

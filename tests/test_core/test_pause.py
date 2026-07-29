@@ -154,6 +154,10 @@ def test_resume_requires_paused(
     # the resume event is bracketed completed
     events = node.db.read('events', where={'node': node.branch, 'event': 'resume'})
     assert [event['status'] for event in events] == ['completed']
+    # resume heals the exclude block -- the relaunch path skips start's
+    # refresh, and this repo carried no info/exclude at all
+    exclude = node.repo_dir / '.git' / 'info' / 'exclude'
+    assert '**/skills/.system/' in exclude.read_text(encoding='utf-8')
 
 
 def test_resume_withdraws_a_pausing_node(
