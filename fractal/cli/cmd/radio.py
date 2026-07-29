@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import Optional
 
@@ -13,6 +14,7 @@ from fractal.cli.utils import (
     print_rows,
     require_non_negative,
     resolve_node,
+    resolve_sender,
 )
 from fractal.constants import PRIORITY_MAX, PRIORITY_MIN
 from fractal.core.node import Node
@@ -142,8 +144,8 @@ def radio_send(app: typer.Typer) -> typer.Typer:
     priority_help = f'Message priority ({PRIORITY_MIN}-{PRIORITY_MAX}; required).'
     priority = typer.Option(None, '--priority', help=priority_help)
     # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+    path_help = 'Worktree directory (default: the calling node, else the cwd).'
+    path = typer.Option(None, '--path', help=path_help)
 
     @command(app, 'send')
     def _send(
@@ -153,7 +155,7 @@ def radio_send(app: typer.Typer) -> typer.Typer:
         channel: Optional[str] = channel,
         subject: Optional[str] = subject,
         priority: Optional[int] = priority,
-        path: str = path,
+        path: Optional[str] = path,
     ) -> None:
         """Send a message to a node's channel (a target or channel is required)."""
         # aggregate every missing required option into one round-trip;
@@ -174,7 +176,7 @@ def radio_send(app: typer.Typer) -> typer.Typer:
             if untargeted:
                 message += " To report out, use 'fractal radio post'."
             raise typer.BadParameter(message)
-        radio = Radio(resolve_node(path))
+        radio = Radio(resolve_sender(path))
         # a named target always defaults to its inbox -- the channel syncs
         # read -- even when the target is this node (an operator standing in
         # a node's worktree names it expecting a directive to land, and a
@@ -248,8 +250,8 @@ def radio_post(app: typer.Typer) -> typer.Typer:
     priority_help = f'Message priority ({PRIORITY_MIN}-{PRIORITY_MAX}; required).'
     priority = typer.Option(None, '--priority', help=priority_help)
     # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+    path_help = 'Worktree directory (default: the calling node, else the cwd).'
+    path = typer.Option(None, '--path', help=path_help)
 
     @command(app, 'post')
     def _post(
@@ -259,7 +261,7 @@ def radio_post(app: typer.Typer) -> typer.Typer:
         channel: Optional[str] = channel,
         subject: Optional[str] = subject,
         priority: Optional[int] = priority,
-        path: str = path,
+        path: Optional[str] = path,
     ) -> None:
         """Post a message to a node's publicly readable channel."""
         # aggregate every missing required option into one round-trip
@@ -272,7 +274,7 @@ def radio_post(app: typer.Typer) -> typer.Typer:
             s = 's' if len(missing) != 1 else ''
             options = ', '.join(missing)
             raise typer.BadParameter(f'Missing required option{s}: {options}.')
-        radio = Radio(resolve_node(path))
+        radio = Radio(resolve_sender(path))
         # the channel default keys on the target: a bare/self post reports
         # out to the own outbox; posting at another node lands on its public
         # board (its outbox is owner-only write)
@@ -309,17 +311,17 @@ def radio_unsend(app: typer.Typer) -> typer.Typer:
     force_help = 'Delete the whole thread even if the message has replies.'
     force = typer.Option(False, '--force', '-f', help=force_help)
     # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+    path_help = 'Worktree directory (default: the calling node, else the cwd).'
+    path = typer.Option(None, '--path', help=path_help)
 
     @command(app, 'unsend')
     def _unsend(
         message_uuid: str = message_uuid,
         force: bool = force,
-        path: str = path,
+        path: Optional[str] = path,
     ) -> None:
         """Delete a sent message (refused if it has replies; use --force)."""
-        radio = Radio(resolve_node(path))
+        radio = Radio(resolve_sender(path))
         radio.unsend(message_uuid, force=force)
         typer.echo(f'Unsent {message_uuid}.')
 
@@ -332,16 +334,16 @@ def radio_save(app: typer.Typer) -> typer.Typer:
     message_uuid_help = '8-char message UUID.'
     message_uuid = typer.Argument(..., help=message_uuid_help)
     # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+    path_help = 'Worktree directory (default: the calling node, else the cwd).'
+    path = typer.Option(None, '--path', help=path_help)
 
     @command(app, 'save')
     def _save(
         message_uuid: str = message_uuid,
-        path: str = path,
+        path: Optional[str] = path,
     ) -> None:
         """Save a message to the archive."""
-        radio = Radio(resolve_node(path))
+        radio = Radio(resolve_sender(path))
         radio.save(message_uuid)
         typer.echo(f'Saved {message_uuid}.')
 
@@ -354,16 +356,16 @@ def radio_unsave(app: typer.Typer) -> typer.Typer:
     message_uuid_help = '8-char message UUID.'
     message_uuid = typer.Argument(..., help=message_uuid_help)
     # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+    path_help = 'Worktree directory (default: the calling node, else the cwd).'
+    path = typer.Option(None, '--path', help=path_help)
 
     @command(app, 'unsave')
     def _unsave(
         message_uuid: str = message_uuid,
-        path: str = path,
+        path: Optional[str] = path,
     ) -> None:
         """Remove a message from the archive."""
-        radio = Radio(resolve_node(path))
+        radio = Radio(resolve_sender(path))
         radio.unsave(message_uuid)
         typer.echo(f'Unsaved {message_uuid}.')
 
@@ -802,18 +804,18 @@ def radio_reply(app: typer.Typer) -> typer.Typer:
     priority_help = f'Message priority ({PRIORITY_MIN}-{PRIORITY_MAX}).'
     priority = typer.Option(None, '--priority', help=priority_help)
     # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+    path_help = 'Worktree directory (default: the calling node, else the cwd).'
+    path = typer.Option(None, '--path', help=path_help)
 
     @command(app, 'reply')
     def _reply(
         message_uuid: str = message_uuid,
         data: str = data,
         priority: Optional[int] = priority,
-        path: str = path,
+        path: Optional[str] = path,
     ) -> None:
         """Reply to a message."""
-        radio = Radio(resolve_node(path))
+        radio = Radio(resolve_sender(path))
         reply_uuid, target, channel = radio.reply(
             message_uuid=message_uuid,
             data=data,
@@ -837,14 +839,14 @@ def radio_react(app: typer.Typer) -> typer.Typer:
     value_help = 'Reaction value (+ or -).'
     value = typer.Argument(..., help=value_help)
     # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+    path_help = 'Worktree directory (default: the calling node, else the cwd).'
+    path = typer.Option(None, '--path', help=path_help)
 
     @command(app, 'react')
     def _react(
         message_uuid: str = message_uuid,
         value: str = value,
-        path: str = path,
+        path: Optional[str] = path,
     ) -> None:
         """React to a message (+ or -)."""
         # convert +/- to 1/-1
@@ -855,7 +857,7 @@ def radio_react(app: typer.Typer) -> typer.Typer:
         else:
             raise typer.BadParameter("value must be '+' or '-'.")
         # resolve node
-        radio = Radio(resolve_node(path))
+        radio = Radio(resolve_sender(path))
         radio.react(message_uuid, int_value)
         typer.echo(f'Reacted {value} to {message_uuid}.')
 
@@ -871,17 +873,17 @@ def radio_sub(app: typer.Typer) -> typer.Typer:
     channel_help = 'Filter by channel name.'
     channel = typer.Option(None, '--channel', help=channel_help)
     # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+    path_help = 'Worktree directory (default: the calling node, else the cwd).'
+    path = typer.Option(None, '--path', help=path_help)
 
     @command(app, 'sub')
     def _sub(
         node: str = node,
         channel: Optional[str] = channel,
-        path: str = path,
+        path: Optional[str] = path,
     ) -> None:
         """Subscribe to a node's channel."""
-        radio = Radio(resolve_node(path))
+        radio = Radio(resolve_sender(path))
         radio.subscribe(node, channel=channel)
         typer.echo(f'Subscribed to {node}.')
 
@@ -897,17 +899,17 @@ def radio_unsub(app: typer.Typer) -> typer.Typer:
     channel_help = 'Filter by channel name.'
     channel = typer.Option(None, '--channel', help=channel_help)
     # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+    path_help = 'Worktree directory (default: the calling node, else the cwd).'
+    path = typer.Option(None, '--path', help=path_help)
 
     @command(app, 'unsub')
     def _unsub(
         node: str = node,
         channel: Optional[str] = channel,
-        path: str = path,
+        path: Optional[str] = path,
     ) -> None:
         """Unsubscribe from a node's channel."""
-        radio = Radio(resolve_node(path))
+        radio = Radio(resolve_sender(path))
         # report the true rowcount -- a zero-match unsub prints 0 and still
         # exits 0, so a mis-pathed target is visible without failing scripts
         removed = radio.unsubscribe(node, channel=channel)
@@ -963,11 +965,28 @@ def _resolve_reader() -> Node:
 
     Raises:
         typer.BadParameter: If no reader resolves (no ``_NODE`` and no
-            node at the cwd).
+            node at the cwd), or the exported ``_NODE`` does not name an
+            initialized node (a stale or mistyped export).
 
     """
     if caller := Node.resolve_caller():
+        # mirror resolve_sender's initialized-node check: a stale _NODE
+        # refuses cleanly, not as an internal error
+        if not caller.exists():
+            raise typer.BadParameter(
+                f'No fractal node at {caller.worktree} (resolved from the'
+                ' exported _NODE). Unset _NODE (--path only selects the'
+                ' mailbox viewed, never the reader).'
+            )
         return caller
+    # a set-but-unresolvable _NODE (a reaped worktree, a typo) refuses too:
+    # silently attributing the receipts to the cwd's node would be worse
+    if node_dir := os.environ.get('_NODE'):
+        raise typer.BadParameter(
+            f'No fractal node at {node_dir} (the exported _NODE names no'
+            ' git worktree). Unset _NODE (--path only selects the mailbox'
+            ' viewed, never the reader).'
+        )
     # the missing piece here is the reader, not the mailbox, so replace
     # resolve_node's generic advice (`fractal init` the cwd) with the remedy
     try:

@@ -559,12 +559,16 @@ fix:
 Run `fractal --help` and `fractal <command> --help` for all commands and
 options. Commands act on the node in the current directory by default, so `cd`
 into a worktree to operate on it; to act on another node from elsewhere in the
-repo, name its branch positionally (e.g. `fractal node status <branch>`).
-`--path` is an escape hatch for running from outside a worktree.
+repo, name its branch positionally (e.g. `fractal node status <branch>`). Radio
+verbs that write rows (send, post, reply, react, unsend, save, unsave, sub,
+unsub, channel create/delete) act as the loop-exported `_NODE` before the cwd,
+so a node's writes attribute to it from any directory; radio listings stay
+cwd-scoped. `--path` is an escape hatch for running from outside a worktree.
 `fractal node init` is the exception: `<name>` plus the project root via
 `--path`.
 
 Nodes spawn their own children — the running loop sets the `_NODE` environment
-that makes `fractal node init` nest the child under the calling node. Running it
-by hand from inside a worktree without that env nests under the repo-root user
-node instead, so operators normally don't spawn children manually.
+that makes `fractal node init` nest the child under the calling node (the same
+export names the acting identity for radio's writing verbs). Running it by hand
+from inside a worktree without that env nests under the repo-root user node
+instead, so operators normally don't spawn children manually.

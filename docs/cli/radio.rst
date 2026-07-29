@@ -65,11 +65,18 @@ attach per message.
 The acting node
 ~~~~~~~~~~~~~~~
 
-Radio commands act as the node that runs them: the loop exports the acting
-node for its agent, and outside a loop the node owning the current worktree
-acts. The ``--path`` option (default ``.``) selects the acting node's
-worktree explicitly. The one exception is ``radio read``, where ``--path``
-selects the *mailbox viewed* and never the reader — see below.
+Radio commands act as the node that runs them. Every verb that writes a row
+attributed to the acting node — ``send``, ``post``, ``reply``, ``react``,
+``unsend``, ``save``, ``unsave``, ``sub``, ``unsub``, ``channel create``,
+``channel delete`` — resolves that node env-first: an explicit ``--path``
+wins, else the calling node the loop exports, else the node owning the
+current worktree. A production write therefore attributes to the node whose
+loop is running, wherever the CLI call runs from. The pure listings
+(``messages``, ``sent``, ``feed``, ``thread``, ``subs``, ``channel list``)
+are subject selectors instead: ``--path`` (default ``.``) picks whose
+mailbox or rows are viewed. ``radio read`` resolves its reader env-first
+the same way, minus ``--path``: it selects the *mailbox viewed* and never
+the reader — see below.
 
 Targets are full branch names (for example ``main.parser.lexer``); the tree
 root is addressable by its branch name. A deleted node is no longer
@@ -135,7 +142,7 @@ radio post``, the reporting-out verb.
      - required
      - Message priority, ``0``–``10``.
    * - ``--path``
-     - ``.``
+     - the calling node, else the cwd
      - Worktree directory of the acting node.
 
 A named target always defaults to its ``inbox``, the sender's own node
@@ -191,7 +198,7 @@ subscribers pick it up.
      - required
      - Message priority, ``0``–``10``.
    * - ``--path``
-     - ``.``
+     - the calling node, else the cwd
      - Worktree directory of the acting node.
 
 A post targeting another node defaults to its ``public`` channel (its
@@ -235,8 +242,8 @@ Saving messages
 ``save`` copies a message into your node's archive — an owned snapshot that
 survives ``unsend``. Re-saving is idempotent. ``unsave`` removes your
 archived copy, erroring when you hold none. Both take only ``--path``
-(default ``.``). Saving a message from a read-only channel is refused for
-non-owners.
+(default: the calling node, else the cwd). Saving a message from a
+read-only channel is refused for non-owners.
 
 Archived messages are listed with ``messages --saved`` or ``feed --saved``.
 The working convention: *read* means seen, *saved* means an open todo — save
@@ -298,7 +305,7 @@ the ``inbox`` channel, and only *unread* messages. Listings are metadata-only
        anything read).
    * - ``--path``
      - ``.``
-     - Worktree directory of the acting node.
+     - Worktree of the node whose mailbox is listed.
 
 An empty default (unread) view is disambiguated on stderr: ``0 unread (N
 total; --all shows everything)``. When the channel defaults to ``inbox`` on a
@@ -477,7 +484,7 @@ Record a ``+1`` or ``-1`` reaction — a lightweight acknowledgment. Any value
 other than ``+`` or ``-`` is refused. Reactions are keyed per reactor and
 message, so re-reacting changes your existing reaction rather than adding a
 second one. Reacting also marks the message read. Takes only ``--path``
-(default ``.``).
+(default: the calling node, else the cwd).
 
 Subscriptions
 -------------
@@ -550,7 +557,7 @@ write.
      - off
      - Only the owner can write to the channel.
    * - ``--path``
-     - ``.``
+     - the calling node, else the cwd
      - Worktree directory of the acting node.
 
 The default channel names (``public``, ``private``, ``inbox``, ``outbox``)

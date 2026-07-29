@@ -38,6 +38,7 @@ __all__ = [
     'init_node',
     'resolve_init_target',
     'resolve_node',
+    'resolve_sender',
     'resolve_user_node',
     'resolve_target',
     'resolve_ledger_target',
@@ -496,6 +497,47 @@ def resolve_node(path: PathLike, *, check: bool = True) -> Node:
             f'No fractal node at {node.worktree}. Run `fractal init` first.'
         )
     return node
+
+
+def resolve_sender(path: Optional[str]) -> Node:
+    """Resolve the acting sender: ``--path`` when given, else the calling node.
+
+    The loop exports ``_NODE`` for the node whose loop is running, so a
+    production send attributes its ``sender`` to that node wherever the
+    agent's CLI call runs from (a detached step's cwd is not a node
+    identity); an explicit ``--path`` still wins -- an operator acting as a
+    node from outside it.
+
+    Args:
+        path: Explicit worktree directory, or ``None`` for the default.
+
+    Returns:
+        Node the message's ``sender`` attributes to.
+
+    Raises:
+        typer.BadParameter: If the exported ``_NODE`` does not name an
+            initialized node (a stale or mistyped export).
+
+    """
+    if path is not None:
+        return resolve_node(path)
+    if caller := Node.resolve_caller():
+        # mirror resolve_node's initialized-node check, naming the env
+        # source: a stale _NODE refuses cleanly, not as an internal error
+        if not caller.exists():
+            raise typer.BadParameter(
+                f'No fractal node at {caller.worktree} (resolved from the'
+                ' exported _NODE). Unset it or pass --path.'
+            )
+        return caller
+    # a set-but-unresolvable _NODE (a reaped worktree, a typo) refuses too:
+    # silently attributing the write to the cwd's node would be worse
+    if node_dir := os.environ.get('_NODE'):
+        raise typer.BadParameter(
+            f'No fractal node at {node_dir} (the exported _NODE names no'
+            ' git worktree). Unset it or pass --path.'
+        )
+    return resolve_node('.')
 
 
 def resolve_user_node(path: PathLike, name: Optional[str] = None) -> Node:

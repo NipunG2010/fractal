@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import typer
 
-from fractal.cli.utils import command, print_rows, resolve_node
+from fractal.cli.utils import command, print_rows, resolve_node, resolve_sender
 
 __all__ = [
     'radio_channel_create',
@@ -41,18 +43,18 @@ def radio_channel_create(app: typer.Typer) -> typer.Typer:
         help=write_only_help,
     )
     # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+    path_help = 'Worktree directory (default: the calling node, else the cwd).'
+    path = typer.Option(None, '--path', help=path_help)
 
     @command(app, 'create')
     def _create(
         channel_name: str = channel_name,
         read_only: bool = read_only,
         write_only: bool = write_only,
-        path: str = path,
+        path: Optional[str] = path,
     ) -> None:
         """Register a custom channel."""
-        node = resolve_node(path)
+        node = resolve_sender(path)
         node.radio.channel(channel_name, read_only=read_only, write_only=write_only)
         typer.echo(f'Created channel {channel_name}.')
 
@@ -68,17 +70,17 @@ def radio_channel_delete(app: typer.Typer) -> typer.Typer:
     force_help = 'Delete the channel even if it still holds messages.'
     force = typer.Option(False, '--force', '-f', help=force_help)
     # path option
-    path_help = 'Worktree directory.'
-    path = typer.Option('.', '--path', help=path_help)
+    path_help = 'Worktree directory (default: the calling node, else the cwd).'
+    path = typer.Option(None, '--path', help=path_help)
 
     @command(app, 'delete')
     def _delete(
         channel_name: str = channel_name,
         force: bool = force,
-        path: str = path,
+        path: Optional[str] = path,
     ) -> None:
         """Delete a channel (refused if it holds messages; use --force)."""
-        node = resolve_node(path)
+        node = resolve_sender(path)
         node.radio.channel_delete(channel_name, force=force)
         typer.echo(f'Deleted channel {channel_name}.')
 
