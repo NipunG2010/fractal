@@ -5,7 +5,7 @@ Radio is fractal's inter-node messaging system. Every node in a tree —
 including the user (root) node — owns a mailbox in the tree's central
 database, and running agents use radio to report progress upward, receive
 directives, and coordinate with their children while the user reads along.
-This page explains the model: channels, the two writing verbs, read state,
+This page explains the model: channels, the two composing verbs, read state,
 threads, reactions, saving, and subscriptions. Exact command syntax and the
 full option surface live in the :doc:`/cli/radio` reference.
 
@@ -65,9 +65,9 @@ redefined — delete it and recreate it to change its flags.
 ``fractal radio channel delete <name>`` removes a custom channel (default
 channels refuse); a channel that still holds messages requires ``--force``,
 which cascades its messages, reactions, receipts, and subscriptions.
-``fractal radio channel list`` shows the acting node's channels and flags.
-Channel names are scoped per node: two nodes may each define a ``reports``
-channel with different flags.
+``fractal radio channel list`` shows the cwd (or ``--path``) node's channels
+and flags. Channel names are scoped per node: two nodes may each define a
+``reports`` channel with different flags.
 
 Send and post
 -------------
@@ -125,8 +125,9 @@ the ``main.parser`` worktree, whose bare ``post`` reports to its own outbox:
 
 Every message carries an 8-character uppercase hex UUID, unique across the
 whole tree; commands that take a UUID accept it case-insensitively. Messages
-also record the sender's branch, a UTC timestamp, and — when the sender's
-agent loop has a live session — the agent session that wrote them.
+also record the sender's branch, a UTC timestamp, and the agent session that
+wrote them when one is known — the acting step's recorded session, or the
+sender's live session outside a step.
 
 Priorities
 ~~~~~~~~~~
@@ -173,7 +174,7 @@ semantics: your receipts never change another node's unread view.
 Listings are passive
 ~~~~~~~~~~~~~~~~~~~~
 
-``fractal radio messages`` lists the acting node's own mailbox;
+``fractal radio messages`` lists the cwd (or ``--path``) node's mailbox;
 ``fractal radio feed`` merges the mailboxes it is subscribed to (each row's
 ``node`` column names its source); ``fractal radio sent`` lists outbound mail
 across every recipient (each row's ``node`` column names the recipient, and
@@ -297,8 +298,8 @@ without it to every channel readable *at that moment* (a channel created
 later is not added automatically). ``fractal radio unsub --node=<branch>``
 removes the matching subscriptions (all of them without ``--channel``) and
 reports the true count — ``Removed 0 subscriptions.`` still exits 0, and
-means nothing matched. ``fractal radio subs`` lists the acting node's
-subscriptions.
+means nothing matched. ``fractal radio subs`` lists the cwd (or ``--path``)
+node's subscriptions.
 
 ``fractal radio feed`` fans one query out per subscription, merges the rows,
 and re-sorts them; a subscribed channel that has since been deleted or made
@@ -309,21 +310,26 @@ owner-only silently drops out, and ``--limit`` applies after the merge. Like
 Sender identity
 ---------------
 
-Radio has no ``--as`` flag: the acting node is resolved from the working
-directory (or ``--path``). Inside a node's worktree, commands act as that
-node; from the repository root, they act as the user (root) node. Inside a
-running loop the agent's working directory is its own worktree, which is why
-bare commands act as the running node; only ``read`` resolves its actor from
-the exported ``_NODE`` environment variable first (the reader its receipts
-attribute to). On the writing and subscription commands, ``--path`` points
-the command at a different worktree to act as that node; on ``read`` alone,
-``--path`` picks only the mailbox viewed, and receipts still attribute to the
-actual reader.
+Radio has no ``--as`` flag: the acting node is resolved from the exported
+``_NODE`` environment variable and the working directory. Every verb that
+writes a row attributed to the acting node — ``send``, ``post``, ``reply``,
+``react``, ``unsend``, ``save``, ``unsave``, ``sub``, ``unsub``, ``channel
+create``, ``channel delete`` — acts as an explicit ``--path`` when given,
+else as the calling node the loop exported ``_NODE`` for — so a production
+write attributes to the node whose loop is running, wherever the CLI call
+runs from — else as the node owning the working directory. ``read``
+resolves its actor env-first the same way, minus ``--path`` (the reader
+its receipts attribute to): its ``--path`` picks only the mailbox viewed,
+and receipts still attribute to the actual reader. The pure listings
+(``messages``, ``sent``, ``feed``, ``thread``, ``subs``, ``channel list``)
+take ``--path`` as a subject selector — whose mailbox or rows are viewed —
+defaulting to the working directory's node.
 
-Every message is stamped with its sender's branch and, when one is live, the
-agent session that wrote it — so a message is traceable to the exact
-conversation that produced it, and the :doc:`TUI </tui>` can fork that
-session to ask the author about it.
+Every message is stamped with its sender's branch and, when one is known, the
+agent session that wrote it (the acting step's recorded session, or the live
+session outside a step) — so a message is traceable to the exact conversation
+that produced it, and the :doc:`TUI </tui>` can fork that session to ask the
+author about it.
 
 Radio in the agent loop
 -----------------------

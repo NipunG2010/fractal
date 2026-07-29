@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 import typing
 from typing import Optional
@@ -1376,14 +1377,39 @@ class Radio:
         return ValueError(f'Channel not found: {channel!r}')
 
     def _sender_session(self: Radio) -> Optional[str]:
-        """Return the acting node's live agent session, stamped on sends.
+        """Return the session a send stamps: the acting step's, else the node's.
 
         The session ties a message to the conversation that wrote it (the
-        cockpit's "chat about this" forks it). ``None`` when the node has no
-        configured agent or no session woven this iteration.
+        cockpit's "chat about this" forks it in the sender's own context,
+        so the stamp stays sender-owned). The acting step's recorded
+        session is the literal author -- the loop exports ``STEP_ID`` for
+        exactly this attribution, and a detached step never writes the
+        session map (resume continuity) -- so it outranks the woven map;
+        the map covers sends outside any step, a step row a self-minting
+        backend has not stamped yet, and a foreign node's step (an
+        operator acting as this node via ``--path`` from inside another
+        loop's step). ``None`` when neither names a session.
         """
+        step_id = os.environ.get('STEP_ID')
+        # isdecimal plus the length gate keep a corrupted STEP_ID from
+        # aborting the send (isdigit admits digits int() rejects, e.g.
+        # superscripts; int() itself raises past the interpreter's digit
+        # limit) -- garbage degrades to the woven-session fallback
+        if step_id and step_id.isdecimal() and len(step_id) < 20:
+            # the SQLite bind overflows past signed 64-bit
+            if int(step_id) < 2**63:
+                # node-scoped read: sessions stay sender-owned, so a foreign
+                # node's exported step degrades to the fallback too
+                rows = self.db.read(
+                    'steps',
+                    where={'step_id': int(step_id), 'node': self.node.branch},
+                    limit=1,
+                )
+                if rows and rows[0]['session']:
+                    return rows[0]['session']
         if agent := self.node._default_agent():
-            return self.node.sessions.get(agent)
+            if session := self.node.sessions.get(agent):
+                return session
         return None
 
     @staticmethod

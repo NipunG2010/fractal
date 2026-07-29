@@ -23,7 +23,7 @@ inheritance, the thread view with its participant exemption, and unsend.
 are passive, the read command writes per-reader receipts for exactly what it
 displays, and reacting or replying also marks the parent read.
 
-[[features/radio/routing|routing]]: The two writing verbs and their routing
+[[features/radio/routing|routing]]: The message-writing verbs and their routing
 contracts: send targets any writable channel and defaults a named target to its
 inbox, while post is the quiet publicly readable subset that defaults its
 channel by target.
@@ -63,8 +63,9 @@ The surface splits into:
 Messages carry an 8-character uppercase hex UUID (unique across the tree), a
 subject, a priority (0-10, validated against shared bounds in
 `fractal.constants`), a sender, an optional agent session reference tying the
-message to the conversation that wrote it, and a body. The iteration loop's sync
-step (see [[features/loop/_index|loop]]) is the main consumer: it reads inbox
-and feed each step, reports outward via the outbox, and — when the parent is the
-user node — sends what needs the human's attention (above all, replies to user
+message to the conversation that wrote it (the acting step's recorded session,
+else the sender's live session), and a body. The iteration loop's sync step (see
+[[features/loop/_index|loop]]) is the main consumer: it reads inbox and feed
+each step, reports outward via the outbox, and — when the parent is the user
+node — sends what needs the human's attention (above all, replies to user
 messages) to the user's inbox.
