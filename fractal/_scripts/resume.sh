@@ -77,4 +77,5 @@ if [[ -n "$BRANCH" ]]; then
     fi
     [[ -f "$NODE_DIR/.headless" ]] && HEADLESS_ARGS+=(--headless)
 fi
-exec bash "$SCRIPT_DIR/start.sh" "$WORKTREE_DIR" "${HEADLESS_ARGS[@]}" --resume
+exec bash "$SCRIPT_DIR/start.sh" "$WORKTREE_DIR" \
+    ${HEADLESS_ARGS[@]+"${HEADLESS_ARGS[@]}"} --resume

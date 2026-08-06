@@ -72,7 +72,8 @@ fi
 # this node execs -- a child spawned from a running parent has
 # a different _NODE and won't match
 if [[ "${_NODE:-}" == "$NODE_DIR" ]]; then
-    exec fractal node _loop --path="$WORKTREE_DIR" "${LOOP_ARGS[@]}"
+    exec fractal node _loop --path="$WORKTREE_DIR" \
+        ${LOOP_ARGS[@]+"${LOOP_ARGS[@]}"}
 fi
 
 # propagate env into the child via env(1) argv -- a plain command
@@ -105,7 +106,7 @@ if [[ "$HEADLESS" == true ]]; then
     printf 'headless\n' >"$HEADLESS_FILE"
     ENV_ARGS+=("FRACTAL_HEADLESS=true")
     exec env "${ENV_ARGS[@]}" fractal node _launch \
-        --path="$WORKTREE_DIR" "${LOOP_ARGS[@]}"
+        --path="$WORKTREE_DIR" ${LOOP_ARGS[@]+"${LOOP_ARGS[@]}"}
 fi
 
 # ------ launch in tmux
@@ -120,7 +121,7 @@ TMUX_SESSION_NAME="${REPO_NAME//[.:]/-} (${BRANCH//./-})"
 
 TMUX_CMD="env"
 for word in "${ENV_ARGS[@]}" bash "$SCRIPT_DIR/start.sh" "$WORKTREE_DIR" \
-    "${LOOP_ARGS[@]}"; do
+    ${LOOP_ARGS[@]+"${LOOP_ARGS[@]}"}; do
     TMUX_CMD="$TMUX_CMD $(printf '%q' "$word")"
 done
 
