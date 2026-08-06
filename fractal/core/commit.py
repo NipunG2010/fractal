@@ -24,18 +24,24 @@ if typing.TYPE_CHECKING:
 
 __all__ = []
 
-# pathspec excludes appended to every stage -- fractal's runtime artifacts
-# (the central DB and its sidecars, the status and pause markers) and
-# virtualenvs must never ride a work commit
+# pathspec excludes appended to every stage -- fractal's
+# runtime artifacts must never ride a work commit
 _STAGE_EXCLUDES = (
+    # virtualenvs -- the dir entry and, for per-file listings, its contents
     ':!**/.venv',
+    ':!**/.venv/**',
+    # the central DB and its sidecars
     ':!**/.db',
     ':!**/.db-*',
+    # the status and pause markers
     ':!**/.status',
     ':!**/.paused',
-    # write_atomic's crash-stranded temp (.{name}-{rand}.tmp) -- a crash
-    # between mkstemp and os.replace can leave one beside a committable target
+    # the config write lock
+    ':!**/config.json.lock',
+    # write_atomic's crash-stranded temps
     ':!**/.*-*.tmp',
+    # engine-materialized system skills
+    ':!**/skills/.system/*',
 )
 
 # advisory threshold for the staged-file size guard
@@ -126,6 +132,13 @@ def commit(
     # nested under the project prefix for a sub-project node
     project = node.project_path
     scope = node.config.get('scope') or []
+    # a '.' root names the project itself, and subsumes any sibling root --
+    # collapse the whole scope so the boundary becomes the project dir (or
+    # unbounded at the repo root); kept out of the joins below: a literal
+    # './' (or '<project>/./') prefix matches no git path, so leaving it in
+    # place would put every changed file out of scope and refuse every commit
+    if any(not pathlib.PurePosixPath(root).parts for root in scope):
+        scope = []
     if scope:
         if project == '.':
             commit_scopes = list(scope)
@@ -405,7 +418,7 @@ def commit_user_init(node: Node, message: str) -> str:
     """Commit a user node's baseline: the project wiki (and node data when tracked).
 
     The ``--init`` baseline is the only commit a user node takes. By default
-    the node's own ``.fractal/`` data is git-excluded on the top-level
+    the node's own ``.fractal/`` data is self-ignored on the top-level
     branch, so this stages only the project wiki (under ``<project>/`` for a
     sub-project) and the ``.gitattributes`` merge attribute ``wiki init``
     wrote; on a tree opted in via ``fractal track`` the node's seed dir
@@ -427,11 +440,11 @@ def commit_user_init(node: Node, message: str) -> str:
         seed, wiki = FRACTAL_FOLDER, 'wiki'
     else:
         seed, wiki = f'{project}/{FRACTAL_FOLDER}', f'{project}/wiki'
-    # stage fractal's node data only when tracked (it is git-excluded on the
+    # stage fractal's node data only when tracked (it is self-ignored on the
     # top-level branch by default); the shared project wiki always rides along
     # so the base ref has a committed wiki
     paths = []
-    if worktree.exclude_tracks(node.repo_dir, f'{seed}/{node.branch}'):
+    if worktree.seed_tracked(node.node_dir):
         paths.append(f'{seed}/{node.branch}')
     if (node.worktree / wiki).is_dir():
         paths.append(wiki)
@@ -447,8 +460,15 @@ def commit_user_init(node: Node, message: str) -> str:
     if not paths:
         return f'User node baseline already committed on {node.branch}.'
     # literal pathspec magic: a glob char in the project prefix must not
-    # widen or empty the match
+    # widen or empty the match; the stage excludes ride every pathspec --
+    # a tracked seed dir stages everything not otherwise ignored, so the
+    # runtime artifacts inside it must be barred here too
     specs = [f':(literal){path}' for path in paths]
+    specs += _STAGE_EXCLUDES
+    # refresh the shared exclude block before staging: its basename patterns
+    # are the first layer keeping runtime files out of a tracked seed, and a
+    # fresh clone starts with no info/exclude at all
+    worktree.exclude_update(node.repo_dir)
 
     # stage the pathspec; closure so the hook-rewrite recovery can re-use it
     def _stage_paths() -> None:
@@ -496,13 +516,18 @@ def _check_clean(node: Node) -> None:
         node: The node whose worktree to check.
 
     Raises:
-        RuntimeError: When any tracked or untracked change remains.
+        RuntimeError: When any tracked or untracked change the stage could
+            commit remains.
 
     """
     # porcelain, not "diff HEAD": diff lists only tracked changes, so a step
     # that left only untracked files reads as clean -- the force-commit safety
     # net skips it and a later --continue (git clean -fd) then discards the work
-    cmd = ['status', '--porcelain']
+    # the stage's own excludes ride along: dirt the stage may never commit
+    # (runtime artifacts in a worktree whose info/exclude has not refreshed)
+    # would otherwise read as permanently dirty and fire the net every
+    # iteration for nothing
+    cmd = ['status', '--porcelain', '--', *_STAGE_EXCLUDES]
     if fractal.util.git.run(cmd, cwd=node.worktree, check=False):
         raise RuntimeError('Uncommitted changes remain (agent should have committed).')
 

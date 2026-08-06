@@ -160,9 +160,12 @@ if [[ "$LOCAL" != true ]]; then
 fi
 
 # ------ remove worktree and branch
-# worktree first -- a checked-out branch can't be deleted
+# worktree first -- a checked-out branch can't be deleted; size captured
+# before removal so every reap reports the disk it freed
+SIZE=$(du -sh "$WORKTREE_DIR" 2>/dev/null | awk '{print $1}' || true)
+SIZE=${SIZE:-?}
 git -C "$REPO_DIR" worktree remove --force "$WORKTREE_DIR"
-echo "Removed worktree: $WORKTREE_DIR"
+echo "Removed worktree: $WORKTREE_DIR ($SIZE)"
 
 # >/dev/null: drop git's own "Deleted branch ... (was <sha>)"
 # so only the script's message below shows (no duplicate line)

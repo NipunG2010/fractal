@@ -147,12 +147,21 @@ def test_init_blind_seeds_channels_without_subs(
     assert peer.unsubscribe(root_branch) == 0
 
 
-def test_send_stamps_sender_session(radio: Radio) -> None:
-    """Sends and replies record the acting node's live agent session.
+def test_send_stamps_sender_session(
+    radio_pair: tuple[Radio, Radio],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sends and replies stamp the conversation that wrote them.
 
-    The stamp ties a message to the conversation that wrote it; a node with
-    no configured agent or no woven session stamps NULL.
+    The acting step's recorded session (the loop-exported ``STEP_ID``) is
+    the literal author, so it outranks the woven session map; the map covers
+    sends outside any step and step rows not yet stamped. Sessions stay
+    sender-owned: a foreign node's exported step degrades to the woven
+    fallback the same way. A node with no agent, no woven session, and no
+    acting step stamps NULL, and a corrupted STEP_ID degrades to the
+    fallback instead of failing the send.
     """
+    radio, peer = radio_pair
     bare, _, _ = radio.send(channel='public', subject='s', data='d', priority=5)
     [row] = radio.node.db.read('messages', where={'message_uuid': bare})
     assert row['session'] is None
@@ -164,6 +173,75 @@ def test_send_stamps_sender_session(radio: Radio) -> None:
     assert row['session'] == 'sess-1'
     reply_uuid, _, _ = radio.reply(stamped, 'on it')
     [row] = radio.node.db.read('messages', where={'message_uuid': reply_uuid})
+    assert row['session'] == 'sess-1'
+    # a detached step never writes the session map: with the map cleared, a
+    # send inside a step (STEP_ID exported by the loop) stamps the step's
+    # recorded session instead of NULL
+    radio.node.sessions.clear()
+    record = radio.node.record
+    run_id = record.run_start()
+    iter_id = record.iter_start(run_id=run_id, iter=1)
+    step_id = record.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=3,
+        step_name='REVIEW',
+    )
+    record.step_session(
+        agent='claude',
+        step_id=step_id,
+        model='claude-fable-5',
+        session='sess-2',
+    )
+    monkeypatch.setenv('STEP_ID', f'{step_id}')
+    detached, _, _ = radio.send(channel='public', subject='s3', data='d3', priority=5)
+    [row] = radio.node.db.read('messages', where={'message_uuid': detached})
+    assert row['session'] == 'sess-2'
+    # a corrupted or row-less STEP_ID degrades to the woven fallback (NULL
+    # here -- the map is cleared) -- the send itself never fails
+    for garbage in ('\N{SUPERSCRIPT TWO}', f'{2**63}', '9' * 5000, '424242'):
+        monkeypatch.setenv('STEP_ID', garbage)
+        bad, _, _ = radio.send(channel='public', subject='s4', data='d4', priority=5)
+        [row] = radio.node.db.read('messages', where={'message_uuid': bad})
+        assert row['session'] is None
+    # the acting step outranks a rewoven session map: with both present,
+    # the step's session stamps
+    radio.node.sessions.set('claude', 'sess-1')
+    monkeypatch.setenv('STEP_ID', f'{step_id}')
+    both, _, _ = radio.send(channel='public', subject='s5', data='d5', priority=5)
+    [row] = radio.node.db.read('messages', where={'message_uuid': both})
+    assert row['session'] == 'sess-2'
+    # a step row a self-minting backend has not stamped yet falls back to
+    # the woven session
+    blank = record.step_start(
+        iter_id=iter_id,
+        run_id=run_id,
+        step=4,
+        step_name='COMMIT',
+    )
+    monkeypatch.setenv('STEP_ID', f'{blank}')
+    fallback, _, _ = radio.send(channel='public', subject='s6', data='d6', priority=5)
+    [row] = radio.node.db.read('messages', where={'message_uuid': fallback})
+    assert row['session'] == 'sess-1'
+    # sessions stay sender-owned: the peer's exported step -- session and
+    # all -- never stamps this sender's row, degrading to the woven fallback
+    foreign_run = peer.node.record.run_start()
+    foreign_iter = peer.node.record.iter_start(run_id=foreign_run, iter=1)
+    foreign = peer.node.record.step_start(
+        iter_id=foreign_iter,
+        run_id=foreign_run,
+        step=3,
+        step_name='REVIEW',
+    )
+    peer.node.record.step_session(
+        agent='claude',
+        step_id=foreign,
+        model='claude-fable-5',
+        session='sess-3',
+    )
+    monkeypatch.setenv('STEP_ID', f'{foreign}')
+    crossed, _, _ = radio.send(channel='public', subject='s7', data='d7', priority=5)
+    [row] = radio.node.db.read('messages', where={'message_uuid': crossed})
     assert row['session'] == 'sess-1'
 
 

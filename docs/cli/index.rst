@@ -61,8 +61,10 @@ only what deviates.
 - **The caller and the target.** Almost every command takes ``--path``
   (default ``.``), which identifies the *caller's* worktree — the node the
   command runs as. Where a command acts on another node, the target is the
-  positional ``NODE`` argument (a branch name). The one exception is
-  ``fractal radio read``, where ``--path`` selects the mailbox being viewed
+  positional ``NODE`` argument (a branch name). The radio verbs that write
+  rows attributed to the caller resolve it env-first instead — an explicit
+  ``--path``, else the loop-exported ``_NODE``, else the cwd — and
+  ``fractal radio read``'s ``--path`` selects the mailbox being viewed
   (see :doc:`/cli/radio`).
 - **Short names.** Branch arguments on ``fractal`` and ``fractal node``
   commands (``node cost`` targets included) resolve a unique trailing

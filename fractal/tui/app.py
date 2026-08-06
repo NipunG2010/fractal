@@ -30,6 +30,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.events import Click, Key, MouseDown, Resize
+from textual.geometry import Size
 from textual.message import Message
 from textual.widgets import Input, OptionList, Static, TextArea
 from textual.worker import Worker, get_current_worker
@@ -713,19 +714,37 @@ class FractalApp(App):
         """Kill any in-flight chat turn on shutdown (no orphan agents)."""
         self.chat.cancel()
 
-    def _resize(self: FractalApp) -> None:
-        """Apply the snapshot's pane geometry (a dragged tree width wins)."""
+    def _resize(self: FractalApp, terminal: Optional[Size] = None) -> None:
+        """Apply the snapshot's pane geometry (a dragged tree width wins).
+
+        Args:
+            terminal: The live terminal size, passed by the resize event
+                (``self.size`` still reads the old size there); the current
+                size when omitted.
+
+        """
         geometry = self.snapshot.geometry
         self.query_one('#node').styles.width = geometry.node_width
         tree = self.query_one('#fractal', Pane)
         if tree.user_size is None:
             # the tree opens no wider than the node pane; dragging widens it
-            tree.styles.width = min(geometry.tree_width, geometry.node_width)
+            width = min(geometry.tree_width, geometry.node_width)
+            # a leftover slice narrower than the radio's own border+padding
+            # cannot render as a pane -- it paints a stray chrome band under
+            # the node pane -- so the tree absorbs the crumb and the radio
+            # collapses entirely behind the node pane
+            left = (terminal or self.size).width - geometry.node_width
+            if width < left < width + theme.PANE_CHROME:
+                width = left
+            tree.styles.width = width
 
     def on_resize(self: FractalApp, event: Resize) -> None:
         """Re-clamp any dragged pane size (a resize moves the 50% caps)."""
         for pane in self.query(Pane):
             pane.clamp_user_size(event.size)
+        # the crumb rule reads the terminal width -- re-apply the geometry so
+        # a window resize lands it without waiting for the next snapshot
+        self._resize(terminal=event.size)
 
     def _set_header(self: FractalApp) -> None:
         """Render the breadcrumb: brand, repository, focused branch."""

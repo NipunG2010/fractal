@@ -30,11 +30,13 @@ project sub-path inside the worktree (`.` for a repo-root project), written once
 at init and read everywhere else.
 
 Fractal's runtime artifacts — the worktrees themselves, databases, status files,
-agent logs — are ignored through a marker-delimited block in the repo-local
-`info/exclude` (shared across all worktrees, template shipped in
-`_assets/git/exclude`), never through the user's committed `.gitignore`. The
-user node's own seed directory is ignored on the top-level branch by default;
-`fractal track` opts it back into tracking, and child seeds stay tracked so
+agent logs, engine-materialized system skills — are ignored through a static
+marker-delimited block in the repo-local `info/exclude` (shared across all
+worktrees, template shipped in `_assets/git/exclude`), never through the user's
+committed `.gitignore`. The block carries no per-tree state: the user node's own
+seed directory hides itself with its own ignore file instead, so a second tree's
+init can never expose the first's. `fractal track` removes that file to opt the
+seed into tracking, and child seeds carry no such file — they stay tracked so
 merge-up and meta-configuration keep working.
 
 ## Forking a child
@@ -48,6 +50,26 @@ tracked changes, while deeper nodes may fork a parent mid-iteration (they get
 its last committed tip). Re-initializing over an existing branch re-adds the
 worktree at that branch's tip and preserves its committed history; a failed init
 rolls the worktree and cache entry back so a retry starts clean.
+
+## Warming the build cache
+
+A fork takes only committed history, so a new worktree starts with none of the
+git-ignored build state its siblings have already paid for. The user node's
+`clone_dirs` key ([[configuration/config_json]]) names the directories worth
+carrying over — a Lean `.lake`, say — and each spawn copy-on-write clones them
+from the main checkout into the child (`cp -c`, APFS clonefile): near-instant,
+costing no disk until a file diverges, and the child owns its logical copy, so
+concurrent builds never share a mutable file.
+
+The clone runs after the spawn lock releases — a multi-gigabyte tree must never
+serialize sibling spawns — and is best-effort throughout. A missing source, an
+already-populated target, a filesystem without clonefile, or any filesystem
+error skips that directory and leaves the node to re-derive the cache exactly as
+it would have without the clone; nothing here can fail a spawn, whose node is
+registered by the time the clone starts. Each directory clones to a dot-prefixed
+temporary sibling and is renamed into place, so a partial tree never poisons the
+build it was meant to warm, and a crash-stranded temp matches the commit
+pipeline's ignore family rather than riding a commit.
 
 ## Scopes
 

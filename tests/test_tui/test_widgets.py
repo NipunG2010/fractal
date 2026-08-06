@@ -26,6 +26,7 @@ __all__ = [
     'test_wheel_over_a_scroller_scrolls_it_and_not_the_screen',
     'test_wheel_over_a_pane_shell_never_pans_the_screen',
     'test_dragging_the_tree_edge_resizes_within_the_clamps',
+    'test_a_radio_crumb_collapses_behind_the_node_pane',
     'test_dragging_the_chat_top_edge_resizes_within_the_clamps',
     'test_far_side_of_a_divide_grabs_the_same_edge',
 ]
@@ -121,16 +122,47 @@ async def test_dragging_the_tree_edge_resizes_within_the_clamps(
         await pilot.mouse_up(None, offset=(0, 5))
         await pilot.pause()
         assert tree.region.width == theme.TREE_W_MIN
-        # a drag across the screen clamps at half the terminal width
+        # a drag across the screen clamps at half the terminal width, or at
+        # the left column when the node pane leaves less than that -- a pane
+        # wider than its column would paint under its neighbors
         await pilot.mouse_down(tree, offset=(tree.region.width - 1, 5))
         await pilot.hover(None, offset=(140, 5))
         await pilot.mouse_up(None, offset=(140, 5))
         await pilot.pause()
-        assert tree.region.width == 75  # half the 150-column terminal
-        # a shrunken terminal re-clamps the dragged width (the cap moved)
+        top = app.query_one('#top')
+        assert tree.region.width == min(75, top.region.width)
+        # a shrunken terminal re-clamps the dragged width (both caps move)
         await pilot.resize_terminal(100, 48)
         await pilot.pause()
-        assert tree.region.width == 50
+        assert tree.region.width == min(50, top.region.width)
+
+
+async def test_a_radio_crumb_collapses_behind_the_node_pane(
+    cockpit_app: Callable[..., FractalApp],
+) -> None:
+    """A left column leaving the radio less than its chrome hides it cleanly.
+
+    A radio slice narrower than its own border and padding cannot render as
+    a pane -- it would paint stray border columns bleeding under the node
+    pane -- so the tree absorbs the crumb and the radio collapses entirely
+    behind the node pane.
+    """
+    app = cockpit_app()
+    async with app.run_test(size=(150, 48)) as pilot:
+        await pilot.pause()
+        geometry = app.snapshot.geometry
+        natural = min(geometry.tree_width, geometry.node_width)
+        # a terminal leaving the radio three columns -- inside the crumb zone
+        await pilot.resize_terminal(natural + geometry.node_width + 3, 48)
+        await pilot.pause()
+        tree = app.query_one('#fractal', Pane)
+        node = app.query_one('#node')
+        radio = app.query_one('#radio')
+        # the tree swallowed the crumb: it meets the node pane exactly
+        assert tree.region.width == natural + 3
+        assert node.region.x == tree.region.width
+        # the radio sits fully behind the node pane, never a visible sliver
+        assert radio.region.x >= node.region.x
 
 
 async def test_dragging_the_chat_top_edge_resizes_within_the_clamps(

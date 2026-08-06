@@ -40,11 +40,13 @@ __all__ = [
     'test_init_materializes_title_in_registry',
     'test_init_on_existing_node_refuses_loudly',
     'test_init_refuses_when_an_active_fractal_shares_the_repo_name',
+    'test_init_allows_a_second_tree_while_a_sibling_node_runs',
     'test_start_refuses_a_foreign_session_name_collision',
     'test_reset_refuses_a_running_or_frozen_node',
     'test_init_refuses_case_variant_of_existing_sibling',
     'test_root_anchors_central_db',
     'test_user_init_on_a_dotted_branch',
+    'test_user_init_rejects_a_dot_nested_second_root',
     'test_user_init_rejects_detached_head',
     'test_user_init_stores_and_updates_agent',
     'test_child_inherits_agent_from_ancestor',
@@ -52,6 +54,7 @@ __all__ = [
     'test_child_inherits_agent_config_from_parent',
     'test_init_stores_unset_booleans_as_null',
     'test_child_inherits_steps_and_scripts_from_parent',
+    'test_init_seeds_steps_from_directory',
     'test_child_inherits_skills_only_on_request',
     'test_child_inherits_config_preferences_not_caps',
     'test_init_requires_resolvable_agent',
@@ -334,15 +337,42 @@ def test_init_refuses_when_an_active_fractal_shares_the_repo_name(
     Two repositories with the same directory basename produce the same tmux
     session namespace (``<basename> (<branch>)``), so their node sessions --
     and ``node kill``, which resolves by that global name -- would collide.
-    tmux names carry no repo path, but this fractal does not exist yet, so a
-    live session under our basename can only be a different repo's; refuse
-    the init rather than create a fractal that cannot be operated safely.
+    tmux names carry no repo path, so a session counts as ours only when its
+    name derives from a branch this repo has checked out; one that no
+    checkout accounts for is a different repo's, and the init is refused
+    rather than creating a fractal that cannot be operated safely.
     """
     repo_name = git_repo.name.replace('.', '-').replace(':', '-')
     sessions = frozenset({f'{repo_name} (main.other)'})
     monkeypatch.setattr('fractal.util.tmux.probe', lambda *, socket=None: sessions)
     with pytest.raises(RuntimeError, match='Another active fractal'):
         Node(git_repo).init(agent='claude', user=True)
+
+
+def test_init_allows_a_second_tree_while_a_sibling_node_runs(
+    git_repo: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running sibling tree never reads as a foreign fractal at init.
+
+    One repository carries several trees, so the namespace guard must place
+    a live session before refusing: a name derived from a branch this repo
+    has checked out is our own tree's node, not a stranger sharing the
+    basename, and initializing the second tree beside it has to work.
+    """
+    Node(git_repo).init(agent='claude', user=True)
+    Node(git_repo).init(name='task', local=True)
+    task = Node(git_repo / '.worktrees' / 'main.task')
+    sessions = frozenset({task.tmux_session})
+    monkeypatch.setattr('fractal.util.tmux.probe', lambda *, socket=None: sessions)
+    subprocess.run(
+        ['git', 'checkout', '-b', 'second'],
+        cwd=git_repo,
+        capture_output=True,
+        check=True,
+    )
+    assert Node(git_repo).init(agent='claude', user=True)
+    assert [user.branch for user in Node.user_nodes(git_repo)] == ['main', 'second']
 
 
 def test_start_refuses_a_foreign_session_name_collision(
@@ -476,6 +506,45 @@ def test_user_init_on_a_dotted_branch(tmp_path: pathlib.Path) -> None:
     # a phantom 'v1'
     with pytest.raises(ValueError, match='No parent node'):
         node.radio.send(parent=True, subject='s', data='d', priority=3)
+
+
+@pytest.mark.parametrize(
+    argnames=('first', 'second'),
+    argvalues=[
+        ('v1', 'v1.0'),
+        ('v1.0', 'v1'),
+    ],
+    ids=['plain_first', 'dotted_first'],
+)
+def test_user_init_rejects_a_dot_nested_second_root(
+    tmp_path: pathlib.Path,
+    first: str,
+    second: str,
+) -> None:
+    """A second tree may not dot-nest under an existing one, in either order.
+
+    A dotted root is fine alone, but ``.`` is the node hierarchy separator:
+    a tree rooted at ``v1.0`` reads as a node inside one rooted at ``v1``, so
+    every ``<root>.*`` scope (destroy, reset, the ancestor walk) would cross
+    between them. The second init is refused whichever root came first, and
+    the existing tree is left intact.
+    """
+    # the repo dir name feeds the wiki project name, so keep it dot-free
+    repo = _make_git_repo(tmp_path / 'repo')
+    for branch in (first, second):
+        subprocess.run(
+            ['git', 'checkout', '-b', branch],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+        if branch == first:
+            assert Node(repo).init(agent='claude', user=True)
+    with pytest.raises(ValueError, match='collides with the tree rooted at'):
+        Node(repo).init(agent='claude', user=True)
+    # the established tree is untouched and still the only one
+    roots = [user.branch for user in Node.user_nodes(repo)]
+    assert roots == [first]
 
 
 def test_user_init_rejects_detached_head(tmp_path: pathlib.Path) -> None:
@@ -679,6 +748,75 @@ def test_child_inherits_steps_and_scripts_from_parent(
     # a flagless sibling still seeds the full profile from the package
     Node(git_repo).init(name='stock')
     stock_steps = node_dir('main.task.stock') / 'steps'
+    assert (stock_steps / '00-PREPARE.md').is_file()
+
+
+def test_init_seeds_steps_from_directory(
+    git_repo: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    """``--steps`` seeds the node's steps from an explicit directory.
+
+    The directory's step files reach the node byte-for-byte in filename
+    order instead of the package seed, even from a directory whose name
+    carries glob metacharacters; a sibling spawned without the flag still
+    seeds the stock set. A missing directory, a directory with no
+    step files, a profile the loop could not discover (a missing ``NN-``
+    prefix, mixed prefix widths), and combining with ``--inherit=steps``
+    -- named or reached through ``all``, two rival step sources -- all
+    refuse before any worktree is created.
+    """
+
+    def node_dir(branch: str) -> pathlib.Path:
+        return git_repo / '.worktrees' / branch / '.fractal' / branch
+
+    Node(git_repo).init(agent='claude', user=True)
+    # author a custom step profile -- the glob metacharacters in the dir
+    # name must reach init.sh's existence check literally, not
+    # pattern-expanded
+    profile = tmp_path / 'pro[file]'
+    profile.mkdir()
+    (profile / '00-SCOUT.md').write_bytes(b'# scout the terrain\n')
+    (profile / '01-STRIKE.md').write_bytes(b'# strike the target\n')
+    # a missing dir and a dir with no step files refuse up front
+    with pytest.raises(ValueError, match='does not exist'):
+        Node(git_repo).init(name='task', steps=tmp_path / 'absent')
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    with pytest.raises(ValueError, match='no step files'):
+        Node(git_repo).init(name='task', steps=empty)
+    # a profile the loop could not discover refuses here, not at the
+    # node's first iteration
+    unprefixed = tmp_path / 'unprefixed'
+    unprefixed.mkdir()
+    (unprefixed / 'scout.md').write_text('# scout the terrain\n')
+    with pytest.raises(ValueError, match='without an NN- prefix'):
+        Node(git_repo).init(name='task', steps=unprefixed)
+    mixed = tmp_path / 'mixed'
+    mixed.mkdir()
+    (mixed / '0-SCOUT.md').write_text('# scout the terrain\n')
+    (mixed / '01-STRIKE.md').write_text('# strike the target\n')
+    with pytest.raises(ValueError, match='mixes digit prefix widths'):
+        Node(git_repo).init(name='task', steps=mixed)
+    # --steps and --inherit=steps are rival step sources, whether the
+    # surface is named or reached through the 'all' alias
+    with pytest.raises(ValueError, match='inherit=steps'):
+        Node(git_repo).init(name='task', steps=profile, inherit=['steps'])
+    with pytest.raises(ValueError, match='inherit=steps'):
+        Node(git_repo).init(name='task', steps=profile, inherit=['all'])
+    assert not (git_repo / '.worktrees' / 'main.task').exists()
+    # the profile replaces the stock set, byte-for-byte in filename order
+    Node(git_repo).init(name='task', steps=profile)
+    seeded = node_dir('main.task') / 'steps'
+    assert sorted(f.name for f in seeded.glob('*.md')) == [
+        '00-SCOUT.md',
+        '01-STRIKE.md',
+    ]
+    for src in profile.glob('*.md'):
+        assert (seeded / src.name).read_bytes() == src.read_bytes()
+    # a flagless sibling still seeds the stock set from the package
+    Node(git_repo).init(name='stock')
+    stock_steps = node_dir('main.stock') / 'steps'
     assert (stock_steps / '00-PREPARE.md').is_file()
 
 

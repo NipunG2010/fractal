@@ -41,20 +41,22 @@ to use or extend fractal — not a line-level code walkthrough.
 
 Start from what you are trying to do:
 
-- **Understand the system.** [[architecture]] explains what fractal is and how
-  it fits together: the node tree, worktrees, the agent-provider seam, the
-  central database, and the package layout. [[design]] explains why it is shaped
-  this way: budgets and reserves, durability, commit discipline, and the status
-  model.
-- **Operate a fractal.** [[user_flow]] walks the operator's journey end to end:
-  init, configure, launch, monitor, steer, finish, merge, and tear down.
-  [[configuration]] is the complete reference for every initialization flag,
-  config key, step override, node script, and inheritance rule.
-- **Go deep on one surface.** [[features]] holds one sub-branch per feature
-  surface: lifecycle, loop, radio, cost, spawning, chat, TUI, files, agents, and
-  the wiki system.
+- **Understand the system.** [[architecture/_index|architecture]] explains what
+  fractal is and how it fits together: the node tree, worktrees, the
+  agent-provider seam, the central database, and the package layout.
+  [[design/_index|design]] explains why it is shaped this way: budgets and
+  reserves, durability, commit discipline, and the status model.
+- **Operate a fractal.** [[user_flow/_index|user_flow]] walks the operator's
+  journey end to end: init, configure, launch, monitor, steer, finish, merge,
+  and tear down. [[configuration/_index|configuration]] is the complete
+  reference for every initialization flag, config key, step override, node
+  script, and inheritance rule.
+- **Go deep on one surface.** [[features/_index|features]] holds one sub-branch
+  per feature surface: lifecycle, loop, radio, cost, spawning, chat, TUI, files,
+  agents, and the wiki system.
 - **Edit a source module.** [[source_map]] maps source paths to the pages that
   document them, one hop from file to reference.
 
-A new reader gets the fastest orientation from [[architecture]] first, then
-[[user_flow]]; the remaining branches are references to dip into as needed.
+A new reader gets the fastest orientation from
+[[architecture/_index|architecture]] first, then [[user_flow/_index|user_flow]];
+the remaining branches are references to dip into as needed.

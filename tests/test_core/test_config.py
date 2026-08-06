@@ -181,7 +181,12 @@ def test_config_set_serializes_concurrent_writers(
         ({'interval': '30m', 'iter_timeout': '2h'}, 'exceeds'),
         ({'scope': ['src', '/abs/root']}, 'repo-relative'),
         ({'scope': ['../sibling']}, 'repo-relative'),
+        ({'scope': ['./src']}, 'canonical'),
+        ({'scope': ['src/']}, 'canonical'),
         ({'scope': 123}, 'list of strings'),
+        ({'clone_dirs': ['../sibling/.cache']}, 'repo-relative'),
+        ({'clone_dirs': ['.']}, 'must name a subdirectory'),
+        ({'clone_dirs': 123}, 'list of strings'),
     ],
     ids=[
         'nan_cost',
@@ -211,7 +216,12 @@ def test_config_set_serializes_concurrent_writers(
         'iter_timeout_over_interval',
         'absolute_scope_root',
         'dotdot_scope_root',
+        'dot_slash_scope_root',
+        'trailing_slash_scope_root',
         'non_list_scope',
+        'dotdot_clone_dir',
+        'root_clone_dir',
+        'non_list_clone_dirs',
     ],
 )
 def test_validate_rejects_launch_invariant_violations(
@@ -231,10 +241,15 @@ def test_validate_rejects_launch_invariant_violations(
     flips the run mode (the loop's ``bool()`` coercion reads a hand-edited
     ``"false"`` string as ``True``), a bare-number or zero-truncating
     duration bricks the loop at launch or crashes its mid-run re-reads,
-    and an absolute or ``..`` scope root never matches the commit
-    pipeline's relative prefix check, bricking every scoped commit. Only
-    the keys present in the mapping are checked, so each case isolates one
-    invariant.
+    an absolute or ``..`` list-key entry points outside the tree (a scope
+    root never matches the commit pipeline's relative prefix check,
+    bricking every scoped commit; a ``clone_dirs`` entry would reach
+    outside the worktree it warms), a non-canonical spelling (``./src``,
+    ``src/``) slips past the setters only by hand-edit and would read
+    every change as out of scope, and a ``.`` cache dir would clone the
+    entire checkout over the worktree root -- while the same ``.`` is a
+    legal scope root, naming the project itself. Only the keys present in
+    the mapping are checked, so each case isolates one invariant.
     """
     with pytest.raises(ValueError, match=match):
         node_with_db.config.validate(config)

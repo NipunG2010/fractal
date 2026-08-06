@@ -70,13 +70,20 @@ class OmpParser(StreamParser):
             message = event.get('message') or {}
             # the session header names no model, so the served model first
             # arrives here -- re-stamp the session once it is known so the
-            # step row records the real model (record_session is idempotent)
+            # step row records the real model (record_session is idempotent;
+            # the isinstance guards the wire type); every distinct served
+            # model also joins the `models` record -- the row keeps only
+            # the last, and a substitution that recovers mid-stream must
+            # still stay visible to the drop check
             model = message.get('model')
-            if model and model != self.model and self.session is not None:
-                self.model = model
-                events.append(
-                    StreamEvent(kind='session', session=self.session, model=model)
-                )
+            if isinstance(model, str) and model and self.session is not None:
+                if model not in self.models:
+                    self.models.append(model)
+                if model != self.model:
+                    self.model = model
+                    events.append(
+                        StreamEvent(kind='session', session=self.session, model=model)
+                    )
             cost = ((message.get('usage') or {}).get('cost') or {}).get('total')
             if isinstance(cost, (int, float)):
                 self.cost = (self.cost or 0.0) + cost

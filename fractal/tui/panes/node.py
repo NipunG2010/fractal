@@ -51,6 +51,7 @@ _CONFIG_ORDER = (
     'user',
     'project',
     'scope',
+    'clone_dirs',
     'base',
     'meta',
     'agent',
@@ -729,7 +730,7 @@ class NodePane:
         """
         if event['event'] == 'start' or event['kind'] == 'node':
             return fractal.tui.theme.DIM
-        if event['kind'] == 'step' and event['name'] == 'SYNC':
+        if event['sync']:
             return fractal.tui.theme.DIM
         _, color = fractal.tui.fmt.status_style(event['status'])
         return color
@@ -741,7 +742,7 @@ class NodePane:
         loses chars to the ellipsis.
         """
         verb = f'[{self._ev_color(event)}]{self._ev_verb(event)}[/]'
-        if event['kind'] == 'step' and event['name'] == 'SYNC':
+        if event['sync']:
             verb = f'[{fractal.tui.theme.DIM}]sync[/] {verb}'
         elif event['kind'] == 'step' and event['name']:
             name = fractal.tui.fmt.esc(event['name'])

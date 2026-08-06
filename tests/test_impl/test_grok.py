@@ -32,6 +32,7 @@ from fractal.impl.grok import GrokAgent, GrokParser
 __all__ = [
     'test_capability_flags_report_provider_facts_grok',
     'test_parser_maps_the_stream_protocol_grok',
+    'test_parser_multi_model_usage_reads_as_unknown',
     'test_parser_suppresses_thought_frames',
     'test_parser_unpriced_model_records_no_cost_grok',
     'test_parser_prefers_the_wire_reported_cost',
@@ -124,8 +125,10 @@ def test_parser_maps_the_stream_protocol_grok(monkeypatch: pytest.MonkeyPatch) -
     text_a, text_b, session, cost, result = events
     assert text_a.text + text_b.text == 'done'
     assert session.session == _END['sessionId']
-    # the stream-reported model rides the modelUsage key
+    # the stream-reported model rides the modelUsage key, and joins the
+    # served record the loop's drop check reads
     assert session.model == 'grok-4.5'
+    assert parser.models == ['grok-4.5']
     assert cost.cost == pytest.approx(_USAGE_COST)
     # the end frame closes the invocation authoritatively
     assert result.final
@@ -133,6 +136,30 @@ def test_parser_maps_the_stream_protocol_grok(monkeypatch: pytest.MonkeyPatch) -
     assert result.turns == 2
     assert result.duration is not None
     assert result.duration >= 0.0
+
+
+def test_parser_multi_model_usage_reads_as_unknown() -> None:
+    """A multi-entry modelUsage names no served model.
+
+    The terminal frame is grok's only model report, and a multi-entry
+    usage is ambiguous -- an auxiliary model beside the serving one, not
+    necessarily a substitution -- so no entry joins the served record:
+    the drop check reads "stream named none" and falls back to the step
+    row, which carries the pin.
+    """
+    parser = GrokParser(model='grok-4.5')
+    end = {
+        **_END,
+        'modelUsage': {
+            'grok-4.5': {'inputTokens': 100, 'modelCalls': 2},
+            'grok-3-mini': {'inputTokens': 5, 'modelCalls': 1},
+        },
+    }
+    events = [event for line in _lines([end]) for event in parser.feed(line)]
+    session = next(event for event in events if event.kind == 'session')
+    # the configured model stands and the served record stays empty
+    assert session.model == 'grok-4.5'
+    assert parser.models == []
 
 
 def test_parser_suppresses_thought_frames() -> None:

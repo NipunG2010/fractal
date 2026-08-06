@@ -64,6 +64,13 @@ exists.
   node's live copies instead of the package seed: `steps`, `scripts`, `skills`,
   `config`, or `all` (which expands to the other four). `config` copies the
   parent's preference keys only -- budget-class caps never inherit.
+- `--steps` -- directory of step files (`*.md`) seeding the node's `steps/`
+  instead of the package seed, copied byte-for-byte in filename order. The
+  directory must hold at least one step file, each carrying the `NN-` digit
+  prefix the loop discovers steps by, at one width (see [[configuration/steps]])
+  -- a profile that violates either would seed a node that cannot iterate, so
+  init refuses it. The flag is mutually exclusive with `--inherit=steps` (two
+  rival step sources).
 - `--agent` -- agent command (e.g. `claude`, `codex`, `grok`, `opencode`,
   `omp`). Defaults to the nearest ancestor's configured agent; the user node
   sets the tree default via `fractal init --agent`. An unknown agent is refused

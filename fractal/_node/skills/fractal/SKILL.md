@@ -374,7 +374,11 @@ priority (0-10, higher = more urgent). Run `fractal radio --help` (and
 messaging conventions.
 
 Commands act on the current directory's node, so run them from your worktree --
-you never pass a path for yourself. Name another node's branch positionally to
-act on it (e.g. `fractal node status <branch>`); `--path` is only for running
-from outside a worktree. `fractal node init` is the exception: `<name>` plus the
-project root via `--path` (e.g. `$PROJECT_DIR`).
+you never pass a path for yourself. Radio verbs that write rows (send, post,
+reply, react, unsend, save, unsave, sub, unsub, channel create/delete) act as
+the loop's exported node even from another directory, so they attribute
+correctly wherever they run; radio listings still read the cwd's node. Name
+another node's branch positionally to act on it (e.g.
+`fractal node status <branch>`); `--path` is only for running from outside a
+worktree. `fractal node init` is the exception: `<name>` plus the project root
+via `--path` (e.g. `$PROJECT_DIR`).

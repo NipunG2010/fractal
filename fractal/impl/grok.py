@@ -64,8 +64,16 @@ class GrokParser(StreamParser):
                     self.session = session
                     # prefer the stream-reported model off the modelUsage key
                     usage_models = event.get('modelUsage')
-                    if isinstance(usage_models, dict) and len(usage_models) == 1:
-                        self.model = next(iter(usage_models))
+                    if isinstance(usage_models, dict):
+                        # the terminal frame is grok's only model report, and
+                        # a multi-entry usage is ambiguous (an auxiliary model
+                        # beside the serving one), so only a sole entry is a
+                        # served-model fact; left empty the drop check reads
+                        # "stream named none" and falls back to the step row
+                        named = [model for model in usage_models if model]
+                        if len(named) == 1:
+                            self.models = named
+                            self.model = named[0]
                     events.append(
                         StreamEvent(kind='session', session=session, model=self.model)
                     )

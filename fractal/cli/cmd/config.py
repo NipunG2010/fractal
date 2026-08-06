@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import typer
 
@@ -13,6 +14,7 @@ from fractal.core.config import (
     IMMUTABLE_KEYS,
     INT_KEYS,
     KEYS,
+    LIST_KEYS,
 )
 
 __all__ = [
@@ -175,10 +177,15 @@ def _config_set(
         # branch name is not silently turned into an int/bool)
         if value == 'null':
             config[key] = None
-        # scope stores a JSON list -- accept both the CLI init's comma-joined
-        # form and the space-joined string form the read normalization splits
-        elif key == 'scope':
-            config[key] = value.replace(',', ' ').split()
+        # list keys store a JSON list -- accept both the CLI init's
+        # comma-joined form and the space-joined string form the read
+        # normalization splits; each entry lands in canonical path form
+        # ('./src', 'src/', 'a//b' -> 'src', 'a/b'): the commit boundary
+        # is a literal string prefix against git's canonical paths, so a
+        # non-canonical spelling would read every change as out of scope
+        elif key in LIST_KEYS:
+            entries = value.replace(',', ' ').split()
+            config[key] = [pathlib.PurePosixPath(entry).as_posix() for entry in entries]
         elif key in _COERCED_KEYS:
             try:
                 parsed = json.loads(value)

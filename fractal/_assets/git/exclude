@@ -40,6 +40,9 @@ headless.log
 .opencode/
 .omp/
 
+# System skills
+**/skills/.system/
+
 # Agent stderr
 claude.err
 codex.err

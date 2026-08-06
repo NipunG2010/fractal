@@ -120,6 +120,12 @@ def node_init(app: typer.Typer) -> typer.Typer:
         ' or all.'
     )
     inherit = typer.Option(None, '--inherit', help=inherit_help)
+    # steps option
+    steps_help = (
+        'Directory of NN- prefixed step files (*.md) to seed steps/ from'
+        ' instead of the package seed; mutually exclusive with --inherit=steps.'
+    )
+    steps = typer.Option(None, '--steps', help=steps_help)
     # agent option
     agent_help = 'Agent command (default: inherited from the nearest ancestor).'
     agent = typer.Option(None, '--agent', help=agent_help)
@@ -218,6 +224,7 @@ def node_init(app: typer.Typer) -> typer.Typer:
         base: Optional[str] = base,
         meta: Optional[str] = meta,
         inherit: Optional[list[str]] = inherit,
+        steps: Optional[str] = steps,
         agent: Optional[str] = agent,
         provider: Optional[str] = provider,
         model: Optional[str] = model,
@@ -284,6 +291,7 @@ def node_init(app: typer.Typer) -> typer.Typer:
             base=base,
             meta=meta,
             inherit=inherit,
+            steps=steps,
             agent=agent,
             provider=provider,
             model=model,
@@ -325,7 +333,15 @@ def node_init(app: typer.Typer) -> typer.Typer:
                 parent = node
             effective_agent = agent or parent.agent_effective()
             tracked = True
-            if effective_agent:
+            # the probe needs an initialized node to anchor the agent
+            # registry's database: the resolve_init target falls back to the
+            # repo root, which carries no config (and so no tree root to
+            # resolve the database through) whenever the checkout sits off
+            # the tree's root branch -- the operator's own branch, while
+            # nodes run; an unprobed agent reads as tracked, exactly like the
+            # unregistered backend below: unknown spend earns the warning,
+            # and this advisory must never fail a spawn that already succeeded
+            if effective_agent and parent.exists():
                 # an unregistered backend reads as tracked -- unknown
                 # spend earns the warning, never a block
                 try:
@@ -563,6 +579,14 @@ def node_merge(app: typer.Typer) -> typer.Typer:
         ' seed, refresh indexes, commit, and advance the merge-base.'
     )
     continue_ = typer.Option(False, '--continue', help=continue_help)
+    # delete flag
+    delete_help = (
+        'Delete the node (worktree, branch, and subtree) after a successful merge.'
+    )
+    delete = typer.Option(False, '--delete', help=delete_help)
+    # force flag
+    force_help = 'With --delete, skip its confirmation prompt.'
+    force = typer.Option(False, '--force', '-f', help=force_help)
     # path option
     path_help = 'Worktree directory.'
     path = typer.Option('.', '--path', help=path_help)
@@ -571,16 +595,56 @@ def node_merge(app: typer.Typer) -> typer.Typer:
     def _merge(
         node: Optional[str] = node,
         continue_: bool = continue_,
+        delete: bool = delete,
+        force: bool = force,
         path: str = path,
     ) -> None:
         """Squash-merge a node's branch into its parent."""
         node = resolve_target(path, node)
+        # --delete tears down the subtree; pre-flight every one of the
+        # teardown's refusals (the cwd inside a doomed worktree, a live or
+        # locked descendant) here, so a refusal lands before the squash
+        # rather than after a merge that already committed
+        if delete:
+            node.guard_delete()
+            # the chained teardown is as destructive as `node delete`, so it
+            # takes the same confirmation gate -- landed before the squash
+            # for the same reason as the refusals above
+            if not force:
+                descendants = len(node.child_list())
+                if descendants:
+                    s = 's' if descendants != 1 else ''
+                    prompt = (
+                        f'Merge node {node.branch}, then delete it and its'
+                        f' {descendants} descendant{s}?'
+                    )
+                else:
+                    prompt = f'Merge node {node.branch}, then delete it?'
+                # the node and each descendant hold one worktree and one branch
+                s = 's' if descendants else ''
+                es = 'es' if descendants else ''
+                typer.echo(
+                    f'Warning: This permanently removes the worktree{s} and'
+                    f' deletes the branch{es} after the merge.\nConsider'
+                    f' retiring the node to hide it while preserving its'
+                    f' branch{es}.',
+                    err=True,
+                )
+                typer.confirm(prompt, abort=True)
         output, notices = node.merge(continue_merge=continue_)
         if output:
             typer.echo(output)
         # success-path warnings ride stderr so piped stdout stays parseable
         if notices:
             typer.echo(notices, err=True)
+        # chain the teardown only after a merge that landed (a failed merge
+        # raised above); its gate already passed with the pre-flight
+        if delete:
+            output, notices = node.delete()
+            if output:
+                typer.echo(output)
+            if notices:
+                typer.echo(notices, err=True)
 
     return app
 
@@ -777,7 +841,9 @@ def node_status(app: typer.Typer) -> typer.Typer:
 def node_list(app: typer.Typer) -> typer.Typer:
     """Register the ``list`` command."""
     # node argument
-    node_help = "Target node branch (default: this node's descendants)."
+    node_help = (
+        "Tree root branch, or a target node branch (default: this node's descendants)."
+    )
     node = typer.Argument(None, help=node_help)
     # all nodes flag
     all_nodes_help = 'Include retired nodes.'
@@ -822,13 +888,15 @@ def node_list(app: typer.Typer) -> typer.Typer:
         """List a node's descendants with status (blank limit columns mean unlimited).
 
         Lists descendants only -- it never includes the target row; use
-        ``fractal node status`` for the node's own status. ``status`` is
+        ``fractal node status`` for the node's own status. A tree root
+        lists its whole tree; with several trees and a checkout belonging
+        to none of them, a bare ``list`` spans them all. ``status`` is
         always bare and ``detail`` carries any qualifier (a pending
-        signal, an exited run's end reason, ``orphaned``). ``spend`` is
-        the current run's subtree cost, the scope ``max_cost`` beside it
-        is enforced at, and is blank for a node that has never run.
-        ``last`` is the age of each node's newest activity; ``!`` flags an
-        active node quiet past ``max(step_timeout, 5m)``.
+        signal, an exited run's end reason, ``orphaned``, an unresolved
+        ``model drop``). ``spend`` is the current run's subtree cost, the
+        scope ``max_cost`` beside it is enforced at, and is blank for a node
+        that has never run. ``last`` is the age of each node's newest activity;
+        ``!`` flags an active node quiet past ``max(step_timeout, 5m)``.
         """
         # validate arguments
         require_non_negative(max_depth=max_depth)
@@ -852,29 +920,43 @@ def node_list(app: typer.Typer) -> typer.Typer:
         # list (exit 0) on the uninitialized case rather than hard-failing
         if node is None:
             try:
-                node = resolve_target(path, node)
+                targets = [resolve_target(path, node)]
             except typer.BadParameter:
                 # a non-init checkout (the user on their own branch while
                 # nodes run) is a live tree, not "no nodes" -- anchor on the
                 # user node by config, not the checkout (mirrors pause)
-                node = Node.resolve_user(path)
-                if node is None:
+                try:
+                    user = Node.resolve_user(path)
+                    targets = [user] if user is not None else []
+                except RuntimeError:
+                    # several trees, and the checkout owns none of them: a
+                    # read-only listing spans them all instead of taking the
+                    # mutating verbs' refusal -- showing every node is no
+                    # guess, and each row's branch names the tree it sits in
+                    targets = Node.user_nodes(path)
+                if not targets:
                     if count:
                         typer.echo(0)
                     else:
                         print_rows([], csv=csv, columns=_LIST_COLUMNS)
                     return
         else:
-            node = resolve_target(path, node)
+            # a tree root owns no worktree of its own, so it resolves by
+            # config like the tree-scoped verbs -- keyed to the worktree map
+            # a whole-tree listing would need its root branch checked out
+            user = Node.resolve_user(path, name=node)
+            targets = [user] if user is not None else [resolve_target(path, node)]
         # list nodes
-        rows = node.list(
-            all_nodes=all_nodes,
-            retired_only=retired,
-            max_depth=max_depth,
-            status=status,
-            live=live,
-            decorated=not count,
-        )
+        rows = []
+        for target in targets:
+            rows += target.list(
+                all_nodes=all_nodes,
+                retired_only=retired,
+                max_depth=max_depth,
+                status=status,
+                live=live,
+                decorated=not count,
+            )
         # count short-circuits formatting -- emit just the number
         if count:
             typer.echo(len(rows))

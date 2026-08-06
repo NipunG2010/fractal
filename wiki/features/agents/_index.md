@@ -4,7 +4,7 @@ desc: |
   Agent providers and routes: the supported agent backends, model and
   effort overrides, and how a new provider slots in.
 created: 2026-07-21T04:35:35Z
-updated: 2026-07-21T05:09:24Z
+updated: 2026-07-25T02:13:07Z
 ---
 
 # features/agents
@@ -18,8 +18,8 @@ from outside the package.
 
 [[features/agents/models_and_effort|models_and_effort]]: Where a spawn's model
 and reasoning-effort overrides come from, how each provider backend spells them
-on its command line, and how a backend resolves the model its own configuration
-defaults to.
+on its command line, how a backend resolves the model its own configuration
+defaults to, and how the served model is recorded off the stream.
 
 [[features/agents/providers|providers]]: The supported agent backends, the
 registry in the core agent module that resolves a base command to its backend

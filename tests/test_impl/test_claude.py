@@ -29,6 +29,7 @@ __all__ = [
     'test_capability_flags_report_provider_facts_claude',
     'test_parser_maps_the_stream_protocol_claude',
     'test_parser_captures_the_session_once_and_prefers_the_stream_model',
+    'test_parser_restamps_the_served_model_from_assistant_rows',
     'test_parser_error_result',
     'test_parser_null_duration',
     'test_parser_marks_a_budget_stop',
@@ -219,6 +220,67 @@ def test_parser_captures_the_session_once_and_prefers_the_stream_model(
     assert parser.model == recorded
     # later frames carrying the id emit no second session event
     assert parser.feed(json.dumps({'type': 'system', 'session_id': 'sess-m'})) == []
+
+
+def test_parser_restamps_the_served_model_from_assistant_rows() -> None:
+    """Assistant rows re-stamp the session with the model that actually served.
+
+    The init frame names the model claude *resolved*, not the one the API
+    served -- infrastructure can silently substitute mid-session -- so each
+    real top-level assistant row naming a different model re-stamps the
+    session, and the step row ends up recording the last served model.
+    Synthetic rows (the CLI's injected error stand-ins) name no real
+    model, a non-string model is wire noise, and a sidechain row (a
+    subagent's, flagged by ``parent_tool_use_id``) legitimately runs its
+    own model -- none may overwrite the fact. The ``models`` record keeps
+    every distinct served model: a substitution the stream recovered from
+    must stay visible after the last re-stamp returns to the resolved
+    model.
+    """
+    parser = ClaudeParser(model='claude-fable-5')
+    frames = [
+        {
+            'type': 'system',
+            'subtype': 'init',
+            'session_id': 'sess-d',
+            'model': 'claude-fable-5',
+        },
+        {
+            'type': 'assistant',
+            'session_id': 'sess-d',
+            'message': {'id': 'msg_a', 'model': 'claude-opus-4-8'},
+        },
+        {
+            'type': 'assistant',
+            'session_id': 'sess-d',
+            'parent_tool_use_id': 'toolu_01',
+            'message': {'id': 'msg_s', 'model': 'claude-haiku-4-5'},
+        },
+        {
+            'type': 'assistant',
+            'session_id': 'sess-d',
+            'message': {'id': 'msg_b', 'model': '<synthetic>'},
+        },
+        {
+            'type': 'assistant',
+            'session_id': 'sess-d',
+            'message': {'id': 'msg_c', 'model': {'oops': 1}},
+        },
+        {
+            'type': 'assistant',
+            'session_id': 'sess-d',
+            'message': {'id': 'msg_d', 'model': 'claude-fable-5'},
+        },
+    ]
+    events = [event for line in _lines(frames) for event in parser.feed(line)]
+    assert [(event.kind, event.session, event.model) for event in events] == [
+        ('session', 'sess-d', 'claude-fable-5'),
+        ('session', 'sess-d', 'claude-opus-4-8'),
+        ('session', 'sess-d', 'claude-fable-5'),
+    ]
+    # the row keeps the last served model; the record keeps them all
+    assert parser.model == 'claude-fable-5'
+    assert parser.models == ['claude-opus-4-8', 'claude-fable-5']
 
 
 def test_parser_error_result() -> None:
@@ -741,17 +803,23 @@ def test_invocation_honors_command_model_budget_and_settings(
     node = node_with_db
     backend = ClaudeAgent(node, 'claude --foo')
     # no node settings file yet -- the flag must not point at a missing file
-    bare = backend.invocation('hi', model='claude-opus-4-8', budget=2.5)
+    bare = backend.invocation('hi', model='claude-opus-4-8', budget=2.5, effort='high')
     assert bare.argv[:2] == ('claude', '--foo')
     assert '--settings' not in bare.argv
     assert bare.argv[bare.argv.index('--model') + 1] == 'claude-opus-4-8'
     assert bare.argv[bare.argv.index('--max-budget-usd') + 1] == '2.5'
+    # the effort rides the --effort flag alone -- never the spawn env, which
+    # would leak into the session's subprocesses and nested claude runs
+    assert bare.argv[bare.argv.index('--effort') + 1] == 'high'
+    assert 'CLAUDE_CODE_EFFORT_LEVEL' not in (bare.env or {})
     # the seeded node settings ride the CLI flag once the file exists
     settings = node.node_dir / '.claude' / 'settings.json'
     settings.parent.mkdir()
     settings.write_text('{}\n', encoding='utf-8')
     seeded = backend.invocation('hi')
     assert seeded.argv[seeded.argv.index('--settings') + 1] == str(settings)
+    # an effort-less launch carries no effort flag
+    assert '--effort' not in seeded.argv
 
 
 def test_routed_invocation_redirects_the_anthropic_seam(

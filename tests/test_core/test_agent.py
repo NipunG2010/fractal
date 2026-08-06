@@ -50,6 +50,7 @@ __all__ = [
     'test_invocation_resolves_modes_and_mints_centrally',
     'test_invocation_merges_the_env_overlay',
     'test_invocation_pops_none_valued_env_keys',
+    'test_invocation_scrubs_ambient_effort_vars',
     'test_stream_records_sessions_and_costs',
     'test_stream_neutralizes_lone_surrogates',
     'test_stream_detached_skips_the_session_map',
@@ -345,6 +346,46 @@ def test_invocation_pops_none_valued_env_keys(
     assert composed.env['PATH'] == os.environ['PATH']
 
 
+def test_invocation_scrubs_ambient_effort_vars(
+    node_with_db: Node,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient effort vars are unset on compose; the pin stays flag-only.
+
+    An operator shell carrying ``CLAUDE_CODE_EFFORT_LEVEL`` would silently
+    override every step's pinned effort inside the child session, and a
+    stale ``CLAUDE_EFFORT`` (claude's own hook/Bash export) would
+    masquerade as the child's -- the verb scrubs the ambient vars, so the
+    only effort signal reaching the agent is ``_invocation``'s own flag.
+    """
+    monkeypatch.setenv('CLAUDE_EFFORT', 'xhigh')
+    monkeypatch.setenv('CLAUDE_CODE_EFFORT_LEVEL', 'high')
+    monkeypatch.setenv('AMBIENT', 'inherited')
+    backend = SampleAgent(node_with_db, 'sample')
+    composed = backend.invocation('hello', effort='low')
+    # neither scrubbed var reaches the spawn env; the pin rides argv alone
+    assert 'CLAUDE_EFFORT' not in composed.env
+    assert 'CLAUDE_CODE_EFFORT_LEVEL' not in composed.env
+    assert composed.argv[-2:] == ('--effort', 'low')
+    # a non-effort ambient key passes through untouched
+    assert composed.env['AMBIENT'] == 'inherited'
+
+    # the scrub forces composition even when the backend reserves no env
+    # keys and no overlay rides along -- env=None would inherit the parent
+    class BareEnvAgent(SampleAgent):
+        """Backend double whose builder reserves no env keys."""
+
+        def _invocation(self: BareEnvAgent, prompt: str, **kwargs: Any) -> Invocation:
+            built = super()._invocation(prompt, **kwargs)
+            return dataclasses.replace(built, env=None)
+
+    bare = BareEnvAgent(node_with_db, 'sample').invocation('hello')
+    assert bare.env is not None
+    assert 'CLAUDE_EFFORT' not in bare.env
+    assert 'CLAUDE_CODE_EFFORT_LEVEL' not in bare.env
+    assert bare.env['AMBIENT'] == 'inherited'
+
+
 def test_stream_records_sessions_and_costs(node_with_db: Node) -> None:
     """The driver stamps the session, flushes each figure, renders all."""
     node = node_with_db
@@ -381,6 +422,7 @@ def test_stream_records_sessions_and_costs(node_with_db: Node) -> None:
         model='opus-4.8',
         cost=0.42,
         budget_stopped=False,
+        models=('opus-4.8',),
     )
     # hooks fire in the documented order, one cost flush per figure
     names = [type(event).__name__ for event in backend.calls]
@@ -420,10 +462,14 @@ def test_stream_neutralizes_lone_surrogates(node_with_db: Node) -> None:
     ]
     rendered: list[StreamEvent] = []
     # no UnicodeEncodeError despite the lone surrogates in the bound fields
-    backend.stream(_lines(frames), step_id=step_id, render=rendered.append)
+    result = backend.stream(_lines(frames), step_id=step_id, render=rendered.append)
     row = node.db.read('steps', where={'step_id': step_id})[0]
     assert '\udc80' not in row['session']
     assert '\udc80' not in row['model']
+    # the drained served-model record is sanitized too -- it feeds the drop
+    # path's SQLite writes (row marks, model_drop events)
+    assert result.models
+    assert not any('\udc80' in model for model in result.models)
     text = next(event.text for event in rendered if event.kind == 'text')
     assert '\udc80' not in text
 

@@ -20,6 +20,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -51,10 +52,12 @@ __all__ = [
     'test_node_init_path_records_subproject',
     'test_init_prints_node_md_next_steps',
     'test_init_scaffolds_ignored_tmp_scratch_dir',
+    'test_engine_system_skills_ignored',
     'test_init_uncapped_priced_agent_warns',
     'test_init_uncapped_unpriced_agent_stays_quiet',
     'test_init_uncapped_warning_reads_the_spawning_parents_agent',
     'test_init_blind_seeds_no_subs_and_start_sweeps',
+    'test_merge_delete_reaps_the_merged_child',
     'test_list_filters_by_retired_and_depth',
     'test_list_status_count_and_live',
     'test_list_rejects_invalid_filters',
@@ -687,6 +690,30 @@ def test_init_scaffolds_ignored_tmp_scratch_dir(repo: dict) -> None:
     assert probe.returncode == 0
 
 
+def test_engine_system_skills_ignored(repo: dict) -> None:
+    """Engine-materialized system skills under ``skills/.system/`` stay untracked.
+
+    Codex materializes its bundled system skills into ``$CODEX_HOME/skills/``
+    at launch, and the agent seed symlinks that path at the node's tracked
+    ``skills/`` dir -- so without the exclude, every node branch would sweep
+    ~1,100 engine files into its next work commit.
+    """
+    task = repo['task']
+    # the managed info/exclude block keeps the engine tree out of git
+    probe = subprocess.run(
+        [
+            'git',
+            '-C',
+            f'{task}',
+            'check-ignore',
+            '-q',
+            '.fractal/main.task/skills/.system/imagegen/SKILL.md',
+        ],
+        capture_output=True,
+    )
+    assert probe.returncode == 0
+
+
 @pytest.mark.parametrize(
     argnames=('flags', 'warns'),
     argvalues=[
@@ -832,6 +859,89 @@ def test_init_blind_seeds_no_subs_and_start_sweeps(
         )
     # clean up so the shared module fixture is left as other tests expect
     assert _run(root, 'node', 'delete', 'main.blindkid', '--force').returncode == 0
+
+
+# ------ merge
+
+
+def test_merge_delete_reaps_the_merged_child(tmp_path: pathlib.Path) -> None:
+    """``node merge --delete`` chains the teardown onto a landed merge.
+
+    The lifecycle's happy path ends with the child's work on the parent and
+    no residue: worktree, branch, and registry row all go with the one
+    command, and the removal echoes the worktree's size. The teardown's own
+    refusals -- and its confirmation gate, which ``--force`` skips --
+    pre-flight the merge, so a chain that cannot finish never starts -- the
+    squash it would leave behind is irreversible.
+    """
+    root = tmp_path
+    _git(root, 'init', '-b', 'main')
+    _git(root, 'config', 'user.email', 'reap@test.local')
+    _git(root, 'config', 'user.name', 'reap')
+    (root / 'README.md').write_text('# reap\n', encoding='utf-8')
+    wiki = root / 'wiki'
+    wiki.mkdir()
+    (wiki / '_index.md').write_text(
+        '---\nname: wiki\n---\n# wiki\n\n***\n',
+        encoding='utf-8',
+    )
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-m', 'init')
+    assert _run(root, 'init').returncode == 0
+    assert _run(root, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    # the child commits real work on its branch
+    task = root / '.worktrees' / 'main.task'
+    _git(task, 'config', 'user.email', 'reap@test.local')
+    _git(task, 'config', 'user.name', 'reap')
+    (task / 'feature.txt').write_text('the work\n', encoding='utf-8')
+    _git(task, 'add', '-A')
+    _git(task, 'commit', '-m', 'main.task: feature')
+    # from inside the doomed worktree the chain refuses up front: git cannot
+    # remove a worktree the caller occupies, and that refusal must land
+    # before the squash rather than after a merge that already committed
+    inside = _run(task, 'node', 'merge', '--delete')
+    assert inside.returncode != 0
+    rendered = ' '.join(inside.stderr.replace('│', ' ').split())
+    assert 'Cannot delete the current worktree from inside it.' in rendered
+    assert not (root / 'feature.txt').exists()
+    assert task.exists()
+    # a paused descendant refuses the chain the same way -- its frozen work
+    # would block the teardown, so the refusal must also land before the squash
+    assert _run(task, 'node', 'init', 'sub', '--agent', 'claude').returncode == 0
+    sub = Node(root / '.worktrees' / 'main.task.sub')
+    sub.status_set('paused')
+    frozen = _run(root, 'node', 'merge', 'main.task', '--delete')
+    assert frozen.returncode != 0
+    rendered = ' '.join(frozen.stderr.replace('│', ' ').split())
+    assert 'active or paused descendant' in rendered
+    assert not (root / 'feature.txt').exists()
+    # settled again, the chain still gates on the delete's confirmation:
+    # declining aborts before the squash, leaving everything in place
+    sub.status_set('idle')
+    declined = _run(root, 'node', 'merge', 'main.task', '--delete', stdin='n\n')
+    assert declined.returncode != 0
+    assert not (root / 'feature.txt').exists()
+    assert task.exists()
+    # one forced command merges the work and reaps the whole subtree
+    result = _run(root, 'node', 'merge', 'main.task', '--delete', '--force')
+    assert result.returncode == 0, result.stderr
+    # the work landed on the parent...
+    assert (root / 'feature.txt').is_file()
+    # ...and the child left no residue: worktree, branch, and registry row
+    assert not task.exists()
+    assert _git(root, 'branch', '--list', 'main.task').stdout.strip() == ''
+    registry = _run(root, 'db', '_query', 'SELECT node FROM nodes', '--csv')
+    assert registry.returncode == 0, registry.stderr
+    assert 'main.task' not in registry.stdout
+    # the removal echo carries the reaped worktree's size: a real du reading
+    # (digits and a unit), never the '?' fallback of a failed measurement
+    removed = next(
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith('Removed worktree:')
+    )
+    size = removed.rsplit('(', 1)[-1].removesuffix(')')
+    assert re.fullmatch(r'[\d.]+[A-Za-z]?', size), removed
 
 
 # ------ list / status

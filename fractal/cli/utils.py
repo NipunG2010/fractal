@@ -38,6 +38,7 @@ __all__ = [
     'init_node',
     'resolve_init_target',
     'resolve_node',
+    'resolve_sender',
     'resolve_user_node',
     'resolve_target',
     'resolve_ledger_target',
@@ -498,30 +499,84 @@ def resolve_node(path: PathLike, *, check: bool = True) -> Node:
     return node
 
 
-def resolve_user_node(path: PathLike) -> Node:
-    """Resolve the tree's user (root) node from any checkout, by config not branch.
+def resolve_sender(path: Optional[str]) -> Node:
+    """Resolve the acting sender: ``--path`` when given, else the calling node.
 
-    The tree-wide brake (``pause``/``resume``) must always anchor on the user
-    node, but :func:`resolve_node` keys on the repo's *current* branch -- so on
-    a non-init checkout (the user on their own branch while nodes run) it
-    silently mis-scopes to a lone child or dies on two.
-    :meth:`Node.resolve_user` finds the ``config.json`` marked ``user: true``
+    The loop exports ``_NODE`` for the node whose loop is running, so a
+    production send attributes its ``sender`` to that node wherever the
+    agent's CLI call runs from (a detached step's cwd is not a node
+    identity); an explicit ``--path`` still wins -- an operator acting as a
+    node from outside it.
+
+    Args:
+        path: Explicit worktree directory, or ``None`` for the default.
+
+    Returns:
+        Node the message's ``sender`` attributes to.
+
+    Raises:
+        typer.BadParameter: If the exported ``_NODE`` does not name an
+            initialized node (a stale or mistyped export).
+
+    """
+    if path is not None:
+        return resolve_node(path)
+    if caller := Node.resolve_caller():
+        # mirror resolve_node's initialized-node check, naming the env
+        # source: a stale _NODE refuses cleanly, not as an internal error
+        if not caller.exists():
+            raise typer.BadParameter(
+                f'No fractal node at {caller.worktree} (resolved from the'
+                ' exported _NODE). Unset it or pass --path.'
+            )
+        return caller
+    # a set-but-unresolvable _NODE (a reaped worktree, a typo) refuses too:
+    # silently attributing the write to the cwd's node would be worse
+    if node_dir := os.environ.get('_NODE'):
+        raise typer.BadParameter(
+            f'No fractal node at {node_dir} (the exported _NODE names no'
+            ' git worktree). Unset it or pass --path.'
+        )
+    return resolve_node('.')
+
+
+def resolve_user_node(path: PathLike, name: Optional[str] = None) -> Node:
+    """Resolve a tree's user (root) node from any checkout, by config not branch.
+
+    The tree-wide verbs (``pause``/``resume``/``track``/...) must always
+    anchor on the user node, but :func:`resolve_node` keys on the repo's
+    *current* branch -- so on a non-init checkout (the user on their own
+    branch while nodes run) it silently mis-scopes to a lone child or dies on
+    two. :meth:`Node.resolve_user` finds the ``config.json`` marked
+    ``user: true`` for the named tree (or the one owning the caller's branch)
     and pins a ``Node`` to that branch, independent of the git checkout; this
-    wrapper turns its no-fractal ``None`` into the CLI refusal.
+    wrapper turns its no-such-tree ``None`` into the CLI refusal.
 
     Args:
         path: Any path inside the repo.
+        name: Root branch of the tree to act on; ``None`` infers it from the
+            caller's branch.
 
     Returns:
-        The user (root) node, branch-pinned.
+        The tree's user (root) node, branch-pinned.
 
     Raises:
-        typer.BadParameter: If the repo has no user node (no fractal).
+        typer.BadParameter: If the repo has no such tree, or several trees
+            leave the caller's checkout ambiguous.
 
     """
-    user = Node.resolve_user(path)
+    # an ambiguous checkout is a usage mistake, not a runtime failure -- its
+    # remedy is naming the tree, so it refuses like the unknown name below
+    try:
+        user = Node.resolve_user(path, name=name)
+    except RuntimeError as error:
+        raise typer.BadParameter(str(error)) from None
     if user is None:
         repo = Node(path).repo_dir
+        if name is not None:
+            trees = ', '.join(tree.branch for tree in Node.user_nodes(path))
+            found = f' Trees here: {trees}.' if trees else ''
+            raise typer.BadParameter(f'No fractal tree {name!r} under {repo}.{found}')
         raise typer.BadParameter(
             f'No user node found under {repo}. Run `fractal init` at the repo root.'
         )

@@ -199,7 +199,11 @@ def test_public_set_scope_space_form_normalizes_to_init_shape(
     A comma-only split at the write boundary would persist a one-entry
     list that consumers of the canonical list form mis-read: space, comma,
     and mixed forms must all land as the init-canonical split list, and a
-    string-form scope must keep reading back split.
+    string-form scope must keep reading back split. Entries land in
+    canonical path form too -- the commit boundary is a literal string
+    prefix against git's canonical paths, so a stored ``./src`` or
+    ``src/`` would read every change as out of scope and refuse every
+    commit.
     """
     config_path = task / '.fractal' / 'main.task' / 'config.json'
     # the space form lands split, not as a one-entry ['roots/a roots/b']
@@ -212,6 +216,11 @@ def test_public_set_scope_space_form_normalizes_to_init_shape(
     assert written.returncode == 0
     stored = json.loads(config_path.read_text(encoding='utf-8'))['scope']
     assert stored == ['roots/a', 'roots/b', 'roots/c']
+    # non-canonical spellings land canonical ('.' is already its own)
+    written = _run(task, 'node', 'config', 'set', 'scope=./roots/a roots/b/ roots//c .')
+    assert written.returncode == 0
+    stored = json.loads(config_path.read_text(encoding='utf-8'))['scope']
+    assert stored == ['roots/a', 'roots/b', 'roots/c', '.']
     # a space-joined string value still reads back split (read normalization intact)
     config = json.loads(config_path.read_text(encoding='utf-8'))
     config['scope'] = 'roots/a roots/b'

@@ -218,12 +218,12 @@ to `.gitignore`. The root node's own `.fractal/` is **git-ignored on the
 top-level branch** by default, keeping it out of your main history; run
 `fractal track` to commit it there too and `fractal untrack` to revert — both
 toggle only the ignore and print the follow-up git command, never touching the
-index. Fractal manages this — its runtime artifacts (worktrees, the central
-database, status, agent logs) plus the top-level `.fractal/` — via the
-repo-local `.git/info/exclude`, which it writes automatically; it never touches
-the committed `.gitignore`. Keep your own ignore patterns anchored
-(`/artifacts/`, not `artifacts/`), or they also match — and silently hide —
-same-named subtrees at any depth, such as a node's committable
+index. Fractal manages this automatically: its runtime artifacts (worktrees, the
+central database, status, agent logs) ride the repo-local `.git/info/exclude`,
+and the top-level `.fractal/<branch>/` hides itself with its own ignore file —
+the committed `.gitignore` is never touched. Keep your own ignore patterns
+anchored (`/artifacts/`, not `artifacts/`), or they also match — and silently
+hide — same-named subtrees at any depth, such as a node's committable
 `.fractal/<node>/artifacts/`.
 
 `fractal init` also wires the wiki merge driver: the committed `.gitattributes`
@@ -424,8 +424,9 @@ Once the node is running, briefly explain how to interact with it:
   included), while `activity`'s `cost` column sums only the node's own steps —
   and both are per-run, with no lifetime rollup.
 - **TUI:** For a live view of the whole tree — nodes, runs, costs, and output —
-  suggest the user open the dashboard with `fractal open` (run from the repo
-  root).
+  suggest the user open the dashboard with `fractal open` (from anywhere in the
+  repo; add a node branch to open focused on it, or a tree's root branch to open
+  at the root).
 - **Stopping:** From the worktree, three escalation levels:
   - `fractal node finish` — stop after current iteration
   - `fractal node stop` — stop after current step
@@ -461,18 +462,33 @@ Once the node is running, briefly explain how to interact with it:
   still carries its own version there, so land the resolution on the node (or
   retire it) or a later re-merge silently re-stages it. Deleting afterward with
   `fractal node delete <branch>` is optional hygiene, never automatic — a merged
-  branch keeps audit value (delete must run from outside the worktree). **Delete
-  is destructive:** it is recursive — removing the node's whole subtree — and
-  force-removes each worktree and **force-deletes the branch(es) regardless of
-  merge state**, so any committed-but-unmerged work is lost. Always confirm the
-  `merge` succeeded first (check its output). To keep a node's branch while
-  hiding it, retire it instead. Delete prompts for confirmation `[y/N]`; pass
-  `--force`/`-f` to skip the prompt.
+  branch keeps audit value (delete must run from outside the worktree). Pass
+  `--delete` to `merge` to chain the two in one command: every delete refusal
+  and the confirmation `[y/N]` pre-flight the squash, so a chain that cannot
+  finish never starts. **Delete is destructive:** it is recursive — removing the
+  node's whole subtree — and force-removes each worktree and **force-deletes the
+  branch(es) regardless of merge state**, so any committed-but-unmerged work is
+  lost. Always confirm the `merge` succeeded first (check its output). To keep a
+  node's branch while hiding it, retire it instead. Delete prompts for
+  confirmation `[y/N]`, chained or standalone; pass `--force`/`-f` to skip the
+  prompt.
 - **Reset:** `fractal reset` (from anywhere in the repo) tears down every node
-  worktree, branch, and registration in one sweep; the project, wiki, and all
-  history in the central database survive, so fresh nodes spawn immediately
-  after. It refuses while any node is running or paused, and prompts `[y/N]`
-  (`--force`/`-f` skips).
+  worktree, branch, and registration in the tree in one sweep; the project,
+  wiki, and all history in the central database survive, so fresh nodes spawn
+  immediately after. It refuses while any node is running; a paused node is
+  killed as part of the teardown, which the confirmation `[y/N]` authorizes
+  (`--force`/`-f` skips it).
+- **Tree scope:** one repository can carry several trees — one per branch you
+  ran `fractal init` on, each with its own user node, database, and history. The
+  tree-scoped verbs (`pause`, `resume`, `reset`, `track`, `untrack`, `open`)
+  take the tree's root branch as an optional first argument and otherwise infer
+  it from your own branch: a node worktree names its tree, the repo root names
+  its checkout. With several trees and a checkout belonging to none of them,
+  they refuse rather than guess — name the tree. `open` and `node list` also
+  accept a node branch in that slot, scoping to that node instead of the whole
+  tree. `destroy` takes the same name but never infers it: a bare
+  `fractal destroy` is ambiguous between this tree and everything, so name a
+  tree or pass `--all`, the one repo-wide verb.
 - **Radio:** nodes communicate via `fractal radio` commands. `radio send` writes
   any channel permissions allow, given at least one routing dimension
   (`--node`/`--parent` or `--channel`) — a fully bare send refuses; `radio post`
@@ -545,12 +561,16 @@ fix:
 Run `fractal --help` and `fractal <command> --help` for all commands and
 options. Commands act on the node in the current directory by default, so `cd`
 into a worktree to operate on it; to act on another node from elsewhere in the
-repo, name its branch positionally (e.g. `fractal node status <branch>`).
-`--path` is an escape hatch for running from outside a worktree.
+repo, name its branch positionally (e.g. `fractal node status <branch>`). Radio
+verbs that write rows (send, post, reply, react, unsend, save, unsave, sub,
+unsub, channel create/delete) act as the loop-exported `_NODE` before the cwd,
+so a node's writes attribute to it from any directory; radio listings stay
+cwd-scoped. `--path` is an escape hatch for running from outside a worktree.
 `fractal node init` is the exception: `<name>` plus the project root via
 `--path`.
 
 Nodes spawn their own children — the running loop sets the `_NODE` environment
-that makes `fractal node init` nest the child under the calling node. Running it
-by hand from inside a worktree without that env nests under the repo-root user
-node instead, so operators normally don't spawn children manually.
+that makes `fractal node init` nest the child under the calling node (the same
+export names the acting identity for radio's writing verbs). Running it by hand
+from inside a worktree without that env nests under the repo-root user node
+instead, so operators normally don't spawn children manually.

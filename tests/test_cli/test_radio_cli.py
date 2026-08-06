@@ -46,6 +46,10 @@ __all__ = [
     'test_read_refuses_cross_tree_mailbox',
     'test_read_without_reader_names_the_remedy',
     'test_listings_are_passive_and_metadata_only',
+    'test_send_sender_follows_node_env',
+    'test_post_and_reply_follow_node_env',
+    'test_write_verbs_follow_node_env',
+    'test_stale_node_env_refused_cleanly',
     'test_sent_command_lists_outbound_mail',
     'test_feed_fans_out_over_subscriptions',
     'test_feed_listing_passive_and_read_feed_catches_up',
@@ -830,6 +834,228 @@ def test_listings_are_passive_and_metadata_only(repo: dict) -> None:
     assert marked in _radio(beta, 'messages', '--read').stdout
     # rows outside the read's selection were untouched
     assert spared in _radio(beta, 'messages', '--channel', 'private').stdout
+
+
+def test_send_sender_follows_node_env(repo: dict) -> None:
+    """An exported ``_NODE`` names the sender regardless of cwd.
+
+    Production loops export ``_NODE`` for the node they drive, so a send
+    run from anywhere attributes its ``sender`` to that node -- a detached
+    step's cwd is not a node identity; an explicit ``--path`` still wins,
+    and without either the cwd's node sends.
+    """
+    alpha, beta, root = repo['alpha'], repo['beta'], repo['root']
+    # send from the ROOT worktree with alpha's identity exported
+    sent = _run(
+        root,
+        'radio',
+        'send',
+        'env-sent body',
+        '--node',
+        'main.beta',
+        '--channel',
+        'inbox',
+        '--subject',
+        'es',
+        '--priority',
+        '5',
+        _NODE=f'{alpha}',
+    )
+    assert sent.returncode == 0, sent.stderr
+    uuid = sent.stdout.strip()
+    # the send attributes to alpha: alpha's sent listing carries it ...
+    assert uuid in _radio(alpha, 'sent').stdout
+    # ... and the root's does not
+    assert uuid not in _radio(root, 'sent').stdout
+    # an explicit --path still wins over the exported identity
+    explicit = _run(
+        root,
+        'radio',
+        'send',
+        'path wins',
+        '--node',
+        'main.beta',
+        '--channel',
+        'inbox',
+        '--subject',
+        'pw',
+        '--priority',
+        '5',
+        '--path',
+        f'{beta}',
+        _NODE=f'{alpha}',
+    )
+    assert explicit.returncode == 0, explicit.stderr
+    assert explicit.stdout.strip() in _radio(beta, 'sent').stdout
+
+
+def test_post_and_reply_follow_node_env(repo: dict) -> None:
+    """An exported ``_NODE`` names the post and reply sender alike.
+
+    All three writing verbs share one sender resolution -- a bare post from
+    a foreign cwd reports out to the exported node's own outbox, and a
+    reply attributes to the exported node the same way.
+    """
+    alpha, beta, root = repo['alpha'], repo['beta'], repo['root']
+    # post from the ROOT worktree with alpha's identity exported
+    posted = _run(
+        root,
+        'radio',
+        'post',
+        'env-post body',
+        '--subject',
+        'ep',
+        '--priority',
+        '5',
+        _NODE=f'{alpha}',
+    )
+    assert posted.returncode == 0, posted.stderr
+    uuid = posted.stdout.strip()
+    # the bare post reports out to alpha's outbox: alpha's sent listing
+    # carries it and the root's does not
+    assert uuid in _radio(alpha, 'sent').stdout
+    assert uuid not in _radio(root, 'sent').stdout
+    # a reply from the root worktree attributes to the exported node too
+    replied = _run(
+        root,
+        'radio',
+        'reply',
+        uuid,
+        'env-reply body',
+        _NODE=f'{beta}',
+    )
+    assert replied.returncode == 0, replied.stderr
+    assert replied.stdout.strip() in _radio(beta, 'sent').stdout
+
+
+def test_write_verbs_follow_node_env(repo: dict) -> None:
+    """An exported ``_NODE`` names the acting node for every row-writing verb.
+
+    The archive, reaction, subscription, channel, and unsend verbs share the
+    writing trio's sender resolution: run from the ROOT worktree as alpha,
+    each row lands in alpha's listings and never the root's, the
+    identity-gated deletes (sender-only ``unsend``, owner-scoped ``unsave``
+    and ``channel delete``) succeed as alpha, and a re-react flips alpha's
+    single vote in place instead of tallying a second node's. An explicit
+    ``--path`` still wins, with the channel pair as the representative.
+    """
+    alpha, beta, root = repo['alpha'], repo['beta'], repo['root']
+    uuid = _send(alpha, 'env verb body', channel='inbox', subject='ev')
+    # save/unsave from the ROOT worktree with alpha's identity exported:
+    # the archive copy is alpha's, never the root's, and only alpha's
+    # exported identity finds it to unsave
+    saved = _run(root, 'radio', 'save', uuid, _NODE=f'{alpha}')
+    assert saved.returncode == 0, saved.stderr
+    assert uuid in _radio(alpha, 'messages', '--saved').stdout
+    assert uuid not in _radio(root, 'messages', '--saved').stdout
+    unsaved = _run(root, 'radio', 'unsave', uuid, _NODE=f'{alpha}')
+    assert unsaved.returncode == 0, unsaved.stderr
+    assert uuid not in _radio(alpha, 'messages', '--saved').stdout
+    # react keys one vote per node: alpha's own '+' then an env-keyed '-'
+    # flips that single vote in place -- a root-attributed react would
+    # tally a second vote (and be refused on alpha's read-only inbox)
+    assert _radio(alpha, 'react', uuid, '+').returncode == 0
+    reacted = _run(root, 'radio', 'react', uuid, '-', _NODE=f'{alpha}')
+    assert reacted.returncode == 0, reacted.stderr
+    rows = json.loads(_radio(alpha, 'messages', '--all', '--json').stdout)
+    row = next(r for r in rows if r['message_uuid'] == uuid)
+    assert (row['pos_reacts'], row['neg_reacts']) == (0, 1)
+    # unsend is sender-gated: alpha's exported identity deletes its own
+    # message, and the row vanishes from beta's mailbox
+    sent_uuid = _send(alpha, 'env unsend body', node='main.beta', subject='eu')
+    assert sent_uuid in _radio(beta, 'messages', '--all').stdout
+    unsent = _run(root, 'radio', 'unsend', sent_uuid, _NODE=f'{alpha}')
+    assert unsent.returncode == 0, unsent.stderr
+    assert sent_uuid not in _radio(beta, 'messages', '--all').stdout
+    # sub/unsub write alpha's subscription rows; the root's seeded set
+    # never moves
+    root_subs = _radio(root, 'subs').stdout
+    subbed = _run(
+        root,
+        'radio',
+        'sub',
+        '--node',
+        'main.beta',
+        '--channel',
+        'public',
+        _NODE=f'{alpha}',
+    )
+    assert subbed.returncode == 0, subbed.stderr
+    subs = list(csv.DictReader(io.StringIO(_radio(alpha, 'subs').stdout)))
+    assert any(s['target'] == 'main.beta' and s['channel'] == 'public' for s in subs)
+    unsubbed = _run(root, 'radio', 'unsub', '--node', 'main.beta', _NODE=f'{alpha}')
+    assert unsubbed.returncode == 0, unsubbed.stderr
+    assert 'Removed 1 subscription.' in unsubbed.stdout
+    assert 'main.beta' not in _radio(alpha, 'subs').stdout
+    assert _radio(root, 'subs').stdout == root_subs
+    # channel create/delete act on alpha's channel-space -- the delete
+    # cascade is keyed to the exported identity, so it succeeds only as
+    # alpha (the root owns no such channel)
+    created = _run(root, 'radio', 'channel', 'create', 'envverb', _NODE=f'{alpha}')
+    assert created.returncode == 0, created.stderr
+    assert 'envverb' in _radio(alpha, 'channel', 'list').stdout
+    assert 'envverb' not in _radio(root, 'channel', 'list').stdout
+    deleted = _run(root, 'radio', 'channel', 'delete', 'envverb', _NODE=f'{alpha}')
+    assert deleted.returncode == 0, deleted.stderr
+    assert 'envverb' not in _radio(alpha, 'channel', 'list').stdout
+    # an explicit --path still wins over the exported identity
+    explicit = _run(
+        root,
+        'radio',
+        'channel',
+        'create',
+        'pathwins',
+        '--path',
+        f'{beta}',
+        _NODE=f'{alpha}',
+    )
+    assert explicit.returncode == 0, explicit.stderr
+    assert 'pathwins' in _radio(beta, 'channel', 'list').stdout
+    assert 'pathwins' not in _radio(alpha, 'channel', 'list').stdout
+    removed = _run(
+        root,
+        'radio',
+        'channel',
+        'delete',
+        'pathwins',
+        '--path',
+        f'{beta}',
+        _NODE=f'{alpha}',
+    )
+    assert removed.returncode == 0, removed.stderr
+    assert 'pathwins' not in _radio(beta, 'channel', 'list').stdout
+
+
+def test_stale_node_env_refused_cleanly(repo: dict, tmp_path: pathlib.Path) -> None:
+    """A stale ``_NODE`` refuses as a usage error, for writers and the reader.
+
+    The write verbs and ``read`` trust the loop-exported identity, so a
+    stale or mistyped export -- a git repo that is no node, or a path that
+    resolves to no worktree at all (a reaped node) -- must fail cleanly,
+    naming the source and the remedy, instead of leaking an internal error
+    or silently attributing to the cwd's node.
+    """
+    root = repo['root']
+    stale = tmp_path / 'stale'
+    stale.mkdir()
+    _git(stale, 'init', '-b', 'main')
+    _git(stale, 'config', 'user.email', 'radio@test.local')
+    _git(stale, 'config', 'user.name', 'radio')
+    _git(stale, 'commit', '--allow-empty', '-m', 'init')
+    # a git repo that is no fractal node, and a path naming no worktree at
+    # all, refuse the same way -- for a write verb and for read's reader
+    for verb, bad in [
+        (('post', 'stale body', '--subject', 'st', '--priority', '5'), stale),
+        (
+            ('post', 'gone body', '--subject', 'go', '--priority', '5'),
+            tmp_path / 'gone',
+        ),
+        (('read', 'AAAA1111'), stale),
+    ]:
+        result = _run(root, 'radio', *verb, _NODE=f'{bad}')
+        assert result.returncode != 0, result.stdout
+        assert 'No fractal node' in result.stderr
+        assert '_NODE' in result.stderr
 
 
 def test_sent_command_lists_outbound_mail(repo: dict) -> None:

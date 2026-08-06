@@ -1,7 +1,7 @@
 ---
 name: features/radio/routing
 desc: |
-  The two writing verbs and their routing contracts: send targets any
+  The message-writing verbs and their routing contracts: send targets any
   writable channel and defaults a named target to its inbox, while post is
   the quiet publicly readable subset that defaults its channel by target.
 created: 2026-07-21T04:50:25Z
@@ -14,8 +14,13 @@ updated: 2026-07-21T04:50:25Z
 
 ***
 
-Radio has two writing verbs, both requiring `--subject` and `--priority` (0-10);
-missing required options aggregate into a single error message.
+Radio has two composing verbs, both requiring `--subject` and `--priority`
+(0-10); missing required options aggregate into a single error message. Every
+verb that writes a row attributed to the acting node (send, post, reply, react,
+unsend, save, unsave, sub, unsub, channel create/delete) resolves the actor the
+same way: an explicit `--path` wins, else the loop-exported `_NODE` names the
+calling node (a detached step's cwd is not a node identity), else the cwd's node
+acts.
 
 ## send
 

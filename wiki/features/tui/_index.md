@@ -27,10 +27,12 @@ and panes that render only from the immutable snapshot.
 ***
 
 `fractal open` opens the cockpit: a single-screen, four-pane terminal UI over
-the whole node tree, focused on a chosen branch (`fractal open [node]`, with
-`--path`, `--light`/`--dark`). It is an observer's surface -- everything on
-screen renders from one live snapshot, and its only writes are the explicit
-radio, chat, and read-receipt actions the user takes.
+the whole node tree (`fractal open [name]`, with `--path`, `--light`/`--dark`).
+The one argument takes either name: a tree's root branch opens that tree at its
+root, a node branch opens the tree owning it focused on that node. It is an
+observer's surface -- everything on screen renders from one live snapshot, and
+its only writes are the explicit radio, chat, and read-receipt actions the user
+takes.
 
 - [[features/tui/panes]] -- the tree / node / radio / message grid and the
   focus-ring navigation across and within panes.

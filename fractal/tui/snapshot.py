@@ -35,10 +35,11 @@ __all__ = [
     'SnapshotBuilder',
 ]
 
-# the sync pre-step persists as step=0 rows (the loop's drain wait); it is
-# excluded from the displayed step numerator/denominator so the card reads
-# step N/N over the real loop steps, and renders as plain `sync` in the
-# explorer and event log
+# the built-in sync pass records under this name, but a user step file can
+# carry the same name, so SYNC-named rows classify structurally (_sync_ids):
+# passes are excluded from the displayed step numerator/denominator and
+# render as plain `sync` in the explorer and event log, while a settled row
+# alone on its number reads as the numbered step it is
 _SYNC_NAME = 'SYNC'
 
 # the widest node-event verb floors the event-log desc column (see Geometry)
@@ -490,7 +491,7 @@ class SnapshotBuilder:
         for branch in self._subtree(scope):
             self._ensure_runcost(branch)
         self._stale.discard(scope)
-        run, it, step = _context(runs, iters, steps)
+        run, it, step = _context(runs, iters, steps, config)
         # the card's session is the currently running one -- the open
         # iteration's newest stamped step -- never a prior step's leftover
         if it is not None:
@@ -513,8 +514,8 @@ class SnapshotBuilder:
             step=step,
             spends=spends,
         )
-        history = _history(runs, iters, steps, runcost)
-        log = _log(log_raw, [run['run_id'] for run in runs], scope)
+        history = _history(runs, iters, steps, runcost, config)
+        log = _log(log_raw, [run['run_id'] for run in runs], scope, config)
         self._logs[scope] = log
         # each row carries the run's subtree spend as of its own end -- the
         # card's run-cost figure when the explorer highlights it (open rows
@@ -580,7 +581,7 @@ class SnapshotBuilder:
             'iter': it['iter'] if it else None,
             'iter_max': iter_max,
             'step': step['step'] if step else None,
-            'step_total': _step_total(steps, run),
+            'step_total': _step_total(steps, run, _sync_ids(steps, config)),
             'step_name': step['step_name'] if step else None,
             'elapsed_step': self._elapsed(step) if step else None,
             'elapsed_iter': self._elapsed(it) if it else None,
@@ -689,10 +690,11 @@ class SnapshotBuilder:
         def placeholder() -> None:
             self._logs[branch] = ()
 
+        config = self._data.config(branch)
         with self._section(branch, placeholder=placeholder) as connection:
             log_raw = self._data.log_rows(connection, (branch,))
             run_ids = self._data.run_ids(connection, branch)
-            self._logs[branch] = _log(log_raw, run_ids, branch)
+            self._logs[branch] = _log(log_raw, run_ids, branch, config)
 
     def _subtree_log(self: SnapshotBuilder, subtree: list[str]) -> tuple[dict, ...]:
         """Merge the subtree's activity logs, newest first (capped like one)."""
@@ -925,15 +927,57 @@ _EMPTY_SHAPE: dict[str, Any] = {
 }
 
 
+def _sync_mode(config: dict) -> bool:
+    """Return the node's sync mode, coerced exactly like the loop coerces it.
+
+    Absent means on; any present value takes its truthiness (so even a
+    string ``"false"`` reads as on, matching the running loop).
+    """
+    sync = config.get('sync')
+    return True if sync is None else bool(sync)
+
+
+def _sync_ids(steps: list[dict], config: dict) -> set[int]:
+    """Return the step ids of the built-in sync passes.
+
+    A SYNC-named row is a pass when it is a step-0 drain-wait row, when a
+    differently-named step in the same iteration owns its number (the
+    pre-step and approval-wait passes), or while it is still open under
+    sync mode (a live pre-step pass precedes its own step's row; with sync
+    off no pass can exist, so a live SYNC row is a user step mid-flight).
+    A settled SYNC row alone on its number reads as a real step -- a user
+    step file named SYNC -- so a fatally timed-out pass, whose step never
+    launched, deliberately wears that step's number and its own failure.
+    """
+    live_pass = _sync_mode(config)
+    owned: dict[int, set[int]] = {}
+    for step in steps:
+        if step['step_name'] != _SYNC_NAME:
+            owned.setdefault(step['iter_id'], set()).add(step['step'])
+    result = set()
+    for step in steps:
+        if step['step_name'] != _SYNC_NAME:
+            continue
+        numbers = owned.get(step['iter_id'], set())
+        if (
+            step['step'] == 0
+            or (live_pass and step['ended_at'] is None)
+            or step['step'] in numbers
+        ):
+            result.add(step['step_id'])
+    return result
+
+
 def _context(
     runs: list[dict],
     iters: list[dict],
     steps: list[dict],
+    config: dict,
 ) -> tuple[Optional[dict], Optional[dict], Optional[dict]]:
     """Resolve the displayed (run, iter, step) from the tables.
 
     Run and iteration are the active else newest; the step is the iteration's
-    active non-SYNC step else its last numbered step.
+    active step else its last numbered one, sync passes excluded.
     """
     run = next((r for r in runs if r['status'] == 'active'), runs[0] if runs else None)
     if run is None:
@@ -946,11 +990,12 @@ def _context(
     step: Optional[dict] = None
     if it is not None:
         it_steps = [s for s in steps if s['iter_id'] == it['iter_id']]
+        sync = _sync_ids(it_steps, config)
         active = next((s for s in it_steps if s['status'] == 'active'), None)
-        if active is not None and active['step_name'] != _SYNC_NAME:
+        if active is not None and active['step_id'] not in sync:
             step = active
         else:
-            numbered = [s for s in it_steps if s['step_name'] != _SYNC_NAME]
+            numbered = [s for s in it_steps if s['step_id'] not in sync]
             step = max(
                 numbered,
                 key=lambda s: (s['step'], s['step_id']),
@@ -976,8 +1021,8 @@ def _open_epoch(row: Optional[dict]) -> Optional[float]:
     return started.timestamp()
 
 
-def _step_total(steps: list[dict], run: dict) -> Optional[int]:
-    """Return a run's pipeline length: ``MAX(step)`` over its steps, no SYNC.
+def _step_total(steps: list[dict], run: dict, sync: set[int]) -> Optional[int]:
+    """Return a run's pipeline length: ``MAX(step)``, sync passes excluded.
 
     Scoped to the given run so a pipeline trimmed between runs (5 -> 3)
     reports the new run's own N rather than the stale all-run max (which never
@@ -985,7 +1030,7 @@ def _step_total(steps: list[dict], run: dict) -> Optional[int]:
     """
     scoped = [s for s in steps if s['run_id'] == run['run_id']]
     total = max(
-        (s['step'] for s in scoped if s['step_name'] != _SYNC_NAME),
+        (s['step'] for s in scoped if s['step_id'] not in sync),
         default=0,
     )
     return total or None
@@ -1049,6 +1094,7 @@ def _history(
     iters: list[dict],
     steps: list[dict],
     runcost: dict[int, tuple[Optional[int], float]],
+    config: dict,
 ) -> tuple[dict, ...]:
     """Shape the explorer tree: runs (newest first) -> iters -> steps.
 
@@ -1056,8 +1102,9 @@ def _history(
     PREPARE`` / ``sync``); every row carries its database ids so the explorer
     and the event-log reveal address exact entities. A step's own pre-step
     sync folds into it (time spans both, costs sum) rather than listing
-    separately; drain-wait syncs list as standalone ``sync`` rows in
-    chronological place.
+    separately; drain-wait and still-live syncs list as standalone ``sync``
+    rows in chronological place, and a settled SYNC row alone on its number
+    lists as the numbered step it is -- a user step named SYNC.
     """
     iters_by_run: dict[int, list[dict]] = {}
     for it in iters:
@@ -1065,6 +1112,7 @@ def _history(
     steps_by_iter: dict[int, list[dict]] = {}
     for step in steps:
         steps_by_iter.setdefault(step['iter_id'], []).append(step)
+    sync = _sync_ids(steps, config)
     total = len(runs)
     result = []
     for index, run in enumerate(runs):
@@ -1080,7 +1128,7 @@ def _history(
                 it_steps[-1] if it_steps else None,
             )
             if display is not None:
-                total_steps = _step_total(steps, run)
+                total_steps = _step_total(steps, run, sync)
                 step_name = display['step_name']
                 step_num = display['step']
                 step_disp = f'{step_name} {step_num}/{total_steps}'
@@ -1088,13 +1136,13 @@ def _history(
                 step_disp = 'done'
             # each numbered step absorbs the sync passes that share its
             # recorded number (its pre-step sync); the step-0 drain-wait
-            # passes precede no step, so they keep standalone `sync` rows
-            # owning their time and cost
-            numbers = {s['step'] for s in it_steps if s['step_name'] != _SYNC_NAME}
+            # and still-live passes precede no recorded step, so they keep
+            # standalone `sync` rows owning their time and cost
+            numbers = {s['step'] for s in it_steps if s['step_id'] not in sync}
             folded: dict[int, list[dict]] = {}
             standalone: set[int] = set()
             for s in it_steps:
-                if s['step_name'] != _SYNC_NAME:
+                if s['step_id'] not in sync:
                     continue
                 if s['step'] in numbers:
                     folded.setdefault(s['step'], []).append(s)
@@ -1102,11 +1150,15 @@ def _history(
                     standalone.add(s['step_id'])
             step_rows = []
             for step in it_steps:
-                is_sync = step['step_name'] == _SYNC_NAME
+                is_sync = step['step_id'] in sync
                 if is_sync and step['step_id'] not in standalone:
                     continue
                 if is_sync:
+                    # step 0 keeps the selected card reading plain `sync`
+                    # (the run-line sentinel), whatever number a live
+                    # pre-step pass recorded
                     label = 'sync'
+                    step_num = 0
                     syncs = []
                 else:
                     step_num = step['step']
@@ -1124,7 +1176,7 @@ def _history(
                 step_row = {
                     'label': label,
                     'status': step['status'],
-                    'step': step['step'],
+                    'step': step_num,
                     'name': step['step_name'],
                     'agent': step['agent'],
                     'model': step['model'],
@@ -1180,17 +1232,47 @@ def _history(
     return tuple(result)
 
 
-def _log(rows: list[dict], run_ids: list[int], branch: str) -> tuple[dict, ...]:
+def _log(
+    rows: list[dict],
+    run_ids: list[int],
+    branch: str,
+    config: dict,
+) -> tuple[dict, ...]:
     """Shape the activity view rows: derive each row's kind from its ids.
 
     Every row carries the owning ``branch`` and its lineage ordinals
     ``run_n``/``iter_n``/``step_n`` (the run ordinal is attached here -- the
     view only knows ids; ``run_ids`` lists the branch's runs newest first);
     a sync pass keeps ``step_n == 0``, which the log renders as an empty
-    step cell.
+    step cell. Step rows also carry ``sync`` -- the pass-vs-step verdict the
+    log's muting keys on, :func:`_sync_ids`'s rule derived from the window's
+    own rows.
     """
     total = len(run_ids)
     run_numbers = {run_id: total - index for index, run_id in enumerate(run_ids)}
+    # classify the window's sync passes like _sync_ids does from the steps
+    # table: a step settles when its end row lands, and rows are newest-first,
+    # so any start row in the window has its end row here too
+    live_pass = _sync_mode(config)
+    owned: dict[int, set[int]] = {}
+    ended: set[int] = set()
+    for row in rows:
+        if row['event_id'] is not None or row['step_id'] is None:
+            continue
+        if row['step_name'] != _SYNC_NAME:
+            owned.setdefault(row['iter_id'], set()).add(row['step_n'])
+        elif row['event'] == 'end':
+            ended.add(row['step_id'])
+    sync_ids: set[int] = set()
+    for row in rows:
+        if row['event_id'] is not None or row['step_id'] is None:
+            continue
+        if row['step_name'] == _SYNC_NAME and (
+            row['step_n'] == 0
+            or (live_pass and row['step_id'] not in ended)
+            or row['step_n'] in owned.get(row['iter_id'], set())
+        ):
+            sync_ids.add(row['step_id'])
     result = []
     for row in rows:
         if row['event_id'] is not None:
@@ -1215,6 +1297,7 @@ def _log(rows: list[dict], run_ids: list[int], branch: str) -> tuple[dict, ...]:
             'step_n': row['step_n'],
             'branch': branch,
             'name': row['step_name'] if kind == 'step' else None,
+            'sync': kind == 'step' and row['step_id'] in sync_ids,
             'event': row['event'],
             'status': row['status'],
             'exit_code': row['exit_code'],

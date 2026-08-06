@@ -31,6 +31,7 @@ __all__ = [
     'test_force_commit_body_describes_the_sweep',
     'test_commit_ignore_scope_bypasses_scope_but_not_lint',
     'test_multi_scope_commit_boundary',
+    'test_dot_scope_root_bounds_the_whole_project',
     'test_scoped_commit_handles_non_ascii_and_whitespace_paths',
     'test_scoped_child_baseline_commits_init_gitattributes',
     'test_commit_check_detects_untracked_work',
@@ -86,6 +87,16 @@ def test_user_node_commit_init_commits_baseline(
     # the baseline commits without error and always tracks the project wiki; the
     # node's own seed is committed only on a tracked tree
     before = _head()
+    # a stranded config write lock sits beside the config at commit time
+    (git_repo / '.fractal' / 'main' / 'config.json.lock').touch()
+    # engine-materialized system skills sit under the tracked skills dir
+    system = git_repo / '.fractal' / 'main' / 'skills' / '.system' / 'imagegen'
+    system.mkdir(parents=True)
+    (system / 'SKILL.md').write_text('engine-materialized\n', encoding='utf-8')
+    # a fresh clone carries no info/exclude at all, so the baseline cannot
+    # lean on a block written at init -- the runtime artifacts beside the
+    # seed must stay out of the commit on their own
+    (git_repo / '.git' / 'info' / 'exclude').unlink()
     node.commit('configure', init=True)
     # a tracked tree makes a real commit (the seed is new); untracked, the wiki
     # is already committed by the fixture, so the baseline is legitimately a no-op
@@ -101,6 +112,10 @@ def test_user_node_commit_init_commits_baseline(
     tracked = result.stdout
     assert 'wiki/_index.md' in tracked
     assert ('.fractal/main/config.json' in tracked) == track
+    # runtime artifacts never ride the baseline, tracked or not
+    assert '.db' not in tracked
+    assert 'config.json.lock' not in tracked
+    assert 'skills/.system' not in tracked
 
 
 def test_commit_pushes_unless_local(tmp_path: pathlib.Path) -> None:
@@ -714,6 +729,56 @@ def test_multi_scope_commit_boundary(tmp_path: pathlib.Path) -> None:
     assert 'inscope_b' in str(excinfo.value)
 
 
+def test_dot_scope_root_bounds_the_whole_project(tmp_path: pathlib.Path) -> None:
+    """A ``.`` scope root names the project itself, so nothing is out of scope.
+
+    ``.`` is the one legal scope root that is not a subdirectory. It collapses
+    to the project boundary instead of joining into a literal ``./`` prefix --
+    which matches no git path, so it would put every changed file out of scope
+    and refuse every commit the node ever makes.
+    """
+    repo = _make_git_repo(tmp_path / 'repo')
+    Node(repo).init(agent='claude', user=True)
+    output = Node(repo).init(
+        name='task',
+        agent='claude',
+        local=True,
+        scope=['.'],
+    )
+    project_dir = _parse_project_dir(output)
+    # configure git identity in the worktree
+    for key, val in (('user.email', 'test@test.com'), ('user.name', 'Test')):
+        subprocess.run(
+            ['git', 'config', key, val],
+            cwd=project_dir,
+            capture_output=True,
+            check=True,
+        )
+    node = Node(project_dir)
+    # '.' is its own canonical form, so the setter's normalization keeps it
+    assert node.config.get('scope') == ['.']
+    # baseline cleans the tree (sweeping init's root .gitattributes); stub the
+    # lint gate (not under test) so the boundary check alone decides
+    node.commit('baseline', init=True)
+    branch = _resolve_branch(project_dir)
+    lint = project_dir / '.fractal' / branch / 'scripts' / 'lint.sh'
+    lint.write_text('#!/usr/bin/env bash\nexit 0\n', encoding='utf-8')
+    # work anywhere in the project commits: a nested dir and the project root
+    (project_dir / 'nested').mkdir()
+    (project_dir / 'nested' / 'work.txt').write_text('nested work\n', encoding='utf-8')
+    (project_dir / 'root.txt').write_text('root work\n', encoding='utf-8')
+    node.commit('touch the whole project')
+    result = subprocess.run(
+        ['git', '-C', f'{project_dir}', 'ls-files'],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    tracked = result.stdout
+    assert 'nested/work.txt' in tracked
+    assert 'root.txt' in tracked
+
+
 def test_scoped_commit_handles_non_ascii_and_whitespace_paths(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -835,7 +900,9 @@ def test_commit_check_detects_untracked_work(tmp_path: pathlib.Path) -> None:
     query ``git diff --name-only HEAD`` never lists untracked files, so a step
     that leaves only new untracked work would be reported clean -- the
     force-commit skipped, and a later ``--continue`` (``git clean -fd``) would
-    discard the work. ``--check`` must use a query that sees untracked files.
+    discard the work. ``--check`` must use a query that sees untracked files,
+    and it sees only dirt the stage could commit: runtime artifacts barred by
+    the stage excludes stay invisible even when info/exclude is stale.
     """
     repo = _make_git_repo(tmp_path / 'repo')
     Node(repo).init(agent='claude', user=True)
@@ -853,6 +920,20 @@ def test_commit_check_detects_untracked_work(tmp_path: pathlib.Path) -> None:
     # baseline commit -- everything committed, tree clean
     node.commit('baseline', init=True)
     # a clean tree passes --check (no raise)
+    node.commit(check=True)
+    # runtime artifacts the stage may never commit stay invisible to the
+    # check, even in a worktree whose info/exclude predates their entry --
+    # strip the line to simulate the stale block
+    system = project_dir / '.fractal' / 'main.task' / 'skills' / '.system' / 'x'
+    system.mkdir(parents=True)
+    (system / 'SKILL.md').write_text('engine-materialized\n', encoding='utf-8')
+    exclude = repo / '.git' / 'info' / 'exclude'
+    stale = [
+        line
+        for line in exclude.read_text(encoding='utf-8').splitlines()
+        if line != '**/skills/.system/'
+    ]
+    exclude.write_text('\n'.join(stale) + '\n', encoding='utf-8')
     node.commit(check=True)
     # a step leaves only an untracked file (no tracked changes)
     (project_dir / 'leftover.txt').write_text('uncommitted work\n', encoding='utf-8')

@@ -47,10 +47,23 @@ String keys:
 - `model` -- model override. Default: the agent's own default.
 - `effort` -- reasoning-effort override.
 
-List key:
+List keys (a JSON list of relative subdirectories -- never absolute, never
+containing `..`; the setter accepts a comma- or space-separated string and
+stores each entry in canonical path form (`./src`, `src/`, `a//b` land as `src`,
+`a/b`), and a space-joined string form is tolerated on read):
 
-- `scope` -- commit scope roots, stored as a JSON list of repo-relative
-  subdirectories (a space-joined string form is tolerated on read).
+- `scope` -- commit scope roots, resolved against the node's **project** root,
+  which is the repo root unless `project` names a sub-project (a `src` root
+  under project `app` bounds `app/src`). A lone `.` names the project itself:
+  the commit boundary collapses to the project directory, exactly as an unset
+  `scope` does.
+- `clone_dirs` -- git-ignored build-cache directories copy-on-write cloned from
+  the main checkout into each freshly spawned worktree, so a node starts warm
+  instead of re-deriving them. Resolved against the **repo** root, and `.` is
+  refused (it would clone the whole checkout). Read from the tree's user node
+  only, and not settable by flag: set it after init with
+  `fractal node config set clone_dirs=<dir>,<dir>`. Default: absent (no
+  cloning). See [[architecture/worktrees]].
 
 Boolean keys (must be JSON `true`/`false`/`null`):
 
@@ -98,7 +111,11 @@ ceilings, a per-iteration or per-step cap without `max_cost`, a reserve at or
 above 99% of `max_cost`, a broken `step <= iter <= run` cost ordering,
 non-integer or degenerate integer caps, non-boolean mode flags, bare-number or
 sub-second durations, `interval` and `sleep` both set, `iter_timeout` exceeding
-`interval`, and absolute or `..` scope roots.
+`interval`, absolute or `..` list-key entries (a scope root that never matches
+the commit pipeline's relative prefix check, or a `clone_dirs` entry reaching
+outside the worktree it warms), non-canonical list-key spellings (`./src`,
+`src/` -- the setters store canonical form, so only a hand-edit lands one), and
+a `.` cache dir, which would clone the whole checkout.
 
 ## Reading and writing after init
 

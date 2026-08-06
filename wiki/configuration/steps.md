@@ -32,7 +32,8 @@ running a partial list.
 ## The seed sequence
 
 A new node is seeded with five steps (or the parent's live step list when
-spawned with `--inherit=steps` -- see [[configuration/inheritance]]):
+spawned with `--inherit=steps` -- see [[configuration/inheritance]] -- or an
+explicit directory of step files passed via `--steps`):
 
 - `00-PREPARE` -- merge the parent branch to pull upstream changes, and review
   and merge children's ready work.
@@ -55,6 +56,13 @@ installed package's mode documents, never a per-node copy, so it is not
 customizable per node; disable it wholesale with `--no-sync` (see
 [[configuration/node_init]]). Run-time semantics -- failure handling, timeouts,
 and the checkpoints around each pass -- live in [[features/loop/steps]].
+
+The name is shared with ordinary step files: a step named `SYNC` records like
+any other step, and the cockpit tells the two apart structurally -- a pass
+carries step 0 (the drain wait) or the number of the differently-named step it
+precedes, and a still-open SYNC row reads as a pass only under sync mode (with
+sync off no pass can exist, so a running SYNC step is numbered immediately) --
+so a step named SYNC lists under its own number, never as muted `sync` chrome.
 
 ## Frontmatter overrides
 
@@ -97,6 +105,7 @@ trim seed steps a narrow node does not need (keeping the prefix widths
 consistent), add project-specific steps, or set frontmatter overrides (a cheap
 model for a mechanical step, an approval gate before an expensive one). Spawning
 with `--inherit=steps` starts from the parent's tailored list instead of the
-package seed. A running node's step files remain editable steering surfaces for
-its operator or parent; the node itself is contractually barred from modifying
-its own seed.
+package seed, and `--steps <dir>` starts from an explicit directory of step
+files (see [[configuration/node_init]]). A running node's step files remain
+editable steering surfaces for its operator or parent; the node itself is
+contractually barred from modifying its own seed.

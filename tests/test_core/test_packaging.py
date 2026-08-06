@@ -1,4 +1,4 @@
-"""Tests for fractal's git-excludes (``.git/info/exclude``) handling."""
+"""Tests for fractal's git-ignore surfaces (``info/exclude`` + seed self-ignore)."""
 
 from __future__ import annotations
 
@@ -14,8 +14,9 @@ __all__ = [
     'test_init_writes_git_excludes',
     'test_init_excludes_subproject_user_seed',
     'test_git_exclude_anchors_workspace_dirs',
+    'test_second_init_keeps_the_first_tree_hidden',
     'test_track_untrack_toggle_survives_exclude_rewrites',
-    'test_git_exclude_skips_user_seed_without_commit',
+    'test_git_exclude_works_without_a_commit',
 ]
 
 
@@ -55,9 +56,9 @@ def test_init_writes_git_excludes(tmp_path: pathlib.Path) -> None:
     ``init`` writes a managed block into the repo-local exclude (shared across
     every worktree), so runtime artifacts are ignored in both the repo root and
     inside a linked worktree; the committed ``.gitignore`` is never created; and
-    re-running the writer is idempotent. The user node's own seed dir is ignored
-    on the top-level branch via a branch-specific pattern, so child node branches
-    still track their seeds.
+    re-running the writer is idempotent. The user node's own seed dir ignores
+    itself via its own self-ignore file, so child node branches still track
+    their seeds and no per-tree state rides the shared block.
     """
     # fresh repo with NO committed .gitignore
     repo = tmp_path / 'repo'
@@ -67,7 +68,7 @@ def test_init_writes_git_excludes(tmp_path: pathlib.Path) -> None:
         ['git', 'config', 'user.email', 'test@test.com'],
         ['git', 'config', 'user.name', 'Test'],
         # neutralize any global excludesFile so check-ignore attributes the
-        # match to our info/exclude (no committed .gitignore exists here)
+        # match to fractal's own surfaces (no committed .gitignore exists here)
         ['git', 'config', 'core.excludesFile', os.devnull],
     ):
         subprocess.run(cmd, cwd=repo, capture_output=True, check=True)
@@ -93,10 +94,10 @@ def test_init_writes_git_excludes(tmp_path: pathlib.Path) -> None:
     assert '# >>> fractal >>>' in body
     assert not (repo / '.gitignore').exists()
 
-    # the user node's own seed dir is git-ignored on the top-level branch via a
-    # branch-specific pattern; a child's differently-named seed dir is not, so
-    # node branches keep tracking their own seed
-    assert 'info/exclude' in _check_ignore(repo, '.fractal/main')
+    # the user node's own seed dir hides itself (its own ignore file, not the
+    # shared block); a child's differently-named seed dir carries no such
+    # file, so node branches keep tracking their seeds
+    assert '.gitignore' in _check_ignore(repo, '.fractal/main/config.json')
     assert not _check_ignore(repo, '.fractal/main.child')
 
     # the exclude is shared across worktrees: artifacts are ignored in the repo
@@ -121,14 +122,15 @@ def test_init_writes_git_excludes(tmp_path: pathlib.Path) -> None:
 def test_init_excludes_subproject_user_seed(tmp_path: pathlib.Path) -> None:
     """A monorepo sub-project user node ignores ``<project>/.fractal/<branch>/``.
 
-    The exclude pattern carries the project prefix, so the sub-project user seed
-    is ignored on the top-level branch while a child's differently-named seed dir
-    is not -- the ``project != '.'`` mirror of the repo-root case.
+    The self-ignore rides the node dir wherever it nests, so the sub-project
+    user seed is hidden on the top-level branch while a child's
+    differently-named seed dir is not -- the ``project != '.'`` mirror of the
+    repo-root case.
     """
     repo = _committed_repo(tmp_path)
     (repo / 'app').mkdir()
     Node(repo).init(path='app', user=True)
-    assert 'info/exclude' in _check_ignore(repo, 'app/.fractal/main')
+    assert '.gitignore' in _check_ignore(repo, 'app/.fractal/main/config.json')
     assert not _check_ignore(repo, 'app/.fractal/main.child')
 
 
@@ -161,47 +163,77 @@ def test_git_exclude_anchors_workspace_dirs(tmp_path: pathlib.Path) -> None:
     assert 'info/exclude' in _check_ignore(repo, 'src/tmp/scratch.txt')
 
 
+def test_second_init_keeps_the_first_tree_hidden(tmp_path: pathlib.Path) -> None:
+    """A second tree's init never exposes the first tree's runtime dir.
+
+    Each user seed dir hides itself, so initializing tree after tree in one
+    repo leaves every runtime dir invisible -- ``git status`` stays silent
+    about ``.fractal/`` no matter which init ran last.
+    """
+    repo = _committed_repo(tmp_path)
+    Node(repo).init(user=True)
+    # commit the wiki baseline so the status silence below is attributable
+    # to the seed dirs alone
+    Node(repo).commit('baseline', init=True)
+    subprocess.run(
+        ['git', 'checkout', '-q', '-b', 'second'],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    )
+    Node(repo).init(user=True)
+    status = subprocess.run(
+        ['git', 'status', '--porcelain'],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert '.fractal' not in status
+    # both runtime dirs exist and each hides itself
+    assert '.gitignore' in _check_ignore(repo, '.fractal/main/config.json')
+    assert '.gitignore' in _check_ignore(repo, '.fractal/second/config.json')
+
+
 def test_track_untrack_toggle_survives_exclude_rewrites(
     tmp_path: pathlib.Path,
 ) -> None:
     """``fractal track``/``untrack`` is the only toggle; block rewrites preserve it.
 
-    Tracking truth lives in the exclude block's own seed-dir ignore line, so
-    the block writer (re-run on every child init and start) re-reads and
-    preserves the current state instead of resetting it to the untracked
-    default. A fresh init is untracked; a re-init is an idempotent no-op.
+    Tracking truth is the seed dir's own self-ignore file, so the shared
+    block writer (re-run on every child init and start) can never reset the
+    choice. A fresh init is untracked; a re-init is an idempotent no-op.
     """
     repo = _committed_repo(tmp_path)
     node = Node(repo)
     node.init(user=True)
-    # a fresh init is untracked: the seed dir is ignored, re-init included
-    assert 'info/exclude' in _check_ignore(repo, '.fractal/main')
+    probe = '.fractal/main/config.json'
+    # a fresh init is untracked: the seed dir hides itself, re-init included
+    assert _check_ignore(repo, probe)
     node.init(user=True)
-    assert 'info/exclude' in _check_ignore(repo, '.fractal/main')
-    # fractal track lifts the seed-dir ignore; a block rewrite preserves it
+    assert _check_ignore(repo, probe)
+    # fractal track lifts the self-ignore; a block rewrite preserves it
     _toggle(repo, 'track')
-    assert not _check_ignore(repo, '.fractal/main')
+    assert not _check_ignore(repo, probe)
     node._git_exclude()
-    assert not _check_ignore(repo, '.fractal/main')
+    assert not _check_ignore(repo, probe)
     # fractal untrack restores the ignore, surviving a rewrite the same way
     _toggle(repo, 'untrack')
-    assert 'info/exclude' in _check_ignore(repo, '.fractal/main')
+    assert _check_ignore(repo, probe)
     node._git_exclude()
-    assert 'info/exclude' in _check_ignore(repo, '.fractal/main')
+    assert _check_ignore(repo, probe)
 
 
-def test_git_exclude_skips_user_seed_without_commit(tmp_path: pathlib.Path) -> None:
-    """On a commitless repo, ``_git_exclude`` writes the template but no user seed.
+def test_git_exclude_works_without_a_commit(tmp_path: pathlib.Path) -> None:
+    """On a commitless repo, ``_git_exclude`` still writes the managed block.
 
-    With no commit there is no branch to resolve a user node from, so the
-    ``check=False`` HEAD guard skips the ``# User node`` prepend -- the managed
-    block is just the shipped template.
+    The block is static -- no user node or branch resolution is involved --
+    so spawn/start rewrites work from any repo state.
     """
     repo = _git_repo(tmp_path)
     Node(repo)._git_exclude()
     block = (repo / '.git' / 'info' / 'exclude').read_text(encoding='utf-8')
     assert '.worktrees/' in block
-    assert '# User node' not in block
 
 
 # ------ helpers
@@ -225,7 +257,7 @@ def _committed_repo(tmp_path: pathlib.Path) -> pathlib.Path:
 
     ``init(user=True)`` needs a branch (a commit), and neutralizing
     ``core.excludesFile`` lets ``check-ignore`` attribute matches to
-    ``info/exclude``.
+    fractal's own surfaces.
     """
     repo = _git_repo(tmp_path)
     for cmd in (

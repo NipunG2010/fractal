@@ -31,13 +31,18 @@ __all__ = [
     'test_commit_records_the_iteration_and_clears_the_check',
     'test_commit_check_fails_on_a_dirty_worker',
     'test_reset_force_tears_worktrees_and_keeps_history',
-    'test_destroy_force_tears_the_fractal_down',
+    'test_destroy_all_force_tears_the_fractal_down',
     'test_destroy_aborts_when_the_prompt_is_declined',
+    'test_destroy_requires_a_tree_or_all',
+    'test_destroy_tree_scoped_spares_sibling_trees',
+    'test_tree_verbs_anchor_on_the_callers_own_tree',
+    'test_tree_verbs_refuse_an_ambiguous_checkout',
+    'test_reset_refuses_a_repo_with_no_tree',
     'test_reset_off_branch_counts_nodes_and_clears_the_registry',
     'test_destroy_off_branch_removes_the_user_data',
     'test_track_untrack_round_trip_prints_git_follow_ups',
     'test_open_rejects_light_and_dark_together',
-    'test_open_anchors_on_the_user_node_from_a_non_init_checkout',
+    'test_open_anchors_on_a_tree_from_any_checkout',
 ]
 
 # the skills both agents receive (fractal ships its own; wiki ships via the
@@ -192,7 +197,7 @@ def test_reset_force_tears_worktrees_and_keeps_history(
     assert (repo / '.worktrees' / 'main.task').exists()
     result = _run(repo, 'reset', '--force')
     assert result.returncode == 0, result.stderr
-    assert 'Reset fractal' in result.stdout
+    assert 'Reset tree: main' in result.stdout
     # the worktree, branch, and registration are gone; the user node's data
     # (the central database and its history) is not
     assert not (repo / '.worktrees' / 'main.task').exists()
@@ -202,12 +207,12 @@ def test_reset_force_tears_worktrees_and_keeps_history(
     assert Node(repo).db.read('nodes') == []
 
 
-def test_destroy_force_tears_the_fractal_down(tmp_path: pathlib.Path) -> None:
-    """``destroy --force`` removes every worktree, branch, and the user data."""
+def test_destroy_all_force_tears_the_fractal_down(tmp_path: pathlib.Path) -> None:
+    """``destroy --all --force`` removes every worktree, branch, and user data."""
     repo = _seed_repo(tmp_path / 'doomed')
     assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
     assert (repo / '.worktrees' / 'main.task').exists()
-    result = _run(repo, 'destroy', '--force')
+    result = _run(repo, 'destroy', '--all', '--force')
     assert result.returncode == 0, result.stderr
     assert 'Destroyed fractal' in result.stdout
     # the worktrees, the registry, and the branch are all gone
@@ -223,11 +228,170 @@ def test_destroy_aborts_when_the_prompt_is_declined(tmp_path: pathlib.Path) -> N
     """Answering 'n' at the confirm prompt leaves the fractal untouched."""
     repo = _seed_repo(tmp_path / 'spared')
     assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
-    result = _run(repo, 'destroy', stdin='n\n')
+    result = _run(repo, 'destroy', '--all', stdin='n\n')
     assert result.returncode != 0  # typer.confirm(abort=True) aborts non-zero
     # nothing was torn down: the worktree and registry are still present
     assert (repo / '.worktrees' / 'main.task').exists()
     assert (repo / '.fractal').exists()
+
+
+def test_destroy_requires_a_tree_or_all(tmp_path: pathlib.Path) -> None:
+    """A bare ``destroy`` (or a tree combined with ``--all``) is refused.
+
+    A bare destroy is ambiguous between "this tree" and "everything", so the
+    scope must be named -- and named exactly once.
+    """
+    repo = _seed_repo(tmp_path / 'ambiguous')
+    # typer boxes and hard-wraps a bad-parameter message, so read it collapsed
+    bare = _run(repo, 'destroy', '--force')
+    assert bare.returncode != 0
+    rendered = ' '.join(bare.stderr.replace('│', ' ').split())
+    assert 'Name a tree or pass --all (exactly one).' in rendered
+    both = _run(repo, 'destroy', 'main', '--all', '--force')
+    assert both.returncode != 0
+    rendered = ' '.join(both.stderr.replace('│', ' ').split())
+    assert 'Name a tree or pass --all (exactly one).' in rendered
+    # nothing was torn down either way
+    assert (repo / '.fractal' / 'main').is_dir()
+
+
+def test_destroy_tree_scoped_spares_sibling_trees(tmp_path: pathlib.Path) -> None:
+    """``destroy <tree>`` removes one tree; sibling trees survive untouched.
+
+    Two trees share one repo (sequential inits). Destroying the first by
+    name takes its worktrees, branches, and data dir, while the sibling's
+    stay put -- along with the shared plumbing and exclude block, which go
+    only when the last tree does, leaving the repo git-clean. The scope the
+    confirmation names is the scope the teardown takes.
+    """
+    repo = _two_tree_repo(tmp_path / 'twotrees')
+    # the confirmation names the tree and its own node count, and declining
+    # it leaves every tree standing
+    declined = _run(repo, 'destroy', 'main', stdin='n\n')
+    assert declined.returncode != 0
+    assert "Destroy the tree 'main'" in declined.stdout
+    assert '(1 node)?' in declined.stdout
+    assert "the tree's node" in declined.stderr
+    assert (repo / '.worktrees' / 'main.task').exists()
+    # destroy the first tree by name: its residue goes, the sibling's stays
+    result = _run(repo, 'destroy', 'main', '--force')
+    assert result.returncode == 0, result.stderr
+    assert 'Destroyed tree: main' in result.stdout
+    assert not (repo / '.fractal' / 'main').exists()
+    assert not (repo / '.worktrees' / 'main.task').exists()
+    assert _git(repo, 'branch', '--list', 'main.task').stdout.strip() == ''
+    assert (repo / '.fractal' / 'second' / '.db').is_file()
+    assert (repo / '.worktrees' / 'second.job').exists()
+    exclude = repo / '.git' / 'info' / 'exclude'
+    assert '>>> fractal >>>' in exclude.read_text(encoding='utf-8')
+    # the last tree destroyed by name takes the plumbing and the block with
+    # it -- a surviving .worktrees/ would outlive the block that hid it
+    result = _run(repo, 'destroy', 'second', '--force')
+    assert result.returncode == 0, result.stderr
+    assert 'Destroyed tree: second' in result.stdout
+    assert '>>> fractal >>>' not in exclude.read_text(encoding='utf-8')
+    assert not (repo / '.worktrees').exists()
+    assert _git(repo, 'status', '--porcelain').stdout == ''
+
+
+def test_tree_verbs_anchor_on_the_callers_own_tree(tmp_path: pathlib.Path) -> None:
+    """On a two-tree repo every tree-scoped verb acts on the caller's tree.
+
+    Each verb resolves the tree owning the caller's branch -- the repo root's
+    checkout, or a node worktree's ``<root>.<...>`` -- so a sibling tree's
+    latch, seed, and worktrees are never touched. Naming a tree outright
+    overrides the inference.
+    """
+    repo = _two_tree_repo(tmp_path / 'anchored')  # checked out on 'second'
+    # pause latches the caller's tree alone
+    assert _run(repo, 'pause').returncode == 0
+    assert (repo / '.fractal' / 'second' / '.paused').exists()
+    assert not (repo / '.fractal' / 'main' / '.paused').exists()
+    assert _run(repo, 'resume').returncode == 0
+    # track toggles the caller's seed; naming the sibling toggles that one
+    assert '.fractal/second/' in _run(repo, 'track').stdout
+    assert not (repo / '.fractal' / 'second' / '.gitignore').exists()
+    assert (repo / '.fractal' / 'main' / '.gitignore').exists()
+    assert '.fractal/main/' in _run(repo, 'track', 'main').stdout
+    assert not (repo / '.fractal' / 'main' / '.gitignore').exists()
+    # from inside a node worktree the owning tree answers, not the checkout's
+    task = repo / '.worktrees' / 'main.task'
+    assert '.fractal/main/' in _run(task, 'untrack').stdout
+    assert (repo / '.fractal' / 'main' / '.gitignore').exists()
+    # reset takes the caller's tree only -- the sibling keeps its nodes
+    result = _run(repo, 'reset', '--force')
+    assert result.returncode == 0, result.stderr
+    assert 'Reset tree: second' in result.stdout
+    assert not (repo / '.worktrees' / 'second.job').exists()
+    assert task.exists()
+    assert Node.resolve_user(repo, name='second').db.read('nodes') == []
+    assert Node.resolve_user(repo, name='main').db.read('nodes') != []
+
+
+def test_tree_verbs_refuse_an_ambiguous_checkout(tmp_path: pathlib.Path) -> None:
+    """A checkout belonging to no tree must be named, never guessed.
+
+    A lone tree answers from any checkout, but with several, a branch outside
+    them all is ambiguous -- guessing would brake, toggle, or tear down a
+    healthy sibling. The verbs refuse and name the trees to choose from;
+    naming one resolves it, and an unknown name is refused outright.
+    """
+    repo = _two_tree_repo(tmp_path / 'ambiguous')
+    _git(repo, 'checkout', '-b', 'sidework')
+    # typer boxes and hard-wraps a bad-parameter message, so read it collapsed
+    for argv in (['pause'], ['resume'], ['track'], ['untrack'], ['reset', '--force']):
+        result = _run(repo, *argv)
+        assert result.returncode != 0, argv
+        rendered = ' '.join(result.stderr.replace('│', ' ').split())
+        assert 'several fractal trees (main, second)' in rendered, argv
+    # the read-only listing spans them instead: showing every node is no
+    # guess, and each row's branch names the tree it sits in
+    listed = _run(repo, 'node', 'list')
+    assert listed.returncode == 0, listed.stderr
+    assert 'main.task' in listed.stdout
+    assert 'second.job' in listed.stdout
+    # naming a tree scopes the listing to it -- a root owns no worktree, so
+    # it resolves by config rather than needing its branch checked out
+    scoped = _run(repo, 'node', 'list', 'main')
+    assert scoped.returncode == 0, scoped.stderr
+    assert 'main.task' in scoped.stdout
+    assert 'second.job' not in scoped.stdout
+    # an unborn checkout has no branch at all -- the refusal still names the
+    # trees rather than dying on the branch it cannot read
+    _git(repo, 'checkout', '--orphan', 'blank')
+    result = _run(repo, 'pause')
+    assert result.returncode != 0
+    rendered = ' '.join(result.stderr.replace('│', ' ').split())
+    assert 'several fractal trees (main, second)' in rendered
+    # naming the tree resolves the ambiguity, from that checkout as much as
+    # any other -- the name is read, never the branch
+    result = _run(repo, 'reset', 'main', '--force')
+    assert result.returncode == 0, result.stderr
+    assert 'Reset tree: main' in result.stdout
+    # an unknown name is refused with the real trees named, nothing torn down
+    # (typer boxes and hard-wraps a bad-parameter message, so read it collapsed)
+    unknown = _run(repo, 'reset', 'ghost', '--force')
+    assert unknown.returncode != 0
+    rendered = ' '.join(unknown.stderr.replace('│', ' ').split())
+    assert "No fractal tree 'ghost'" in rendered
+    assert 'Trees here: main, second.' in rendered
+    assert (repo / '.worktrees' / 'second.job').exists()
+
+
+def test_reset_refuses_a_repo_with_no_tree(tmp_path: pathlib.Path) -> None:
+    """``reset`` on an uninitialized repo refuses instead of prompting.
+
+    Reset is tree-scoped, so with no tree there is nothing to name and
+    nothing to confirm -- the refusal points at ``init``, and it lands the
+    same way with or without ``--force``.
+    """
+    repo = _git_repo_only(tmp_path / 'bare')
+    for argv in (['reset'], ['reset', '--force']):
+        result = _run(repo, *argv)
+        assert result.returncode != 0, argv
+        rendered = ' '.join(result.stderr.replace('│', ' ').split())
+        assert 'No user node found under' in rendered, argv
+        assert 'Reset the tree' not in result.stdout, argv
 
 
 def test_reset_off_branch_counts_nodes_and_clears_the_registry(
@@ -268,10 +432,10 @@ def test_destroy_off_branch_removes_the_user_data(tmp_path: pathlib.Path) -> Non
     assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
     _git(repo, 'checkout', '-b', 'sidework')
     # the confirmation still names the real node count from the side branch
-    declined = _run(repo, 'destroy', stdin='n\n')
+    declined = _run(repo, 'destroy', '--all', stdin='n\n')
     assert declined.returncode != 0
     assert '(1 node)?' in declined.stdout
-    result = _run(repo, 'destroy', '--force')
+    result = _run(repo, 'destroy', '--all', '--force')
     assert result.returncode == 0, result.stderr
     assert not (repo / '.worktrees').exists()
     assert not (repo / '.fractal').exists()
@@ -283,47 +447,48 @@ def test_destroy_off_branch_removes_the_user_data(tmp_path: pathlib.Path) -> Non
 def test_track_untrack_round_trip_prints_git_follow_ups(
     tmp_path: pathlib.Path,
 ) -> None:
-    """``track``/``untrack`` toggle the seed-dir ignore and print git follow-ups.
+    """``track``/``untrack`` toggle the seed dir's self-ignore and print follow-ups.
 
-    The verbs rewrite only the repo-local exclude block -- the index is never
-    touched, so each prints the git command that finishes the move. Both are
-    idempotent: repeating one is a no-op that prints the same follow-up.
+    The verbs toggle only the seed dir's own ignore file -- the index is
+    never touched, so each prints the git command that finishes the move.
+    Both are idempotent: repeating one is a no-op printing the same follow-up.
     """
     repo = _seed_repo(tmp_path / 'toggled')
     # neutralize any global excludes file so the ignore state below is
-    # attributable to fractal's exclude block alone
+    # attributable to fractal's own surfaces alone
     _git(repo, 'config', 'core.excludesFile', os.devnull)
     seed_dir = '.fractal/main'
-    # a fresh tree is untracked: the seed dir is git-ignored
-    assert _ignored(repo, seed_dir)
+    probe = f'{seed_dir}/config.json'
+    # a fresh tree is untracked: the seed dir hides itself
+    assert _ignored(repo, probe)
     # track lifts the ignore and prints the staging follow-up without staging
     result = _run(repo, 'track')
     assert result.returncode == 0, result.stderr
     assert f'git add -- {seed_dir}' in result.stdout
-    assert not _ignored(repo, seed_dir)
+    assert not _ignored(repo, probe)
     assert _git(repo, 'ls-files', seed_dir).stdout == ''
     # idempotent: a second track is a no-op printing the same follow-up
     result = _run(repo, 'track')
     assert result.returncode == 0, result.stderr
     assert f'git add -- {seed_dir}' in result.stdout
-    assert not _ignored(repo, seed_dir)
+    assert not _ignored(repo, probe)
     # untrack restores the ignore and prints the unstage follow-up
     result = _run(repo, 'untrack')
     assert result.returncode == 0, result.stderr
     assert f'git rm -r --cached -- {seed_dir}' in result.stdout
-    assert _ignored(repo, seed_dir)
+    assert _ignored(repo, probe)
     # idempotent the same way in reverse
     result = _run(repo, 'untrack')
     assert result.returncode == 0, result.stderr
     assert f'git rm -r --cached -- {seed_dir}' in result.stdout
-    assert _ignored(repo, seed_dir)
+    assert _ignored(repo, probe)
     # the verbs anchor on the user node by config, not the checkout, so they
     # stay usable when the repo root sits on a non-init branch
     _git(repo, 'checkout', '-b', 'sidework')
     result = _run(repo, 'track')
     assert result.returncode == 0, result.stderr
     assert f'git add -- {seed_dir}' in result.stdout
-    assert not _ignored(repo, seed_dir)
+    assert not _ignored(repo, probe)
 
 
 # ------ open
@@ -341,36 +506,55 @@ def test_open_rejects_light_and_dark_together(tmp_path: pathlib.Path) -> None:
     assert 'Traceback' not in result.stdout + result.stderr
 
 
-def test_open_anchors_on_the_user_node_from_a_non_init_checkout(
-    tmp_path: pathlib.Path,
-) -> None:
-    """``open <node>`` anchors the cockpit on the user node from any checkout.
+def test_open_anchors_on_a_tree_from_any_checkout(tmp_path: pathlib.Path) -> None:
+    """``open`` opens a tree's cockpit, focused on a node or its root.
 
-    The cockpit anchors on the user node by config, not the checkout (mirrors
-    pause): a branch-keyed resolution on a non-init checkout would refuse to
-    open even with the node to focus named explicitly. The TUI is stubbed
-    through ``sitecustomize`` (imported at subprocess startup) to print the
-    resolved anchor and focus instead of needing a terminal.
+    The cockpit is the tree's, so it anchors on the user node by config, not
+    the checkout (mirrors pause) -- a branch-keyed resolution would refuse on
+    a non-init checkout, exactly when the operator most wants to look. A lone
+    tree answers any checkout; with several, the caller's branch names its
+    own and an outside branch must name one. The one argument takes either
+    name (mirrors ``node list``): a tree root opens at the root, a node
+    branch opens its own tree focused there. The TUI is stubbed through
+    ``sitecustomize`` (imported at subprocess startup) to print the resolved
+    anchor and focus instead of needing a terminal.
     """
-    repo = _seed_repo(tmp_path / 'sideopened')
-    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
-    assert _run(repo, 'node', 'init', 'docs', '--agent', 'claude').returncode == 0
     shim = tmp_path / 'shim'
     shim.mkdir()
     (shim / 'sitecustomize.py').write_text(_TUI_STUB, encoding='utf-8')
     # the conftest env overlay replaces PYTHONPATH wholesale, so compose
     # shim + worktree (the worktree entry keeps the edited package importable)
     pythonpath = os.pathsep.join((str(shim), str(_worktree_root())))
-    # the user checks the repo root out to their own branch (mirrors track)
+    repo = _seed_repo(tmp_path / 'sideopened')
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    # the user checks the repo root out to their own branch (mirrors track);
+    # the lone tree still answers
     _git(repo, 'checkout', '-b', 'sidework')
+    result = _run(repo, 'open', PYTHONPATH=pythonpath)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'cockpit root=main focus=None'
+    # a node branch focuses that node, naming its tree on the way
     result = _run(repo, 'open', 'main.task', PYTHONPATH=pythonpath)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == 'cockpit root=main focus=main.task'
-    # a bare open from the init checkout still anchors and focuses the root
-    _git(repo, 'checkout', 'main')
-    result = _run(repo, 'open', PYTHONPATH=pythonpath)
+    # with several trees the caller's own tree answers, and naming one wins
+    two = _two_tree_repo(tmp_path / 'twoopened')  # checked out on 'second'
+    result = _run(two, 'open', PYTHONPATH=pythonpath)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == 'cockpit root=main focus=main'
+    assert result.stdout.strip() == 'cockpit root=second focus=None'
+    result = _run(two, 'open', 'main', PYTHONPATH=pythonpath)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'cockpit root=main focus=None'
+    # a checkout belonging to no tree must name one, never be guessed for
+    _git(two, 'checkout', '-b', 'sidework')
+    result = _run(two, 'open', PYTHONPATH=pythonpath)
+    assert result.returncode != 0
+    rendered = ' '.join(result.stderr.replace('│', ' ').split())
+    assert 'several fractal trees (main, second)' in rendered
+    # ...but a node branch names its tree, so it opens from that checkout too
+    result = _run(two, 'open', 'main.task', PYTHONPATH=pythonpath)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'cockpit root=main focus=main.task'
 
 
 # ------ helpers
@@ -386,8 +570,8 @@ def _ignored(repo: pathlib.Path, path: str) -> bool:
     return result.returncode == 0
 
 
-def _seed_repo(path: pathlib.Path) -> pathlib.Path:
-    """Create a committed git repo with a user (root) node via the real CLI."""
+def _git_repo_only(path: pathlib.Path) -> pathlib.Path:
+    """Create a committed git repo with a wiki but no fractal."""
     path.mkdir(parents=True, exist_ok=True)
     _git(path, 'init', '-b', 'main')
     _git(path, 'config', 'user.email', 'fractal-cmd@test.local')
@@ -401,9 +585,30 @@ def _seed_repo(path: pathlib.Path) -> pathlib.Path:
     )
     _git(path, 'add', '-A')
     _git(path, 'commit', '-m', 'init')
+    return path
+
+
+def _seed_repo(path: pathlib.Path) -> pathlib.Path:
+    """Create a committed git repo with a user (root) node via the real CLI."""
+    _git_repo_only(path)
     assert _run(path, 'init').returncode == 0
     assert Node(path).is_user
     return path
+
+
+def _two_tree_repo(path: pathlib.Path) -> pathlib.Path:
+    """Create a repo carrying two trees: ``main`` (+ task) and ``second`` (+ job).
+
+    Sequential inits on two root branches. The checkout is left on
+    ``second`` -- the tree initialized last, and the one every scoped verb
+    should infer from the repo root.
+    """
+    repo = _seed_repo(path)
+    assert _run(repo, 'node', 'init', 'task', '--agent', 'claude').returncode == 0
+    _git(repo, 'checkout', '-b', 'second')
+    assert _run(repo, 'init').returncode == 0
+    assert _run(repo, 'node', 'init', 'job', '--agent', 'claude').returncode == 0
+    return repo
 
 
 @pytest.fixture(scope='module')

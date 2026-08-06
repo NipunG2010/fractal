@@ -51,6 +51,8 @@ __all__ = [
     'test_destroy_rejects_from_inside_worktree',
     'test_teardown_locked_preflight_precedes_paused_settle',
     'test_destroy_lifecycle',
+    'test_destroy_rejects_an_unknown_tree',
+    'test_teardown_guards_travel_with_the_scope',
     'test_destroy_prunes_phantom_node_branches',
     'test_reset_lifecycle',
 ]
@@ -820,6 +822,72 @@ def test_destroy_lifecycle(git_repo: pathlib.Path) -> None:
     assert 'Nothing to destroy' in second
 
 
+def test_destroy_rejects_an_unknown_tree(git_repo: pathlib.Path) -> None:
+    """A tree-scoped destroy anchors the named tree's user node or refuses.
+
+    A wrong or mid-tree branch name must error before any teardown -- keyed
+    to the wrong tree it would guard and prune a healthy sibling's state.
+    """
+    node = Node(git_repo)
+    node.init(agent='claude', user=True)
+    node.init(name='task')
+    with pytest.raises(RuntimeError, match='No tree found'):
+        Node.destroy(git_repo, name='ghost')
+    # a mid-tree (non-user) branch is refused the same way
+    with pytest.raises(RuntimeError, match='No tree found'):
+        Node.destroy(git_repo, name='main.task')
+    assert (git_repo / '.worktrees' / 'main.task').exists()
+
+
+def test_teardown_guards_travel_with_the_scope(git_repo: pathlib.Path) -> None:
+    """Each teardown pre-flights exactly the trees it will tear down.
+
+    A repo-wide sweep guards every tree before settling any, so one tree's
+    locked worktree refuses the whole run with a sibling's paused work still
+    frozen -- guarding one tree while tearing down another would discard
+    work the caller was never warned about. A tree-scoped teardown is the
+    mirror: it pre-flights only its own tree, so a locked sibling cannot
+    block it, and it settles only its own paused nodes.
+    """
+    node = Node(git_repo)
+    node.init(agent='claude', user=True)
+    node.init(name='frozen')
+    frozen = Node(git_repo / '.worktrees' / 'main.frozen')
+    run_id = frozen.record.run_start()
+    frozen.status_set('paused')
+    # a second tree beside it, holding the locked worktree
+    subprocess.run(
+        ['git', 'checkout', '-b', 'second'],
+        cwd=git_repo,
+        capture_output=True,
+        check=True,
+    )
+    Node(git_repo).init(agent='claude', user=True)
+    Node(git_repo).init(name='pinned')
+    pinned_worktree = git_repo / '.worktrees' / 'second.pinned'
+    subprocess.run(
+        ['git', 'worktree', 'lock', f'{pinned_worktree}'],
+        cwd=git_repo,
+        capture_output=True,
+        check=True,
+    )
+    # the repo-wide sweep refuses on the sibling's lock, and the first tree's
+    # paused work is still frozen -- nothing was settled behind the refusal
+    with pytest.raises(RuntimeError, match='locked'):
+        Node.destroy(git_repo)
+    assert frozen.status() == 'paused'
+    run = frozen.db.read('runs', where={'run_id': run_id})[0]
+    assert run['ended_at'] is None
+    # scoped to its own tree, the same teardown runs: the lock is out of
+    # scope, the paused node settles, and the locked sibling stands
+    user = Node.resolve_user(git_repo, name='main')
+    Node.reset(git_repo, name='main')
+    assert not (git_repo / '.worktrees' / 'main.frozen').exists()
+    assert pinned_worktree.is_dir()
+    run = user.db.read('runs', where={'run_id': run_id})[0]
+    assert run['ended_at'] is not None
+
+
 def test_destroy_prunes_phantom_node_branches(git_repo: pathlib.Path) -> None:
     """Destroy deletes the branch of a node whose worktree vanished out of band.
 
@@ -904,7 +972,7 @@ def test_reset_lifecycle(
     latch.write_text('paused\n', encoding='utf-8')
 
     output = Node.reset(git_repo)
-    assert 'Reset fractal' in output
+    assert 'Reset tree: main' in output
     # every worktree and branch is gone; .worktrees/ itself survives
     assert not task_wt.exists()
     assert not (git_repo / '.worktrees' / 'main.other').exists()

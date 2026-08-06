@@ -3,8 +3,9 @@ name: features/loop/steps
 desc: |
   The step sequence of an iteration: how step files are discovered and
   ordered, what each of the five seed steps instructs, the frontmatter
-  overrides a step file can carry, the SYNC pass that precedes each step, and
-  the checkpoints the loop runs between steps.
+  overrides a step file can carry, the SYNC pass that precedes each step,
+  the checkpoints the loop runs between steps, and the retry and model-drop
+  re-dispatch policies.
 created: 2026-07-21T04:51:13Z
 updated: 2026-07-21T04:51:13Z
 ---
@@ -105,5 +106,39 @@ outcomes that never retry. The extra-attempt count and the backoff before each
 retry are node configuration, and a count of zero disables retries. Every
 attempt books its own step row, so cost and duration attribute honestly to the
 attempt that spent them. A step with `requires_approval` arms an approval gate
-on each attempt's row; a granted approval is never re-demanded, because a retry
-only follows a failed attempt whose wait never ran.
+on each attempt's row; a failure retry follows a failed attempt whose wait never
+ran, and a model-drop re-dispatch (below) produces new work, so its fresh demand
+is deliberate — an approval never transfers between attempts.
+
+## Model drops
+
+Infrastructure can silently serve a different model than a step pinned, so
+enforcement is tool-native: the stream driver records every model the agent's
+own stream names (see [[features/agents/models_and_effort|models_and_effort]]),
+and when a completed launch's record does not carry its pin — the step's
+`model:` frontmatter or the node default it fell back to — the loop records a
+`model_drop` event with the attempt's lineage, marks the attempt's own row
+(`model drop (served <model>)`), and re-dispatches the step once, outside the
+failure-retry allowance but with the same backoff. Matching admits the forms a
+pin legitimately resolves to and nothing looser: a gateway slug
+(`anthropic/<id>`) matches its bare form, and a dated snapshot matches its pin
+when the date stamp is the *whole* extension — so a version bump flags even
+behind a date (`claude-opus-4` against `claude-opus-4-1-20250805`). A bare-word
+alias (`opus`) names a family rather than a version, so it matches the family's
+own version run and date alike, but not a named variant riding one
+(`claude-opus-5-mini`). A truncation or variant suffix flags even though one id
+contains the other. A drop the re-dispatch also served off the pin is evented
+and marked again, and the loop proceeds — consumer-side gates and the operator
+own the response, never a crash or a kill: a spent deadline abandons the
+re-dispatch outright, and a re-dispatch that fails or times out books its own
+rows while the loop proceeds on the dropped attempt's completed work (an
+interrupted approval keeps the failure path — unapproved work never ships).
+`fractal node list` composes a `model drop` marker into the node's `detail`
+column while a step of the newest iteration has its newest *completed* attempt
+marked: a clean re-dispatch supersedes the mark, an abandoned or failed one
+leaves it standing, and the marker reads off the newest iteration alone, so a
+later iteration supersedes it. Detection reads the launch's own stream record —
+every model named, so a substitution the stream recovered from before ending
+still flags — falling back to the step row, and attached and detached launches
+are enforced identically; an agent whose stream never names the served model
+records the pin itself, so unknown never reads as a verified match.
